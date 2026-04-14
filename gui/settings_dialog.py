@@ -28,12 +28,12 @@ class SettingsDialog(ctk.CTkToplevel):
         self.title("Globale innstillinger")
         self.configure(fg_color=COLORS["surface"])
         self.grab_set()
-        self.resizable(False, False)
+        self.resizable(True, False)
         self._on_save = on_save
         self._vars: dict[str, ctk.Variable] = {}
         self._build()
-        self.geometry("560x420")
-        self.minsize(560, 420)
+        self.geometry("780x520")
+        self.minsize(780, 420)
 
     def _build(self):
         from settings import load_config, _CONFIG_FILE
@@ -89,7 +89,7 @@ class SettingsDialog(ctk.CTkToplevel):
                     cell = ctk.CTkFrame(frm, fg_color="transparent")
                     cell.grid(row=row, column=1, padx=12, pady=6, sticky="ew")
                     cell.grid_columnconfigure(0, weight=1)
-                    ctk.CTkEntry(cell, textvariable=var, width=220,
+                    ctk.CTkEntry(cell, textvariable=var, width=340,
                                  fg_color=COLORS["bg"],
                                  font=ctk.CTkFont(family=FONTS["mono"], size=10)
                                  ).grid(row=0, column=0, sticky="ew")
@@ -112,7 +112,7 @@ class SettingsDialog(ctk.CTkToplevel):
                                   command=_browse).grid(
                                       row=0, column=1, padx=(4, 0))
                 else:
-                    ctk.CTkEntry(frm, textvariable=var, width=120,
+                    ctk.CTkEntry(frm, textvariable=var, width=160,
                                  fg_color=COLORS["bg"],
                                  font=ctk.CTkFont(
                                      family=FONTS["mono"], size=11)).grid(
@@ -155,7 +155,7 @@ class SettingsDialog(ctk.CTkToplevel):
             init_args = str(raw_args)
         args_var = ctk.StringVar(value=init_args)
         self._vars["av_args"] = args_var
-        ctk.CTkEntry(frm, textvariable=args_var, width=320,
+        ctk.CTkEntry(frm, textvariable=args_var, width=420,
                      fg_color=COLORS["bg"],
                      font=ctk.CTkFont(family=FONTS["mono"], size=10)).grid(
                          row=r, column=1, padx=12, pady=6, sticky="ew"); r += 1
@@ -181,7 +181,7 @@ class SettingsDialog(ctk.CTkToplevel):
         init_val = ", ".join(raw_list) if isinstance(raw_list, list) else str(raw_list)
         conv_var = ctk.StringVar(value=init_val)
         self._vars["lo_convertible"] = conv_var
-        ctk.CTkEntry(frm, textvariable=conv_var, width=320,
+        ctk.CTkEntry(frm, textvariable=conv_var, width=420,
                      fg_color=COLORS["bg"],
                      font=ctk.CTkFont(family=FONTS["mono"], size=10)).grid(
                          row=r, column=1, padx=12, pady=6, sticky="ew"); r += 1
@@ -203,7 +203,7 @@ class SettingsDialog(ctk.CTkToplevel):
                       else str(raw_rename)
         rename_var = ctk.StringVar(value=init_rename)
         self._vars["rename_only"] = rename_var
-        ctk.CTkEntry(frm, textvariable=rename_var, width=320,
+        ctk.CTkEntry(frm, textvariable=rename_var, width=420,
                      fg_color=COLORS["bg"],
                      font=ctk.CTkFont(family=FONTS["mono"], size=10)).grid(
                          row=r, column=1, padx=12, pady=6, sticky="ew"); r += 1
@@ -225,7 +225,7 @@ class SettingsDialog(ctk.CTkToplevel):
                    if isinstance(raw_upg, dict) else str(raw_upg)
         upg_var = ctk.StringVar(value=init_upg)
         self._vars["lo_upgrade"] = upg_var
-        ctk.CTkEntry(frm, textvariable=upg_var, width=320,
+        ctk.CTkEntry(frm, textvariable=upg_var, width=420,
                      fg_color=COLORS["bg"],
                      font=ctk.CTkFont(family=FONTS["mono"], size=10)).grid(
                          row=r, column=1, padx=12, pady=6, sticky="ew"); r += 1

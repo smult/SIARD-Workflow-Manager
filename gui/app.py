@@ -147,8 +147,6 @@ class App(ctk.CTk):
         col = 2
         for label, cmd in [
             ("Endre temp",   self._browse_temp),
-            ("Importer WF",  self._import_workflow),
-            ("Eksporter WF", self._export_workflow),
             ("Rapport",      self._export_report),
             ("Logg til fil", self._toggle_auto_log),
             ("Innstillinger",self._open_settings),
@@ -189,19 +187,12 @@ class App(ctk.CTk):
         frm.grid_columnconfigure(0, weight=1)
 
         # Tittel
-        hdr = ctk.CTkFrame(frm, fg_color="transparent")
-        hdr.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 2))
-        hdr.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(hdr, text="SIARD-KØ",
+        ctk.CTkLabel(frm, text="SIARD-KØ",
                      font=ctk.CTkFont(family=FONTS["mono"], size=9, weight="bold"),
-                     text_color=COLORS["muted"]).grid(row=0, column=0, sticky="w")
-        ctk.CTkButton(hdr, text="+", width=24, height=20, corner_radius=4,
-                      fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
-                      font=ctk.CTkFont(family=FONTS["mono"], size=11, weight="bold"),
-                      command=self._queue_add_file).grid(row=0, column=1, padx=(4,0))
+                     text_color=COLORS["muted"]).grid(
+                         row=0, column=0, sticky="w", padx=10, pady=(6, 2))
 
-        # Drag-drop-felt (tk.Label for å ta imot DnD)
-        import tkinter as tk
+        # Drag-drop-felt
         self._drop_zone = ctk.CTkLabel(
             frm,
             text="Dra og slipp SIARD-filer hit",
@@ -209,19 +200,12 @@ class App(ctk.CTk):
             text_color=COLORS["muted"],
             fg_color=COLORS["panel"],
             corner_radius=6,
-            height=40)
+            height=44)
         self._drop_zone.grid(row=1, column=0, padx=8, pady=(2, 4), sticky="ew")
 
-        # Registrer drag-and-drop (tkinterdnd2 hvis tilgjengelig, ellers tk DnD)
-        try:
-            self._drop_zone.drop_target_register("DND_Files")  # type: ignore[attr-defined]
-            self._drop_zone.dnd_bind("<<Drop>>",              # type: ignore[attr-defined]
-                                     self._on_dnd_drop)
-        except Exception:
-            # tkinterdnd2 ikke installert — bind til Button-1 som fallback
-            self._drop_zone.bind("<Button-1>", lambda e: self._queue_add_file())
-            self._drop_zone.configure(
-                text="Klikk for å legge til SIARD-filer")
+        # Prøv tkinterdnd2 først, deretter Windows shell DnD, deretter klikk-fallback
+        self._dnd_active = False
+        self._setup_dnd()
 
         # Kø-liste
         self._queue_frame = ctk.CTkScrollableFrame(
@@ -236,6 +220,49 @@ class App(ctk.CTk):
             font=ctk.CTkFont(family=FONTS["mono"], size=9),
             text_color=COLORS["muted"])
         self._queue_lbl_none.grid(row=0, column=0, pady=4)
+
+    def _setup_dnd(self):
+        """Sett opp drag-and-drop. Prøver tkinterdnd2, deretter klikk-fallback."""
+        # Metode 1: tkinterdnd2
+        try:
+            self._drop_zone.drop_target_register("DND_Files")   # type: ignore
+            self._drop_zone.dnd_bind("<<Drop>>", self._on_dnd_drop)  # type: ignore
+            self._drop_zone.dnd_bind("<<DragEnter>>", self._on_dnd_enter)  # type: ignore
+            self._drop_zone.dnd_bind("<<DragLeave>>", self._on_dnd_leave)  # type: ignore
+            self._dnd_active = True
+            return
+        except Exception:
+            pass
+
+        # Metode 2: Windows shell DnD via tkinter intern-API
+        try:
+            import tkinter as tk
+            inner = self._drop_zone._canvas if hasattr(self._drop_zone, '_canvas') \
+                    else self._drop_zone
+            inner.drop_target_register("DND_Files")   # type: ignore
+            inner.dnd_bind("<<Drop>>", self._on_dnd_drop)  # type: ignore
+            self._dnd_active = True
+            return
+        except Exception:
+            pass
+
+        # Fallback: klikk åpner filvelger
+        self._drop_zone.configure(text="Klikk for å legge til SIARD-filer")
+        self._drop_zone.bind("<Button-1>", lambda e: self._queue_add_file())
+        self._drop_zone.bind("<Enter>",
+            lambda e: self._drop_zone.configure(text_color=COLORS["accent"]))
+        self._drop_zone.bind("<Leave>",
+            lambda e: self._drop_zone.configure(text_color=COLORS["muted"]))
+
+    def _on_dnd_enter(self, event):
+        self._drop_zone.configure(
+            fg_color=COLORS["accent_dim"] if "accent_dim" in COLORS else COLORS["btn"],
+            text_color=COLORS["accent"])
+
+    def _on_dnd_leave(self, event):
+        self._drop_zone.configure(
+            fg_color=COLORS["panel"],
+            text_color=COLORS["muted"])
 
     def _browse_temp(self):
         """Manuell override av global temp-mappe."""
@@ -310,15 +337,19 @@ class App(ctk.CTk):
 
     def _on_dnd_drop(self, event):
         """Håndter drag-and-drop fra tkinterdnd2."""
+        self._on_dnd_leave(event)  # nullstill farge
         raw = event.data
-        # tkinterdnd2 returnerer stier omgitt av {} på Windows
         import re
+        # tkinterdnd2: {sti med mellomrom} eller sti\nsti
         paths = re.findall(r'\{([^}]+)\}|(\S+)', raw)
         for grp in paths:
-            p = grp[0] or grp[1]
+            p = (grp[0] or grp[1]).strip()
             if p:
                 path = Path(p)
                 if path.suffix.lower() in (".siard", ".zip") and path.exists():
+                    self._queue_push(path)
+                elif path.exists():
+                    # Aksepter uansett filendelse hvis filen finnes
                     self._queue_push(path)
 
     def _queue_push(self, path: Path):
