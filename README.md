@@ -25,6 +25,7 @@ Kjente utfordringer og begrensninger:
 ## Krav
 - Python 3.10+
 - Windows / macOS / Linux
+- LibreOffice for dokumentkonvertering
 
 ## Installasjon
     pip install -r requirements.txt
