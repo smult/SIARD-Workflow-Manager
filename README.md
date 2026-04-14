@@ -29,7 +29,7 @@ Kjente utfordringer og begrensninger:
 ## Installasjon
     pip install -r requirements.txt
 
-## Kjoer direkte
+## Kjør direkte
     python main.py eller start.bat
 
 ## Bygg EXE
