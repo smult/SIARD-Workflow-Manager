@@ -2,6 +2,26 @@
 
 Rammeverk og GUI for behandling av SIARD-uttrekk.
 
+Funksjonalitet omfatter blant annet:
+- Valg av SIARD-filer og arbeidsmapper
+- En del grunnleggende operasjoner for SIARD Workflow Manager, som for eksempel:
+  - Sjekk av BLOB-er
+  - Konvertering av BLOB-er
+  - Ekstraksjon av hex-data
+  - SHA256-hash av BLOB-er
+  - Virus-skanning av BLOB-er (forutsatt at ClamAV er installert - forstatt noe ustabtil.. så ikke bruk denne funksjonen ennå)
+
+Kjente utfordringer og begrensninger:
+- Noen av operasjonene kan være ustabile, spesielt virus-skanning av BLOB
+- Noen filformater er ikke støttet ennå, så det kan oppstå feil underveis. Alt skal logges, så det er mulig å se hva som skjer.
+- Hvis det settes opp for mange workers, kan det oppstå problemer med ressursbruk og stabilitet.
+  Det er derfor anbefalt å starte med et lavt antall workers og øke etterhvert hvis det fungerer stabilt.
+  For egen maskin med 16 kjerner er 8 workers et godt utgangspunkt.
+- Avhengig av menge ram i maskinen kan batch-størrelsen endre.
+  Standard er 50, men kan hvis man har mye minne økers til 100 eller mer.
+  Det er anbefalt å starte med 50 å øke etterhvert hvis det fungerer stabilt.
+  Har man lite minne (<32GB) kan det være nødvendig å redusere batch-størrelsen til 25 eller mindre.
+
 ## Krav
 - Python 3.10+
 - Windows / macOS / Linux
