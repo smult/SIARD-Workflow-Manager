@@ -13,7 +13,7 @@ from siard_workflow.operations import (
     XMLValidationOperation, MetadataExtractOperation,
     VirusScanOperation, ConditionalOperation,
 )
-from settings import save_op_params, _SETTINGS_FILE
+from settings import save_op_params, save_config, get_config, _SETTINGS_FILE
 
 
 def _dim(hex_color, factor=0.3):
@@ -53,7 +53,8 @@ OP_DEFS = [
         "desc": "Identifiserer blob-filer (.bin/.txt/andre), konverterer dokumenter til PDF/A, ekstraher inline NBLOB/NCLOB. Filer som er ren tekst, XML eller ukjent format beholdes. Oppdaterer SIARD-arkivet.",
         "params": [
             {"key": "output_suffix",      "label": "Suffix ny SIARD-fil",          "type": "str",    "default": "_konvertert"},
-            {"key": "pdfa_version",       "label": "PDF/A-versjon",                 "type": "choice", "default": "PDF/A-1a (ISO 19005-1, level A)",
+            {"key": "pdfa_version",       "label": "PDF/A-versjon",                 "type": "choice",
+             "default": get_config("pdfa_version") or "PDF/A-2u (ISO 19005-2, level U)",
              "choices": [
                  "PDF/A-1a (ISO 19005-1, level A)",
                  "PDF/A-1b (ISO 19005-1, level B)",
@@ -62,8 +63,8 @@ OP_DEFS = [
                  "PDF/A-3b (ISO 19005-3, level B)",
              ]},
             {"key": "lo_timeout",         "label": "LibreOffice timeout (s)",       "type": "int",    "default": 300},
-            {"key": "max_workers",        "label": "Parallelle tråder",             "type": "hw_int", "default": 4,  "hw_key": "max_workers"},
-            {"key": "lo_batch_size",      "label": "Batch-størrelse (filer/batch)", "type": "hw_int", "default": 50, "hw_key": "lo_batch_size"},
+            {"key": "max_workers",        "label": "Parallelle tråder",             "type": "hw_int", "default": get_config("max_workers"), "hw_key": "max_workers"},
+            {"key": "lo_batch_size",      "label": "Batch-størrelse (filer/batch)", "type": "int",    "default": get_config("lo_batch_size")},
             {"key": "skip_existing_pdf",  "label": "Hopp over eksist. PDF",         "type": "bool",   "default": True},
             {"key": "extract_inline",     "label": "Ekstraher inline NBLOB/NCLOB",  "type": "bool",   "default": True},
             {"key": "dry_run",            "label": "Tørkjøring (ikke skriv)",       "type": "bool",   "default": False},
@@ -198,21 +199,25 @@ class ParamDialog(ctk.CTkToplevel):
                                  font=ctk.CTkFont(family=FONTS["mono"], size=11)
                                  ).pack(side="left", padx=(0, 4))
 
-                    hw_key = p.get("hw_key", p["key"])
-
-                    def _auto_hw(v=var, k=hw_key):
+                    def _auto_hw(v=var):
                         try:
                             from siard_workflow.operations.blob_convert_operation \
                                 import suggest_lo_defaults
                             hw = suggest_lo_defaults()
-                            v.set(str(hw[k]))
+                            v.set(str(hw["max_workers"]))
+                            if "lo_batch_size" in self._vars:
+                                self._vars["lo_batch_size"][0].set(str(hw["lo_batch_size"]))
+                            save_config({
+                                "max_workers":   hw["max_workers"],
+                                "lo_batch_size": hw["lo_batch_size"],
+                            })
                             from tkinter import messagebox
                             messagebox.showinfo(
                                 "Maskinvare-forslag",
                                 f"Prosessor: {hw['_cpus']} kjerner\n"
                                 f"RAM: {hw['_ram_gb']} GB\n\n"
-                                f"Anbefalt workers: {hw['max_workers']}\n"
-                                f"Anbefalt batch-størrelse: {hw['lo_batch_size']}",
+                                f"Tråder satt til: {hw['max_workers']}\n"
+                                f"Batch-størrelse satt til: {hw['lo_batch_size']}",
                                 parent=self)
                         except Exception as exc:
                             from tkinter import messagebox
@@ -309,6 +314,11 @@ class ParamDialog(ctk.CTkToplevel):
         if op and op.operation_id:
             try:
                 save_op_params(op.operation_id, kwargs)
+                # Lagre maskinvare- og format-innstillinger til config.json
+                _config_keys = {"max_workers", "lo_batch_size", "pdfa_version"}
+                _config_updates = {k: kwargs[k] for k in _config_keys if k in kwargs}
+                if _config_updates:
+                    save_config(_config_updates)
                 if self._on_saved:
                     self._on_saved(op.operation_id, kwargs, _SETTINGS_FILE)
             except Exception as e:

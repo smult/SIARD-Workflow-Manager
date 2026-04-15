@@ -37,9 +37,9 @@ _CONFIG_DEFAULTS: dict = {
         "rtf",
         "wpd", "wp", "wp5", "wp6", "wps",
         "wri", "lwp", "sxw", "sdw",
-        "txt", "csv",
     ],
     "rename_only": [                 # filformater som beholdes i originalformat
+        "csv",                       # ren tekst/tabellformat — ikke konverter
         "tiff", "tif", "jpg", "jpeg", "png", "gif", "bmp",
         "pptx", "potx", "odp",
         "xlsx", "xltx", "ods",
@@ -54,6 +54,8 @@ _CONFIG_DEFAULTS: dict = {
         "xls":  "xlsx",   "xlt":  "xlsx",
         "ppt":  "pptx",   "pot":  "pptx",
     },
+    "pdfa_version":         "PDF/A-2u (ISO 19005-2, level U)",  # standard PDF/A-versjon
+    "disk_overhead_factor": 2.0,   # multiplikator for estimert temp-diskbehov
 }
 
 

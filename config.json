@@ -1,10 +1,10 @@
 {
-  "global_temp_dir": "E:/temp",
+  "global_temp_dir": "E:/",
   "av_executable": "",
   "av_args": [],
   "av_infected_rc": 1,
   "av_timeout": 300,
-  "max_workers": 4,
+  "max_workers": "4",
   "lo_batch_size": 50,
   "lo_timeout": 300,
   "lo_convertible": [
@@ -24,11 +24,10 @@
     "wri",
     "lwp",
     "sxw",
-    "sdw",
-    "txt",
-    "csv"
+    "sdw"
   ],
   "rename_only": [
+    "csv",
     "tiff",
     "tif",
     "jpg",
@@ -70,5 +69,6 @@
     "xlt": "xlsx",
     "ppt": "pptx",
     "pot": "pptx"
-  }
+  },
+  "pdfa_version": "PDF/A-2u (ISO 19005-2, level U)"
 }

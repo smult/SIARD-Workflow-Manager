@@ -55,6 +55,7 @@ class App(ctk.CTk):
         self._current_run: "WorkflowRun | None" = None
         self._auto_log_dir: Path | None = None
         self._global_temp_dir: Path | None = None
+        self._output_dir_override: str = ""   # satt av preflight hvis output-disk har lite plass
         self._conv_ctx = None
         self._stop_event  = threading.Event()
         self._pause_event = threading.Event()
@@ -660,6 +661,125 @@ class App(ctk.CTk):
 
     # ─── Kjoring ──────────────────────────────────────────────────────────────
 
+    def _disk_space_preflight(self, ops: list) -> bool:
+        """
+        Pre-flight diskplass-sjekk for BlobConvertOperation:
+          1. Temp-disk: nok plass til utpakking og konvertering?
+          2. Output-disk: nok plass til å skrive ferdig konvertert SIARD ved kildefilen?
+
+        Viser advarsel-dialog(er) og ber om alternativt lagringssted ved output-problem.
+        Returnerer True = fortsett, False = avbryt.
+        """
+        import shutil as _shutil
+        from siard_workflow.operations.blob_convert_operation import BlobConvertOperation
+        from disk_selector import check_disk_space, format_bytes, _disk_root
+        from tkinter import messagebox, filedialog
+
+        blob_ops = [op for op in ops if isinstance(op, BlobConvertOperation)]
+        if not blob_ops:
+            return True
+
+        self._output_dir_override = ""   # nullstill fra forrige kjøring
+
+        # Effektiv temp-dir: global overstyrer per-op
+        if self._global_temp_dir:
+            effective_temp = Path(str(self._global_temp_dir))
+        else:
+            per_op_dir = blob_ops[0].params.get("temp_dir", "").strip()
+            effective_temp = Path(per_op_dir) if per_op_dir else None
+
+        temp_warnings:   list[tuple[Path, dict]] = []
+        output_warnings: list[tuple[Path, int, int]] = []  # (path, required, available)
+
+        for siard_path in self.siard_queue:
+            # — Temp-sjekk —
+            r = check_disk_space(siard_path, effective_temp)
+            if not r["ok"]:
+                temp_warnings.append((siard_path, r))
+
+            # — Output-sjekk —
+            # Estimert output-størrelse ≈ total utpakket innhold
+            # (PDF/A komprimerer dårlig i ZIP, så dette er realistisk øvre grense)
+            output_estimate = r["uncompressed_bytes"]
+            try:
+                out_free = _shutil.disk_usage(siard_path.parent).free
+                if out_free < output_estimate:
+                    output_warnings.append((siard_path, output_estimate, out_free))
+            except Exception:
+                pass
+
+        # ── Temp-advarsel ────────────────────────────────────────────────────
+        if temp_warnings:
+            lines: list[str] = [
+                "Advarsel: estimert temp-diskbehov overstiger tilgjengelig plass!\n"
+            ]
+            for siard_path, r in temp_warnings:
+                lines.append(f"  Fil      : {siard_path.name}")
+                lines.append(f"  Behov    : {format_bytes(r['required_bytes'])}"
+                             f"  (utpakket: {format_bytes(r['uncompressed_bytes'])})")
+                lines.append(f"  Ledig    : {format_bytes(r['available_bytes'])}"
+                             f"  på {r['temp_path']}")
+                if r["alternatives"]:
+                    lines.append("  Disker med nok plass:")
+                    for alt in r["alternatives"][:3]:
+                        lines.append(f"    • {alt['label']}")
+                else:
+                    lines.append("  Ingen andre disker med tilstrekkelig plass funnet.")
+                lines.append("")
+            lines.append(
+                "Tips: endre temp-mappe i operasjonens innstillinger, "
+                "eller rydd opp på gjeldende disk.\n\nVil du fortsette uansett?"
+            )
+            if not messagebox.askyesno(
+                "Lite temp-diskplass", "\n".join(lines),
+                icon="warning", default="no",
+            ):
+                return False
+
+        # ── Output-advarsel ──────────────────────────────────────────────────
+        if output_warnings:
+            lines = [
+                "Advarsel: estimert plass for ferdig konvertert SIARD-fil "
+                "overstiger ledig plass der kilde-filen ligger!\n"
+            ]
+            for siard_path, needed, avail in output_warnings:
+                lines.append(f"  Fil      : {siard_path.name}")
+                lines.append(f"  Estimert : {format_bytes(needed)}")
+                lines.append(f"  Ledig    : {format_bytes(avail)}"
+                             f"  ({siard_path.parent})")
+                lines.append("")
+            lines.append(
+                "Velg et alternativt lagringssted for den konverterte filen, "
+                "eller avbryt og rydd opp plass først."
+            )
+            messagebox.showwarning("Lite plass for output-fil", "\n".join(lines))
+
+            chosen = filedialog.askdirectory(
+                title="Velg alternativ lagringsmappe for konvertert SIARD",
+                mustexist=True,
+            )
+            if not chosen:
+                return False   # Bruker avbrøt mappe-velger
+
+            # Verifiser at valgt mappe faktisk har nok plass
+            try:
+                worst_needed = max(n for _, n, _ in output_warnings)
+                chosen_free  = _shutil.disk_usage(chosen).free
+                if chosen_free < worst_needed:
+                    messagebox.showerror(
+                        "Ikke nok plass",
+                        f"Valgt mappe har bare {format_bytes(chosen_free)} ledig "
+                        f"— trenger minst {format_bytes(worst_needed)}.\n"
+                        "Velg en annen mappe eller rydd opp plass.",
+                    )
+                    return False
+            except Exception:
+                pass
+
+            self._output_dir_override = chosen
+
+        return True
+
     def _run_workflow(self):
         if self._running:
             return
@@ -669,6 +789,9 @@ class App(ctk.CTk):
         ops = list(self.workflow_panel.get_operations())
         if not ops:
             self._log("Workflowen er tom", "warn")
+            return
+
+        if not self._disk_space_preflight(ops):
             return
 
         self._running = True
@@ -725,6 +848,8 @@ class App(ctk.CTk):
             ctx.metadata["pause_event"]  = self._pause_event
             if self._global_temp_dir:
                 ctx.metadata["temp_dir"] = str(self._global_temp_dir)
+            if self._output_dir_override:
+                ctx.metadata["output_dir_override"] = self._output_dir_override
             log_dir = path.parent
             if self._auto_log_dir:
                 log_dir = self._auto_log_dir

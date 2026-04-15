@@ -23,6 +23,11 @@ from pathlib import Path
 MIN_FREE_GB    = 20
 MIN_FREE_BYTES = MIN_FREE_GB * 1024 ** 3
 
+# Overhead-faktor for temp-estimat:
+# 1.0x utpakkede innholdsfiler + 1.0x for mellomlagring / LibreOffice-temp = 2.0x
+# (filer overskrives underveis, så 2x dekker topp-behovet)
+DISK_OVERHEAD_FACTOR = 2.0
+
 # Rangering — lavere tall = bedre
 _TYPE_RANK = {"nvme": 0, "ssd": 1, "": 2, "hdd": 3, "usb": 4}
 
@@ -48,6 +53,109 @@ def get_disk_candidates(min_free_bytes: int = MIN_FREE_BYTES) -> list[dict]:
         -d["free_bytes"],
     ))
     return candidates
+
+
+def estimate_uncompressed_size(siard_path: Path) -> int:
+    """
+    Les ZIP central directory og summer uomprimerte filstørrelser.
+    Returnerer 0 ved feil (f.eks. ikke en gyldig ZIP).
+    """
+    import zipfile
+    total = 0
+    try:
+        with zipfile.ZipFile(siard_path) as zf:
+            for info in zf.infolist():
+                total += info.file_size
+    except Exception:
+        return 0
+    return total
+
+
+def check_disk_space(
+    siard_path: Path,
+    temp_dir: "Path | None" = None,
+    overhead_factor: "float | None" = None,
+) -> dict:
+    """
+    Estimer diskplass-behov for prosessering av siard_path og sjekk mot
+    ledig plass på temp_dir.
+
+    Overhead-faktor dekker: utpakkede filer (1x) + output-SIARD (1x) +
+    LibreOffice temp-filer og arbeidsrom (0.5x) = 2.5x som standard.
+
+    Returnerer dict:
+      ok              bool   — True hvis det antas å være nok plass
+      required_bytes  int    — estimert behov (bytes)
+      available_bytes int    — ledig plass på temp-disk (bytes)
+      temp_path       Path   — hvilken disk som ble sjekket
+      uncompressed_bytes int — total utpakket størrelse fra ZIP-catalog
+      alternatives    list   — andre disker med nok plass, sortert best-først
+    """
+    # Les overhead-faktor fra config.json hvis ikke eksplisitt gitt
+    if overhead_factor is None:
+        try:
+            from settings import get_config
+            overhead_factor = float(get_config("disk_overhead_factor") or DISK_OVERHEAD_FACTOR)
+        except Exception:
+            overhead_factor = DISK_OVERHEAD_FACTOR
+
+    uncompressed = estimate_uncompressed_size(siard_path)
+    # Minst siard-filens størrelse selv om ZIP-lesing feiler
+    siard_size = 0
+    try:
+        siard_size = siard_path.stat().st_size
+    except Exception:
+        pass
+    uncompressed = max(uncompressed, siard_size)
+
+    required = int(uncompressed * overhead_factor)
+
+    # Bestem temp-disk
+    if temp_dir is None:
+        try:
+            temp_dir = best_temp_disk(siard_path=siard_path)
+        except Exception:
+            temp_dir = siard_path.parent
+
+    # Finn diskrot for temp_dir (brukes til disk_usage og sammenligning)
+    try:
+        temp_root = _disk_root(temp_dir)
+    except Exception:
+        temp_root = temp_dir
+
+    try:
+        available = shutil.disk_usage(temp_root).free
+    except Exception:
+        # Kan ikke lese — anta OK for å ikke blokkere
+        return {
+            "ok": True,
+            "required_bytes": required,
+            "available_bytes": 0,
+            "temp_path": temp_dir,
+            "uncompressed_bytes": uncompressed,
+            "alternatives": [],
+        }
+
+    ok = available >= required
+
+    alternatives: list[dict] = []
+    if not ok:
+        try:
+            alternatives = [
+                c for c in get_disk_candidates(min_free_bytes=required)
+                if _disk_root(c["path"]) != temp_root
+            ]
+        except Exception:
+            pass
+
+    return {
+        "ok": ok,
+        "required_bytes": required,
+        "available_bytes": available,
+        "temp_path": temp_dir,
+        "uncompressed_bytes": uncompressed,
+        "alternatives": alternatives,
+    }
 
 
 def best_temp_disk(min_free_bytes: int = MIN_FREE_BYTES,

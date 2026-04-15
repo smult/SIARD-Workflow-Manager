@@ -1,9 +1,9 @@
 """
-BlobConvertOperation  —  høyytelses SIARD BLOB/NBLOB/NCLOB-konvertering
+BlobConvertOperation  —  SIARD BLOB/NBLOB/NCLOB-konvertering
 =======================================================================
 
 Arkitektur for ytelse:
-1. ZIP ekstraheres til tmpdir med extractall()  (én pass, ingen random-access)
+1. ZIP ekstraheres til tmpdir med extractall()
 2. Alle filer detekteres parallelt              (CPU-bundet, ingen I/O)
 3. LibreOffice kjøres i BATCH-modus per worker  (én LO-oppstart per worker,
    konverterer N filer — eliminerer startup-overhead som er ~3s/fil)
@@ -118,7 +118,6 @@ def _get_lo_convertible() -> set:
         "rtf",
         "wpd", "wp", "wp5", "wp6", "wps",
         "wri", "lwp", "sxw", "sdw",
-        "txt", "csv",
     }
     try:
         import sys as _sys
@@ -141,6 +140,7 @@ _LO_CONVERTIBLE = _get_lo_convertible()
 def _get_rename_only() -> set:
     """Les behold-formater fra config.json. Faller tilbake til innebygd liste."""
     _DEFAULT = {
+        "csv",
         "tiff", "tif", "jpg", "jpeg", "png", "gif", "bmp",
         "ppt", "pptx", "pot", "potx", "odp",
         "xls", "xlsx", "xlt", "xltx", "ods",
@@ -204,7 +204,7 @@ _PDFA_VERSIONS: dict[str, tuple[str, str]] = {
     "PDF/A-2u (ISO 19005-2, level U)": ("7", "false"),
     "PDF/A-3b (ISO 19005-3, level B)": ("9", "false"),
 }
-_PDFA_DEFAULT = "PDF/A-1a (ISO 19005-1, level A)"
+_PDFA_DEFAULT = "PDF/A-2u (ISO 19005-2, level U)"
 
 
 def _build_pdfa_filter(version_label: str) -> str:
@@ -353,19 +353,24 @@ def _detect(data: bytes) -> tuple[str, str]:
         if sig[0:1] in (b"{", b"<", b"%") and sig in search_window:
             return ext, mime
 
-    return "txt", "text/plain"
-    # WPTools native format — sjekk før generisk XML
-    stripped = data[:256].lstrip(b"\xef\xbb\xbf\xfe\xff\x00 \t\r\n")
+    # ── Tekst-basert fallback (ingen magic-byte treff) ───────────────────────
+    # WPTools native format — starter med <!WPTools_Format etter BOM/whitespace
     if stripped[:16].startswith(b"<!WPTools_Format"):
         return "wpt", "application/x-wptools"
+
+    # Generisk XML/markup-innhold som ikke matchet kjent MAGIC-signatur
     if stripped.startswith(b"<"):
         return "xml", "application/xml"
+
+    # Gyldig UTF-8 uten null-bytes → ren tekst
     try:
         if b"\x00" not in data[:512] and data[:512]:
             data[:512].decode("utf-8")
             return "txt", "text/plain"
     except (UnicodeDecodeError, ValueError):
         pass
+
+    # Ukjent binærformat
     return "bin", "application/octet-stream"
 
 
@@ -1251,7 +1256,34 @@ def suggest_lo_defaults() -> dict:
         import psutil
         ram_gb = psutil.virtual_memory().total / (1024 ** 3)
     except Exception:
-        pass
+        # Fallback: Windows native via ctypes, deretter /proc/meminfo på Linux
+        try:
+            import ctypes
+            if sys.platform == "win32":
+                class _MEMSTATUS(ctypes.Structure):
+                    _fields_ = [
+                        ("dwLength",                ctypes.c_ulong),
+                        ("dwMemoryLoad",             ctypes.c_ulong),
+                        ("ullTotalPhys",             ctypes.c_ulonglong),
+                        ("ullAvailPhys",             ctypes.c_ulonglong),
+                        ("ullTotalPageFile",         ctypes.c_ulonglong),
+                        ("ullAvailPageFile",         ctypes.c_ulonglong),
+                        ("ullTotalVirtual",          ctypes.c_ulonglong),
+                        ("ullAvailVirtual",          ctypes.c_ulonglong),
+                        ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+                    ]
+                stat = _MEMSTATUS()
+                stat.dwLength = ctypes.sizeof(stat)
+                ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+                ram_gb = stat.ullTotalPhys / (1024 ** 3)
+            else:
+                with open("/proc/meminfo") as _f:
+                    for _line in _f:
+                        if _line.startswith("MemTotal:"):
+                            ram_gb = int(_line.split()[1]) / (1024 ** 2)
+                            break
+        except Exception:
+            pass
 
     lo_ram_mb          = 400           # konservativt estimat per LO-instans
     ram_budget_mb      = ram_gb * 1024 * 0.60
@@ -1373,6 +1405,13 @@ class BlobConvertOperation(BaseOperation):
         src_path = ctx.siard_path
         dst_path = src_path.with_name(
             src_path.stem + self.params["output_suffix"] + src_path.suffix)
+
+        # Alternativt lagringssted satt av GUI preflight (lite plass ved kilde-fil)
+        output_dir_override = ctx.metadata.get("output_dir_override", "").strip() \
+            if hasattr(ctx, "metadata") else ""
+        if output_dir_override:
+            dst_path = Path(output_dir_override) / dst_path.name
+            w(f"  Output-mappe: {dst_path.parent}  (alternativt lagringssted)", "info")
 
         dst_path = self._resolve_dst_path(dst_path, w)
 
@@ -1901,6 +1940,13 @@ class BlobConvertOperation(BaseOperation):
         for idx, zip_sti in enumerate(all_blobs):
             ext, mime = det_results[zip_sti]
             file_ext  = PurePosixPath(zip_sti).suffix.lstrip(".").lower()
+
+            # Bevar CSV-ekstensjon: innhold er alltid ren tekst → detektert som "txt",
+            # men hvis blob er lagret med .csv-ekstensjon skal den forbli .csv
+            if ext == "txt" and file_ext == "csv":
+                ext  = "csv"
+                mime = "text/csv"
+
             if ext == "wpt":
                 to_wpt.append((idx, zip_sti, ext, mime))
             elif ext in ("txt", "xml", "bin"):
