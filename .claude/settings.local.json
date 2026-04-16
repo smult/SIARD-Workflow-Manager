@@ -4,7 +4,10 @@
       "Bash(python -c \"import psutil; print\\(psutil.virtual_memory\\(\\).total / 1024**3\\)\")",
       "Bash(pip install:*)",
       "Bash(python -c ':*)",
-      "Bash(python -c \"import gui.app; print\\('app.py OK'\\)\")"
+      "Bash(python -c \"import gui.app; print\\('app.py OK'\\)\")",
+      "Bash(python -)",
+      "Bash(python _test_pack.py)",
+      "Bash(del _test_pack.py)"
     ]
   }
 }

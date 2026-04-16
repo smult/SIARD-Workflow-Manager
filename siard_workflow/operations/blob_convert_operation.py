@@ -3657,8 +3657,24 @@ class BlobConvertOperation(BaseOperation):
         n_written = 0
         n_skipped = 0
 
+        # Katalogoppføringer fra original ZIP (f.eks. header/siardversion/).
+        # Disse er påkrevd for korrekt SIARD-validering, men filtreres bort
+        # av is_file()-sjekken nedenfor. Gjenopprettes eksplisitt fra orig_namelist.
+        orig_dir_entries = sorted(n for n in orig_namelist if n.endswith("/"))
+
         with zipfile.ZipFile(dst_path, "w", zipfile.ZIP_DEFLATED,
                              allowZip64=True) as zf:
+            # 1. Skriv katalogoppføringer (tomme mapper) fra original ZIP
+            for dir_entry in orig_dir_entries:
+                dir_info = zipfile.ZipInfo(dir_entry)
+                zf.writestr(dir_info, b"")
+                n_written += 1
+            if orig_dir_entries:
+                w(f"  Kataloger: {len(orig_dir_entries)} oppføringer "
+                  f"({', '.join(e for e in orig_dir_entries[:4])}"
+                  f"{'…' if len(orig_dir_entries) > 4 else ''})", "info")
+
+            # 2. Skriv alle filer fra extract_dir
             for file_path in sorted(all_files):
                 if not file_path.is_file():
                     continue
