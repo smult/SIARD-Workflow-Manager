@@ -38,6 +38,7 @@ class VirusScanOperation(BaseOperation):
     label          = "Virusskan"
     description    = "Pakker ut SIARD og kjorer ClamAV-daemon (clamd+clamdscan) pa alle filer."
     category       = "Sikkerhet"
+    status         = 0
     default_params = {"keep_temp": False}
 
     # ─── Finn ClamAV ──────────────────────────────────────────────────────────

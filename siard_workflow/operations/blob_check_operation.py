@@ -51,6 +51,7 @@ class BlobCheckOperation(BaseOperation):
         "Eksporterer opptelling til logg."
     )
     category     = "Innhold"
+    status       = 0
     default_params = {
         "content_prefix": "content/",
         "schema_pattern": r"^schema\d+$",

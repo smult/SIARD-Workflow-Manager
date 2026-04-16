@@ -146,6 +146,10 @@ class Workflow:
                 result = op.run(ctx)
                 # Lagre resultat i kontekst så neste operasjon kan lese det
                 ctx.set_result(op.operation_id, result.data)
+                # Hvis operasjonen produserte en ny SIARD-fil, oppdater input-stien
+                new_siard = ctx.chain_siard(op.produces_siard, result.data)
+                if new_siard and verbose:
+                    print(f"       ↪ Input videreført: {new_siard.name}")
             except Exception as exc:
                 result = op._fail(str(exc))
                 logger.exception("Operasjon %s kastet unntak", op.operation_id)

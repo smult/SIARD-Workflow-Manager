@@ -247,9 +247,11 @@ class HexExtractOperation(BaseOperation):
     Kjøres FØR BlobConvertOperation.
     """
 
-    operation_id = "hex_extract"
-    label        = "HEX Inline Extract"
-    category     = "Konvertering"
+    operation_id   = "hex_extract"
+    label          = "HEX Inline Extract"
+    category       = "Innhold"
+    status         = 2
+    produces_siard = True
 
     default_params = {
         "dry_run":         False,
@@ -353,6 +355,18 @@ class HexExtractOperation(BaseOperation):
                 except Exception:
                     pass
             target_version = get_target_siard_version()
+
+            # Finn faktisk mappeversjon i header/siardversion/<x.y>/ direkte
+            # fra ZIP-listen — uavhengig av XML-namespace-deteksjon.
+            import re as _re
+            _folder_version = src_version
+            for _n in zin.namelist():
+                _fm = _re.match(r'header/siardversion/(\d+\.\d+)/',
+                                _n, _re.IGNORECASE)
+                if _fm:
+                    _folder_version = _fm.group(1)
+                    break
+
             w(f"  Kilde SIARD: {src_version}  →  "
               f"Mål SIARD: {target_version}", "info")
 
@@ -397,7 +411,16 @@ class HexExtractOperation(BaseOperation):
                                        zipfile.ZIP_DEFLATED,
                                        allowZip64=True)
             try:
-                # Kopier alt unntatt behandlede tableX.xml
+                # Kopier alt unntatt behandlede tableX.xml.
+                # Rename header/siardversion/<kilde>/ → header/siardversion/<mål>/
+                # basert på faktisk mappenavn (ikke XML-namespace-innhold).
+                def _ver_path_hex(name: str) -> str:
+                    if _folder_version and _folder_version != target_version \
+                            and _folder_version in name \
+                            and name.startswith("header/"):
+                        return name.replace(_folder_version, target_version)
+                    return name
+
                 n_transformed = 0
                 if not dry_run:
                     for n_done, item in enumerate(all_items, 1):
@@ -413,9 +436,10 @@ class HexExtractOperation(BaseOperation):
                                 ct   = (zipfile.ZIP_STORED
                                         if item.filename.lower().endswith(".bin")
                                         else zipfile.ZIP_DEFLATED)
-                                zout.writestr(item.filename, data,
+                                out_name = _ver_path_hex(item.filename)
+                                zout.writestr(out_name, data,
                                               compress_type=ct)
-                                written_files.add(item.filename)
+                                written_files.add(out_name)
                             except Exception as exc:
                                 w(f"    [FEIL] Kopiering {item.filename}: "
                                   f"{exc}", "feil")

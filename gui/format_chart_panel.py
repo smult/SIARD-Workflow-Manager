@@ -68,6 +68,8 @@ _FMT_COLORS: dict[str, str] = {
     "7z":    "#888888",
     "rar":   "#999999",
     "warc":  "#70a0b0",
+    # WPTools native (konvertert via RTF→PDF/A)
+    "wpt":   "#c87a3a",
 }
 _DEFAULT_COLOR = "#4f8ef7"
 

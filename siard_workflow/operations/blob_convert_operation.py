@@ -1325,13 +1325,15 @@ class BlobConvertOperation(BaseOperation):
     - LibreOffice i batch-modus: én LO-oppstart konverterer N filer
     - Ny SIARD pakkes fra filsystem
     """
-    operation_id  = "blob_convert"
-    label         = "BLOB Konverter til PDF/A"
-    description   = (
+    operation_id   = "blob_convert"
+    label          = "BLOB Konverter til PDF/A"
+    description    = (
         "Konverterer .bin/.txt-filer og inline NBLOB/NCLOB til riktige filtyper "
         "og PDF/A. Bruker batch-konvertering for høy ytelse."
     )
-    category      = "Innhold"
+    category       = "Innhold"
+    status         = 2
+    produces_siard = True
     _hw           = suggest_lo_defaults()
     default_params = {
         "output_suffix":        "_konvertert",
@@ -2219,6 +2221,10 @@ class BlobConvertOperation(BaseOperation):
                         res_name, til_sz, "wpt+rtf→pdf",
                         kommentar)
 
+            # Rapporter WPT-filer til format-diagram
+            if to_wpt:
+                progress("rename_format_counts", counts={"wpt": len(to_wpt)})
+
             # Legg WPT-genererte RTF-filer til vanlig konvertering
             if wpt_rtf_for_lo:
                 w(f"  {len(wpt_rtf_for_lo)} WPT-RTF-filer legges til batch", "info")
@@ -3052,6 +3058,25 @@ class BlobConvertOperation(BaseOperation):
                     return files
             except Exception:
                 pass
+            # 7z — krever py7zr
+            try:
+                import py7zr
+                with py7zr.SevenZipFile(str(path), mode="r") as sz:
+                    sz.extractall(path=str(work_dir))
+                    return [f for f in work_dir.rglob("*") if f.is_file()]
+            except Exception:
+                pass
+            # RAR — krever rarfile
+            try:
+                import rarfile
+                with rarfile.RarFile(str(path)) as rf:
+                    members = [m for m in rf.infolist() if not m.is_dir()]
+                    for m in members:
+                        rf.extract(m.filename, work_dir)
+                        files.append(work_dir / m.filename)
+                    return files
+            except Exception:
+                pass
             return []
 
         n_ok   = [0]
@@ -3723,13 +3748,25 @@ class BlobConvertOperation(BaseOperation):
         n_skipped = 0
         n_transformed = 0
 
-        # Hjelpefunksjon: erstatt kildeversjon med målversjon i header-stier.
-        # Dekker katalogoppføringer som header/siardversion/2.2/ og lignende.
+        # Finn den faktiske versjonen i siardversion-mappa fra ZIP-listen.
+        # Bruker mapper-stien direkte (f.eks. header/siardversion/2.2/) i stedet
+        # for å stole på detect_siard_version fra XML-innholdet, som kan ha
+        # blitt transformert av et tidligere steg til generisk /2/-namespace.
+        import re as _re
+        _folder_version = src_version   # fallback til XML-detektert versjon
+        for _n in orig_namelist:
+            _fm = _re.match(r'header/siardversion/(\d+\.\d+)/', _n,
+                            _re.IGNORECASE)
+            if _fm:
+                _folder_version = _fm.group(1)
+                break
+
+        # Hjelpefunksjon: erstatt versjon i siardversion-mappa i header-stier.
         def _ver_path(name: str) -> str:
-            if src_version and src_version != target_version \
-                    and src_version in name \
+            if _folder_version and _folder_version != target_version \
+                    and _folder_version in name \
                     and name.startswith("header/"):
-                return name.replace(src_version, target_version)
+                return name.replace(_folder_version, target_version)
             return name
 
         # Katalogoppføringer fra original ZIP (f.eks. header/siardversion/).

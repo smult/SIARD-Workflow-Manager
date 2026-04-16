@@ -27,6 +27,7 @@ class XMLValidationOperation(BaseOperation):
     label        = "XML-validering"
     description  = "Validerer metadata.xml og tabellskjemaer. Logger alle funn."
     category     = "Validering"
+    status       = 2
     default_params = {
         "required_elements": ["dbName", "databaseProduct", "tables"],
         "check_table_xsd":   True,
@@ -191,79 +192,314 @@ class XMLValidationOperation(BaseOperation):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+_LOB_TYPE_RE = re.compile(
+    r"\b(blob|clob|nclob|binary large object|character large object"
+    r"|national character large object)\b",
+    re.IGNORECASE,
+)
+
+
 class MetadataExtractOperation(BaseOperation):
     """
-    Henter ut nøkkelmetadata fra SIARD-filens metadata.xml:
-    databasenavn, DBMS, antall skjemaer, tabeller og estimert radeantall.
+    Henter ut komplett metadata fra SIARD-filens metadata.xml og genererer
+    en visuell PDF-rapport med tabelloversikt, ER-diagram og kolonnedetaljer.
     """
 
     operation_id = "metadata_extract"
     label = "Metadata-uttrekk"
-    description = "Henter metadata (DB-navn, DBMS, tabeller, rader) fra SIARD-filen."
+    description = (
+        "Henter komplett metadata fra SIARD-filen og genererer en PDF-rapport "
+        "med tabelloversikt, statistikk, ER-diagram og kolonnedetaljer."
+    )
     category = "Metadata"
-    default_params = {}
+    status = 2
+    default_params = {
+        "generate_pdf": True,
+        "pdf_suffix": "_metadata_rapport",
+    }
 
     _NS = re.compile(r"\{[^}]+\}")
 
     def _tag(self, el: ET.Element) -> str:
         return self._NS.sub("", el.tag)
 
-    def run(self, ctx: WorkflowContext) -> OperationResult:
+    def _text(self, el: ET.Element, tag: str) -> str | None:
+        """Hent tekstinnhold av første barn med gitt lokal tag-navn."""
+        for child in el:
+            if self._tag(child) == tag:
+                return (child.text or "").strip() or None
+        return None
+
+    def _extract_all(self, siard_path: Path) -> dict:
+        """
+        Henter ut komplett metadata fra metadata.xml i SIARD-arkivet.
+
+        Returnerer en dict med følgende nøkler:
+            db_name, db_product, db_origin, connection, db_user,
+            archival_date, producer_app, data_start, data_end,
+            description, siard_version, message_digest, message_digest_algo,
+            file_size, zip_entry_count, lob_file_count, content_extensions,
+            schema_count, table_count, row_count, lob_table_count,
+            schemas: [
+                {
+                    name, description,
+                    tables: [
+                        {
+                            name, description, rows, has_lob, lob_col_count,
+                            columns: [
+                                {pos, name, type, type_original, nullable,
+                                 is_lob, mime_type, description}
+                            ],
+                            primary_key: {name, columns: [...]},
+                            foreign_keys: [
+                                {name, ref_schema, ref_table,
+                                 references: [{column, referenced}]}
+                            ],
+                            unique_keys: [{name, columns: [...]}],
+                        }
+                    ]
+                }
+            ]
+        """
         meta: dict = {
-            "db_name": None,
-            "db_product": None,
-            "schemas": [],
-            "table_count": 0,
-            "row_count": 0,
+            "db_name": None, "db_product": None, "db_origin": None,
+            "connection": None, "db_user": None, "archival_date": None,
+            "producer_app": None, "data_start": None, "data_end": None,
+            "description": None, "siard_version": None,
+            "message_digest": None, "message_digest_algo": None,
+            "file_size": None, "zip_entry_count": 0, "lob_file_count": 0,
+            "content_extensions": [],
+            "schema_count": 0, "table_count": 0, "row_count": 0,
+            "lob_table_count": 0, "schemas": [],
         }
 
+        # Filstatistikk
         try:
-            with zipfile.ZipFile(ctx.siard_path, "r") as zf:
-                names_lower = {n.lower(): n for n in zf.namelist()}
-                entry = names_lower.get("header/metadata.xml") or names_lower.get("metadata.xml")
-                if not entry:
-                    return self._fail("metadata.xml ikke funnet")
+            meta["file_size"] = siard_path.stat().st_size
+        except OSError:
+            pass
 
-                with zf.open(entry) as f:
-                    root = ET.parse(f).getroot()
+        with zipfile.ZipFile(siard_path, "r") as zf:
+            namelist = zf.namelist()
+            meta["zip_entry_count"] = len(namelist)
 
+            # Tell LOB-filer (filer utenfor header/ og content/*.xml / *.xsd)
+            lob_extensions: set[str] = set()
+            for n in namelist:
+                nl = n.lower()
+                if nl.startswith("header/"):
+                    continue
+                if nl.endswith(".xml") or nl.endswith(".xsd"):
+                    continue
+                meta["lob_file_count"] += 1
+                ext = PurePosixPath(nl).suffix.lstrip(".")
+                if ext:
+                    lob_extensions.add(ext)
+            meta["content_extensions"] = sorted(lob_extensions)
+
+            # Les metadata.xml
+            names_lower = {n.lower(): n for n in namelist}
+            entry = (names_lower.get("header/metadata.xml")
+                     or names_lower.get("metadata.xml"))
+            if not entry:
+                raise FileNotFoundError("metadata.xml ikke funnet i SIARD-arkivet")
+
+            with zf.open(entry) as f:
+                root = ET.parse(f).getroot()
+
+        # ── Rot-nivå-attributter ──────────────────────────────────────────
+        for child in root:
+            tag = self._tag(child)
+            txt = (child.text or "").strip() or None
+            if   tag == "dbName":            meta["db_name"]         = txt
+            elif tag == "databaseProduct":   meta["db_product"]      = txt
+            elif tag == "databaseOrigin":    meta["db_origin"]       = txt
+            elif tag == "connection":        meta["connection"]       = txt
+            elif tag == "databaseUser":      meta["db_user"]         = txt
+            elif tag == "archivalDate":      meta["archival_date"]   = txt
+            elif tag == "producerApplication": meta["producer_app"]  = txt
+            elif tag == "dataStart":         meta["data_start"]      = txt
+            elif tag == "dataEnd":           meta["data_end"]        = txt
+            elif tag == "description":       meta["description"]     = txt
+            elif tag == "version":           meta["siard_version"]   = txt
+            elif tag == "messageDigest":
+                meta["message_digest"]      = txt
+                algo = child.get("algorithm") or child.get("digestType")
+                if algo:
+                    meta["message_digest_algo"] = algo.strip()
+
+        # ── Skjema- og tabellstruktur ─────────────────────────────────────
+        def _parse_columns(tbl_el) -> list[dict]:
+            cols = []
+            for col_el in tbl_el:
+                if self._tag(col_el) != "column":
+                    continue
+                pos_txt = self._text(col_el, "columnId") or self._text(col_el, "pos")
+                try:
+                    pos = int(pos_txt) if pos_txt else len(cols) + 1
+                except ValueError:
+                    pos = len(cols) + 1
+
+                col_type  = self._text(col_el, "type") or ""
+                col_torig = self._text(col_el, "typeOriginal") or ""
+                nullable_txt = (self._text(col_el, "nullable") or "true").lower()
+                nullable = nullable_txt not in ("false", "0", "no")
+                mime = self._text(col_el, "mimeType") or ""
+                is_lob = bool(_LOB_TYPE_RE.search(col_type) or
+                              _LOB_TYPE_RE.search(col_torig) or
+                              mime)
+                cols.append({
+                    "pos":           pos,
+                    "name":          self._text(col_el, "name") or "",
+                    "type":          col_type,
+                    "type_original": col_torig,
+                    "nullable":      nullable,
+                    "is_lob":        is_lob,
+                    "mime_type":     mime,
+                    "description":   self._text(col_el, "description") or "",
+                })
+            return cols
+
+        def _parse_primary_key(tbl_el) -> dict | None:
+            for child in tbl_el:
+                if self._tag(child) != "primaryKey":
+                    continue
+                pk_cols = [
+                    c.text.strip()
+                    for c in child
+                    if self._tag(c) == "column" and c.text
+                ]
+                return {
+                    "name":    self._text(child, "name") or "",
+                    "columns": pk_cols,
+                }
+            return None
+
+        def _parse_foreign_keys(tbl_el) -> list[dict]:
+            fks = []
+            for child in tbl_el:
+                if self._tag(child) != "foreignKey":
+                    continue
+                refs = []
+                ref_schema = ref_table = ""
+                for sub in child:
+                    st = self._tag(sub)
+                    if st == "referencedSchema":
+                        ref_schema = (sub.text or "").strip()
+                    elif st == "referencedTable":
+                        ref_table = (sub.text or "").strip()
+                    elif st == "reference":
+                        col      = self._text(sub, "column") or ""
+                        ref_col  = self._text(sub, "referenced") or ""
+                        refs.append({"column": col, "referenced": ref_col})
+                fks.append({
+                    "name":       self._text(child, "name") or "",
+                    "ref_schema": ref_schema,
+                    "ref_table":  ref_table,
+                    "references": refs,
+                })
+            return fks
+
+        def _parse_unique_keys(tbl_el) -> list[dict]:
+            uks = []
+            for child in tbl_el:
+                if self._tag(child) != "uniqueKey":
+                    continue
+                uk_cols = [
+                    c.text.strip()
+                    for c in child
+                    if self._tag(c) == "column" and c.text
+                ]
+                uks.append({
+                    "name":    self._text(child, "name") or "",
+                    "columns": uk_cols,
+                })
+            return uks
+
+        def _parse_table(tbl_el) -> dict:
+            cols        = _parse_columns(tbl_el)
+            has_lob     = any(c["is_lob"] for c in cols)
+            lob_col_cnt = sum(1 for c in cols if c["is_lob"])
+            rows_txt    = self._text(tbl_el, "rows")
+            try:
+                rows = int(rows_txt) if rows_txt else 0
+            except ValueError:
+                rows = 0
+
+            return {
+                "name":         self._text(tbl_el, "name") or "",
+                "description":  self._text(tbl_el, "description") or "",
+                "rows":         rows,
+                "has_lob":      has_lob,
+                "lob_col_count": lob_col_cnt,
+                "columns":      cols,
+                "primary_key":  _parse_primary_key(tbl_el),
+                "foreign_keys": _parse_foreign_keys(tbl_el),
+                "unique_keys":  _parse_unique_keys(tbl_el),
+            }
+
+        # Iterer over skjemaer
+        for el in root.iter():
+            if self._tag(el) != "schema":
+                continue
+            schema_name = self._text(el, "name") or "ukjent"
+            schema_desc = self._text(el, "description") or ""
+            tables = []
+            for child in el:
+                if self._tag(child) == "tables":
+                    for tbl_el in child:
+                        if self._tag(tbl_el) == "table":
+                            tbl = _parse_table(tbl_el)
+                            tables.append(tbl)
+                            meta["table_count"] += 1
+                            meta["row_count"] += tbl["rows"]
+                            if tbl["has_lob"]:
+                                meta["lob_table_count"] += 1
+            meta["schemas"].append({
+                "name":        schema_name,
+                "description": schema_desc,
+                "tables":      tables,
+            })
+
+        meta["schema_count"] = len(meta["schemas"])
+        return meta
+
+    def run(self, ctx: WorkflowContext) -> OperationResult:
+        try:
+            meta = self._extract_all(ctx.siard_path)
         except (zipfile.BadZipFile, OSError) as e:
             return self._fail(str(e))
         except ET.ParseError as e:
             return self._fail(f"XML-parsefeil: {e}")
-
-        # Hent nøkkelverdier (namespace-uavhengig)
-        for el in root.iter():
-            tag = self._tag(el)
-            if tag == "dbName" and not meta["db_name"]:
-                meta["db_name"] = el.text
-            elif tag == "databaseProduct" and not meta["db_product"]:
-                meta["db_product"] = el.text
-            elif tag == "schema":
-                schema_name = None
-                for child in el:
-                    if self._tag(child) == "name":
-                        schema_name = child.text
-                        break
-                if schema_name:
-                    meta["schemas"].append(schema_name)
-            elif tag == "table":
-                meta["table_count"] += 1
-                for child in el:
-                    if self._tag(child) == "rows":
-                        try:
-                            meta["row_count"] += int(child.text or 0)
-                        except ValueError:
-                            pass
+        except FileNotFoundError as e:
+            return self._fail(str(e))
 
         ctx.set_result("metadata", meta)
 
+        result_data = dict(meta)
+
+        # ── PDF-generering ────────────────────────────────────────────────
+        if self.params.get("generate_pdf", True):
+            suffix = self.params.get("pdf_suffix", "_metadata_rapport")
+            pdf_path = ctx.siard_path.parent / (ctx.siard_path.stem + suffix + ".pdf")
+            try:
+                from siard_workflow.operations.metadata_pdf import generate_metadata_pdf
+                generate_metadata_pdf(meta, ctx.siard_path, pdf_path)
+                result_data["pdf_path"] = str(pdf_path)
+            except ImportError:
+                result_data["pdf_warning"] = "reportlab ikke installert — PDF ikke generert"
+            except Exception as exc:
+                result_data["pdf_warning"] = f"PDF-generering feilet: {exc}"
+
         msg = (
-            f"{meta['db_name'] or '?'} | "
+            f"{meta.get('db_name') or '?'} | "
             f"{meta['table_count']} tabeller | "
             f"{meta['row_count']:,} rader"
         )
-        return self._ok(data=meta, message=msg)
+        if "pdf_path" in result_data:
+            msg += f" | PDF: {Path(result_data['pdf_path']).name}"
+
+        return self._ok(data=result_data, message=msg)
 
 
 
@@ -284,6 +520,7 @@ class ConditionalOperation(BaseOperation):
     operation_id = "conditional"
     label = "Betinget operasjon"
     category = "Kontroll"
+    status = 0
     default_params = {
         "flag": "",         # kontekstflagg å sjekke
         "run_when": True,   # kjør når flagget er denne verdien

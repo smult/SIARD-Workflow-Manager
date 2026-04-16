@@ -80,6 +80,7 @@ OP_DEFS = [
         "label": "SHA-256 Sjekksum",
         "category": "Integritet",
         "desc": "Beregner SHA-256 sjekksum for hele SIARD-filen.",
+        "status": SHA256Operation.status,
         "params": [
             {"key": "save_to_file", "label": "Lagre .sha256-fil", "type": "bool", "default": False},
             {"key": "chunk_size",   "label": "Chunk-storrelse (bytes)", "type": "int", "default": 8192},
@@ -90,6 +91,7 @@ OP_DEFS = [
         "label": "BLOB/CLOB Kontroll",
         "category": "Innhold",
         "desc": "Sjekker om uttrekket inneholder binærfiler i Content/SchemaX/tableX.",
+        "status": BlobCheckOperation.status,
         "params": [
             {"key": "content_prefix", "label": "Content-prefiks", "type": "str", "default": "content/"},
         ],
@@ -99,6 +101,7 @@ OP_DEFS = [
         "label": "BLOB Konverter til PDF/A",
         "category": "Innhold",
         "desc": "Identifiserer blob-filer (.bin/.txt/andre), konverterer dokumenter til PDF/A, ekstraher inline NBLOB/NCLOB. Filer som er ren tekst, XML eller ukjent format beholdes. Oppdaterer SIARD-arkivet.",
+        "status": BlobConvertOperation.status,
         "params": [
             {"key": "output_suffix",      "label": "Suffix ny SIARD-fil",          "type": "str",    "default": "_konvertert"},
             {"key": "pdfa_version",       "label": "PDF/A-versjon",                 "type": "choice",
@@ -123,15 +126,18 @@ OP_DEFS = [
         "label": "HEX Inline Extract",
         "category": "Innhold",
         "desc": "Dekoder inline HEX CLOB-tekst i tableX.xml og eksporterer til eksterne .txt-filer. Kjøres før BLOB Konverter.",
+        "status": HexExtractOperation.status,
         "params": [
             {"key": "min_text_length", "label": "Min. tekstlengde (tegn)",    "type": "int",  "default": 30},
             {"key": "dry_run",         "label": "Tørkjøring (ikke skriv)",     "type": "bool", "default": False},
         ],
     },
     {
+        "cls": XMLValidationOperation,
         "label": "XML-validering",
         "category": "Validering",
         "desc": "Validerer metadata.xml og tabellskjemaer.",
+        "status": XMLValidationOperation.status,
         "params": [
             {"key": "check_table_xsd", "label": "Sjekk tableX.xsd", "type": "bool", "default": True},
         ],
@@ -141,6 +147,7 @@ OP_DEFS = [
         "label": "Metadata-uttrekk",
         "category": "Metadata",
         "desc": "Henter databasenavn, DBMS, tabeller og rader.",
+        "status": MetadataExtractOperation.status,
         "params": [],
     },
     {
@@ -148,6 +155,7 @@ OP_DEFS = [
         "label": "Virusskan",
         "category": "Sikkerhet",
         "desc": "Pakker ut SIARD og kjører valgfritt antivirus rekursivt på alle filer. AV-sti og innstillinger hentes fra config.json.",
+        "status": VirusScanOperation.status,
         "params": [
             {"key": "keep_temp", "label": "Behold utpakket mappe", "type": "bool", "default": False},
         ],
@@ -157,6 +165,7 @@ OP_DEFS = [
         "label": "Betinget (IF-flagg)",
         "category": "Kontroll",
         "desc": "Kjorer en operasjon kun hvis et kontekstflagg er True/False.",
+        "status": 2,
         "params": [],
         "special": "conditional",
     },
@@ -500,7 +509,16 @@ class OperationsPanel(ctk.CTkFrame):
                      font=ctk.CTkFont(family=FONTS["mono"], size=10, weight="bold"),
                      text_color=COLORS["muted"]).pack(side="left")
 
-        categories = list(dict.fromkeys(d["category"] for d in OP_DEFS))
+        # Filtrer operasjoner basert på min_operation_status fra config.json.
+        # 0 = vis alle, 1 = vis beta + ok, 2 = vis kun ok/releaset (standard).
+        try:
+            min_status = int(get_config("min_operation_status") or 2)
+        except (TypeError, ValueError):
+            min_status = 2
+        visible = [d for d in OP_DEFS if d.get("status", 2) >= min_status]
+
+        # Bygg kun kategorier som har minst én synlig operasjon
+        categories = list(dict.fromkeys(d["category"] for d in visible))
         self._tabs = ctk.CTkTabview(
             self, height=90,
             fg_color=COLORS["panel"],
@@ -515,7 +533,7 @@ class OperationsPanel(ctk.CTkFrame):
         for cat in categories:
             tab = self._tabs.add(cat)
             tab.grid_columnconfigure((0, 1, 2), weight=1)
-            ops = [d for d in OP_DEFS if d["category"] == cat]
+            ops = [d for d in visible if d["category"] == cat]
             for i, op_def in enumerate(ops):
                 OperationCard(tab, op_def,
                               on_add=self._on_add,

@@ -20,6 +20,7 @@ class SHA256Operation(BaseOperation):
     label = "SHA-256 Sjekksum"
     description = "Kalkulerer SHA-256 sjekksum for hele SIARD-filen."
     category = "Integritet"
+    status = 2
     default_params = {
         "chunk_size": 8192,          # bytes per lesechunk
         "save_to_file": False,       # skriv .sha256-fil ved siden av SIARD-filen

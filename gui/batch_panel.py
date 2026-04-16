@@ -236,6 +236,10 @@ class BatchWindow(ctk.CTkToplevel):
                     try:
                         result = op.run(ctx)
                         ctx.set_result(op.operation_id, result.data)
+                        # Hvis operasjonen produserte en ny SIARD-fil, oppdater input-stien
+                        new_siard = ctx.chain_siard(op.produces_siard, result.data)
+                        if new_siard:
+                            wfl.log(f"  ↪ Neste steg bruker: {new_siard.name}", "info")
                     except Exception as exc:
                         result = op._fail(str(exc))
                     run.results.append(result)

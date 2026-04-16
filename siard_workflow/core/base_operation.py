@@ -51,6 +51,11 @@ class BaseOperation(ABC):
     description: str = ""
     category: str = "Generell"
     default_params: dict[str, Any] = {}
+    # 0 = under utvikling, 1 = beta, 2 = ok/releaset
+    status: int = 2
+    # True hvis operasjonen skriver en ny SIARD-fil og lagrer stien som
+    # result.data["output_path"] — neste operasjon bruker da den filen som input
+    produces_siard: bool = False
 
     def __init__(self, **params):
         # Prioritet: 1) eksplisitte params, 2) lagrede op_params, 3) config.json, 4) defaults

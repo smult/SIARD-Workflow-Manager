@@ -263,6 +263,33 @@ class SettingsDialog(ctk.CTkToplevel):
                          row=r, column=0, columnspan=2,
                          padx=14, pady=(0, 4), sticky="w"); r += 1
 
+        _seksjon("Operasjoner — synlighet", r); r += 1
+        ctk.CTkLabel(frm, text="Vis operasjoner med status",
+                     font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                     text_color=COLORS["text"],
+                     anchor="w").grid(row=r, column=0,
+                                      padx=(12, 8), pady=6, sticky="w")
+        op_status_var = ctk.StringVar(
+            value=str(cfg.get("min_operation_status", 2)))
+        self._vars["min_operation_status"] = op_status_var
+        ctk.CTkOptionMenu(
+            frm,
+            variable=op_status_var,
+            values=["0", "1", "2"],
+            fg_color=COLORS["bg"],
+            button_color=COLORS["accent"],
+            button_hover_color=COLORS["accent_dim"],
+            dropdown_fg_color=COLORS["panel"],
+            font=ctk.CTkFont(family=FONTS["mono"], size=11),
+            width=120,
+        ).grid(row=r, column=1, padx=12, pady=6, sticky="e"); r += 1
+        ctk.CTkLabel(frm,
+                     text="0 = alle (inkl. under utvikling)  |  1 = beta + ok  |  2 = kun ok/releaset",
+                     font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                     text_color=COLORS["muted"]).grid(
+                         row=r, column=0, columnspan=2,
+                         padx=14, pady=(0, 4), sticky="w"); r += 1
+
         # Knapper
         btns = ctk.CTkFrame(self, fg_color="transparent")
         btns.grid(row=2, column=0, padx=16, pady=(0, 14), sticky="e")
@@ -281,7 +308,7 @@ class SettingsDialog(ctk.CTkToplevel):
     def _save(self):
         cfg: dict = {}
         int_keys  = {"max_workers", "lo_batch_size", "lo_timeout",
-                     "av_infected_rc", "av_timeout"}
+                     "av_infected_rc", "av_timeout", "min_operation_status"}
         list_keys = {"lo_convertible", "rename_only"}
         args_keys = {"av_args"}
         dict_keys = {"lo_upgrade"}  # kommaseparert nøkkel=verdi → dict
