@@ -27,21 +27,18 @@ Kjente utfordringer og begrensninger:
 - Windows / macOS / Linux
 - LibreOffice for dokumentkonvertering
 
+## Kjør direkte
+    start.bat kjører opp programmet og kjører installasjon av requirements. 
+    Ønsker du å kjøre direkte uten requirements hver gang kan kommandoen "python main.py" brukes.
+
 ## Installasjon
     pip install -r requirements.txt
-
-## Kjør direkte
-    python main.py eller start.bat
-
-## Bygg EXE
-    python bygg_exe.py
-    # -> dist/SIARDWorkflowManager.exe
 
 ## Prosjektstruktur
 
     siard_manager/
+      start.bat                # OBS! Oppstarts-batch-fil som håndterer kjøring og installasjon av requirements
       main.py                  # Inngangspunkt
-      bygg_exe.py              # PyInstaller build-skript
       requirements.txt
       gui/
         app.py                 # Hovedvindu (App)
