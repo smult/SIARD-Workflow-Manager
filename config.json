@@ -1,5 +1,5 @@
 {
-  "global_temp_dir": "E:/",
+  "global_temp_dir": "",
   "av_executable": "",
   "av_args": [],
   "av_infected_rc": 1,
@@ -71,5 +71,5 @@
     "pot": "pptx"
   },
   "pdfa_version": "PDF/A-2u (ISO 19005-2, level U)",
-  "disk_overhead_factor": 2.0
+  "disk_overhead_factor": 1.5
 }
