@@ -140,7 +140,7 @@ class BatchWindow(ctk.CTkToplevel):
         log_frame.grid_propagate(False)
 
         ctk.CTkLabel(log_frame, text="LOGG",
-                     font=ctk.CTkFont(family=FONTS["mono"], size=9, weight="bold"),
+                     font=ctk.CTkFont(family=FONTS["mono"], size=11, weight="bold"),
                      text_color=COLORS["muted"]).grid(row=0, column=0, padx=12, pady=(8, 2), sticky="w")
 
         self._log_box = ctk.CTkTextbox(log_frame,

@@ -23,6 +23,10 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from siard_workflow.core.base_operation import BaseOperation
+from siard_workflow.core.siard_format import (
+    detect_siard_version, siard_version_transform,
+    get_target_siard_version, is_siard_xml,
+)
 
 
 # ── Hjelpefunksjoner ──────────────────────────────────────────────────────────
@@ -338,6 +342,20 @@ class HexExtractOperation(BaseOperation):
             raise RuntimeError(f"Kan ikke åpne SIARD: {exc}") from exc
 
         with zin:
+            # ── Versjondeteksjon ──────────────────────────────────────────────
+            _meta_name = next(
+                (n for n in zin.namelist()
+                 if n.lower().endswith("header/metadata.xml")), None)
+            src_version = "2.1"
+            if _meta_name:
+                try:
+                    src_version = detect_siard_version(zin.read(_meta_name))
+                except Exception:
+                    pass
+            target_version = get_target_siard_version()
+            w(f"  Kilde SIARD: {src_version}  →  "
+              f"Mål SIARD: {target_version}", "info")
+
             try:
                 tables = _find_clob_tables(zin)
             except FileNotFoundError as exc:
@@ -380,6 +398,7 @@ class HexExtractOperation(BaseOperation):
                                        allowZip64=True)
             try:
                 # Kopier alt unntatt behandlede tableX.xml
+                n_transformed = 0
                 if not dry_run:
                     for n_done, item in enumerate(all_items, 1):
                         if item.filename in table_xml_paths:
@@ -387,6 +406,10 @@ class HexExtractOperation(BaseOperation):
                         else:
                             try:
                                 data = zin.read(item.filename)
+                                if is_siard_xml(item.filename):
+                                    data = siard_version_transform(
+                                        data, target_version)
+                                    n_transformed += 1
                                 ct   = (zipfile.ZIP_STORED
                                         if item.filename.lower().endswith(".bin")
                                         else zipfile.ZIP_DEFLATED)
@@ -399,6 +422,9 @@ class HexExtractOperation(BaseOperation):
                         if n_done % REPORT == 0 or n_done == n_total:
                             progress("phase_progress",
                                      done=n_done, total=n_total)
+                    if n_transformed:
+                        w(f"  SIARD-versjon: {n_transformed} XML-filer "
+                          f"transformert til versjon {target_version}", "info")
 
                 # Behandle CLOB-tabellene
                 for table_info in tables:

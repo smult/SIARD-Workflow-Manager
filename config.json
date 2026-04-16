@@ -1,11 +1,11 @@
 {
-  "global_temp_dir": "",
+  "global_temp_dir": "C:\\",
   "av_executable": "",
   "av_args": [],
   "av_infected_rc": 1,
   "av_timeout": 300,
   "max_workers": "8",
-  "lo_batch_size": 100,
+  "lo_batch_size": 75,
   "lo_timeout": 300,
   "lo_convertible": [
     "doc",
@@ -71,5 +71,6 @@
     "pot": "pptx"
   },
   "pdfa_version": "PDF/A-2u (ISO 19005-2, level U)",
-  "disk_overhead_factor": 1.5
+  "disk_overhead_factor": 1.5,
+  "siard_output_version": "2.1"
 }

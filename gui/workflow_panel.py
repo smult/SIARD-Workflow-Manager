@@ -56,7 +56,7 @@ class OperationRow(ctk.CTkFrame):
 
         ctk.CTkLabel(
             info, text=op.category,
-            font=ctk.CTkFont(family=FONTS["mono"], size=9),
+            font=ctk.CTkFont(family=FONTS["mono"], size=11),
             text_color=color, anchor="w").grid(
                 row=0, column=2, sticky="w")
 

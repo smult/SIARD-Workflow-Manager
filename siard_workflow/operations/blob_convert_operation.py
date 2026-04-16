@@ -46,6 +46,11 @@ from pathlib import Path, PurePosixPath
 from siard_workflow.core.base_operation import BaseOperation, OperationResult
 from siard_workflow.core.context import WorkflowContext
 from siard_workflow.core.blob_csv_logger import BlobCsvLogger, ConversionErrorLogger
+from siard_workflow.core.siard_format import (
+    detect_siard_version, siard_version_transform,
+    get_target_siard_version, is_siard_xml,
+    sanitize_metadata_schema_names,
+)
 
 # ── Magic-byte signaturer ─────────────────────────────────────────────────────
 
@@ -1561,6 +1566,21 @@ class BlobConvertOperation(BaseOperation):
             with src_zip:
                 namelist = src_zip.namelist()
 
+                # ── Versjondeteksjon ──────────────────────────────────────────
+                _meta_name = next(
+                    (n for n in namelist
+                     if n.lower().endswith("header/metadata.xml")), None)
+                src_version = "2.1"
+                if _meta_name:
+                    try:
+                        src_version = detect_siard_version(
+                            src_zip.read(_meta_name))
+                    except Exception:
+                        pass
+                target_version = get_target_siard_version()
+                w(f"  Kilde SIARD: {src_version}  →  "
+                  f"Mål SIARD: {target_version}", "info")
+
                 table_blobs:   dict[str, list[str]] = defaultdict(list)
                 table_xml_map: dict[str, str]        = {}
 
@@ -1765,7 +1785,9 @@ class BlobConvertOperation(BaseOperation):
                 if not self.params["dry_run"]:
                     phase(6, "Pakker ny SIARD-fil")
                     self._pack_new_zip(extract_dir, namelist, inline_new,
-                                       corrupt_in_zip, dst_path, w, progress)
+                                       corrupt_in_zip, dst_path,
+                                       target_version, w, progress,
+                                       src_version=src_version)
                     progress("phase_done")
 
         # ── Rydd opp temp-mappe ───────────────────────────────────────────────
@@ -2076,7 +2098,7 @@ class BlobConvertOperation(BaseOperation):
             self._process_archives(
                 to_archive, to_convert, to_rename_only, stats,
                 extract_dir, lo_bin, stop_ev, pause_ev,
-                csv_log, err_log, w, lock)
+                csv_log, err_log, w, lock, max_workers=max_w)
 
         # Steg B3: Formatoppgradering — xls→xlsx, ppt→pptx, doc→docx osv.
         if to_upgrade and not stop_ev.is_set():
@@ -2695,63 +2717,94 @@ class BlobConvertOperation(BaseOperation):
         if not pause_ev.is_set():
             stop_ev.clear()
 
-        # ── Retry-runde: enkeltvis konvertering av feilede filer ─────────────
+        # ── Retry-runde: parallell batch-konvertering av feilede filer ───────
         if retry_list and not stop_ev.is_set():
             retry_timeout = min(90, self.params["lo_timeout"])
-            w(f"  Nytt forsøk: {len(retry_list)} filer kjøres enkeltvis "
+            retry_batches = [retry_list[i:i + batch_size]
+                             for i in range(0, len(retry_list), batch_size)]
+            w(f"  Nytt forsøk: {len(retry_list)} filer i "
+              f"{len(retry_batches)} batch(er), {max_w} worker(e) "
               f"(timeout {retry_timeout}s) ...", "info")
-            n_ok = 0
-            for ri, item in enumerate(retry_list):
-                if stop_ev.is_set():
-                    break
-                _, zip_sti, ext, mime = item
-                fname = PurePosixPath(zip_sti).name
-                retry_root = extract_dir.parent / f"retry_{ri}"
 
-                profile_dir = None
-                while profile_dir is None:
+            converted_before = stats.get("converted", 0)
+
+            def _run_retry_batch(rb_args):
+                rb_idx, rb_items = rb_args
+                if stop_ev.is_set():
+                    return
+                while pause_ev.is_set():
+                    if stop_ev.is_set():
+                        return
+                    import time as _t; _t.sleep(0.1)
+
+                rb_profile = None
+                while rb_profile is None:
+                    if stop_ev.is_set():
+                        return
                     try:
                         import queue as _qr
-                        profile_dir = profile_pool.get(timeout=5)
+                        rb_profile = profile_pool.get(timeout=5)
                     except _qr.Empty:
-                        if stop_ev.is_set():
-                            break
-                if profile_dir is None:
-                    break
+                        continue
 
                 try:
+                    retry_root = extract_dir.parent / f"retry_b{rb_idx}"
                     lo_ok, lo_err, input_map = _run_lo_chunk(
-                        [item], f"retry_{ri}", profile_dir, retry_timeout, retry_root)
-                    if input_map:
+                        rb_items, f"retry_b{rb_idx}", rb_profile,
+                        retry_timeout, retry_root)
+
+                    expected: dict[str, tuple] = {
+                        zip_sti: (ext, mime)
+                        for _, zip_sti, ext, mime in rb_items
+                    }
+                    processed_stis: set[str] = set()
+
+                    for batch_file, zip_sti, ext, mime in input_map:
+                        if stop_ev.is_set():
+                            break
+                        processed_stis.add(zip_sti)
+                        fname  = PurePosixPath(zip_sti).name
                         pdf_ok = (retry_root / "out" /
-                                  (input_map[0][0].stem + ".pdf")).exists()
+                                  (batch_file.stem + ".pdf")).exists()
                         if pdf_ok:
                             _process_file_result(
-                                input_map[0][0], zip_sti, ext,
+                                batch_file, zip_sti, ext,
                                 retry_root / "out", True, "")
                             w(f"    Nytt forsøk OK: {fname}", "ok")
-                            n_ok += 1
                         else:
                             err = lo_err or "Ingen PDF produsert"
                             _process_file_result(
-                                input_map[0][0], zip_sti, ext,
+                                batch_file, zip_sti, ext,
                                 retry_root / "out", False, err)
-                            w(f"    Nytt forsøk feilet: {fname} — beholdes som .{ext}", "warn")
+                            w(f"    Nytt forsøk feilet: {fname} "
+                              f"— beholdes som .{ext}", "warn")
                             if err_log:
-                                err_log.write(fname, ext, f"Retry feilet: {err}")
-                    else:
-                        # Kopi feilet — marker direkte
-                        self._rename_file(extract_dir, zip_sti, ext)
-                        with lock:
-                            stats["failed"] += 1
-                        w(f"    Nytt forsøk kopi-feil: {fname}", "warn")
-                        if err_log:
-                            err_log.write(fname, ext, "Retry kopi-feil")
+                                err_log.write(fname, ext,
+                                              f"Retry feilet: {err}")
+
+                    # Filer som ikke kom med i input_map (kopi feilet)
+                    for zip_sti, (ext, mime) in expected.items():
+                        if zip_sti not in processed_stis:
+                            fname = PurePosixPath(zip_sti).name
+                            self._rename_file(extract_dir, zip_sti, ext)
+                            with lock:
+                                stats["failed"] += 1
+                            w(f"    Nytt forsøk kopi-feil: {fname}", "warn")
+                            if err_log:
+                                err_log.write(fname, ext, "Retry kopi-feil")
+
                     shutil.rmtree(retry_root, ignore_errors=True)
                 finally:
-                    profile_pool.put(profile_dir)
+                    profile_pool.put(rb_profile)
 
-            w(f"  Nytt forsøk ferdig: {n_ok}/{len(retry_list)} konvertert", "info")
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=max_w) as retry_pool:
+                list(retry_pool.map(_run_retry_batch,
+                                    enumerate(retry_batches)))
+
+            retry_ok = stats.get("converted", 0) - converted_before
+            w(f"  Nytt forsøk ferdig: {retry_ok}/{len(retry_list)} konvertert",
+              "info")
 
         # Rydd profiler ved slutten
         shutil.rmtree(profiles_root, ignore_errors=True)
@@ -2915,7 +2968,8 @@ class BlobConvertOperation(BaseOperation):
                           csv_log,
                           err_log,
                           w,
-                          lock:           threading.Lock) -> None:
+                          lock:           threading.Lock,
+                          max_workers:    int = 1) -> None:
         """
         Behandler komprimerte blob-filer (zip/gz/bz2/tar/rar/7z):
 
@@ -3000,115 +3054,124 @@ class BlobConvertOperation(BaseOperation):
                 pass
             return []
 
-        n_ok = 0
-        n_fail = 0
+        n_ok   = [0]
+        n_fail = [0]
         tmp_base = Path(tempfile.mkdtemp(prefix="siard_arc_", dir=extract_dir))
 
-        try:
-            for i, (idx, zip_sti, arc_ext, arc_mime) in enumerate(to_archive):
-                if stop_ev.is_set():
-                    break
+        def _process_one_archive(args):
+            i, (idx, zip_sti, arc_ext, arc_mime) = args
+            if stop_ev.is_set():
+                return
 
-                blob_path = extract_dir / zip_sti
-                if not blob_path.exists():
-                    continue
+            blob_path = extract_dir / zip_sti
+            if not blob_path.exists():
+                return
 
-                stem    = PurePosixPath(zip_sti).stem
-                parent  = PurePosixPath(zip_sti).parent
-                work_dir = tmp_base / f"arc_{i}_{stem}"
-                work_dir.mkdir(parents=True, exist_ok=True)
-                lo_work  = work_dir / "lo_tmp"
-                lo_work.mkdir(exist_ok=True)
+            stem     = PurePosixPath(zip_sti).stem
+            parent   = PurePosixPath(zip_sti).parent
+            work_dir = tmp_base / f"arc_{i}_{stem}"
+            work_dir.mkdir(parents=True, exist_ok=True)
+            lo_work  = work_dir / "lo_tmp"
+            lo_work.mkdir(exist_ok=True)
 
-                w(f"  Arkiv [{i+1}/{len(to_archive)}]: {PurePosixPath(zip_sti).name}"
-                  f" ({arc_ext.upper()})", "info")
+            w(f"  Arkiv [{i+1}/{len(to_archive)}]: {PurePosixPath(zip_sti).name}"
+              f" ({arc_ext.upper()})", "info")
 
-                # Pakk ut
-                inner_files = _unpack_archive(blob_path, work_dir)
-                if not inner_files:
-                    w(f"    Kunne ikke pakke ut — beholdes som {arc_ext}", "warn")
+            # Pakk ut
+            inner_files = _unpack_archive(blob_path, work_dir)
+            if not inner_files:
+                w(f"    Kunne ikke pakke ut — beholdes som {arc_ext}", "warn")
+                with lock:
                     to_rename_only.append((idx, zip_sti, arc_ext, arc_mime))
-                    n_fail += 1
+                    n_fail[0] += 1
+                return
+
+            w(f"    Pakket ut: {len(inner_files)} fil(er)", "info")
+
+            # Identifiser og konverter innhold
+            result_files: list[Path] = []
+            for src in inner_files:
+                if not src.exists() or not src.is_file():
+                    continue
+                try:
+                    data = src.read_bytes()[:65536]
+                except Exception:
+                    result_files.append(src)
                     continue
 
-                w(f"    Pakket ut: {len(inner_files)} fil(er)", "info")
+                inner_ext, _ = _detect(data)
 
-                # Identifiser og konverter innhold
-                result_files: list[Path] = []
-                for src in inner_files:
-                    if not src.exists() or not src.is_file():
-                        continue
-                    try:
-                        data = src.read_bytes()[:65536]
-                    except Exception:
-                        result_files.append(src)
-                        continue
-
-                    inner_ext, _ = _detect(data)
-
-                    if inner_ext in _LO_CONVERTIBLE:
-                        w(f"    Konverterer: {src.name} ({inner_ext.upper()} → PDF/A)", "info")
-                        pdf = _lo_convert_file(src, lo_work)
-                        if pdf:
-                            result_files.append(pdf)
-                            with lock:
-                                stats["converted"] += 1
-                        else:
-                            w(f"    LO-konvertering feilet: {src.name} — beholdes", "warn")
-                            result_files.append(src)
-                            with lock:
-                                stats["failed"] += 1
+                if inner_ext in _LO_CONVERTIBLE:
+                    w(f"    Konverterer: {src.name} ({inner_ext.upper()} → PDF/A)", "info")
+                    pdf = _lo_convert_file(src, lo_work)
+                    if pdf:
+                        result_files.append(pdf)
+                        with lock:
+                            stats["converted"] += 1
                     else:
+                        w(f"    LO-konvertering feilet: {src.name} — beholdes", "warn")
                         result_files.append(src)
-
-                if not result_files:
-                    to_rename_only.append((idx, zip_sti, arc_ext, arc_mime))
-                    n_fail += 1
-                    continue
-
-                # Én fil: erstatt blob direkte
-                if len(result_files) == 1:
-                    single = result_files[0]
-                    single_ext, _ = _detect(single.read_bytes()[:65536])
-                    new_name = f"{stem}.{single_ext}"
-                    new_path = blob_path.parent / new_name
-                    try:
-                        shutil.copy2(str(single), str(new_path))
-                        if new_path != blob_path:
-                            blob_path.unlink(missing_ok=True)
-                        w(f"    Enkeltfil → {new_name}", "ok")
                         with lock:
-                            stats["kept"] += 1
-                        n_ok += 1
-                    except Exception as exc:
-                        w(f"    Kopi-feil: {exc}", "warn")
-                        to_rename_only.append((idx, zip_sti, arc_ext, arc_mime))
-                        n_fail += 1
-
+                            stats["failed"] += 1
                 else:
-                    # Flere filer: pakk som ny .zip
-                    new_name = f"{stem}.zip"
-                    new_path = blob_path.parent / new_name
-                    try:
-                        with zipfile.ZipFile(new_path, "w",
-                                             compression=zipfile.ZIP_DEFLATED) as zout:
-                            for rf in result_files:
-                                zout.write(rf, rf.name)
-                        if new_path != blob_path:
-                            blob_path.unlink(missing_ok=True)
-                        w(f"    {len(result_files)} filer → {new_name}", "ok")
-                        with lock:
-                            stats["kept"] += 1
-                        n_ok += 1
-                    except Exception as exc:
-                        w(f"    ZIP-pakking feilet: {exc} — beholder original", "warn")
-                        to_rename_only.append((idx, zip_sti, arc_ext, arc_mime))
-                        n_fail += 1
+                    result_files.append(src)
 
+            if not result_files:
+                with lock:
+                    to_rename_only.append((idx, zip_sti, arc_ext, arc_mime))
+                    n_fail[0] += 1
+                return
+
+            # Én fil: erstatt blob direkte
+            if len(result_files) == 1:
+                single = result_files[0]
+                single_ext, _ = _detect(single.read_bytes()[:65536])
+                new_name = f"{stem}.{single_ext}"
+                new_path = blob_path.parent / new_name
+                try:
+                    shutil.copy2(str(single), str(new_path))
+                    if new_path != blob_path:
+                        blob_path.unlink(missing_ok=True)
+                    w(f"    Enkeltfil → {new_name}", "ok")
+                    with lock:
+                        stats["kept"] += 1
+                        n_ok[0] += 1
+                except Exception as exc:
+                    w(f"    Kopi-feil: {exc}", "warn")
+                    with lock:
+                        to_rename_only.append((idx, zip_sti, arc_ext, arc_mime))
+                        n_fail[0] += 1
+
+            else:
+                # Flere filer: pakk som ny .zip
+                new_name = f"{stem}.zip"
+                new_path = blob_path.parent / new_name
+                try:
+                    with zipfile.ZipFile(new_path, "w",
+                                         compression=zipfile.ZIP_DEFLATED) as zout:
+                        for rf in result_files:
+                            zout.write(rf, rf.name)
+                    if new_path != blob_path:
+                        blob_path.unlink(missing_ok=True)
+                    w(f"    {len(result_files)} filer → {new_name}", "ok")
+                    with lock:
+                        stats["kept"] += 1
+                        n_ok[0] += 1
+                except Exception as exc:
+                    w(f"    ZIP-pakking feilet: {exc} — beholder original", "warn")
+                    with lock:
+                        to_rename_only.append((idx, zip_sti, arc_ext, arc_mime))
+                        n_fail[0] += 1
+
+        try:
+            max_arc_w = max(1, min(max_workers, len(to_archive), os.cpu_count() or 2))
+            w(f"  Arkiver: {len(to_archive)} fordelt på {max_arc_w} worker(e) ...", "info")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_arc_w) as arc_pool:
+                list(arc_pool.map(_process_one_archive, enumerate(to_archive)))
         finally:
             shutil.rmtree(str(tmp_base), ignore_errors=True)
 
-        w(f"  Arkiver ferdig: {n_ok} OK, {n_fail} feil", "info")
+        w(f"  Arkiver ferdig: {n_ok[0]} OK, {n_fail[0]} feil", "info")
 
     def _spor_ukjent_format(self, ext: str, antall: int,
                              eksempler: str, mime: str) -> str:
@@ -3650,12 +3713,24 @@ class BlobConvertOperation(BaseOperation):
 
     def _pack_new_zip(self, extract_dir: Path, orig_namelist: list[str],
                       inline_new: dict, corrupt_files: set[str],
-                      dst_path: Path, w, progress) -> None:
+                      dst_path: Path, target_version: str,
+                      w, progress,
+                      src_version: str = "") -> None:
         w(f"  Pakker: {dst_path.name}", "step")
         # Samle alle filer fra extract_dir
         all_files = list(extract_dir.rglob("*"))
         n_written = 0
         n_skipped = 0
+        n_transformed = 0
+
+        # Hjelpefunksjon: erstatt kildeversjon med målversjon i header-stier.
+        # Dekker katalogoppføringer som header/siardversion/2.2/ og lignende.
+        def _ver_path(name: str) -> str:
+            if src_version and src_version != target_version \
+                    and src_version in name \
+                    and name.startswith("header/"):
+                return name.replace(src_version, target_version)
+            return name
 
         # Katalogoppføringer fra original ZIP (f.eks. header/siardversion/).
         # Disse er påkrevd for korrekt SIARD-validering, men filtreres bort
@@ -3664,9 +3739,11 @@ class BlobConvertOperation(BaseOperation):
 
         with zipfile.ZipFile(dst_path, "w", zipfile.ZIP_DEFLATED,
                              allowZip64=True) as zf:
-            # 1. Skriv katalogoppføringer (tomme mapper) fra original ZIP
+            # 1. Skriv katalogoppføringer (tomme mapper) fra original ZIP,
+            #    med versjonstreng transformert i header-stier.
             for dir_entry in orig_dir_entries:
-                dir_info = zipfile.ZipInfo(dir_entry)
+                dir_entry_out = _ver_path(dir_entry)
+                dir_info = zipfile.ZipInfo(dir_entry_out)
                 zf.writestr(dir_info, b"")
                 n_written += 1
             if orig_dir_entries:
@@ -3679,13 +3756,25 @@ class BlobConvertOperation(BaseOperation):
                 if not file_path.is_file():
                     continue
                 arc_name = str(file_path.relative_to(extract_dir)).replace("\\", "/")
+                arc_name = _ver_path(arc_name)
                 try:
-                    zf.write(file_path, arc_name)
+                    if is_siard_xml(arc_name):
+                        data = file_path.read_bytes()
+                        if arc_name.lower().endswith("header/metadata.xml"):
+                            data = sanitize_metadata_schema_names(data)
+                        data = siard_version_transform(data, target_version)
+                        zf.writestr(arc_name, data)
+                        n_transformed += 1
+                    else:
+                        zf.write(file_path, arc_name)
                     n_written += 1
                 except Exception as exc:
                     w(f"    FEIL skriv {arc_name}: {exc}", "feil")
                     progress("error", file=arc_name, error=str(exc))
                     n_skipped += 1
+        if n_transformed:
+            w(f"  SIARD-versjon: {n_transformed} XML-filer transformert "
+              f"til versjon {target_version}", "info")
 
         sz = dst_path.stat().st_size
         w(f"  Ferdig: {n_written:,} filer  {sz:,} bytes", "ok")

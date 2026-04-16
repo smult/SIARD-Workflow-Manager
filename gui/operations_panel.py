@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing import Callable
 import sys
+import tkinter as tk
 from pathlib import Path
 import customtkinter as ctk
 
@@ -14,6 +15,53 @@ from siard_workflow.operations import (
     VirusScanOperation, ConditionalOperation,
 )
 from settings import save_op_params, save_config, get_config, _SETTINGS_FILE
+
+
+class _ToolTip:
+    """Balloon-tooltip for tkinter/CustomTkinter-widgets."""
+
+    def __init__(self, widget, text: str, delay: int = 500):
+        self._widget  = widget
+        self._text    = text
+        self._delay   = delay
+        self._tip_win = None
+        self._job_id  = None
+        widget.bind("<Enter>",       self._schedule, add="+")
+        widget.bind("<Leave>",       self._hide,     add="+")
+        widget.bind("<ButtonPress>", self._hide,     add="+")
+
+    def _schedule(self, _=None):
+        self._cancel()
+        self._job_id = self._widget.after(self._delay, self._show)
+
+    def _cancel(self):
+        if self._job_id:
+            self._widget.after_cancel(self._job_id)
+            self._job_id = None
+
+    def _show(self):
+        if self._tip_win:
+            return
+        x = self._widget.winfo_rootx() + 8
+        y = self._widget.winfo_rooty() + self._widget.winfo_height() + 4
+        self._tip_win = tw = tk.Toplevel(self._widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        tk.Label(
+            tw, text=self._text,
+            justify="left",
+            background=COLORS["panel"],
+            foreground=COLORS["text"],
+            font=("Courier New", 11),
+            relief="solid", borderwidth=1,
+            wraplength=300, padx=8, pady=5,
+        ).pack()
+
+    def _hide(self, _=None):
+        self._cancel()
+        if self._tip_win:
+            self._tip_win.destroy()
+            self._tip_win = None
 
 
 def _dim(hex_color, factor=0.3):
@@ -402,31 +450,30 @@ class OperationCard(ctk.CTkFrame):
         self.grid_columnconfigure(0, weight=1)
 
         top = ctk.CTkFrame(self, fg_color="transparent")
-        top.grid(row=0, column=0, padx=6, pady=(6, 2), sticky="ew")
+        top.grid(row=0, column=0, padx=6, pady=(6, 6), sticky="ew")
         top.grid_columnconfigure(1, weight=1)
 
         ctk.CTkFrame(top, width=4, height=4, corner_radius=2,
                      fg_color=color).grid(row=0, column=0, padx=(0, 5), sticky="ns")
 
-        ctk.CTkLabel(top, text=op_def["label"],
-                     font=ctk.CTkFont(family=FONTS["mono"], size=10, weight="bold"),
-                     text_color=COLORS["text"], anchor="w",
-                     wraplength=120).grid(row=0, column=1, sticky="ew")
+        lbl = ctk.CTkLabel(top, text=op_def["label"],
+                           font=ctk.CTkFont(family=FONTS["mono"], size=11,
+                                            weight="bold"),
+                           text_color=COLORS["text"], anchor="w",
+                           wraplength=120)
+        lbl.grid(row=0, column=1, sticky="ew")
 
-        ctk.CTkButton(top, text="+", width=24, height=24, corner_radius=5,
-                      fg_color=_dim(color, 0.35),
-                      hover_color=_dim(color, 0.65),
-                      text_color=color,
-                      font=ctk.CTkFont(size=14, weight="bold"),
-                      command=lambda: self._clicked(op_def, on_add, on_saved)).grid(
-                          row=0, column=2, padx=(4, 0))
+        btn = ctk.CTkButton(top, text="+", width=24, height=24, corner_radius=5,
+                            fg_color=_dim(color, 0.35),
+                            hover_color=_dim(color, 0.65),
+                            text_color=color,
+                            font=ctk.CTkFont(size=14, weight="bold"),
+                            command=lambda: self._clicked(op_def, on_add, on_saved))
+        btn.grid(row=0, column=2, padx=(4, 0))
 
-        short = op_def["desc"][:55] + ("…" if len(op_def["desc"]) > 55 else "")
-        ctk.CTkLabel(self, text=short,
-                     font=ctk.CTkFont(family=FONTS["mono"], size=8),
-                     text_color=COLORS["muted"], anchor="w",
-                     wraplength=160, justify="left").grid(
-                         row=1, column=0, padx=8, pady=(0, 6), sticky="ew")
+        # Beskrivelsen vises som balloon-tooltip ved hover
+        for widget in (self, top, lbl, btn):
+            _ToolTip(widget, op_def["desc"])
 
     def _clicked(self, op_def, on_add, on_saved=None):
         if op_def.get("special") == "conditional":
@@ -455,7 +502,7 @@ class OperationsPanel(ctk.CTkFrame):
 
         categories = list(dict.fromkeys(d["category"] for d in OP_DEFS))
         self._tabs = ctk.CTkTabview(
-            self, height=115,
+            self, height=90,
             fg_color=COLORS["panel"],
             segmented_button_fg_color=COLORS["bg"],
             segmented_button_selected_color=COLORS["accent"],

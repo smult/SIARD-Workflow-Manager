@@ -174,7 +174,7 @@ class ProgressPanel(ctk.CTkFrame):
             dot.create_oval(1, 1, 9, 9, fill=color, outline="")
             dot.pack(side="left", padx=(0, 3))
             ctk.CTkLabel(legend, text=label,
-                         font=ctk.CTkFont(family=FONTS["mono"], size=9),
+                         font=ctk.CTkFont(family=FONTS["mono"], size=11),
                          text_color=COLORS["muted"]).pack(side="left", padx=(0, 12))
 
         # ── Tellerbokser ──────────────────────────────────────────────────────
@@ -200,7 +200,7 @@ class ProgressPanel(ctk.CTkFrame):
                                text_color=color)
             num.grid(row=0, column=0, pady=(8, 2))
             ctk.CTkLabel(box, text=label,
-                         font=ctk.CTkFont(family=FONTS["mono"], size=9),
+                         font=ctk.CTkFont(family=FONTS["mono"], size=11),
                          text_color=COLORS["muted"]).grid(
                              row=1, column=0, pady=(0, 8))
             self._counters[key] = num
@@ -220,7 +220,7 @@ class ProgressPanel(ctk.CTkFrame):
             pady = (10, 4) if i == 0 else (4, 4) if i < 4 else (4, 10)
 
             ctk.CTkLabel(pf, text=f"{i+1}",
-                         font=ctk.CTkFont(family=FONTS["mono"], size=9, weight="bold"),
+                         font=ctk.CTkFont(family=FONTS["mono"], size=11, weight="bold"),
                          text_color=COLORS["muted"],
                          width=16, anchor="e").grid(
                              row=i, column=0, padx=(10, 4), pady=pady)
@@ -230,14 +230,14 @@ class ProgressPanel(ctk.CTkFrame):
             self._phase_canvases.append(pc)
 
             lbl = ctk.CTkLabel(pf, text=phase_label,
-                               font=ctk.CTkFont(family=FONTS["mono"], size=9),
+                               font=ctk.CTkFont(family=FONTS["mono"], size=11),
                                text_color=COLORS["muted"],
                                anchor="w", width=170)
             lbl.grid(row=i, column=2, sticky="w", padx=(0, 4), pady=pady)
             self._phase_lbls.append(lbl)
 
             pct = ctk.CTkLabel(pf, text="",
-                               font=ctk.CTkFont(family=FONTS["mono"], size=9),
+                               font=ctk.CTkFont(family=FONTS["mono"], size=11),
                                text_color=COLORS["muted"],
                                anchor="e", width=70)
             pct.grid(row=i, column=3, padx=(0, 10), pady=pady)

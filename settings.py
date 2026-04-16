@@ -56,6 +56,7 @@ _CONFIG_DEFAULTS: dict = {
     },
     "pdfa_version":         "PDF/A-2u (ISO 19005-2, level U)",  # standard PDF/A-versjon
     "disk_overhead_factor": 2.0,   # multiplikator for estimert temp-diskbehov
+    "siard_output_version": "2.1", # målversjon for eksportert SIARD ("2.1" eller "2.2")
 }
 
 

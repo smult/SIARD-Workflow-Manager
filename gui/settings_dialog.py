@@ -32,8 +32,8 @@ class SettingsDialog(ctk.CTkToplevel):
         self._on_save = on_save
         self._vars: dict[str, ctk.Variable] = {}
         self._build()
-        self.geometry("780x520")
-        self.minsize(780, 420)
+        self.geometry("780x580")
+        self.minsize(780, 480)
 
     def _build(self):
         from settings import load_config, _CONFIG_FILE
@@ -51,7 +51,7 @@ class SettingsDialog(ctk.CTkToplevel):
                      text_color=COLORS["accent"]).grid(
                          row=0, column=0, padx=20, pady=12, sticky="w")
         ctk.CTkLabel(hdr, text=f"Lagres i: {_CONFIG_FILE}",
-                     font=ctk.CTkFont(family=FONTS["mono"], size=9),
+                     font=ctk.CTkFont(family=FONTS["mono"], size=11),
                      text_color=COLORS["muted"]).grid(
                          row=1, column=0, padx=20, pady=(0, 10), sticky="w")
 
@@ -64,7 +64,7 @@ class SettingsDialog(ctk.CTkToplevel):
 
         def _seksjon(tekst: str, row: int):
             ctk.CTkLabel(frm, text=tekst,
-                         font=ctk.CTkFont(family=FONTS["mono"], size=10,
+                         font=ctk.CTkFont(family=FONTS["mono"], size=12,
                                           weight="bold"),
                          text_color=COLORS["accent"]).grid(
                              row=row, column=0, columnspan=2,
@@ -91,7 +91,7 @@ class SettingsDialog(ctk.CTkToplevel):
                     cell.grid_columnconfigure(0, weight=1)
                     ctk.CTkEntry(cell, textvariable=var, width=340,
                                  fg_color=COLORS["bg"],
-                                 font=ctk.CTkFont(family=FONTS["mono"], size=10)
+                                 font=ctk.CTkFont(family=FONTS["mono"], size=12)
                                  ).grid(row=0, column=0, sticky="ew")
 
                     def _browse(v=var, d=browse_dir):
@@ -108,7 +108,7 @@ class SettingsDialog(ctk.CTkToplevel):
                     ctk.CTkButton(cell, text="Bla…", width=52,
                                   fg_color=COLORS["btn"],
                                   hover_color=COLORS["btn_hover"],
-                                  font=ctk.CTkFont(family=FONTS["mono"], size=10),
+                                  font=ctk.CTkFont(family=FONTS["mono"], size=12),
                                   command=_browse).grid(
                                       row=0, column=1, padx=(4, 0))
                 else:
@@ -126,7 +126,7 @@ class SettingsDialog(ctk.CTkToplevel):
              default="", browse_dir=True);  r += 1
         ctk.CTkLabel(frm,
                      text="Tom = auto-velg raskeste disk ved filvalg",
-                     font=ctk.CTkFont(family=FONTS["mono"], size=9),
+                     font=ctk.CTkFont(family=FONTS["mono"], size=11),
                      text_color=COLORS["muted"]).grid(
                          row=r, column=0, columnspan=2,
                          padx=14, pady=(0, 4), sticky="w"); r += 1
@@ -136,7 +136,7 @@ class SettingsDialog(ctk.CTkToplevel):
              default="", browse_file=True); r += 1
         ctk.CTkLabel(frm,
                      text="Eks: C:\\Program Files\\ClamAV\\clamscan.exe  (tom = autodetekter)",
-                     font=ctk.CTkFont(family=FONTS["mono"], size=9),
+                     font=ctk.CTkFont(family=FONTS["mono"], size=11),
                      text_color=COLORS["muted"]).grid(
                          row=r, column=0, columnspan=2,
                          padx=14, pady=(0, 4), sticky="w"); r += 1
@@ -157,11 +157,11 @@ class SettingsDialog(ctk.CTkToplevel):
         self._vars["av_args"] = args_var
         ctk.CTkEntry(frm, textvariable=args_var, width=420,
                      fg_color=COLORS["bg"],
-                     font=ctk.CTkFont(family=FONTS["mono"], size=10)).grid(
+                     font=ctk.CTkFont(family=FONTS["mono"], size=12)).grid(
                          row=r, column=1, padx=12, pady=6, sticky="ew"); r += 1
         ctk.CTkLabel(frm,
                      text="Tom = auto. Eks: --recursive --infected {scan_path}",
-                     font=ctk.CTkFont(family=FONTS["mono"], size=9),
+                     font=ctk.CTkFont(family=FONTS["mono"], size=11),
                      text_color=COLORS["muted"]).grid(
                          row=r, column=0, columnspan=2,
                          padx=14, pady=(0, 4), sticky="w"); r += 1
@@ -183,11 +183,11 @@ class SettingsDialog(ctk.CTkToplevel):
         self._vars["lo_convertible"] = conv_var
         ctk.CTkEntry(frm, textvariable=conv_var, width=420,
                      fg_color=COLORS["bg"],
-                     font=ctk.CTkFont(family=FONTS["mono"], size=10)).grid(
+                     font=ctk.CTkFont(family=FONTS["mono"], size=12)).grid(
                          row=r, column=1, padx=12, pady=6, sticky="ew"); r += 1
         ctk.CTkLabel(frm,
                      text="Kommaseparert, f.eks: doc, docx, rtf, odt, txt",
-                     font=ctk.CTkFont(family=FONTS["mono"], size=9),
+                     font=ctk.CTkFont(family=FONTS["mono"], size=11),
                      text_color=COLORS["muted"]).grid(
                          row=r, column=0, columnspan=2,
                          padx=14, pady=(0, 4), sticky="w"); r += 1
@@ -205,11 +205,11 @@ class SettingsDialog(ctk.CTkToplevel):
         self._vars["rename_only"] = rename_var
         ctk.CTkEntry(frm, textvariable=rename_var, width=420,
                      fg_color=COLORS["bg"],
-                     font=ctk.CTkFont(family=FONTS["mono"], size=10)).grid(
+                     font=ctk.CTkFont(family=FONTS["mono"], size=12)).grid(
                          row=r, column=1, padx=12, pady=6, sticky="ew"); r += 1
         ctk.CTkLabel(frm,
                      text="Kommaseparert, f.eks: jpg, png, xlsx, pptx, mp3",
-                     font=ctk.CTkFont(family=FONTS["mono"], size=9),
+                     font=ctk.CTkFont(family=FONTS["mono"], size=11),
                      text_color=COLORS["muted"]).grid(
                          row=r, column=0, columnspan=2,
                          padx=14, pady=(0, 4), sticky="w"); r += 1
@@ -227,11 +227,38 @@ class SettingsDialog(ctk.CTkToplevel):
         self._vars["lo_upgrade"] = upg_var
         ctk.CTkEntry(frm, textvariable=upg_var, width=420,
                      fg_color=COLORS["bg"],
-                     font=ctk.CTkFont(family=FONTS["mono"], size=10)).grid(
+                     font=ctk.CTkFont(family=FONTS["mono"], size=12)).grid(
                          row=r, column=1, padx=12, pady=6, sticky="ew"); r += 1
         ctk.CTkLabel(frm,
                      text="Kommaseparert, f.eks: xls=xlsx, ppt=pptx, doc=docx",
-                     font=ctk.CTkFont(family=FONTS["mono"], size=9),
+                     font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                     text_color=COLORS["muted"]).grid(
+                         row=r, column=0, columnspan=2,
+                         padx=14, pady=(0, 4), sticky="w"); r += 1
+
+        _seksjon("SIARD-format", r);          r += 1
+        ctk.CTkLabel(frm, text="SIARD eksportversjon",
+                     font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                     text_color=COLORS["text"],
+                     anchor="w").grid(row=r, column=0,
+                                      padx=(12, 8), pady=6, sticky="w")
+        siard_ver_var = ctk.StringVar(
+            value=str(cfg.get("siard_output_version", "2.1")))
+        self._vars["siard_output_version"] = siard_ver_var
+        ctk.CTkOptionMenu(
+            frm,
+            variable=siard_ver_var,
+            values=["2.1", "2.2"],
+            fg_color=COLORS["bg"],
+            button_color=COLORS["accent"],
+            button_hover_color=COLORS["accent_dim"],
+            dropdown_fg_color=COLORS["panel"],
+            font=ctk.CTkFont(family=FONTS["mono"], size=11),
+            width=120,
+        ).grid(row=r, column=1, padx=12, pady=6, sticky="e"); r += 1
+        ctk.CTkLabel(frm,
+                     text="Versjon for eksportert SIARD-arkiv etter blob-konvertering",
+                     font=ctk.CTkFont(family=FONTS["mono"], size=11),
                      text_color=COLORS["muted"]).grid(
                          row=r, column=0, columnspan=2,
                          padx=14, pady=(0, 4), sticky="w"); r += 1

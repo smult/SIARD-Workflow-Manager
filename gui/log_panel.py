@@ -30,7 +30,7 @@ class LogPanel(ctk.CTkFrame):
 
         self._mode_lbl = ctk.CTkLabel(
             hdr, text="",
-            font=ctk.CTkFont(family=FONTS["mono"], size=9),
+            font=ctk.CTkFont(family=FONTS["mono"], size=11),
             text_color=COLORS["accent"])
         self._mode_lbl.grid(row=0, column=1, padx=(0, 8))
 

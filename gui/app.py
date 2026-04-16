@@ -171,13 +171,13 @@ class App(ctk.CTk):
 
         self.temp_label = ctk.CTkLabel(
             sb, text="Temp: (auto)",
-            font=ctk.CTkFont(family=FONTS["mono"], size=9),
+            font=ctk.CTkFont(family=FONTS["mono"], size=11),
             text_color=COLORS["muted"], anchor="w")
         self.temp_label.grid(row=0, column=1, padx=6, pady=2, sticky="w")
 
         self._status_right = ctk.CTkLabel(
             sb, text="",
-            font=ctk.CTkFont(family=FONTS["mono"], size=9),
+            font=ctk.CTkFont(family=FONTS["mono"], size=11),
             text_color=COLORS["muted"], anchor="e")
         self._status_right.grid(row=0, column=2, padx=(0,12), pady=2, sticky="e")
 
@@ -189,7 +189,7 @@ class App(ctk.CTk):
 
         # Tittel
         ctk.CTkLabel(frm, text="SIARD-KØ",
-                     font=ctk.CTkFont(family=FONTS["mono"], size=9, weight="bold"),
+                     font=ctk.CTkFont(family=FONTS["mono"], size=11, weight="bold"),
                      text_color=COLORS["muted"]).grid(
                          row=0, column=0, sticky="w", padx=10, pady=(6, 2))
 
@@ -218,7 +218,7 @@ class App(ctk.CTk):
         self._queue_rows: list[ctk.CTkFrame] = []
         self._queue_lbl_none = ctk.CTkLabel(
             self._queue_frame, text="(tom)",
-            font=ctk.CTkFont(family=FONTS["mono"], size=9),
+            font=ctk.CTkFont(family=FONTS["mono"], size=11),
             text_color=COLORS["muted"])
         self._queue_lbl_none.grid(row=0, column=0, pady=4)
 
@@ -414,7 +414,7 @@ class App(ctk.CTk):
             ctk.CTkButton(row, text="✕", width=20, height=20, corner_radius=3,
                           fg_color="#2a1515", hover_color="#3d2020",
                           text_color=COLORS["red"],
-                          font=ctk.CTkFont(size=9),
+                          font=ctk.CTkFont(size=11),
                           command=_rm).grid(row=0, column=1, padx=(0,4), pady=3)
 
             self._queue_rows.append(row)
