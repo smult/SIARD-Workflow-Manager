@@ -2150,6 +2150,17 @@ class BlobConvertOperation(BaseOperation):
                     s = dict(stats)
                 progress("stats_update", stats=s, done=idx + 1)
 
+        # Advarsel for arkivformater som beholdes ubehandlet
+        _ARCHIVE_WARN = {"7z", "rar"}
+        for arc_ext in sorted(_ARCHIVE_WARN & set(rename_ext_counts)):
+            cnt = rename_ext_counts[arc_ext]
+            w(
+                f"  ADVARSEL: {cnt} fil(er) med format '.{arc_ext}' ble beholdt ubehandlet "
+                f"(rename_only). Innholdet er ikke tilgjengelig uten utpakking og er "
+                f"uegnet for langtidsbevaring.",
+                "warn",
+            )
+
         # Send aggregert format-teller for rename-only til GUI
         if rename_ext_counts:
             progress("rename_format_counts", counts=dict(rename_ext_counts))
