@@ -146,9 +146,13 @@ OP_DEFS = [
         "cls": MetadataExtractOperation,
         "label": "Metadata-uttrekk",
         "category": "Metadata",
-        "desc": "Henter databasenavn, DBMS, tabeller og rader.",
+        "desc": "Henter komplett metadata og genererer PDF-rapport med tabelloversikt, ER-diagram og kolonnedetaljer.",
         "status": MetadataExtractOperation.status,
-        "params": [],
+        "params": [
+            {"key": "generate_pdf",        "label": "Generer PDF-rapport",  "type": "bool", "default": True},
+            {"key": "generate_er_diagram", "label": "Inkluder ER-diagram",  "type": "bool", "default": True},
+            {"key": "pdf_suffix",          "label": "PDF-filsuffiks",        "type": "str",  "default": "_metadata_rapport"},
+        ],
     },
     {
         "cls": VirusScanOperation,

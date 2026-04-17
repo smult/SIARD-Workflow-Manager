@@ -69,7 +69,12 @@ def _abbrev_type(type_str: str) -> str:
 # Hoved-funksjon
 # ─────────────────────────────────────────────────────────────────────────────
 
-def generate_metadata_pdf(meta: dict, siard_path: Path, pdf_path: Path) -> None:
+def generate_metadata_pdf(
+    meta: dict,
+    siard_path: Path,
+    pdf_path: Path,
+    options: dict | None = None,
+) -> None:
     """
     Genererer en profesjonell A4 PDF-rapport fra SIARD-arkiv-metadata.
 
@@ -107,12 +112,15 @@ def generate_metadata_pdf(meta: dict, siard_path: Path, pdf_path: Path) -> None:
 
     from datetime import date as _date
 
+    _opts = options or {}
+    _generate_er = _opts.get("generate_er_diagram", True)
+
     # ── Fargepalett ────────────────────────────────────────────────────────
     C_NAVY       = colors.Color(0.10, 0.22, 0.42)
     C_BLUE       = colors.Color(0.20, 0.44, 0.68)
     C_LIGHT_BLUE = colors.Color(0.88, 0.93, 0.98)
     C_LOB_ORANGE = colors.Color(0.80, 0.38, 0.10)
-    C_LOB_LIGHT  = colors.Color(0.99, 0.93, 0.87)
+    C_LOB_YELLOW = colors.Color(0.93, 0.85, 0.65)
     C_GREEN      = colors.Color(0.18, 0.60, 0.36)
     C_ALT_ROW    = colors.Color(0.96, 0.96, 0.97)
     C_BORDER     = colors.Color(0.78, 0.78, 0.82)
@@ -260,10 +268,10 @@ def generate_metadata_pdf(meta: dict, siard_path: Path, pdf_path: Path) -> None:
         d = Drawing(CONTENT_W, title_bar_h)
         d.add(Rect(0, 0, CONTENT_W, title_bar_h, fillColor=C_NAVY,
                    strokeColor=None))
-        d.add(String(14, title_bar_h - 18, "KDRS",
-                     fontSize=22, fillColor=C_WHITE,
+        d.add(String(14, title_bar_h - 30, "KDRS",
+                     fontSize=24, fillColor=C_WHITE,
                      fontName="Helvetica-Bold"))
-        d.add(String(14, title_bar_h - 36, "SIARD METADATA-RAPPORT",
+        d.add(String(14, title_bar_h - 46, "SIARD Metadata-rapport",
                      fontSize=13, fillColor=colors.Color(0.75, 0.85, 0.97),
                      fontName="Helvetica-Bold"))
         story.append(DrawingFlowable(d))
@@ -370,8 +378,7 @@ def generate_metadata_pdf(meta: dict, siard_path: Path, pdf_path: Path) -> None:
             ("DB-bruker",            _val(meta.get("db_user"))),
             ("Arkiveringsdato",      _val(meta.get("archival_date"))),
             ("Produsert av",         _val(meta.get("producer_app"))),
-            ("Data fra",             _val(meta.get("data_start"))),
-            ("Data til",             _val(meta.get("data_end"))),
+            ("Tidsperiode",             _val(meta.get("data_origin_time_span"))),
             ("SIARD-versjon",        _val(meta.get("siard_version"))),
             ("Meldingssammendrag",   digest_str),
             ("Antall ZIP-poster",    str(meta.get("zip_entry_count", "–"))),
@@ -496,7 +503,7 @@ def generate_metadata_pdf(meta: dict, siard_path: Path, pdf_path: Path) -> None:
 
     def _build_inventory() -> list:
         story = []
-        story.append(Paragraph("Tabellinventar", style_h1))
+        story.append(Paragraph("Tabelloversikt", style_h1))
         story.append(HRFlowable(width=CONTENT_W, thickness=1.0,
                                 color=C_NAVY, spaceAfter=4*mm))
 
@@ -510,109 +517,93 @@ def generate_metadata_pdf(meta: dict, siard_path: Path, pdf_path: Path) -> None:
             return story
 
         # Sortert etter rader desc
-        all_tables.sort(key=lambda x: x[1].get("rows", 0) or 0, reverse=True)
+        all_tables.sort(key=lambda x: (x[0].lower(), x[1].get("name", "").lower()))
 
         # Kolonne-bredder:
-        #  Skjema(20) | Tabell/Kolonne(38) | Rader/Type(32) | Nullable(14) | LOB(10) | Mime/PK(28) | rest
-        CW_SCHEMA  = 20 * mm
-        CW_NAME    = 38 * mm
-        CW_ROWS    = 32 * mm
-        CW_NULL    = 14 * mm
-        CW_LOB     = 10 * mm
-        CW_EXTRA   = 28 * mm
-        CW_REST    = CONTENT_W - CW_SCHEMA - CW_NAME - CW_ROWS - CW_NULL - CW_LOB - CW_EXTRA
-        col_widths = [CW_SCHEMA, CW_NAME, CW_ROWS, CW_NULL, CW_LOB, CW_EXTRA, CW_REST]
+        #  Skjema(18) | Tabell(36) | Rader(20) | LOB(15) | PK(28) | Beskrivelse(rest)
+        CW_SCHEMA = 18 * mm
+        CW_NAME   = 36 * mm
+        CW_ROWS   = 20 * mm
+        CW_LOB    = 15 * mm
+        CW_PK     = 28 * mm
+        CW_DESC   = CONTENT_W - CW_SCHEMA - CW_NAME - CW_ROWS - CW_LOB - CW_PK
+        col_widths = [CW_SCHEMA, CW_NAME, CW_ROWS, CW_LOB, CW_PK, CW_DESC]
 
-        # Topptekst — to linjer (tabell-nivå / kolonne-nivå)
         headers = [
-            _p("Skjema",          style_cell_bold),
-            _p("Tabell / Kolonne", style_cell_bold),
-            _p("Rader / Type",     style_cell_bold),
-            _p("Nullable",         style_cell_bold),
-            _p("LOB",              style_cell_bold),
-            _p("Primærnøkkel / Mime-type", style_cell_bold),
-            _p("Beskrivelse",      style_cell_bold),
+            _p("Skjema",       style_cell_bold),
+            _p("Tabell",       style_cell_bold),
+            _p("Rader",        style_cell_bold),
+            _p("LOB-filer",    style_cell_bold),
+            _p("Primærnøkkel", style_cell_bold),
+            _p("Beskrivelse",  style_cell_bold),
         ]
 
-        C_TBL_ROW  = C_LIGHT_BLUE                       # blå bakgrunn for tabellrader
-        C_COL_ODD  = colors.Color(0.96, 0.96, 0.97)     # lys grå for odde kolonnerader
-        C_COL_EVEN = colors.Color(0.99, 0.99, 1.00)     # nesten hvit for like kolonnerader
+        C_TBL_ROW  = C_LIGHT_BLUE
+
+        # Stil for beskrivelse under tabellnavn (liten, kursiv, grå)
+        style_tbl_desc = ParagraphStyle(
+            "tbl_desc",
+            parent=style_cell,
+            fontSize=6.5,
+            leading=8,
+            textColor=C_MED_GREY,
+            fontName="Helvetica-Oblique",
+            spaceBefore=1,
+        )
 
         rows = [headers]
         row_styles: list[tuple] = [
-            # Header
             ("BACKGROUND", (0, 0), (-1, 0), C_LIGHT_BLUE),
             ("TEXTCOLOR",  (0, 0), (-1, 0), C_NAVY),
             ("FONTNAME",   (0, 0), (-1, 0), "Helvetica-Bold"),
         ]
 
-        ri = 1  # løpende rad-indeks (etter header)
+        ri = 1
 
         for sname, tbl in all_tables:
-            has_lob = tbl.get("has_lob") or tbl.get("lob_col_count", 0) > 0
-            rows_val = tbl.get("rows", 0) or 0
-            rows_str = f"{rows_val:,}".replace(",", "\u00a0")
-            columns  = tbl.get("columns", [])
+            lob_file_cnt = tbl.get("lob_file_count", 0)
+            has_lob      = tbl.get("has_lob") or tbl.get("lob_col_count", 0) > 0 or lob_file_cnt > 0
+            rows_val     = tbl.get("rows", 0) or 0
+            rows_str     = f"{rows_val:,}".replace(",", "\u00a0")
 
             pk = tbl.get("primary_key")
             pk_str = ""
             if pk:
                 pk_cols = pk.get("columns", [])
-                pk_str = ", ".join(pk_cols[:3])
-                if len(pk_cols) > 3:
-                    pk_str += f" (+{len(pk_cols) - 3})"
+                pk_str = ", ".join(pk_cols[:4])
+                if len(pk_cols) > 4:
+                    pk_str += f" (+{len(pk_cols) - 4})"
 
             desc = (tbl.get("description") or "").strip()
-            if len(desc) > 50:
-                desc = desc[:48] + "…"
+
+            # Tabellnavn-celle: navn (fet) + tableX-mappe
+            tbl_name   = tbl.get("name", "")
+            tbl_folder = tbl.get("folder", "")
+            name_parts = [Paragraph(f"<b>{tbl_name}</b>", style_cell)]
+            if tbl_folder:
+                name_parts.append(Paragraph(tbl_folder, style_tbl_desc))
+            name_cell = name_parts if len(name_parts) > 1 else name_parts[0]
+
+            # LOB-filer: vis antall (tom hvis ingen)
+            lob_str = str(lob_file_cnt) if lob_file_cnt > 0 else ""
 
             # ── Tabellrad ──────────────────────────────────────────────────
             tbl_row = [
                 _p(_trunc_name(sname), style_cell_bold),
-                _p(tbl.get("name", ""), style_cell_bold),
+                name_cell,
                 _p(rows_str, style_cell_bold),
-                _p(str(len(columns)), style_cell_center),
-                _p("Ja" if has_lob else "", style_cell_center),
+                _p(lob_str, style_cell_center),
                 _p(pk_str, style_cell),
                 _p(desc, style_cell),
             ]
             rows.append(tbl_row)
 
-            bg = C_LOB_LIGHT if has_lob else C_TBL_ROW
+            bg = C_LOB_YELLOW if has_lob else C_TBL_ROW
             row_styles.append(("BACKGROUND", (0, ri), (-1, ri), bg))
             row_styles.append(("TOPPADDING",    (0, ri), (-1, ri), 4))
-            row_styles.append(("BOTTOMPADDING", (0, ri), (-1, ri), 4))
+            row_styles.append(("BOTTOMPADDING", (0, ri), (-1, ri), 5))
+            row_styles.append(("VALIGN",        (0, ri), (-1, ri), "TOP"))
             ri += 1
-
-            # ── Kolonnerader ───────────────────────────────────────────────
-            for ci, col_info in enumerate(columns):
-                cname    = col_info.get("name", "")
-                ctype    = _abbrev_type(col_info.get("type", ""))
-                nullable = "Nei" if not col_info.get("nullable", True) else ""
-                is_lob   = col_info.get("is_lob", False)
-                mime     = (col_info.get("mime_type") or "").strip()
-
-                col_row = [
-                    _p("", style_cell),
-                    _p(f"\u00a0\u00a0↳ {cname}", style_cell),
-                    _p(ctype, style_cell),
-                    _p(nullable, style_cell_center),
-                    _p("Ja" if is_lob else "", style_cell_center),
-                    _p(mime, style_cell),
-                    _p("", style_cell),
-                ]
-                rows.append(col_row)
-
-                if is_lob:
-                    col_bg = C_LOB_LIGHT
-                elif ci % 2 == 0:
-                    col_bg = C_COL_ODD
-                else:
-                    col_bg = C_COL_EVEN
-                row_styles.append(("BACKGROUND", (0, ri), (-1, ri), col_bg))
-                row_styles.append(("TOPPADDING",    (0, ri), (-1, ri), 2))
-                row_styles.append(("BOTTOMPADDING", (0, ri), (-1, ri), 2))
-                ri += 1
 
         t = Table(rows, colWidths=col_widths, repeatRows=1)
         ts = TableStyle([
@@ -632,8 +623,12 @@ def generate_metadata_pdf(meta: dict, siard_path: Path, pdf_path: Path) -> None:
 
         # Fargeforklaring
         story.append(Spacer(1, 2 * mm))
+        # C_LOB_YELLOW = Color(0.93, 0.85, 0.65) → #EDD9A6  (same as LOB row background)
         story.append(Paragraph(
-            '<font color="#cc6010">■</font> Oransje rader = tabeller/kolonner med LOB-data',
+            '<font color="#EDD9A6">■</font>'
+            ' Rader med denne bakgrunnsfargen = tabeller med LOB-data'
+            '&nbsp;&nbsp;&nbsp;'
+            '<b>LOB-filer</b> = antall binærfiler talt fra content/schema{n}/table{m}/lob*/',
             style_caption,
         ))
 
@@ -644,14 +639,16 @@ def generate_metadata_pdf(meta: dict, siard_path: Path, pdf_path: Path) -> None:
     # ══════════════════════════════════════════════════════════════════════
 
     def _build_er_diagram() -> list:
+        import math as _math
+
         story = []
         story.append(Paragraph("ER-diagram", style_h1))
         story.append(HRFlowable(width=CONTENT_W, thickness=1.0,
                                 color=C_NAVY, spaceAfter=4*mm))
 
         schemas = meta.get("schemas", [])
-        all_tables = []
-        schema_color_map = {}
+        all_tables: list[tuple] = []
+        schema_color_map: dict = {}
         for si, schema in enumerate(schemas):
             sc = SCHEMA_PALETTE[si % len(SCHEMA_PALETTE)]
             schema_color_map[schema["name"]] = sc
@@ -663,238 +660,144 @@ def generate_metadata_pdf(meta: dict, siard_path: Path, pdf_path: Path) -> None:
             return story
 
         n = len(all_tables)
-        compact = n > 25
 
-        HEADER_H = 22
-        COL_ROW_H = 13
-        MAX_SHOWN_COLS = 8
-        GAP = 8
+        # ── Dimensjoner ────────────────────────────────────────────────────
+        BOX_H  = 26.0   # fast høyde — kun header (tabellnavn + rader)
+        GAP_X  = 12.0   # horisontalt mellomrom
+        GAP_Y  = 16.0   # vertikalt mellomrom (nok plass til FK-labels)
 
-        # Bestem antall kolonner i grid
-        if n <= 6:
-            n_cols = 2
-        elif n <= 15:
-            n_cols = 3
-        else:
-            n_cols = 4
+        # Antall kolonner i grid
+        if   n <= 4:  n_cols = 2
+        elif n <= 9:  n_cols = 3
+        elif n <= 20: n_cols = 4
+        else:         n_cols = 5
 
         avail_w = float(CONTENT_W)
-        box_w = min(130.0, avail_w / n_cols - GAP)
-        box_w = max(box_w, 60.0)
+        box_w = (avail_w - GAP_X * (n_cols + 1)) / n_cols
+        box_w = max(box_w, 65.0)
 
-        def _box_height(tbl):
-            if compact:
-                return HEADER_H + COL_ROW_H
-            nc = len(tbl.get("columns", []))
-            shown = min(nc, MAX_SHOWN_COLS)
-            extra = 1 if nc > MAX_SHOWN_COLS else 0
-            return HEADER_H + shown * COL_ROW_H + extra * COL_ROW_H
-
-        # Beregn boks-høyder
-        box_heights = [_box_height(tbl) for _, tbl, _ in all_tables]
-
-        # Grid-layout: slange-mønster (fyll kolonne 0 ned, så kolonne 1 osv.)
         n_rows_grid = (n + n_cols - 1) // n_cols
 
-        # Beregn total høyde per kolonne
-        col_assignments = []  # (col, row) for hvert bord
-        for idx in range(n):
-            col = idx // n_rows_grid
-            row = idx % n_rows_grid
-            col_assignments.append((col, row))
+        # Grid-plassering: rad for rad, venstre til høyre
+        col_assignments = [(idx % n_cols, idx // n_cols) for idx in range(n)]
 
-        # Finn max boks-høyde per rad per kolonne
-        # Anta uniform plassering: alle bokser i en rad har samme y
-        row_heights = [0.0] * n_rows_grid
-        for idx, (col, row) in enumerate(col_assignments):
-            row_heights[row] = max(row_heights[row], box_heights[idx])
+        # ── Kant-punkt-hjelper ─────────────────────────────────────────────
+        def _edge_pt(cx: float, cy: float, tx: float, ty: float) -> tuple[float, float]:
+            """Punkt på bokskanten (cx,cy,box_w,BOX_H) i retning (tx,ty)."""
+            dx, dy = tx - cx, ty - cy
+            if dx == 0 and dy == 0:
+                return cx, cy
+            hw, hh = box_w / 2, BOX_H / 2
+            t_x = hw / abs(dx) if dx != 0 else float("inf")
+            t_y = hh / abs(dy) if dy != 0 else float("inf")
+            t = min(t_x, t_y)
+            return cx + dx * t, cy + dy * t
 
-        # Akkumuler y-posisjoner (fra topp)
-        row_tops = [0.0] * n_rows_grid
-        current_y = 0.0
-        for r in range(n_rows_grid):
-            row_tops[r] = current_y
-            current_y += row_heights[r] + GAP
+        # ── Sideberegning ──────────────────────────────────────────────────
+        row_h     = BOX_H + GAP_Y
+        page_avail_h = float(PAGE_H - MARGIN_TOP - MARGIN_BOT - 30 * mm)
+        rows_per_pg  = max(1, int(page_avail_h / row_h))
 
-        total_draw_h = current_y + 10
-        page_avail_h = PAGE_H - MARGIN_TOP - MARGIN_BOT - 30 * mm
-
-        # Splitt i sider om nødvendig
-        rows_per_page = max(1, int(page_avail_h / (sum(row_heights[:1]) + GAP + 1))
-                            if row_heights else 1)
-
-        # Dynamisk: finn hvor mange rader som passer på én side
-        def _rows_fitting(start_row):
-            h = 0.0
-            r = start_row
-            while r < n_rows_grid:
-                h += row_heights[r] + GAP
-                if h > page_avail_h:
-                    break
-                r += 1
-            return max(1, r - start_row)
-
-        # Bygg én eller flere drawings
+        # ── Tegn side for side ─────────────────────────────────────────────
         page_row_start = 0
         while page_row_start < n_rows_grid:
-            fitting = _rows_fitting(page_row_start)
-            page_row_end = min(page_row_start + fitting, n_rows_grid)
+            page_row_end = min(page_row_start + rows_per_pg, n_rows_grid)
+            n_page_rows  = page_row_end - page_row_start
 
-            # Beregn høyde for denne siden
-            page_draw_h = sum(row_heights[page_row_start:page_row_end]) + \
-                          GAP * (page_row_end - page_row_start) + 10
+            draw_h = n_page_rows * row_h + 8.0
 
-            d = Drawing(avail_w, page_draw_h)
-            d.add(Rect(0, 0, avail_w, page_draw_h,
+            d = Drawing(avail_w, draw_h)
+            d.add(Rect(0, 0, avail_w, draw_h,
                        fillColor=colors.Color(0.98, 0.98, 0.99),
                        strokeColor=None))
 
-            # Boks-posisjoner for FK-linjer
-            box_centers = {}  # tbl_name → (cx, cy) i drawing-koordinater
+            # Boks-sentre for FK-oppslag: tbl_name → (cx, cy)
+            box_centers: dict[str, tuple[float, float]] = {}
 
+            # ── Tegn alle bokser ───────────────────────────────────────────
             for idx, (sname, tbl, sc) in enumerate(all_tables):
-                col, row = col_assignments[idx]
-                if not (page_row_start <= row < page_row_end):
+                col_idx, row_idx = col_assignments[idx]
+                if not (page_row_start <= row_idx < page_row_end):
                     continue
 
-                local_row = row - page_row_start
-                # y fra topp i drawing
-                y_top_from_top = sum(row_heights[page_row_start:page_row_start + local_row]) + \
-                                 GAP * local_row
-                # Konverter til bottom-up (reportlab Drawing-koordinater)
-                bh = box_heights[idx]
-                x_left = col * (box_w + GAP) + GAP / 2
-                y_bottom = page_draw_h - y_top_from_top - bh - 5
+                local_row = row_idx - page_row_start
+                # Bottom-up koordinater i Drawing
+                x_left   = GAP_X / 2 + col_idx * (box_w + GAP_X)
+                y_top    = local_row * row_h          # fra topp
+                y_bottom = draw_h - y_top - BOX_H - 4
+
+                cx = x_left + box_w / 2
+                cy = y_bottom + BOX_H / 2
+                box_centers[tbl.get("name", "")] = (cx, cy)
 
                 # Boks-ramme
-                d.add(Rect(x_left, y_bottom, box_w, bh,
+                d.add(Rect(x_left, y_bottom, box_w, BOX_H,
                            fillColor=C_WHITE, strokeColor=sc, strokeWidth=1.2))
-                # Header-stripe
-                d.add(Rect(x_left, y_bottom + bh - HEADER_H, box_w, HEADER_H,
+                # Header-farge-stripe (øverste 16 pt)
+                HDR = 16.0
+                d.add(Rect(x_left, y_bottom + BOX_H - HDR, box_w, HDR,
                            fillColor=sc, strokeColor=None))
 
-                # Tabellnavn i header
+                # Tabellnavn
                 tname = tbl.get("name", "")
-                tname_disp = tname if len(tname) <= 18 else tname[:16] + "…"
+                max_ch = max(10, int(box_w / 5.5))
+                tname_disp = tname if len(tname) <= max_ch else tname[:max_ch - 1] + "…"
                 d.add(String(x_left + box_w / 2,
-                             y_bottom + bh - HEADER_H + 7,
+                             y_bottom + BOX_H - HDR + 5,
                              tname_disp,
-                             fontSize=8, fillColor=C_WHITE,
+                             fontSize=7, fillColor=C_WHITE,
                              fontName="Helvetica-Bold",
                              textAnchor="middle"))
 
-                # Radantall i header
+                # Radantall + tableX under header-stripa
                 rows_val = tbl.get("rows", 0) or 0
+                folder   = tbl.get("folder", "")
+                sub_line = f"{rows_val:,}".replace(",", "\u00a0") + " rader"
+                if folder:
+                    sub_line += f"  ({folder})"
                 d.add(String(x_left + box_w / 2,
-                             y_bottom + bh - HEADER_H + 1,
-                             f"{rows_val:,}".replace(",", "\u00a0") + " rader",
-                             fontSize=6, fillColor=colors.Color(0.88, 0.93, 0.98),
+                             y_bottom + 3,
+                             sub_line,
+                             fontSize=5.5, fillColor=C_MED_GREY,
                              textAnchor="middle"))
 
-                # Lagre boks-senter for FK-linjer
-                cx = x_left + box_w / 2
-                cy = y_bottom + bh / 2
-                box_centers[tname] = (cx, cy)
-
-                if not compact:
-                    cols_list = tbl.get("columns", [])
-                    pk = tbl.get("primary_key")
-                    pk_cols = set(pk.get("columns", [])) if pk else set()
-                    fk_cols = set()
-                    for fk in tbl.get("foreign_keys", []):
-                        for ref in fk.get("references", []):
-                            fk_cols.add(ref.get("column", ""))
-
-                    shown = cols_list[:MAX_SHOWN_COLS]
-                    for ci, col_info in enumerate(shown):
-                        cy_col = y_bottom + bh - HEADER_H - (ci + 1) * COL_ROW_H
-                        cname = col_info.get("name", "")
-                        ctype = _abbrev_type(col_info.get("type", ""))
-                        is_pk = cname in pk_cols
-                        is_fk = cname in fk_cols
-                        is_lob = col_info.get("is_lob", False)
-
-                        # Badge
-                        badge_x = x_left + 2
-                        if is_pk:
-                            d.add(Rect(badge_x, cy_col + 1, 14, COL_ROW_H - 3,
-                                       fillColor=C_GREEN, strokeColor=None))
-                            d.add(String(badge_x + 7, cy_col + 3, "PK",
-                                         fontSize=5.5, fillColor=C_WHITE,
-                                         fontName="Helvetica-Bold",
-                                         textAnchor="middle"))
-                        elif is_fk:
-                            d.add(Rect(badge_x, cy_col + 1, 14, COL_ROW_H - 3,
-                                       fillColor=C_BLUE, strokeColor=None))
-                            d.add(String(badge_x + 7, cy_col + 3, "FK",
-                                         fontSize=5.5, fillColor=C_WHITE,
-                                         fontName="Helvetica-Bold",
-                                         textAnchor="middle"))
-                        elif is_lob:
-                            d.add(Rect(badge_x, cy_col + 1, 14, COL_ROW_H - 3,
-                                       fillColor=C_LOB_ORANGE, strokeColor=None))
-                            d.add(String(badge_x + 7, cy_col + 3, "LOB",
-                                         fontSize=5, fillColor=C_WHITE,
-                                         fontName="Helvetica-Bold",
-                                         textAnchor="middle"))
-
-                        # Kolonnenavn
-                        cname_disp = cname if len(cname) <= 12 else cname[:10] + "…"
-                        d.add(String(x_left + 18, cy_col + 3, cname_disp,
-                                     fontSize=6.5, fillColor=C_DARK_GREY,
-                                     fontName="Helvetica"))
-                        # Type
-                        d.add(String(x_left + box_w - 2, cy_col + 3, ctype,
-                                     fontSize=6, fillColor=C_MED_GREY,
-                                     textAnchor="end"))
-                        # Linjeskiller
-                        d.add(Line(x_left, cy_col, x_left + box_w, cy_col,
-                                   strokeColor=C_BORDER, strokeWidth=0.3))
-
-                    if len(cols_list) > MAX_SHOWN_COLS:
-                        extra = len(cols_list) - MAX_SHOWN_COLS
-                        cy_more = y_bottom + bh - HEADER_H - (MAX_SHOWN_COLS + 1) * COL_ROW_H
-                        d.add(String(x_left + box_w / 2, cy_more + 3,
-                                     f"… +{extra} kolonner",
-                                     fontSize=6, fillColor=C_MED_GREY,
-                                     textAnchor="middle"))
-
-            # FK-piler
+            # ── Tegn FK-piler ──────────────────────────────────────────────
+            C_ARROW = colors.Color(0.45, 0.45, 0.60)
             for sname, tbl, sc in all_tables:
                 src_name = tbl.get("name", "")
                 if src_name not in box_centers:
                     continue
-                sx, sy = box_centers[src_name]
+                scx, scy = box_centers[src_name]
+
                 for fk in tbl.get("foreign_keys", []):
                     ref_tbl = fk.get("ref_table", "")
-                    if ref_tbl not in box_centers:
+                    if ref_tbl not in box_centers or ref_tbl == src_name:
                         continue
-                    tx, ty = box_centers[ref_tbl]
-                    if sx == tx and sy == ty:
-                        continue
-                    # Tegn linje
-                    d.add(Line(sx, sy, tx, ty,
-                               strokeColor=colors.Color(0.55, 0.55, 0.65),
-                               strokeWidth=0.8))
-                    # Liten pil ved destinasjon
-                    import math
-                    dx_ = tx - sx
-                    dy_ = ty - sy
-                    length = math.sqrt(dx_ * dx_ + dy_ * dy_)
+                    tcx, tcy = box_centers[ref_tbl]
+
+                    # Kant-punkter i stedet for sentre
+                    ex1, ey1 = _edge_pt(scx, scy, tcx, tcy)   # ut fra kilde
+                    ex2, ey2 = _edge_pt(tcx, tcy, scx, scy)   # inn i mål
+
+                    # Linje
+                    d.add(Line(ex1, ey1, ex2, ey2,
+                               strokeColor=C_ARROW, strokeWidth=0.9))
+
+                    # Pilhode ved kant av mål-boksen
+                    ddx, ddy = ex2 - ex1, ey2 - ey1
+                    length = _math.hypot(ddx, ddy)
                     if length > 0:
-                        ux = dx_ / length
-                        uy = dy_ / length
-                        arr_len = 6
-                        arr_w = 3
-                        ax = tx - ux * arr_len
-                        ay = ty - uy * arr_len
-                        px = -uy * arr_w
-                        py = ux * arr_w
-                        d.add(Polygon([tx, ty,
-                                       ax + px, ay + py,
-                                       ax - px, ay - py],
-                                      fillColor=colors.Color(0.55, 0.55, 0.65),
-                                      strokeColor=None))
+                        ux, uy = ddx / length, ddy / length
+                        al, aw = 7.0, 3.0
+                        ax = ex2 - ux * al
+                        ay = ey2 - uy * al
+                        px, py = -uy * aw, ux * aw
+                        d.add(Polygon(
+                            [ex2, ey2,
+                             ax + px, ay + py,
+                             ax - px, ay - py],
+                            fillColor=C_ARROW, strokeColor=None,
+                        ))
 
             story.append(DrawingFlowable(d))
 
@@ -914,8 +817,10 @@ def generate_metadata_pdf(meta: dict, siard_path: Path, pdf_path: Path) -> None:
                     f'{int(sc.green*255):02x}{int(sc.blue*255):02x}">&#9632;</font>'
                     f' {_trunc_name(sname, 20)}'
                 )
-            story.append(Paragraph("Skjema-farger: " + "   ".join(legend_items),
-                                   style_caption))
+            story.append(Paragraph(
+                "Skjema-farger: " + "   ".join(legend_items),
+                style_caption,
+            ))
 
         return story
 
@@ -975,9 +880,9 @@ def generate_metadata_pdf(meta: dict, siard_path: Path, pdf_path: Path) -> None:
 
                 # ── Kolonnetabell ────────────────────────────────────────
                 col_headers = ["Pos", "Kolonne", "SQL-type", "Orig.type",
-                               "Nullable", "LOB", "Mime-type", "Beskrivelse"]
-                cw = [10*mm, 32*mm, 24*mm, 24*mm, 14*mm, 10*mm,
-                      24*mm, CONTENT_W - 138*mm]
+                               "LOB", "Beskrivelse"]
+                cw = [10*mm, 50*mm, 24*mm, 24*mm, 10*mm,
+                      CONTENT_W - 138*mm]
 
                 col_rows = [col_headers]
                 col_row_styles = []
@@ -997,14 +902,12 @@ def generate_metadata_pdf(meta: dict, siard_path: Path, pdf_path: Path) -> None:
                         col_info.get("name", ""),
                         _abbrev_type(col_info.get("type", "")),
                         orig_t or "–",
-                        nullable,
                         lob_flag,
-                        mime,
                         cdesc,
                     ])
                     if is_lob:
                         col_row_styles.append(
-                            ("BACKGROUND", (0, ri), (-1, ri), C_LOB_LIGHT))
+                            ("BACKGROUND", (0, ri), (-1, ri), C_LOB_YELLOW))
                     elif ci % 2 == 1:
                         col_row_styles.append(
                             ("BACKGROUND", (0, ri), (-1, ri), C_ALT_ROW))
@@ -1105,15 +1008,16 @@ def generate_metadata_pdf(meta: dict, siard_path: Path, pdf_path: Path) -> None:
     story.extend(_build_overview())
     story.append(PageBreak())
 
-    # Side 3: Tabellinventar
+    # Side 3: Tabelloversikt
     story.extend(_build_inventory())
     story.append(PageBreak())
 
-    # Side 4: ER-diagram
-    story.extend(_build_er_diagram())
-    story.append(PageBreak())
+    # Side 4: ER-diagram (valgfritt)
+    if _generate_er:
+        story.extend(_build_er_diagram())
+        story.append(PageBreak())
 
-    # Side 5: Skjema- og tabelldetaljer
+    # Side 4/5: Skjema- og tabelldetaljer
     story.extend(_build_details())
 
     doc.build(story,

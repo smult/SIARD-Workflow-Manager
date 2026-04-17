@@ -8,12 +8,29 @@ Diverse operasjoner:
 
 from __future__ import annotations
 import re
+import subprocess
 import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path, PurePosixPath
 
 from siard_workflow.core.base_operation import BaseOperation, OperationResult
 from siard_workflow.core.context import WorkflowContext
+
+
+def _open_file(path: Path) -> None:
+    """Åpner en fil med standard systemprogram (plattformuavhengig)."""
+    import os
+    import platform
+    try:
+        _sys = platform.system()
+        if _sys == "Windows":
+            os.startfile(str(path))
+        elif _sys == "Darwin":
+            subprocess.Popen(["open", str(path)])
+        else:
+            subprocess.Popen(["xdg-open", str(path)])
+    except Exception:
+        pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -214,8 +231,9 @@ class MetadataExtractOperation(BaseOperation):
     category = "Metadata"
     status = 2
     default_params = {
-        "generate_pdf": True,
-        "pdf_suffix": "_metadata_rapport",
+        "generate_pdf":       True,
+        "generate_er_diagram": True,
+        "pdf_suffix":         "_metadata_rapport",
     }
 
     _NS = re.compile(r"\{[^}]+\}")
@@ -279,22 +297,33 @@ class MetadataExtractOperation(BaseOperation):
         except OSError:
             pass
 
+        # Regex: content/{schema_folder}/{table_folder}/lob*/filnavn
+        # Fanger faktiske mappenavn (ikke antatt schema1/table1-indeksering)
+        _lob_path_re = re.compile(
+            r"^content/([^/]+)/([^/]+)/lob[^/]*/[^/]+$",
+            re.IGNORECASE,
+        )
+
         with zipfile.ZipFile(siard_path, "r") as zf:
             namelist = zf.namelist()
             meta["zip_entry_count"] = len(namelist)
 
-            # Tell LOB-filer (filer utenfor header/ og content/*.xml / *.xsd)
+            # Tell LOB-filer totalt og per (schema_folder, table_folder)
             lob_extensions: set[str] = set()
+            # lob_counts_by_folder[(schema_folder_lower, table_folder_lower)] = antall filer
+            lob_counts_by_folder: dict[tuple[str, str], int] = {}
             for n in namelist:
+                if n.endswith("/"):   # hopp over mappe-oppføringer
+                    continue
                 nl = n.lower()
-                if nl.startswith("header/"):
-                    continue
-                if nl.endswith(".xml") or nl.endswith(".xsd"):
-                    continue
-                meta["lob_file_count"] += 1
-                ext = PurePosixPath(nl).suffix.lstrip(".")
-                if ext:
-                    lob_extensions.add(ext)
+                lob_m = _lob_path_re.match(nl)
+                if lob_m:
+                    meta["lob_file_count"] += 1
+                    key = (lob_m.group(1), lob_m.group(2))
+                    lob_counts_by_folder[key] = lob_counts_by_folder.get(key, 0) + 1
+                    ext = PurePosixPath(nl).suffix.lstrip(".")
+                    if ext:
+                        lob_extensions.add(ext)
             meta["content_extensions"] = sorted(lob_extensions)
 
             # Les metadata.xml
@@ -308,21 +337,29 @@ class MetadataExtractOperation(BaseOperation):
                 root = ET.parse(f).getroot()
 
         # ── Rot-nivå-attributter ──────────────────────────────────────────
+        # SIARD 2.x: versjon ligger som attributt på rot-elementet
+        for attr_name, attr_val in root.attrib.items():
+            local = self._NS.sub("", attr_name).lower()
+            if local == "version" and attr_val.strip():
+                meta["siard_version"] = attr_val.strip()
+
         for child in root:
-            tag = self._tag(child)
-            txt = (child.text or "").strip() or None
-            if   tag == "dbName":            meta["db_name"]         = txt
-            elif tag == "databaseProduct":   meta["db_product"]      = txt
-            elif tag == "databaseOrigin":    meta["db_origin"]       = txt
-            elif tag == "connection":        meta["connection"]       = txt
-            elif tag == "databaseUser":      meta["db_user"]         = txt
-            elif tag == "archivalDate":      meta["archival_date"]   = txt
-            elif tag == "producerApplication": meta["producer_app"]  = txt
-            elif tag == "dataStart":         meta["data_start"]      = txt
-            elif tag == "dataEnd":           meta["data_end"]        = txt
-            elif tag == "description":       meta["description"]     = txt
-            elif tag == "version":           meta["siard_version"]   = txt
-            elif tag == "messageDigest":
+            tag  = self._tag(child)
+            tagl = tag.lower()
+            txt  = (child.text or "").strip() or None
+            if   tagl == "dbname":              meta["db_name"]         = txt
+            elif tagl == "databaseproduct":     meta["db_product"]      = txt
+            elif tagl == "databaseorigin":      meta["db_origin"]       = txt
+            elif tagl == "dataorigintimespan":  meta["data_origin_time_span"] = txt
+            elif tagl == "connection":          meta["connection"]      = txt
+            elif tagl == "databaseuser":        meta["db_user"]         = txt
+            elif tagl == "archivaldate":        meta["archival_date"]   = txt
+            elif tagl == "producerapplication": meta["producer_app"]    = txt
+            elif tagl == "datastart":           meta["data_start"]      = txt
+            elif tagl == "dataend":             meta["data_end"]        = txt
+            elif tagl == "description":         meta["description"]     = txt
+            elif tagl == "version":             meta["siard_version"]   = txt  # SIARD 1.x fallback
+            elif tagl == "messagedigest":
                 meta["message_digest"]      = txt
                 algo = child.get("algorithm") or child.get("digestType")
                 if algo:
@@ -330,37 +367,42 @@ class MetadataExtractOperation(BaseOperation):
 
         # ── Skjema- og tabellstruktur ─────────────────────────────────────
         def _parse_columns(tbl_el) -> list[dict]:
+            # I SIARD 2.x er kolonner pakket inn i <columns>-elementet
             cols = []
-            for col_el in tbl_el:
-                if self._tag(col_el) != "column":
+            for wrapper in tbl_el:
+                if self._tag(wrapper) != "columns":
                     continue
-                pos_txt = self._text(col_el, "columnId") or self._text(col_el, "pos")
-                try:
-                    pos = int(pos_txt) if pos_txt else len(cols) + 1
-                except ValueError:
-                    pos = len(cols) + 1
+                for col_el in wrapper:
+                    if self._tag(col_el) != "column":
+                        continue
+                    pos_txt = self._text(col_el, "columnId") or self._text(col_el, "pos")
+                    try:
+                        pos = int(pos_txt) if pos_txt else len(cols) + 1
+                    except ValueError:
+                        pos = len(cols) + 1
 
-                col_type  = self._text(col_el, "type") or ""
-                col_torig = self._text(col_el, "typeOriginal") or ""
-                nullable_txt = (self._text(col_el, "nullable") or "true").lower()
-                nullable = nullable_txt not in ("false", "0", "no")
-                mime = self._text(col_el, "mimeType") or ""
-                is_lob = bool(_LOB_TYPE_RE.search(col_type) or
-                              _LOB_TYPE_RE.search(col_torig) or
-                              mime)
-                cols.append({
-                    "pos":           pos,
-                    "name":          self._text(col_el, "name") or "",
-                    "type":          col_type,
-                    "type_original": col_torig,
-                    "nullable":      nullable,
-                    "is_lob":        is_lob,
-                    "mime_type":     mime,
-                    "description":   self._text(col_el, "description") or "",
-                })
+                    col_type  = self._text(col_el, "type") or ""
+                    col_torig = self._text(col_el, "typeOriginal") or ""
+                    nullable_txt = (self._text(col_el, "nullable") or "true").lower()
+                    nullable = nullable_txt not in ("false", "0", "no")
+                    mime = self._text(col_el, "mimeType") or ""
+                    is_lob = bool(_LOB_TYPE_RE.search(col_type) or
+                                  _LOB_TYPE_RE.search(col_torig) or
+                                  mime)
+                    cols.append({
+                        "pos":           pos,
+                        "name":          self._text(col_el, "name") or "",
+                        "type":          col_type,
+                        "type_original": col_torig,
+                        "nullable":      nullable,
+                        "is_lob":        is_lob,
+                        "mime_type":     mime,
+                        "description":   self._text(col_el, "description") or "",
+                    })
             return cols
 
         def _parse_primary_key(tbl_el) -> dict | None:
+            # <primaryKey> er direkte barn av <table>
             for child in tbl_el:
                 if self._tag(child) != "primaryKey":
                     continue
@@ -376,44 +418,52 @@ class MetadataExtractOperation(BaseOperation):
             return None
 
         def _parse_foreign_keys(tbl_el) -> list[dict]:
+            # I SIARD 2.x er fremmednøkler pakket inn i <foreignKeys>-elementet
             fks = []
-            for child in tbl_el:
-                if self._tag(child) != "foreignKey":
+            for wrapper in tbl_el:
+                if self._tag(wrapper) != "foreignKeys":
                     continue
-                refs = []
-                ref_schema = ref_table = ""
-                for sub in child:
-                    st = self._tag(sub)
-                    if st == "referencedSchema":
-                        ref_schema = (sub.text or "").strip()
-                    elif st == "referencedTable":
-                        ref_table = (sub.text or "").strip()
-                    elif st == "reference":
-                        col      = self._text(sub, "column") or ""
-                        ref_col  = self._text(sub, "referenced") or ""
-                        refs.append({"column": col, "referenced": ref_col})
-                fks.append({
-                    "name":       self._text(child, "name") or "",
-                    "ref_schema": ref_schema,
-                    "ref_table":  ref_table,
-                    "references": refs,
-                })
+                for fk_el in wrapper:
+                    if self._tag(fk_el) != "foreignKey":
+                        continue
+                    refs = []
+                    ref_schema = ref_table = ""
+                    for sub in fk_el:
+                        st = self._tag(sub)
+                        if st == "referencedSchema":
+                            ref_schema = (sub.text or "").strip()
+                        elif st == "referencedTable":
+                            ref_table = (sub.text or "").strip()
+                        elif st == "reference":
+                            col     = self._text(sub, "column") or ""
+                            ref_col = self._text(sub, "referenced") or ""
+                            refs.append({"column": col, "referenced": ref_col})
+                    fks.append({
+                        "name":       self._text(fk_el, "name") or "",
+                        "ref_schema": ref_schema,
+                        "ref_table":  ref_table,
+                        "references": refs,
+                    })
             return fks
 
         def _parse_unique_keys(tbl_el) -> list[dict]:
+            # I SIARD 2.x er unike nøkler pakket inn i <uniqueKeys>-elementet
             uks = []
-            for child in tbl_el:
-                if self._tag(child) != "uniqueKey":
+            for wrapper in tbl_el:
+                if self._tag(wrapper) != "uniqueKeys":
                     continue
-                uk_cols = [
-                    c.text.strip()
-                    for c in child
-                    if self._tag(c) == "column" and c.text
-                ]
-                uks.append({
-                    "name":    self._text(child, "name") or "",
-                    "columns": uk_cols,
-                })
+                for uk_el in wrapper:
+                    if self._tag(uk_el) != "uniqueKey":
+                        continue
+                    uk_cols = [
+                        c.text.strip()
+                        for c in uk_el
+                        if self._tag(c) == "column" and c.text
+                    ]
+                    uks.append({
+                        "name":    self._text(uk_el, "name") or "",
+                        "columns": uk_cols,
+                    })
             return uks
 
         def _parse_table(tbl_el) -> dict:
@@ -438,22 +488,35 @@ class MetadataExtractOperation(BaseOperation):
                 "unique_keys":  _parse_unique_keys(tbl_el),
             }
 
-        # Iterer over skjemaer
+        # Iterer over skjemaer — bruker <folder>-elementet fra metadata.xml
+        # for å matche mot faktiske mappenavn i ZIP-arkivet
+        schema_idx = 0
         for el in root.iter():
             if self._tag(el) != "schema":
                 continue
-            schema_name = self._text(el, "name") or "ukjent"
-            schema_desc = self._text(el, "description") or ""
+            schema_idx += 1
+            schema_name   = self._text(el, "name")   or "ukjent"
+            schema_folder = (self._text(el, "folder") or f"schema{schema_idx}").lower()
+            schema_desc   = self._text(el, "description") or ""
             tables = []
+            table_idx = 0
             for child in el:
                 if self._tag(child) == "tables":
                     for tbl_el in child:
                         if self._tag(tbl_el) == "table":
+                            table_idx += 1
+                            table_folder = (
+                                self._text(tbl_el, "folder") or f"table{table_idx}"
+                            )
                             tbl = _parse_table(tbl_el)
+                            tbl["folder"] = table_folder
+                            tbl["lob_file_count"] = lob_counts_by_folder.get(
+                                (schema_folder, table_folder.lower()), 0
+                            )
                             tables.append(tbl)
                             meta["table_count"] += 1
                             meta["row_count"] += tbl["rows"]
-                            if tbl["has_lob"]:
+                            if tbl["has_lob"] or tbl["lob_file_count"] > 0:
                                 meta["lob_table_count"] += 1
             meta["schemas"].append({
                 "name":        schema_name,
@@ -484,8 +547,12 @@ class MetadataExtractOperation(BaseOperation):
             pdf_path = ctx.siard_path.parent / (ctx.siard_path.stem + suffix + ".pdf")
             try:
                 from siard_workflow.operations.metadata_pdf import generate_metadata_pdf
-                generate_metadata_pdf(meta, ctx.siard_path, pdf_path)
+                pdf_opts = {
+                    "generate_er_diagram": self.params.get("generate_er_diagram", True),
+                }
+                generate_metadata_pdf(meta, ctx.siard_path, pdf_path, options=pdf_opts)
                 result_data["pdf_path"] = str(pdf_path)
+                _open_file(pdf_path)
             except ImportError:
                 result_data["pdf_warning"] = "reportlab ikke installert — PDF ikke generert"
             except Exception as exc:
