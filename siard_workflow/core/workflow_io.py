@@ -13,17 +13,22 @@ def _op_map() -> dict:
         SHA256Operation, BlobCheckOperation,
         XMLValidationOperation, MetadataExtractOperation,
         VirusScanOperation, ConditionalOperation,
+        UnpackSiardOperation, RepackSiardOperation,
+        WorkflowReportOperation,
     )
     from siard_workflow.operations.blob_convert_operation import BlobConvertOperation
     from siard_workflow.operations.hex_extract_operation import HexExtractOperation
     return {
-        "sha256":           SHA256Operation,
-        "blob_check":       BlobCheckOperation,
-        "xml_validation":   XMLValidationOperation,
-        "metadata_extract": MetadataExtractOperation,
-        "virus_scan":       VirusScanOperation,
-        "blob_convert":     BlobConvertOperation,
-        "hex_extract":      HexExtractOperation,
+        "sha256":            SHA256Operation,
+        "blob_check":        BlobCheckOperation,
+        "xml_validation":    XMLValidationOperation,
+        "metadata_extract":  MetadataExtractOperation,
+        "virus_scan":        VirusScanOperation,
+        "blob_convert":      BlobConvertOperation,
+        "hex_extract":       HexExtractOperation,
+        "unpack_siard":      UnpackSiardOperation,
+        "repack_siard":      RepackSiardOperation,
+        "workflow_report":   WorkflowReportOperation,
     }
 
 

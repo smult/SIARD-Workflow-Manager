@@ -15,8 +15,9 @@ Logikk basert på referansescript (SIARD-Hex-convert.py):
 from __future__ import annotations
 
 import hashlib
+import io
 import os
-import re
+import shutil
 import tempfile
 import zipfile
 import xml.etree.ElementTree as ET
@@ -66,25 +67,15 @@ def _md5_upper(data: bytes) -> str:
     return hashlib.md5(data).hexdigest().upper()
 
 
-def _find_clob_tables(zf: zipfile.ZipFile) -> list[dict]:
+def _parse_clob_tables_from_xml(xml_bytes: bytes) -> list[dict]:
     """
-    Les metadata.xml og returner liste av tabeller med CLOB-kolonner.
-    Støtter alle skjemaer (schema0, schema1 ...).
+    Felles hjelpefunksjon: parser metadata.xml-bytes og returnerer
+    liste av tabeller med CLOB-kolonner.
     """
     ns = {"ns": "http://www.bar.admin.ch/xmlns/siard/2/metadata.xsd"}
-
-    metadata_path = next(
-        (n for n in zf.namelist() if n.lower().endswith("header/metadata.xml")),
-        None,
-    )
-    if not metadata_path:
-        raise FileNotFoundError("metadata.xml ikke funnet i SIARD-arkivet")
+    root = ET.parse(io.BytesIO(xml_bytes)).getroot()
 
     tables = []
-    with zf.open(metadata_path) as f:
-        tree = ET.parse(f)
-        root = tree.getroot()
-
     schema_idx = 0
     for schema in root.findall("ns:schemas/ns:schema", ns):
         folder_el = schema.find("ns:folder", ns)
@@ -114,8 +105,155 @@ def _find_clob_tables(zf: zipfile.ZipFile) -> list[dict]:
                     "schema_folder": schema_folder,
                     "clob_columns":  clob_cols,
                 })
-
     return tables
+
+
+def _find_clob_tables(zf: zipfile.ZipFile) -> list[dict]:
+    """
+    Les metadata.xml fra ZIP og returner liste av tabeller med CLOB-kolonner.
+    Støtter alle skjemaer (schema0, schema1 ...).
+    """
+    metadata_path = next(
+        (n for n in zf.namelist() if n.lower().endswith("header/metadata.xml")),
+        None,
+    )
+    if not metadata_path:
+        raise FileNotFoundError("metadata.xml ikke funnet i SIARD-arkivet")
+
+    with zf.open(metadata_path) as f:
+        xml_bytes = f.read()
+
+    return _parse_clob_tables_from_xml(xml_bytes)
+
+
+def _find_clob_tables_fs(extract_dir: Path) -> list[dict]:
+    """
+    Les metadata.xml fra filsystemet (utpakket SIARD) og returner
+    liste av tabeller med CLOB-kolonner.
+    """
+    # Prøv direkte sti først (uten rglob for Windows-kompatibilitet)
+    metadata_path = extract_dir / "header" / "metadata.xml"
+    if not metadata_path.exists():
+        raise FileNotFoundError(
+            f"metadata.xml ikke funnet i utpakket SIARD: {metadata_path}")
+    return _parse_clob_tables_from_xml(metadata_path.read_bytes())
+
+
+def _process_table_fs(
+    extract_dir:     Path,
+    table_info:      dict,
+    w,
+    stats:           dict,
+    dry_run:         bool = False,
+    min_text_length: int  = 30,
+) -> int:
+    """
+    Filesystem-variant av _process_table.
+    Leser tableX.xml fra extract_dir, dekoder HEX CLOB-felt, skriver
+    xrec{N}.txt til lob{N}/ og oppdaterer XML-filen på disk.
+    Returnerer antall LOB-filer skrevet.
+    """
+    schema_folder = table_info["schema_folder"]
+    folder        = table_info["folder"]
+    clob_columns  = table_info["clob_columns"]
+    table_name    = table_info["name"]
+
+    xml_path = extract_dir / "content" / schema_folder / folder / f"{folder}.xml"
+    w(f"  Prosesserer {table_name} — CLOB-kol: {clob_columns}", "info")
+
+    if not xml_path.exists():
+        w(f"  [ADVARSEL] {xml_path} ikke funnet", "warn")
+        return 0
+
+    lob_written = 0
+    row_counter = 0
+
+    tmp_fd, tmp_path_str = tempfile.mkstemp(suffix=".xml")
+    os.close(tmp_fd)
+    tmp_path = Path(tmp_path_str)
+
+    try:
+        with open(xml_path, "rb") as f_in, open(tmp_path, "wb") as out:
+            out.write(b'<?xml version="1.0" encoding="utf-8"?>\n')
+            out.write(b"<table>\n")
+
+            context = ET.iterparse(f_in, events=("start", "end"))
+            for event, elem in context:
+                if _strip_ns(elem.tag) != "row" or event != "end":
+                    continue
+
+                row_counter += 1
+
+                for col_index in clob_columns:
+                    target_tag = f"c{col_index}"
+                    lob_dir    = (extract_dir / "content" / schema_folder
+                                  / folder / f"lob{col_index}")
+
+                    for child in elem:
+                        if _strip_ns(child.tag).lower() != target_tag:
+                            continue
+                        if child.get("file") or child.get("fileName"):
+                            continue
+                        if not child.text or not child.text.strip():
+                            continue
+
+                        raw = child.text.strip()
+                        if not _is_hex_string(raw):
+                            continue
+
+                        try:
+                            text_value = _hex_to_text(raw).rstrip()
+                            if len(text_value) < min_text_length:
+                                stats["hex_skipped"] = stats.get("hex_skipped", 0) + 1
+                                continue
+
+                            filename   = f"xrec{row_counter}.txt"
+                            data_bytes = text_value.encode("utf-8")
+                            length     = len(data_bytes)
+                            digest     = _md5_upper(data_bytes)
+
+                            if not dry_run:
+                                lob_dir.mkdir(parents=True, exist_ok=True)
+                                (lob_dir / filename).write_bytes(data_bytes)
+
+                            lob_written += 1
+                            stats["hex_exported"] = stats.get("hex_exported", 0) + 1
+
+                            child.text = None
+                            child.attrib.clear()
+                            child.set("file",       filename)
+                            child.set("length",     str(length))
+                            child.set("digestType", "MD5")
+                            child.set("digest",     digest)
+
+                            w(f"    rad {row_counter}/{target_tag} → "
+                              f"lob{col_index}/{filename} ({length:,} bytes)", "info")
+
+                        except Exception as exc:
+                            w(f"  [FEIL] CLOB rad {row_counter}/{target_tag}: {exc}",
+                              "feil")
+
+                _strip_ns_recursively(elem)
+                out.write(ET.tostring(elem, encoding="utf-8"))
+                elem.clear()
+
+            out.write(b"</table>")
+
+        if not dry_run:
+            shutil.copy2(tmp_path, xml_path)
+            stats["tables_patched"] = stats.get("tables_patched", 0) + 1
+
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    w(f"  {table_name}: {lob_written} felt eksportert ({row_counter} rader)",
+      "ok" if lob_written else "info")
+    return lob_written
+
+
 
 
 def _process_table(
@@ -247,11 +385,12 @@ class HexExtractOperation(BaseOperation):
     Kjøres FØR BlobConvertOperation.
     """
 
-    operation_id   = "hex_extract"
-    label          = "HEX Inline Extract"
-    category       = "Innhold"
-    status         = 2
-    produces_siard = True
+    operation_id    = "hex_extract"
+    label           = "HEX Inline Extract"
+    category        = "Innhold"
+    status          = 2
+    produces_siard  = True
+    requires_unpack = True
 
     default_params = {
         "dry_run":         False,
@@ -265,8 +404,6 @@ class HexExtractOperation(BaseOperation):
                 "til eksterne .txt-filer. Kjøres før BLOB Konverter.")
 
     def run(self, ctx) -> object:
-        import threading as _th
-
         log = ctx.metadata.get("file_logger")
         pcb = ctx.metadata.get("progress_cb")
 
@@ -281,6 +418,34 @@ class HexExtractOperation(BaseOperation):
         w("  HEX INLINE EXTRACT", "step")
         w("=" * 56)
 
+        stats: dict = {"hex_exported": 0, "tables_patched": 0, "hex_skipped": 0}
+
+        # ── Pipeline-modus: jobb direkte på utpakket filsystem ───────────────
+        extract_dir = getattr(ctx, "extracted_path", None)
+        if extract_dir and extract_dir.is_dir():
+            w(f"  Pipeline-modus: bruker utpakket mappe {extract_dir}", "info")
+            try:
+                self._process_filesystem(extract_dir, stats, w, progress)
+            except Exception as exc:
+                import traceback as _tb
+                w(f"  Feil: {exc}\n{_tb.format_exc()}", "feil")
+                progress("finish", stats=stats)
+                return self._fail(str(exc), stats)
+
+            w("  OPPSUMMERING:", "step")
+            for k, v in stats.items():
+                w(f"    {'HEX-felt eksportert' if k == 'hex_exported' else k:<28} {v}",
+                  "info")
+            w("=" * 56)
+            progress("finish", stats=stats)
+            # Ingen ny SIARD — RepackSiard pakker sammen til slutt
+            self.produces_siard = False
+            return self._ok(
+                {**stats},
+                f"{stats['hex_exported']} HEX-felt eksportert (pipeline-modus)")
+
+        # ── Normal ZIP-modus ─────────────────────────────────────────────────
+        self.produces_siard = True
         src_path = ctx.siard_path
         suffix   = "_hex_extracted"
         dst_path = src_path.with_name(src_path.stem + suffix + src_path.suffix)
@@ -290,7 +455,6 @@ class HexExtractOperation(BaseOperation):
                 src_path.stem + suffix + f"_{c}" + src_path.suffix)
             c += 1
 
-        stats: dict = {"hex_exported": 0, "tables_patched": 0, "hex_skipped": 0}
         try:
             self._process(ctx, src_path, dst_path, stats, w, progress)
         except Exception as exc:
@@ -319,6 +483,62 @@ class HexExtractOperation(BaseOperation):
             {**stats, "output_path": str(dst_path)},
             f"{stats['hex_exported']} HEX-felt eksportert, "
             f"{stats['tables_patched']} tabeller patchet")
+
+    def _process_filesystem(self, extract_dir: Path,
+                            stats: dict, w, progress) -> None:
+        """
+        Pipeline-modus: prosesser HEX CLOB direkte på utpakket filsystem.
+        Endrer tableX.xml og LOB-filer in-place i extract_dir.
+        """
+        dry_run         = bool(self.params.get("dry_run", False))
+        min_text_length = max(0, int(self.params.get("min_text_length", 30)))
+        PHASES = 3
+
+        def phase(n, label):
+            progress("phase", phase=n, total_phases=PHASES, label=label)
+
+        phase(1, "Leser metadata — finner CLOB-tabeller")
+        try:
+            tables = _find_clob_tables_fs(extract_dir)
+        except Exception as exc:
+            raise RuntimeError(f"Kan ikke lese metadata: {exc}") from exc
+
+        if not tables:
+            w("  Ingen CLOB-tabeller funnet.", "info")
+            for _ in range(PHASES):
+                progress("phase_done")
+            return
+
+        w(f"  Fant {len(tables)} tabell(er) med CLOB-kolonner:", "info")
+        for t in tables:
+            w(f"    • {t['schema_folder']}/{t['folder']} "
+              f"— kol {t['clob_columns']}", "info")
+        progress("phase_done")
+
+        phase(2, "Prosesserer tabeller (filesystem)")
+        lob_before = sum(
+            1 for f in extract_dir.rglob("*")
+            if f.is_file() and "lob" in f.parent.name.lower())
+        for table_info in tables:
+            _process_table_fs(extract_dir, table_info, w, stats,
+                              dry_run=dry_run,
+                              min_text_length=min_text_length)
+        progress("phase_done")
+
+        phase(3, "Validering")
+        lob_after = sum(
+            1 for f in extract_dir.rglob("*")
+            if f.is_file() and "lob" in f.parent.name.lower())
+        stats["lob_before"] = lob_before
+        stats["lob_after"]  = lob_after
+        stats["lob_diff"]   = lob_after - lob_before
+        if lob_after >= lob_before:
+            w(f"  LOB-validering OK: {lob_before} → {lob_after} "
+              f"(+{lob_after - lob_before})", "ok")
+        else:
+            w(f"  [ADVARSEL] LOB-antall gikk ned: {lob_before} → {lob_after}",
+              "warn")
+        progress("phase_done")
 
     def _process(self, ctx, src_path: Path, dst_path: Path,
                  stats: dict, w, progress) -> None:
@@ -377,7 +597,7 @@ class HexExtractOperation(BaseOperation):
 
             if not tables:
                 w("  Ingen CLOB-tabeller funnet.", "info")
-                for n in range(1, PHASES + 1):
+                for _ in range(1, PHASES + 1):
                     progress("phase_done")
                 return
 

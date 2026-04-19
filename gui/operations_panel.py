@@ -13,6 +13,8 @@ from siard_workflow.operations import (
     HexExtractOperation,
     XMLValidationOperation, MetadataExtractOperation,
     VirusScanOperation, ConditionalOperation,
+    UnpackSiardOperation, RepackSiardOperation,
+    WorkflowReportOperation,
 )
 from settings import save_op_params, save_config, get_config, _SETTINGS_FILE
 
@@ -75,6 +77,56 @@ def _dim(hex_color, factor=0.3):
 
 
 OP_DEFS = [
+    # ── Pipeline-operasjoner ─────────────────────────────────────────────────
+    {
+        "cls": UnpackSiardOperation,
+        "label": "Pakk ut SIARD",
+        "category": "Pipeline",
+        "desc": (
+            "Pakker ut SIARD-arkivet til en midlertidig mappe én gang. "
+            "Etterfølgende operasjoner (Virusskan, HEX Extract, BLOB Konverter) "
+            "jobber direkte på filsystemet uten å åpne ZIP-filen på nytt. "
+            "Bruk alltid 'Pakk sammen SIARD' som siste operasjon."
+        ),
+        "status": UnpackSiardOperation.status,
+        "params": [],
+    },
+    {
+        "cls": RepackSiardOperation,
+        "label": "Pakk sammen SIARD",
+        "category": "Pipeline",
+        "desc": (
+            "Pakker den utpakkede SIARD-strukturen til en ny .siard-fil og "
+            "rydder temp-mappen. Bruk alltid som siste operasjon etter "
+            "'Pakk ut SIARD' i pipeline-arbeidsflyten."
+        ),
+        "status": RepackSiardOperation.status,
+        "params": [
+            {"key": "output_suffix", "label": "Suffix ny SIARD-fil",
+             "type": "str", "default": "_konvertert"},
+            {"key": "keep_temp", "label": "Behold temp-mappe",
+             "type": "bool", "default": False},
+        ],
+    },
+    # ── Rapport ──────────────────────────────────────────────────────────────
+    {
+        "cls": WorkflowReportOperation,
+        "label": "Kjørerapport (PDF)",
+        "category": "Rapport",
+        "desc": (
+            "Genererer en PDF-sluttrapport med oversikt over alle utførte steg, "
+            "resultater og grafisk fremstilling av nøkkeltall. "
+            "Rapporten lagres automatisk i mappen der kilde-SIARD-filen befinner seg. "
+            "Legg denne operasjonen sist i workflowen for best resultat."
+        ),
+        "status": WorkflowReportOperation.status,
+        "params": [
+            {"key": "report_suffix",   "label": "Filsuffiks rapport",     "type": "str",  "default": "_workflow_rapport"},
+            {"key": "include_charts",  "label": "Inkluder kakediagrammer", "type": "bool", "default": True},
+            {"key": "include_details", "label": "Inkluder detaljseksjoner","type": "bool", "default": True},
+        ],
+    },
+    # ── Standard operasjoner ─────────────────────────────────────────────────
     {
         "cls": SHA256Operation,
         "label": "SHA-256 Sjekksum",
@@ -135,7 +187,7 @@ OP_DEFS = [
     {
         "cls": XMLValidationOperation,
         "label": "XML-validering",
-        "category": "Validering",
+        "category": "Integritet",
         "desc": "Validerer metadata.xml og tabellskjemaer.",
         "status": XMLValidationOperation.status,
         "params": [
@@ -145,7 +197,7 @@ OP_DEFS = [
     {
         "cls": MetadataExtractOperation,
         "label": "Metadata-uttrekk",
-        "category": "Metadata",
+        "category": "Rapport",
         "desc": "Henter komplett metadata og genererer PDF-rapport med tabelloversikt, ER-diagram og kolonnedetaljer.",
         "status": MetadataExtractOperation.status,
         "params": [
@@ -158,21 +210,41 @@ OP_DEFS = [
         "cls": VirusScanOperation,
         "label": "Virusskan",
         "category": "Sikkerhet",
-        "desc": "Pakker ut SIARD og kjører valgfritt antivirus rekursivt på alle filer. AV-sti og innstillinger hentes fra config.json.",
+        "desc": (
+            "Kjører valgfritt antivirus mot SIARD-filen eller utpakket innhold. "
+            "Bruk {FILE} i argumentfeltet som plassholder for skannemålet. "
+            "Tom exe-felt = auto-detect (Windows Defender / clamscan). "
+            "Eksempel args Windows Defender: scan /ScanType:3 /File:{FILE}  "
+            "Eksempel clamscan: --recursive --infected {FILE}"
+        ),
         "status": VirusScanOperation.status,
         "params": [
-            {"key": "keep_temp", "label": "Behold utpakket mappe", "type": "bool", "default": False},
+            {"key": "scan_target",   "label": "Skannemål",
+             "type": "choice", "choices": ["file", "folder"],
+             "default": "file",
+             "hint": "file = SIARD-fila direkte  |  folder = pakk ut til temp-mappe først"},
+            {"key": "av_executable", "label": "AV-program (sti)",
+             "type": "str",  "default": "",
+             "hint": "Tom = hent fra Innstillinger / auto-detect"},
+            {"key": "av_args",       "label": "AV-argumenter",
+             "type": "str",  "default": "",
+             "hint": "Bruk {FILE} som plassholder. Eks: --recursive --infected {FILE}"},
+            {"key": "av_infected_rc","label": "Infisert returkode",
+             "type": "str",  "default": "",
+             "hint": "Tom = hent fra Innstillinger (standard: 1)"},
+            {"key": "keep_temp",     "label": "Behold utpakket mappe",
+             "type": "bool", "default": False},
         ],
     },
-    {
-        "cls": None,
-        "label": "Betinget (IF-flagg)",
-        "category": "Kontroll",
-        "desc": "Kjorer en operasjon kun hvis et kontekstflagg er True/False.",
-        "status": 2,
-        "params": [],
-        "special": "conditional",
-    },
+    #{
+    #    "cls": None,
+    #    "label": "Betinget (IF-flagg)",
+    #    "category": "Kontroll",
+    #    "desc": "Kjorer en operasjon kun hvis et kontekstflagg er True/False.",
+    #    "status": 2,
+    #    "params": [],
+    #    "special": "conditional",
+    #},
 ]
 
 

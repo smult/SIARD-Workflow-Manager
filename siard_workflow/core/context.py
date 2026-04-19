@@ -17,6 +17,10 @@ class WorkflowContext:
     results: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
     flags: dict[str, bool] = field(default_factory=dict)
+    # Settes av UnpackSiardOperation; ryddes av RepackSiardOperation.
+    # Når satt, kan operasjoner jobbe direkte på filsystemet i stedet for
+    # å pakke ut/inn SIARD-filen på nytt.
+    extracted_path: "Path | None" = field(default=None)
 
     # ── Hjelpere ────────────────────────────────────────────────────────────
     def set_result(self, key: str, value: Any) -> None:

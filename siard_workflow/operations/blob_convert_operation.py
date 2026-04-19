@@ -1325,15 +1325,16 @@ class BlobConvertOperation(BaseOperation):
     - LibreOffice i batch-modus: én LO-oppstart konverterer N filer
     - Ny SIARD pakkes fra filsystem
     """
-    operation_id   = "blob_convert"
-    label          = "BLOB Konverter til PDF/A"
-    description    = (
+    operation_id    = "blob_convert"
+    label           = "BLOB Konverter til PDF/A"
+    description     = (
         "Konverterer .bin/.txt-filer og inline NBLOB/NCLOB til riktige filtyper "
         "og PDF/A. Bruker batch-konvertering for høy ytelse."
     )
-    category       = "Innhold"
-    status         = 2
-    produces_siard = True
+    category        = "Innhold"
+    status          = 2
+    produces_siard  = True
+    requires_unpack = True
     _hw           = suggest_lo_defaults()
     default_params = {
         "output_suffix":        "_konvertert",
@@ -1399,6 +1400,17 @@ class BlobConvertOperation(BaseOperation):
         w("=" * 56)
         w("  BLOB-KONVERTERING", "step")
         w("=" * 56)
+
+        # Pipeline-modus: ikke produser ny SIARD — RepackSiard tar seg av det
+        pipeline_mode = bool(
+            getattr(ctx, "extracted_path", None)
+            and ctx.extracted_path.is_dir())
+        if pipeline_mode:
+            w("  Pipeline-modus: ingen ny SIARD-fil — repakking via 'Pakk sammen SIARD'",
+              "info")
+            self.produces_siard = False
+        else:
+            self.produces_siard = True
 
         lo_bin = _find_libreoffice(self.params["libreoffice_bin"])
         if not lo_bin:
@@ -1510,6 +1522,179 @@ class BlobConvertOperation(BaseOperation):
             message=(f"{stats['converted']} konvertert, {stats['kept']} beholdt, "
                      f"{stats['inline_extracted']} inline, {stats['failed']} feil"))
 
+    # ── Pipeline-prosessering (utpakket filsystem) ────────────────────────────
+
+    def _process_pipeline(self, ctx, extract_dir: Path,
+                          stats: dict, w, progress,
+                          lo_bin: str,
+                          stop_ev: threading.Event,
+                          pause_ev: threading.Event,
+                          csv_log=None,
+                          err_log=None) -> None:
+        """
+        Pipeline-modus: kjem rett inn i prosessering-fasene uten å pakke ut
+        eller pakke inn ZIP. extract_dir er allerede utpakket av
+        UnpackSiardOperation. Repacking gjøres av RepackSiardOperation.
+        """
+        PHASES = 4   # scan, inline, convert, patch XML  (ingen utpakking/repakking)
+
+        def phase(n, label):
+            progress("phase", phase=n, total_phases=PHASES, label=label)
+
+        schema_re = re.compile(r"^schema\d+$", re.IGNORECASE)
+        table_re  = re.compile(r"^table\d+$",  re.IGNORECASE)
+
+        # ── Fase 1: Skann filsystemet ─────────────────────────────────────────
+        phase(1, "Skanner utpakket filsystem")
+
+        # Versjondeteksjon
+        metadata_xml = extract_dir / "header" / "metadata.xml"
+        src_version  = "2.1"
+        if metadata_xml.exists():
+            try:
+                src_version = detect_siard_version(metadata_xml.read_bytes())
+            except Exception:
+                pass
+        target_version = get_target_siard_version()
+        w(f"  Kilde SIARD: {src_version}  →  Mål SIARD: {target_version}", "info")
+
+        table_blobs:   dict = defaultdict(list)
+        table_xml_map: dict = {}
+
+        content_dir = extract_dir / "content"
+        if content_dir.exists():
+            all_paths = list(content_dir.rglob("*"))
+            n_total   = len(all_paths)
+            for scan_i, fp in enumerate(all_paths, 1):
+                if not fp.is_file():
+                    continue
+                rel_parts = fp.relative_to(extract_dir).parts
+                if (len(rel_parts) < 4
+                        or rel_parts[0].lower() != "content"
+                        or not schema_re.match(rel_parts[1])
+                        or not table_re.match(rel_parts[2])):
+                    continue
+                table_key  = f"{rel_parts[1]}/{rel_parts[2]}"
+                fname_lower = fp.name.lower()
+                arc_name   = str(fp.relative_to(extract_dir)).replace("\\", "/")
+                if len(rel_parts) == 4 and fname_lower.endswith(".xml"):
+                    table_xml_map[table_key] = arc_name
+                elif not fname_lower.endswith(".xml") and not fname_lower.endswith(".xsd"):
+                    table_blobs[table_key].append(arc_name)
+                if scan_i % max(1, n_total // 20) == 0 or scan_i == n_total:
+                    progress("phase_progress", done=scan_i, total=n_total)
+
+        all_blobs = [p for paths in table_blobs.values() for p in paths]
+        ext_counts: dict = {}
+        for p in all_blobs:
+            e = PurePosixPath(p).suffix.lstrip(".").lower() or "ingen"
+            ext_counts[e] = ext_counts.get(e, 0) + 1
+        ext_summary = ", ".join(
+            f"{n}×.{e}" for e, n in sorted(ext_counts.items(), key=lambda x: -x[1]))
+        w(f"  Fant: {len(all_blobs):,} blob-filer ({ext_summary}), "
+          f"{len(table_xml_map)} tableX.xml", "info")
+        progress("phase_done")
+
+        # ── Fase 2: Inline NBLOB/NCLOB ───────────────────────────────────────
+        inline_new: dict = {}
+        xml_pre:    dict = {}
+        col_meta:   dict = {}
+        lob_type_map: dict = {}
+
+        if self.params.get("extract_inline"):
+            phase(2, "Ekstraherer inline NBLOB/NCLOB")
+            col_meta = _read_col_metadata(metadata_xml) if metadata_xml.exists() else {}
+            lob_cols = {k: v["lob_cols"] for k, v in col_meta.items()}
+
+            for table_key, xml_sti in table_xml_map.items():
+                xml_file = extract_dir / xml_sti
+                if not xml_file.exists():
+                    continue
+                try:
+                    xml_bytes = xml_file.read_bytes()
+                except Exception as exc:
+                    w(f"  FEIL les {xml_sti}: {exc}", "feil")
+                    continue
+                patched, new_files, n = self._extract_inline(
+                    xml_bytes, xml_sti, table_key, stats, w, lob_cols=lob_cols)
+                if n > 0:
+                    xml_pre[xml_sti]  = patched
+                    inline_new.update(new_files)
+                    for lob_sti, lob_data in new_files.items():
+                        lob_path = extract_dir / lob_sti
+                        lob_path.parent.mkdir(parents=True, exist_ok=True)
+                        lob_path.write_bytes(lob_data)
+                    w(f"  {table_key}: {n} inline ekstrahert", "ok")
+
+            # Oppdater all_blobs etter inline-ekstraksjon
+            if inline_new:
+                for lob_sti in inline_new:
+                    rel_parts = PurePosixPath(lob_sti).parts
+                    if (len(rel_parts) >= 4
+                            and schema_re.match(rel_parts[1])
+                            and table_re.match(rel_parts[2])):
+                        table_key = f"{rel_parts[1]}/{rel_parts[2]}"
+                        table_blobs[table_key].append(lob_sti)
+                        all_blobs.append(lob_sti)
+
+            # Filtype-hints
+            xml_type_hints: dict = {}
+            for table_key, xml_sti in table_xml_map.items():
+                xml_file = extract_dir / xml_sti
+                if not xml_file.exists():
+                    continue
+                blob_list = table_blobs.get(table_key, [])
+                hints = _build_type_hints_from_xml(xml_file, blob_list)
+                if hints:
+                    xml_type_hints.update(hints)
+                col_map = _build_lob_type_col_map(xml_file, blob_list)
+                if col_map:
+                    lob_type_map[table_key] = col_map
+            progress("phase_done")
+        else:
+            inline_new = {}
+            xml_pre    = {}
+            xml_type_hints = {}
+            phase(2, "Inline-ekstraksjon hoppet over")
+            progress("phase_done")
+
+        if stop_ev.is_set():
+            w("  Avbrutt av bruker", "warn")
+            progress("aborted", stats=dict(stats))
+            return
+
+        # ── Fase 3: Detekter og konverter blob-filer ──────────────────────────
+        total = len(all_blobs)
+        if total == 0:
+            w("  Ingen blob-filer å behandle", "info")
+            phase(3, "Konvertering hoppet over (ingen blobs)")
+            progress("phase_done")
+        else:
+            phase(3, "Detekterer og konverterer blob-filer")
+            progress("init", total=total)
+            self._convert_all(
+                all_blobs, extract_dir, stats, w, progress,
+                lo_bin, stop_ev, pause_ev, csv_log,
+                xml_type_hints=xml_type_hints,
+                err_log=err_log)
+            progress("phase_done")
+
+        if stop_ev.is_set():
+            w("  Konvertering avbrutt av bruker", "warn")
+            progress("aborted", stats=dict(stats))
+            return
+
+        # ── Fase 4: Patch tableX.xml ──────────────────────────────────────────
+        phase(4, "Oppdaterer tableX.xml")
+        self._patch_all_xml(
+            table_xml_map, table_blobs, extract_dir,
+            inline_new, xml_pre, stats, w, progress,
+            lob_type_map=lob_type_map,
+            col_meta=col_meta)
+        progress("phase_done")
+
+        w("  Pipeline-modus: repakking overlates til 'Pakk sammen SIARD'.", "info")
+
     # ── Hoved-prosessering ────────────────────────────────────────────────────
 
     def _resolve_dst_path(self, dst_path: Path, w) -> Path:
@@ -1546,6 +1731,14 @@ class BlobConvertOperation(BaseOperation):
                  csv_log=None,
                  temp_root: Path = None,
                  err_log=None) -> None:
+
+        # ── Pipeline-modus: utpakket mappe finnes allerede ───────────────────
+        pre_dir = getattr(ctx, "extracted_path", None)
+        if pre_dir is not None and pre_dir.is_dir():
+            self._process_pipeline(
+                ctx, pre_dir, stats, w, progress,
+                lo_bin, stop_ev, pause_ev, csv_log, err_log)
+            return
 
         PHASES = 6
         def phase(n, label):

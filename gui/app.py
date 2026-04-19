@@ -29,6 +29,98 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
 
 
+class _PipelineSuggestionDialog(ctk.CTkToplevel):
+    """
+    Dialog som foreslår å legge til 'Pakk ut SIARD' og 'Pakk sammen SIARD'
+    når workflow inneholder operasjoner som drar nytte av pipeline-modus.
+    result: "ja" | "nei" | "avbryt"
+    """
+
+    def __init__(self, parent, message: str):
+        super().__init__(parent)
+        self.result = "avbryt"
+        self.title("Pipeline-forslag")
+        self.resizable(False, False)
+        self.grab_set()
+        self.lift()
+
+        # Sentrer over foreldrevinduet
+        self.update_idletasks()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        px, py = parent.winfo_x(), parent.winfo_y()
+        w, h = 520, 300
+        x = px + (pw - w) // 2
+        y = py + (ph - h) // 2
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        self.configure(fg_color=COLORS["bg"])
+
+        # Ikon + tittel
+        header = ctk.CTkFrame(self, fg_color=COLORS["panel"], corner_radius=0)
+        header.pack(fill="x", padx=0, pady=0)
+        ctk.CTkLabel(
+            header,
+            text="  Pipeline-modus anbefalt",
+            font=ctk.CTkFont(family=FONTS["mono"], size=13, weight="bold"),
+            text_color=COLORS["accent"],
+            anchor="w",
+        ).pack(side="left", padx=12, pady=10)
+
+        # Meldingstekst
+        ctk.CTkLabel(
+            self,
+            text=message,
+            font=ctk.CTkFont(family=FONTS["mono"], size=11),
+            text_color=COLORS["text"],
+            wraplength=480,
+            justify="left",
+            anchor="nw",
+        ).pack(padx=16, pady=(14, 8), fill="x")
+
+        # Knapper
+        btn_row = ctk.CTkFrame(self, fg_color="transparent")
+        btn_row.pack(side="bottom", fill="x", padx=16, pady=14)
+        btn_row.grid_columnconfigure((0, 1, 2), weight=1)
+
+        ctk.CTkButton(
+            btn_row, text="Ja, legg til automatisk",
+            fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"],
+            font=ctk.CTkFont(family=FONTS["mono"], size=11, weight="bold"),
+            height=34,
+            command=self._on_ja,
+        ).grid(row=0, column=0, padx=(0, 6), sticky="ew")
+
+        ctk.CTkButton(
+            btn_row, text="Nei, kjør uten",
+            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+            font=ctk.CTkFont(family=FONTS["mono"], size=11),
+            height=34,
+            command=self._on_nei,
+        ).grid(row=0, column=1, padx=3, sticky="ew")
+
+        ctk.CTkButton(
+            btn_row, text="Avbryt",
+            fg_color="#2a1515", hover_color="#3d2020",
+            text_color=COLORS["red"],
+            font=ctk.CTkFont(family=FONTS["mono"], size=11),
+            height=34,
+            command=self._on_avbryt,
+        ).grid(row=0, column=2, padx=(6, 0), sticky="ew")
+
+        self.protocol("WM_DELETE_WINDOW", self._on_avbryt)
+
+    def _on_ja(self):
+        self.result = "ja"
+        self.destroy()
+
+    def _on_nei(self):
+        self.result = "nei"
+        self.destroy()
+
+    def _on_avbryt(self):
+        self.result = "avbryt"
+        self.destroy()
+
+
 class App(ctk.CTk):
     TITLE   = "SIARD Workflow Manager"
     try:
@@ -66,6 +158,9 @@ class App(ctk.CTk):
         self._load_persistent_profiles()
         self._load_saved_temp()
         self._poll_log_queue()
+
+        # Sjekk for oppdateringer i bakgrunnen (2 sek forsinkelse for at GUI skal være klar)
+        self.after(2000, self._check_for_updates)
 
     # ─── UI ──────────────────────────────────────────────────────────────────
 
@@ -113,6 +208,7 @@ class App(ctk.CTk):
 
         self.progress_panel = ProgressPanel(right)
         self.progress_panel.grid(row=1, column=0, pady=(0,8), sticky="ew")
+        self.progress_panel.grid_remove()   # skjult ved oppstart; grid-info er lagret
         self.progress_panel.set_callbacks(
             pause_cb=self._conv_pause,
             stop_cb=self._conv_stop)
@@ -449,6 +545,14 @@ class App(ctk.CTk):
         self.workflow_panel.load_workflow(wf)
         self._log(f"Profil '{name}' lastet  ({len(wf)} operasjoner)", "info")
 
+    def _check_for_updates(self):
+        """Sjekk GitHub for ny versjon i bakgrunnstråd."""
+        try:
+            from gui.update_checker import check_for_updates
+            check_for_updates(self, self.VERSION)
+        except Exception:
+            pass
+
     def _load_saved_temp(self):
         """Last inn lagret global temp-mappe fra config.json ved oppstart."""
         try:
@@ -661,6 +765,107 @@ class App(ctk.CTk):
 
     # ─── Kjoring ──────────────────────────────────────────────────────────────
 
+    def _pipeline_preflight(self, ops: list) -> bool:
+        """
+        Sjekker om workflow inneholder operasjoner som krever utpakket SIARD
+        (requires_unpack=True) uten at UnpackSiardOperation og
+        RepackSiardOperation er lagt til. Viser en dialog med forslag om å
+        legge dem til automatisk.
+
+        Returnerer True hvis workflow kan kjøres, False hvis brukeren avbrøt.
+        """
+        from siard_workflow.operations import UnpackSiardOperation, RepackSiardOperation
+
+        needs_unpack = [op for op in ops if getattr(op, "requires_unpack", False)]
+        if not needs_unpack:
+            return True   # ingen operasjoner krever utpakking
+
+        has_unpack = any(isinstance(op, UnpackSiardOperation) for op in ops)
+        has_repack = any(isinstance(op, RepackSiardOperation) for op in ops)
+
+        if has_unpack and has_repack:
+            return True   # allerede konfigurert korrekt
+
+        missing = []
+        if not has_unpack:
+            missing.append("Pakk ut SIARD")
+        if not has_repack:
+            missing.append("Pakk sammen SIARD")
+
+        op_names = ", ".join(f"'{op.label}'" for op in needs_unpack[:3])
+        if len(needs_unpack) > 3:
+            op_names += f" (+{len(needs_unpack) - 3} til)"
+
+        msg = (
+            f"Workflowen inneholder {op_names} som kan dra nytte av "
+            f"pipeline-modus (én utpakking/sammenpakning).\n\n"
+            f"Mangler: {', '.join(missing)}.\n\n"
+            f"Vil du legge til disse automatisk?\n"
+            f"• 'Pakk ut SIARD' settes først i workflowen\n"
+            f"• 'Pakk sammen SIARD' settes sist i workflowen"
+        )
+
+        dialog = _PipelineSuggestionDialog(self, msg)
+        self.wait_window(dialog)
+
+        if dialog.result == "ja":
+            current_ops = list(self.workflow_panel.get_operations())
+            new_ops = []
+            if not has_unpack:
+                new_ops.append(UnpackSiardOperation())
+            new_ops.extend(current_ops)
+            if not has_repack:
+                new_ops.append(RepackSiardOperation())
+            self.workflow_panel.clear()
+            for op in new_ops:
+                self.workflow_panel.add_operation(op)
+            self._log(
+                "Pipeline-operasjoner lagt til: 'Pakk ut SIARD' og/eller "
+                "'Pakk sammen SIARD' — klikk Kjør for å starte.", "ok")
+            return False   # stopp denne kjøringen; bruker klikker Kjør på nytt
+
+        if dialog.result == "nei":
+            # Fortsett uten pipeline-operasjoner (gammel ZIP-modus)
+            return True
+
+        # Avbrutt
+        return False
+
+    def _report_preflight(self, ops: list) -> bool:
+        """
+        Spør om brukeren vil legge til 'Kjørerapport (PDF)' dersom den ikke
+        allerede er med i workflowen.
+
+        Returnerer True = fortsett, False = avbryt.
+        """
+        from siard_workflow.operations import WorkflowReportOperation
+
+        if any(isinstance(op, WorkflowReportOperation) for op in ops):
+            return True   # allerede med
+
+        msg = (
+            "Workflowen inneholder ingen 'Kjørerapport (PDF)'-operasjon.\n\n"
+            "En PDF-sluttrapport gir saksbehandler en lesbar oversikt over "
+            "hva som ble utført og hva resultatet ble.\n\n"
+            "Vil du legge til rapporten automatisk (sist i workflowen)?"
+        )
+
+        dialog = _PipelineSuggestionDialog(self, msg)
+        dialog.title("Sluttrapport")
+        self.wait_window(dialog)
+
+        if dialog.result == "ja":
+            self.workflow_panel.add_operation(WorkflowReportOperation())
+            self._log(
+                "'Kjørerapport (PDF)' lagt til sist i workflowen "
+                "— klikk Kjør for å starte.", "ok")
+            return False   # stopp denne kjøringen; bruker klikker Kjør på nytt
+
+        if dialog.result == "nei":
+            return True   # brukeren vil ikke ha rapport — fortsett uten
+
+        return False       # avbrutt
+
     def _disk_space_preflight(self, ops: list) -> bool:
         """
         Pre-flight diskplass-sjekk for BlobConvertOperation:
@@ -791,6 +996,19 @@ class App(ctk.CTk):
             self._log("Workflowen er tom", "warn")
             return
 
+        if not self._pipeline_preflight(ops):
+            return
+
+        # Re-hent ops etter preflight — pipeline_preflight kan ha lagt til
+        # UnpackSiardOperation og RepackSiardOperation i panelet
+        ops = list(self.workflow_panel.get_operations())
+
+        if not self._report_preflight(ops):
+            return
+
+        # Re-hent ops igjen i tilfelle rapport-operasjon ble lagt til
+        ops = list(self.workflow_panel.get_operations())
+
         if not self._disk_space_preflight(ops):
             return
 
@@ -864,6 +1082,8 @@ class App(ctk.CTk):
             except Exception:
                 pass
 
+            ctx.metadata["step_results"] = []
+
             for i, op in enumerate(wf):
                 self._log_queue.put(("step_start", i, op.label))
                 if file_logger:
@@ -873,7 +1093,17 @@ class App(ctk.CTk):
                     run.skipped.append(op.operation_id)
                     if file_logger:
                         file_logger.log("  Hoppet over (vilkår ikke oppfylt)", "muted")
+                    ctx.metadata["step_results"].append({
+                        "id":       op.operation_id,
+                        "label":    op.label,
+                        "category": getattr(op, "category", ""),
+                        "success":  None,
+                        "message":  "Hoppet over (vilkår ikke oppfylt)",
+                        "skipped":  True,
+                        "elapsed":  0.0,
+                    })
                     continue
+                t0 = time.time()
                 try:
                     result = op.run(ctx)
                     ctx.set_result(op.operation_id, result.data)
@@ -884,11 +1114,29 @@ class App(ctk.CTk):
                             f"  ↪ Neste steg bruker: {new_siard.name}", "info"))
                 except Exception as exc:
                     result = op._fail(str(exc))
+                elapsed = time.time() - t0
                 run.results.append(result)
                 self._log_queue.put(("result", result))
                 if file_logger:
                     lvl = "ok" if result.success else "feil"
                     file_logger.log(f"  {lvl.upper()}: {result.message}", lvl)
+                ctx.metadata["step_results"].append({
+                    "id":       op.operation_id,
+                    "label":    op.label,
+                    "category": getattr(op, "category", ""),
+                    "success":  result.success,
+                    "message":  result.message,
+                    "skipped":  False,
+                    "elapsed":  elapsed,
+                })
+                # Stopp workflowen umiddelbart ved kritisk feil
+                if not result.success and getattr(op, "halt_on_failure", False):
+                    self._log_queue.put((
+                        "workflow_halted",
+                        op.label,
+                        result.message,
+                    ))
+                    break
 
             run.end_time = time.time()
             if file_logger:
@@ -916,14 +1164,20 @@ class App(ctk.CTk):
                     _, idx, label = item
                     self._log(f"  [{idx+1}] {label}", "step")
                     self.workflow_panel.highlight_step(idx)
+                    self.progress_panel.show_simple(label)
+                    needs_redraw = True
                 elif kind == "skip":
                     _, op_id, label = item
                     self._log(f"      [-] Hoppet over", "muted")
+                    self.progress_panel.reset()
+                    needs_redraw = True
                 elif kind == "result":
                     _, result = item
                     ok  = result.success
                     lvl = "success" if ok else "error"
                     self._log(f"      [{'OK' if ok else 'FEIL'}] {result.message}", lvl)
+                    self.progress_panel.step_complete(ok)
+                    needs_redraw = True
                 elif kind == "log_saved":
                     _, path = item
                     self._log(f"Kjørelogg skrevet til: {path}", "muted")
@@ -948,6 +1202,21 @@ class App(ctk.CTk):
                     self._log(f"Fullført: {status}  ({run.elapsed:.2f}s)", lvl)
                     if run.skipped:
                         self._log(f"Hoppet over: {', '.join(run.skipped)}", "muted")
+                elif kind == "workflow_halted":
+                    _, op_label, msg = item
+                    self._log("!" * 56, "error")
+                    self._log(f"  WORKFLOW STOPPET — {op_label.upper()}", "error")
+                    self._log(f"  {msg}", "error")
+                    self._log("  Ingen videre operasjoner vil bli kjørt.", "error")
+                    self._log("!" * 56, "error")
+                    from tkinter import messagebox
+                    messagebox.showerror(
+                        "Workflow stoppet",
+                        f"Operasjonen «{op_label}» feilet:\n\n{msg}\n\n"
+                        "Ingen videre operasjoner vil bli kjørt for denne filen.\n"
+                        "Undersøk filen manuelt før du fortsetter.",
+                    )
+                    needs_redraw = True
                 elif kind == "queue_done":
                     self._running = False
                     self.workflow_panel.set_running(False)

@@ -56,6 +56,13 @@ class BaseOperation(ABC):
     # True hvis operasjonen skriver en ny SIARD-fil og lagrer stien som
     # result.data["output_path"] — neste operasjon bruker da den filen som input
     produces_siard: bool = False
+    # True hvis operasjonen krever/anbefaler at SIARD er pakket ut på forhånd
+    # (via UnpackSiardOperation). GUI bruker dette til å foreslå å legge til
+    # Pakk ut / Pakk sammen rundt slike operasjoner.
+    requires_unpack: bool = False
+    # True hvis en feil i denne operasjonen skal stoppe hele workflowen
+    # umiddelbart (ingen etterfølgende steg kjøres).
+    halt_on_failure: bool = False
 
     def __init__(self, **params):
         # Prioritet: 1) eksplisitte params, 2) lagrede op_params, 3) config.json, 4) defaults
