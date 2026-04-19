@@ -90,12 +90,12 @@ class XMLValidationOperation(BaseOperation):
                 def local(tag: str) -> str:
                     return re.sub(r"\{[^}]+\}", "", tag)
 
-                found = {local(el.tag) for el in root.iter()}
+                found_lower = {local(el.tag).lower() for el in root.iter()}
                 for req in self.params["required_elements"]:
-                    if req in found:
-                        ok_msgs.append(f"Paakredd element <{req}>: funnet")
+                    if req.lower() in found_lower:
+                        ok_msgs.append(f"Påkrevd element <{req}>: funnet")
                     else:
-                        errors.append(f"Mangler paakredd element: <{req}>")
+                        errors.append(f"Mangler påkrevd element: <{req}>")
 
                 # ── 3. Hent skjema- og tabellstruktur fra metadata ────────────
                 schemas_in_meta: list[str] = []
