@@ -1,12 +1,12 @@
 {
-  "global_temp_dir": "E:/temp",
+  "global_temp_dir": "",
   "av_executable": "",
-  "lo_executable": "C:\\Program Files\\LibreOffice\\program\\soffice.exe",
+  "lo_executable": "",
   "av_args": [],
   "av_infected_rc": 1,
   "av_timeout": 300,
-  "max_workers": "8",
-  "lo_batch_size": 100,
+  "max_workers": "4",
+  "lo_batch_size": 50,
   "lo_timeout": 300,
   "lo_convertible": [
     "doc",
