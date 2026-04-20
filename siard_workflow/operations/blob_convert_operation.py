@@ -636,6 +636,77 @@ def _wpt_raw_text_to_rtf(wpt_bytes: bytes) -> bytes:
         return b""
 
 
+def _strip_rtf_ole_objects(data: bytes) -> bytes:
+    """
+    Fjern alle {\\object...} grupper fra RTF-binærdata.
+
+    OLE1/OLE2-innebygde objekter (f.eks. Word.Picture.8 fra Word 97/2000) kan
+    hindre LibreOffice i å laste RTF-filen. Dersom objektgruppen inneholder en
+    {\\result ...} sub-gruppe (visuell fallback-rendering, typisk \\pict/EMF),
+    beholdes innholdet i den. Alt annet — inkludert \\objdata-blokken — fjernes.
+
+    Returnerer modifisert RTF, eller originaldata uendret ved feil.
+    """
+    BS       = 92    # backslash
+    OB       = 123   # {
+    CB       = 125   # }
+    MARKER   = b'{\\object'
+    RESULT_M = b'{\\result'
+    n        = len(data)
+
+    if MARKER not in data:
+        return data
+
+    def _group_end(buf: bytes, start: int) -> int:
+        """Returner indeks etter avsluttende } for gruppen som starter på start."""
+        depth = 0
+        j = start
+        while j < len(buf):
+            c = buf[j]
+            if c == BS and j + 1 < len(buf):
+                j += 2
+                continue
+            if c == OB:
+                depth += 1
+            elif c == CB:
+                depth -= 1
+                if depth == 0:
+                    return j + 1
+            j += 1
+        return len(buf)
+
+    def _find_result_content(obj_block: bytes) -> bytes:
+        """
+        Finn {\\result ...} sub-gruppen i et object-block og returner
+        innholdet (uten de ytre klammene). Returnerer b'' om ikke funnet.
+        """
+        pos = obj_block.find(RESULT_M)
+        if pos < 0:
+            return b""
+        end = _group_end(obj_block, pos)
+        inner = obj_block[pos + len(RESULT_M):end - 1]
+        return inner.strip()
+
+    out = bytearray()
+    i   = 0
+    try:
+        while i < n:
+            if data[i:i + len(MARKER)] == MARKER:
+                end        = _group_end(data, i)
+                obj_block  = data[i:end]
+                result_content = _find_result_content(obj_block)
+                if result_content:
+                    out.extend(result_content)
+                i = end
+            else:
+                out.append(data[i])
+                i += 1
+    except Exception:
+        return data     # sikker fallback: returner original
+
+    return bytes(out)
+
+
 def _count_lines(path: Path) -> int:
     """Tell antall linjer i en fil raskt via chunk-basert newline-telling."""
     count = 0
@@ -2568,6 +2639,11 @@ class BlobConvertOperation(BaseOperation):
                 dst      = work_root / dst_name
                 try:
                     shutil.copy2(src, dst)
+                    if ext == "rtf":
+                        raw      = dst.read_bytes()
+                        stripped = _strip_rtf_ole_objects(raw)
+                        if stripped != raw:
+                            dst.write_bytes(stripped)
                     input_map.append((dst, zip_sti, ext, mime))
                 except Exception as exc:
                     w(f"    Kopi feilet {zip_sti}: {exc}", "feil")

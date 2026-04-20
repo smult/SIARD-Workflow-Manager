@@ -1,7 +1,7 @@
 {
   "global_temp_dir": "",
   "av_executable": "",
-  "lo_executable": "",
+  "lo_executable": "C:\\Program Files\\LibreOffice\\program\\soffice.exe",
   "av_args": [],
   "av_infected_rc": 1,
   "av_timeout": 300,

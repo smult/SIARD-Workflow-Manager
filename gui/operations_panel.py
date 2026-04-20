@@ -568,7 +568,7 @@ class OperationCard(ctk.CTkFrame):
                            font=ctk.CTkFont(family=FONTS["mono"], size=11,
                                             weight="bold"),
                            text_color=COLORS["text"], anchor="w",
-                           wraplength=120)
+                           wraplength=300)
         lbl.grid(row=0, column=1, sticky="ew")
 
         btn = ctk.CTkButton(top, text="+", width=24, height=24, corner_radius=5,
