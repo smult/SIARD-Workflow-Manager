@@ -25,6 +25,7 @@ _CONFIG_FILE  = _PROGRAM_DIR / "config.json"
 _CONFIG_DEFAULTS: dict = {
     "global_temp_dir":  "",          # tom = auto-velg ved filvalg
     "av_executable":    "",          # sti til antivirus-program
+    "lo_executable":    "",          # sti til LibreOffice soffice (auto-detektert ved oppstart)
     "av_args":          [],          # tom = auto-sett basert på program
     "av_infected_rc":   1,           # returkode som betyr funn
     "av_timeout":       300,         # sekunder maks skanning
@@ -54,9 +55,10 @@ _CONFIG_DEFAULTS: dict = {
         "xls":  "xlsx",   "xlt":  "xlsx",
         "ppt":  "pptx",   "pot":  "pptx",
     },
-    "pdfa_version":         "PDF/A-2u (ISO 19005-2, level U)",  # standard PDF/A-versjon
-    "disk_overhead_factor": 2.0,   # multiplikator for estimert temp-diskbehov
-    "siard_output_version": "2.1", # målversjon for eksportert SIARD ("2.1" eller "2.2")
+    "pdfa_version":           "PDF/A-2u (ISO 19005-2, level U)",  # standard PDF/A-versjon
+    "disk_overhead_factor":   2.0,   # multiplikator for estimert temp-diskbehov
+    "siard_output_version":   "2.1", # målversjon for eksportert SIARD ("2.1" eller "2.2")
+    "min_operation_status":   2,     # 0=alle, 1=beta+ok, 2=kun ok/releaset
 }
 
 

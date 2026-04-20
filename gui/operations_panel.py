@@ -16,6 +16,7 @@ from siard_workflow.operations import (
     UnpackSiardOperation, RepackSiardOperation,
     WorkflowReportOperation,
 )
+from siard_workflow.systemspecific_operations import CosDocMailMergeOperation
 from settings import save_op_params, save_config, get_config, _SETTINGS_FILE
 
 
@@ -182,6 +183,28 @@ OP_DEFS = [
         "params": [
             {"key": "min_text_length", "label": "Min. tekstlengde (tegn)",    "type": "int",  "default": 30},
             {"key": "dry_run",         "label": "Tørkjøring (ikke skriv)",     "type": "bool", "default": False},
+        ],
+    },
+    # ── Systemspesifikke operasjoner ─────────────────────────────────────────
+    {
+        "cls": CosDocMailMergeOperation,
+        "label": "CosDoc: Lås opp og flett dokumenter",
+        "category": "Systemspesifikt",
+        "desc": (
+            "CosDoc-spesifikk: Låser opp passordbeskyttede dokumenter i "
+            "Eef_ElFiler-tabellen og utfører mailmerge for dokumentpar "
+            "(SeqNr 1+2 med samme EveID). "
+            "Passord utledes av filnavnet (R + omvendt filstamme). "
+            "Krever: msoffcrypto-tool (pip) og docx-mailmerge2 (pip)."
+        ),
+        "status": CosDocMailMergeOperation.status,
+        "params": [
+            {"key": "output_suffix", "label": "Suffix ny SIARD-fil",      "type": "str",  "default": "_cosdoc"},
+            {"key": "table_name",    "label": "Tabellnavn (Eef_ElFiler)",  "type": "str",  "default": "Eef_ElFiler"},
+            {"key": "lo_executable", "label": "LibreOffice (soffice-sti)", "type": "str",  "default": ""},
+            {"key": "lo_timeout",    "label": "LO timeout per fil (s)",    "type": "int",  "default": 120},
+            {"key": "max_workers",   "label": "Parallelle tråder (0=auto)", "type": "int",  "default": 0},
+            {"key": "dry_run",       "label": "Tørkjøring (ikke skriv)",   "type": "bool", "default": False},
         ],
     },
     {

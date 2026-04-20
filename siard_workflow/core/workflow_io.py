@@ -18,17 +18,21 @@ def _op_map() -> dict:
     )
     from siard_workflow.operations.blob_convert_operation import BlobConvertOperation
     from siard_workflow.operations.hex_extract_operation import HexExtractOperation
+    from siard_workflow.systemspecific_operations.cosdoc_operation import (
+        CosDocMailMergeOperation,
+    )
     return {
-        "sha256":            SHA256Operation,
-        "blob_check":        BlobCheckOperation,
-        "xml_validation":    XMLValidationOperation,
-        "metadata_extract":  MetadataExtractOperation,
-        "virus_scan":        VirusScanOperation,
-        "blob_convert":      BlobConvertOperation,
-        "hex_extract":       HexExtractOperation,
-        "unpack_siard":      UnpackSiardOperation,
-        "repack_siard":      RepackSiardOperation,
-        "workflow_report":   WorkflowReportOperation,
+        "sha256":             SHA256Operation,
+        "blob_check":         BlobCheckOperation,
+        "xml_validation":     XMLValidationOperation,
+        "metadata_extract":   MetadataExtractOperation,
+        "virus_scan":         VirusScanOperation,
+        "blob_convert":       BlobConvertOperation,
+        "hex_extract":        HexExtractOperation,
+        "unpack_siard":       UnpackSiardOperation,
+        "repack_siard":       RepackSiardOperation,
+        "workflow_report":    WorkflowReportOperation,
+        "cosdoc_mailmerge":   CosDocMailMergeOperation,
     }
 
 

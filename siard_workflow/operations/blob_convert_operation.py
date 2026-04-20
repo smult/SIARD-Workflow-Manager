@@ -3802,7 +3802,6 @@ class BlobConvertOperation(BaseOperation):
 
             if xml_sti not in xml_pre and xml_file_path.stat().st_size >= SIZE_THRESHOLD:
                 n = self._patch_xml_file_inplace(xml_file_path, renames, w,
-                                                  progress_cb=progress,
                                                   col_map=col_map,
                                                   mime_col_idxs=mime_cols,
                                                   digest_col_idxs=digest_cols,
@@ -3932,7 +3931,6 @@ class BlobConvertOperation(BaseOperation):
             xml_path: Path,
             renames: dict[str, Path],
             w,
-            progress_cb=None,
             **kwargs) -> int:
         """
         Patch stor tableX.xml direkte på disk.
@@ -3992,16 +3990,12 @@ class BlobConvertOperation(BaseOperation):
                                f"{line_no:,}/{total_lines:,} linjer "
                                f"({pct:.0f}%), {updates:,} oppdateringer")
                         w(msg, "info")
-                        if progress_cb:
-                            progress_cb("log", msg=msg, level="info")
 
             tmp_path.replace(xml_path)
             sz_mb    = xml_path.stat().st_size // 1024 // 1024
             done_msg = (f"    Ferdig: {xml_path.name} ({sz_mb} MB), "
                         f"{line_no:,} linjer, {updates:,} oppdateringer")
             w(done_msg, "ok")
-            if progress_cb:
-                progress_cb("log", msg=done_msg, level="ok")
 
         except Exception as exc:
             tmp_path.unlink(missing_ok=True)

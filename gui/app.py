@@ -24,6 +24,7 @@ from siard_workflow.core.workflow_io import workflow_to_json, workflow_from_json
 from siard_workflow.core.file_logger import WorkflowFileLogger
 from gui.progress_panel import ProgressPanel
 from gui.format_chart_panel import FormatChartPanel
+from settings import get_config, set_config
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
@@ -157,6 +158,7 @@ class App(ctk.CTk):
         self._build_ui()
         self._load_persistent_profiles()
         self._load_saved_temp()
+        self._detect_libreoffice()
         self._poll_log_queue()
 
         # Sjekk for oppdateringer i bakgrunnen (2 sek forsinkelse for at GUI skal være klar)
@@ -556,11 +558,23 @@ class App(ctk.CTk):
     def _load_saved_temp(self):
         """Last inn lagret global temp-mappe fra config.json ved oppstart."""
         try:
-            from settings import get_config
             saved = get_config("global_temp_dir", "")
             if saved and Path(saved).is_dir():
                 self._global_temp_dir = Path(saved)
                 self._update_temp_label()
+        except Exception:
+            pass
+
+    def _detect_libreoffice(self):
+        """Auto-detekter LibreOffice ved oppstart og lagre sti til config.json."""
+        try:
+            saved = get_config("lo_executable", "")
+            if saved and Path(saved).is_file():
+                return  # allerede funnet og lagret
+            from siard_workflow.systemspecific_operations.cosdoc_operation import _find_libreoffice
+            found = _find_libreoffice("")
+            if found:
+                set_config("lo_executable", found)
         except Exception:
             pass
 
