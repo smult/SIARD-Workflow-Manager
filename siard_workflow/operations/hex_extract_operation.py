@@ -53,14 +53,27 @@ def _is_hex_string(s: str) -> bool:
         return False
 
 
-def _hex_to_text(text: str) -> str:
-    """Dekod hex-streng til UTF-8-tekst. Returnerer original ved feil."""
-    if _is_hex_string(text):
-        try:
-            return bytes.fromhex(text.strip()).decode("utf-8")
-        except Exception:
-            return text
-    return text
+_LOB_TYPES = {"CLOB", "NCLOB", "BLOB", "NBLOB"}
+
+
+def _is_lob_type(type_str: str) -> bool:
+    return type_str.strip().upper() in _LOB_TYPES
+
+
+def _hex_decode(text: str) -> tuple[bytes | None, str]:
+    """
+    Dekod hex-streng til bytes.
+    Returnerer (decoded_bytes, ext) der ext er 'txt' hvis gyldig UTF-8, ellers 'bin'.
+    Returnerer (None, '') hvis ikke gyldig hex.
+    """
+    if not _is_hex_string(text):
+        return None, ""
+    raw = bytes.fromhex(text.strip())
+    try:
+        raw.decode("utf-8")
+        return raw, "txt"
+    except UnicodeDecodeError:
+        return raw, "bin"
 
 
 def _md5_upper(data: bytes) -> str:
@@ -95,7 +108,7 @@ def _parse_clob_tables_from_xml(xml_bytes: bytes) -> list[dict]:
             for col in cols_el.findall("ns:column", ns):
                 col_idx += 1
                 type_el = col.find("ns:type", ns)
-                if type_el is not None and "CLOB" in type_el.text.upper():
+                if type_el is not None and _is_lob_type(type_el.text or ""):
                     clob_cols.append(col_idx)
 
             if clob_cols:
@@ -198,17 +211,17 @@ def _process_table_fs(
                             continue
 
                         raw = child.text.strip()
-                        if not _is_hex_string(raw):
+                        decoded, ext = _hex_decode(raw)
+                        if decoded is None:
                             continue
 
                         try:
-                            text_value = _hex_to_text(raw).rstrip()
-                            if len(text_value) < min_text_length:
+                            if len(decoded) < min_text_length:
                                 stats["hex_skipped"] = stats.get("hex_skipped", 0) + 1
                                 continue
 
-                            filename   = f"xrec{row_counter}.txt"
-                            data_bytes = text_value.encode("utf-8")
+                            filename   = f"xrec{row_counter}.{ext}"
+                            data_bytes = decoded
                             length     = len(data_bytes)
                             digest     = _md5_upper(data_bytes)
 
@@ -230,7 +243,7 @@ def _process_table_fs(
                               f"lob{col_index}/{filename} ({length:,} bytes)", "info")
 
                         except Exception as exc:
-                            w(f"  [FEIL] CLOB rad {row_counter}/{target_tag}: {exc}",
+                            w(f"  [FEIL] LOB rad {row_counter}/{target_tag}: {exc}",
                               "feil")
 
                 _strip_ns_recursively(elem)
@@ -318,18 +331,18 @@ def _process_table(
                             continue
 
                         raw = child.text.strip()
-                        if not _is_hex_string(raw):
+                        decoded, ext = _hex_decode(raw)
+                        if decoded is None:
                             continue
 
                         try:
-                            text_value = _hex_to_text(raw)
                             # Hopp over felt som er kortere enn minimumslengde
-                            if len(text_value) < min_text_length:
+                            if len(decoded) < min_text_length:
                                 stats["hex_skipped"] = stats.get("hex_skipped", 0) + 1
                                 continue
-                            filename   = f"xrec{row_counter}.txt"
+                            filename   = f"xrec{row_counter}.{ext}"
                             zip_path   = lob_folder + filename
-                            data_bytes = text_value.encode("utf-8")
+                            data_bytes = decoded
                             length     = len(data_bytes)
                             digest     = _md5_upper(data_bytes)
 

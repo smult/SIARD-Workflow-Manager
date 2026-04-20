@@ -287,7 +287,24 @@ def _detect_ole2_type(data: bytes) -> tuple[str, str] | None:
     if "PowerPoint Document" in top_names:
         return "ppt", "application/vnd.ms-powerpoint"
 
-    # Fallback på subtype-markører kun i de første 4 KB
+    # Fallback 1: Søk hele filen etter OLE2-katalognavn (UTF-16LE) og
+    # CompObj ProgID-strenger (ASCII) — fanger tilfeller der FAT-kjeden
+    # gjør at katalogentryene ikke er sammenhengende (se Word.Document.8).
+    # Word-sjekk MÅ komme før PPT-sjekk; et Word-dokument med innebygd
+    # PPT-objekt kan ha "Microsoft PowerPoint" tidlig i datastrømmen.
+    _WORD_U16 = b"W\x00o\x00r\x00d\x00D\x00o\x00c\x00u\x00m\x00e\x00n\x00t\x00"
+    if _WORD_U16 in data or b"Word.Document" in data:
+        return "doc", "application/msword"
+
+    _XLS_U16 = b"W\x00o\x00r\x00k\x00b\x00o\x00o\x00k\x00"
+    if _XLS_U16 in data or b"Excel.Sheet" in data:
+        return "xls", "application/vnd.ms-excel"
+
+    _PPT_U16 = b"P\x00o\x00w\x00e\x00r\x00P\x00o\x00i\x00n\x00t\x00 \x00D\x00o\x00c\x00u\x00m\x00e\x00n\x00t\x00"
+    if _PPT_U16 in data or b"PowerPoint.Show" in data:
+        return "ppt", "application/vnd.ms-powerpoint"
+
+    # Fallback 2: subtype-markører kun i de første 4 KB
     # (ikke hele filen — unngår treffer på innebygde objekter)
     early = data[:4096]
     for marker, ext, mime in _OLE2_SUBTYPES:

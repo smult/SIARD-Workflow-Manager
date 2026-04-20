@@ -640,7 +640,7 @@ def _op_detail(
 
         out.append(Paragraph("Konverteringsresultat", s_sub))
         rows = [
-            ("Filer oppdaget:",            f"{detected:,}"),
+            ("Filer identifisert:",            f"{detected:,}"),
             ("Konvertert til PDF/A:",      f"{converted:,}"),
             ("Beholdt originalformat:",    f"{kept:,}"),
             ("Inline LOBs hentet:",        f"{inline_ex:,}"),
