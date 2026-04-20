@@ -39,13 +39,25 @@ Kjente utfordringer og begrensninger:
     siard_manager/
       start.bat                # OBS! Oppstarts-batch-fil som håndterer kjøring og installasjon av requirements
       main.py                  # Inngangspunkt
-      requirements.txt
+      requirements.txt         # Requirements for Python-kode
+      version.py               # Versjonering
+      settings.py              # Konfig-handler
+      disk_selector.py         # Disk-selekterings-funksjonalitet
+      config.json              # Konfig-fil med innstillinger
       gui/
         app.py                 # Hovedvindu (App)
         workflow_panel.py      # Venstre: workflow-kø med rekkefølgekontroll
         operations_panel.py    # Høyre: operasjonspalett med parameterdialog
         log_panel.py           # Høyre: fargekoded kjørelogg
         styles.py              # Farger og fonter
+        update_checker.py      #
+        update_dialog.py       #
+        settings_dialog.py     #
+        progress_panel.py      #  
+        profile_dialog.py      #
+        format_chart_panel.py  #
+        batch_panel.py         #
+        app_backup.py          # 
       siard_workflow/          # Backend-rammeverket
         core/                  # Context, BaseOperation, Workflow, Manager
         operations/            # SHA256, BlobCheck, XML, Metadata, Virus, Conditional
