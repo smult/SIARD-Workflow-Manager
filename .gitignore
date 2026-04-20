@@ -1,3 +1,5 @@
 *.pyc
 .claude/
-rec231369.bin
+*.bin
+*.docx
+*.doc

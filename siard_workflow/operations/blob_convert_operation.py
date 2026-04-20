@@ -236,16 +236,30 @@ _CHECKSUM_TAGS = {
 
 # ── Hjelpefunksjoner ──────────────────────────────────────────────────────────
 
-def _detect_ole2_type(data: bytes) -> tuple[str, str] | None:
+def _detect_ole2_type(data: bytes) -> tuple[str, str, bool] | None:
     """
-    Les OLE2 compound document directory og returner (ext, mime) basert på
-    directory-strøm-navnene i rot-entrien — ikke subtype-markører i innholdet.
+    Les OLE2 compound document directory og returner (ext, mime, is_encrypted).
+
+    is_encrypted=True hvis filen er passordbeskyttet ("EncryptionInfo"-strøm
+    finnes, noe som gjelder for både Office 2007+ OOXML kryptert og eldre
+    CryptoAPI-krypterte .doc/.xls/.ppt).
+
+    For OOXML-krypterte filer (EncryptedPackage + EncryptionInfo):
+    bestemmes filtypen fra root-entryens CLSID, med docx som fallback.
 
     Kun directory entries med type=2 (stream) eller type=1 (storage) i det
     øverste nivået teller. Innebygde OLE-objekter (Excel embedded i Word,
     osv.) vil aldri vises på rot-nivå og forstyrrer ikke deteksjonen.
     """
     import struct as _struct
+
+    # Kjente root-entry CLSIDs (little-endian GUID) for krypterte OOXML-filer
+    _CLSID_WORD  = (b"\x06\x09\x02\x00\x00\x00\x00\x00"
+                    b"\xc0\x00\x00\x00\x00\x00\x00\x46")  # Word.Document.8
+    _CLSID_EXCEL = (b"\x20\x08\x02\x00\x00\x00\x00\x00"
+                    b"\xc0\x00\x00\x00\x00\x00\x00\x46")  # Excel.Sheet.8
+    _CLSID_PPT   = (b"\x10\x8d\x81\x64\x9b\x4f\xcf\x11"
+                    b"\x86\xea\x00\xaa\x00\xb9\x29\xe8")  # PowerPoint.Show
 
     # OLE2-sektordimensjoner fra header
     try:
@@ -257,9 +271,13 @@ def _detect_ole2_type(data: bytes) -> tuple[str, str] | None:
     except Exception:
         return None
 
-    # Root entry (entry 0) har barn via sibling-tre.
-    # Vi leser de første 64 directory-entries lineært for å finne
-    # alle navn på topp-nivå (Children av Root Entry, type 2 eller 1).
+    # Les root-entry CLSID (bytes 80-95 av entry 0, type=5).
+    # Brukes til å identifisere krypterte OOXML-filer.
+    root_clsid = b""
+    if dir_offset + 96 <= len(data):
+        root_clsid = data[dir_offset + 80: dir_offset + 96]
+
+    # Les directory-entries lineært (type 1=storage, 2=stream).
     # Entry-format: 128 bytes, navn i UTF-16LE, lengde i byte 64+65.
     top_names: set[str] = set()
     for i in range(64):
@@ -267,7 +285,7 @@ def _detect_ole2_type(data: bytes) -> tuple[str, str] | None:
         if offset + 128 > len(data):
             break
         try:
-            name_len  = _struct.unpack_from('<H', data, offset + 64)[0]
+            name_len   = _struct.unpack_from('<H', data, offset + 64)[0]
             entry_type = data[offset + 66]
             if entry_type not in (1, 2) or name_len < 2 or name_len > 64:
                 continue
@@ -279,13 +297,36 @@ def _detect_ole2_type(data: bytes) -> tuple[str, str] | None:
         except Exception:
             continue
 
-    # Prioritert sjekk — viktigst: WordDocument slår Workbook
+    # ── Krypteringsdeteksjon ──────────────────────────────────────────────────
+    # "EncryptionInfo"-strøm finnes i alle moderne krypterte Office-filer.
+    # "EncryptedPackage" + "EncryptionInfo" = OOXML-fil kryptert med passord.
+    is_encrypted = "EncryptionInfo" in top_names
+
+    if is_encrypted and "EncryptedPackage" in top_names:
+        # OOXML kryptert — original filtype leses fra root-entry CLSID
+        if root_clsid == _CLSID_EXCEL:
+            return ("xlsx",
+                    "application/vnd.openxmlformats-officedocument"
+                    ".spreadsheetml.sheet",
+                    True)
+        if root_clsid == _CLSID_PPT:
+            return ("pptx",
+                    "application/vnd.openxmlformats-officedocument"
+                    ".presentationml.presentation",
+                    True)
+        # Word CLSID eller ukjent → docx som fallback
+        return ("docx",
+                "application/vnd.openxmlformats-officedocument"
+                ".wordprocessingml.document",
+                True)
+
+    # ── Prioritert strøm-navnsjekk (kryptert eller ikke) ─────────────────────
     if "WordDocument" in top_names:
-        return "doc", "application/msword"
+        return "doc", "application/msword", is_encrypted
     if "Workbook" in top_names or "Book" in top_names:
-        return "xls", "application/vnd.ms-excel"
+        return "xls", "application/vnd.ms-excel", is_encrypted
     if "PowerPoint Document" in top_names:
-        return "ppt", "application/vnd.ms-powerpoint"
+        return "ppt", "application/vnd.ms-powerpoint", is_encrypted
 
     # Fallback 1: Søk hele filen etter OLE2-katalognavn (UTF-16LE) og
     # CompObj ProgID-strenger (ASCII) — fanger tilfeller der FAT-kjeden
@@ -294,29 +335,34 @@ def _detect_ole2_type(data: bytes) -> tuple[str, str] | None:
     # PPT-objekt kan ha "Microsoft PowerPoint" tidlig i datastrømmen.
     _WORD_U16 = b"W\x00o\x00r\x00d\x00D\x00o\x00c\x00u\x00m\x00e\x00n\x00t\x00"
     if _WORD_U16 in data or b"Word.Document" in data:
-        return "doc", "application/msword"
+        return "doc", "application/msword", is_encrypted
 
     _XLS_U16 = b"W\x00o\x00r\x00k\x00b\x00o\x00o\x00k\x00"
     if _XLS_U16 in data or b"Excel.Sheet" in data:
-        return "xls", "application/vnd.ms-excel"
+        return "xls", "application/vnd.ms-excel", is_encrypted
 
     _PPT_U16 = b"P\x00o\x00w\x00e\x00r\x00P\x00o\x00i\x00n\x00t\x00 \x00D\x00o\x00c\x00u\x00m\x00e\x00n\x00t\x00"
     if _PPT_U16 in data or b"PowerPoint.Show" in data:
-        return "ppt", "application/vnd.ms-powerpoint"
+        return "ppt", "application/vnd.ms-powerpoint", is_encrypted
 
     # Fallback 2: subtype-markører kun i de første 4 KB
     # (ikke hele filen — unngår treffer på innebygde objekter)
     early = data[:4096]
     for marker, ext, mime in _OLE2_SUBTYPES:
         if marker in early:
-            return ext, mime
+            return ext, mime, is_encrypted
 
     return None
 
 
-def _detect(data: bytes) -> tuple[str, str]:
+def _detect(data: bytes) -> tuple[str, str, bool]:
+    """
+    Returner (ext, mime, is_encrypted).
+    is_encrypted=True betyr at filen er passordbeskyttet og ikke skal
+    konverteres av LibreOffice — kun kopiere med riktig filendelse.
+    """
     if not data:
-        return "bin", "application/octet-stream"
+        return "bin", "application/octet-stream", False
 
     # Strip kjente BOM-er og leading whitespace for å nå frem til faktisk header
     # Mange eldre systemer skriver UTF-8/UTF-16 BOM foran RTF, HTML etc.
@@ -346,13 +392,13 @@ def _detect(data: bytes) -> tuple[str, str]:
         # kan stamme fra innebygde OLE-objekter (f.eks. Excel embedded i Word).
         ole_type = _detect_ole2_type(data)
         if ole_type:
-            return ole_type
-        return "doc", "application/msword"
+            return ole_type  # 3-tuple (ext, mime, is_encrypted)
+        return "doc", "application/msword", False
 
     # BZ2 med 4-byte størrelses-header [uint32_LE][BZh9...]
     # Brukes av norske fagsystemer (f.eks. PPT-tjenester, KITH-meldinger)
     if len(data) > 10 and data[4:7] == b"BZh" and data[7:8] in b"123456789":
-        return "bz2", "application/x-bzip2"
+        return "bz2", "application/x-bzip2", False
 
     # OOXML/ODF (ZIP-basert) — alltid i byte 0
     if data[:4] == b"PK\x03\x04" or stripped[:4] == b"PK\x03\x04":
@@ -361,39 +407,39 @@ def _detect(data: bytes) -> tuple[str, str]:
                 names = "\n".join(z.namelist())
                 for k, v in _OOXML_SIGS.items():
                     if k in names:
-                        return v
+                        return v[0], v[1], False
         except Exception:
             pass
-        return "zip", "application/zip"
+        return "zip", "application/zip", False
 
     # MAGIC-tabell — sjekk både stripped og søkevindu
     for sig, ext, mime in _MAGIC:
         slen = len(sig)
         if stripped[:slen] == sig:
-            return ext, mime
+            return ext, mime, False
         # Søk etter signaturen innen de første 512 bytes for tekst-baserte formater
         if sig[0:1] in (b"{", b"<", b"%") and sig in search_window:
-            return ext, mime
+            return ext, mime, False
 
     # ── Tekst-basert fallback (ingen magic-byte treff) ───────────────────────
     # WPTools native format — starter med <!WPTools_Format etter BOM/whitespace
     if stripped[:16].startswith(b"<!WPTools_Format"):
-        return "wpt", "application/x-wptools"
+        return "wpt", "application/x-wptools", False
 
     # Generisk XML/markup-innhold som ikke matchet kjent MAGIC-signatur
     if stripped.startswith(b"<"):
-        return "xml", "application/xml"
+        return "xml", "application/xml", False
 
     # Gyldig UTF-8 uten null-bytes → ren tekst
     try:
         if b"\x00" not in data[:512] and data[:512]:
             data[:512].decode("utf-8")
-            return "txt", "text/plain"
+            return "txt", "text/plain", False
     except (UnicodeDecodeError, ValueError):
         pass
 
     # Ukjent binærformat
-    return "bin", "application/octet-stream"
+    return "bin", "application/octet-stream", False
 
 
 def _wpt_to_rtf(wpt_bytes: bytes) -> bytes:
@@ -2036,14 +2082,14 @@ class BlobConvertOperation(BaseOperation):
         # Steg A: Deteksjon parallelt
         _COMPRESSED = {"zip", "gz", "bz2", "tar", "rar", "7z"}
 
-        def _detect_one(zip_sti: str) -> tuple[str, tuple[str, str]]:
+        def _detect_one(zip_sti: str) -> tuple[str, tuple[str, str, bool]]:
             p = extract_dir / zip_sti
             try:
                 data = p.read_bytes()[:65536]
             except Exception:
-                return zip_sti, ("bin", "application/octet-stream")
+                return zip_sti, ("bin", "application/octet-stream", False)
 
-            ext, mime = _detect(data)
+            ext, mime, is_encrypted = _detect(data)
 
             # ── Base64-dekoding ───────────────────────────────────────────────
             # Hvis innholdet er "txt" (ukjent tekst), prøv å tolke det som base64.
@@ -2054,7 +2100,7 @@ class BlobConvertOperation(BaseOperation):
                 full_data = p.read_bytes() if len(data) == 65536 else data
                 decoded = _try_decode_base64(full_data)
                 if decoded is not None:
-                    inner_ext, inner_mime = _detect(decoded[:65536])
+                    inner_ext, inner_mime, inner_enc = _detect(decoded[:65536])
                     # Kjør evt. utpakking på dekodede data hvis det er et arkiv
                     if inner_ext in _COMPRESSED:
                         tmp_arc = p.with_suffix(".b64tmp")
@@ -2063,16 +2109,16 @@ class BlobConvertOperation(BaseOperation):
                             unpacked = _unpack_single_file(tmp_arc)
                             if unpacked is not None:
                                 unpacked_data, unpacked_name = unpacked
-                                inner_ext, inner_mime = _detect(unpacked_data[:65536])
+                                inner_ext, inner_mime, inner_enc = _detect(unpacked_data[:65536])
                                 p.write_bytes(unpacked_data)
                                 w(f"    Base64+utpakket: {PurePosixPath(zip_sti).name} "
                                   f"({PurePosixPath(unpacked_name).name} → {inner_ext})", "info")
-                                return zip_sti, (inner_ext, inner_mime)
+                                return zip_sti, (inner_ext, inner_mime, inner_enc)
                             else:
                                 # Arkiv med flere filer — behold dekodert arkiv
                                 p.write_bytes(decoded)
                                 w(f"    Base64→{inner_ext}: {PurePosixPath(zip_sti).name}", "info")
-                                return zip_sti, (inner_ext, inner_mime)
+                                return zip_sti, (inner_ext, inner_mime, inner_enc)
                         except Exception:
                             pass
                         finally:
@@ -2081,8 +2127,9 @@ class BlobConvertOperation(BaseOperation):
                         # Kjent binærformat etter dekoding — erstatt og re-detekter
                         try:
                             p.write_bytes(decoded)
-                            ext  = inner_ext
-                            mime = inner_mime
+                            ext          = inner_ext
+                            mime         = inner_mime
+                            is_encrypted = inner_enc
                             w(f"    Base64→{ext}: {PurePosixPath(zip_sti).name}", "info")
                         except Exception:
                             pass
@@ -2094,12 +2141,13 @@ class BlobConvertOperation(BaseOperation):
                 result = _unpack_single_file(p)
                 if result is not None:
                     inner_data, inner_name = result
-                    inner_ext, inner_mime = _detect(inner_data[:65536])
+                    inner_ext, inner_mime, inner_enc = _detect(inner_data[:65536])
                     if inner_ext not in ("bin", "txt") or len(inner_data) > 0:
                         try:
                             p.write_bytes(inner_data)
-                            ext  = inner_ext
-                            mime = inner_mime
+                            ext          = inner_ext
+                            mime         = inner_mime
+                            is_encrypted = inner_enc
                             w(f"    Pakket ut: {PurePosixPath(zip_sti).name} "
                               f"({PurePosixPath(inner_name).name} → {inner_ext})", "info")
                         except Exception:
@@ -2116,7 +2164,7 @@ class BlobConvertOperation(BaseOperation):
                                 xml_count = 0
                                 for m in members:
                                     chunk = zf.read(m.filename)[:512]
-                                    member_ext, _ = _detect(chunk)
+                                    member_ext, _, _ = _detect(chunk)
                                     if member_ext in ("xml", "txt", "html"):
                                         xml_count += 1
                                 if xml_count == len(members):
@@ -2137,10 +2185,10 @@ class BlobConvertOperation(BaseOperation):
                     ext  = hint_ext
                     mime = f"application/{hint_ext}"
 
-            return zip_sti, (ext, mime)
+            return zip_sti, (ext, mime, is_encrypted)
 
         w(f"  Detekterer {len(all_blobs):,} filer ...", "info")
-        det_results: dict[str, tuple[str, str]] = {}
+        det_results: dict[str, tuple[str, str, bool]] = {}
         n_total       = len(all_blobs)
         DETECT_REPORT = max(1, n_total // 10)   # logg ~10 ganger totalt
         n_detected    = 0
@@ -2172,7 +2220,7 @@ class BlobConvertOperation(BaseOperation):
         _upgrade_live = _get_lo_upgrade()
 
         for idx, zip_sti in enumerate(all_blobs):
-            ext, mime = det_results[zip_sti]
+            ext, mime, is_encrypted = det_results[zip_sti]
             file_ext  = PurePosixPath(zip_sti).suffix.lstrip(".").lower()
 
             # Bevar CSV-ekstensjon: innhold er alltid ren tekst → detektert som "txt",
@@ -2180,6 +2228,13 @@ class BlobConvertOperation(BaseOperation):
             if ext == "txt" and file_ext == "csv":
                 ext  = "csv"
                 mime = "text/csv"
+
+            # Passordbeskyttede filer: ikke konverter — kopier med riktig endelse
+            if is_encrypted:
+                to_rename_only.append((idx, zip_sti, ext, mime))
+                w(f"  {PurePosixPath(zip_sti).name}: passordbeskyttet "
+                  f"({ext.upper()}) — beholdes uten konvertering", "warn")
+                continue
 
             if ext == "wpt":
                 to_wpt.append((idx, zip_sti, ext, mime))
@@ -3345,9 +3400,9 @@ class BlobConvertOperation(BaseOperation):
                     result_files.append(src)
                     continue
 
-                inner_ext, _ = _detect(data)
+                inner_ext, _, inner_enc = _detect(data)
 
-                if inner_ext in _LO_CONVERTIBLE:
+                if not inner_enc and inner_ext in _LO_CONVERTIBLE:
                     w(f"    Konverterer: {src.name} ({inner_ext.upper()} → PDF/A)", "info")
                     pdf = _lo_convert_file(src, lo_work)
                     if pdf:
@@ -3371,7 +3426,7 @@ class BlobConvertOperation(BaseOperation):
             # Én fil: erstatt blob direkte
             if len(result_files) == 1:
                 single = result_files[0]
-                single_ext, _ = _detect(single.read_bytes()[:65536])
+                single_ext, _, _ = _detect(single.read_bytes()[:65536])
                 new_name = f"{stem}.{single_ext}"
                 new_path = blob_path.parent / new_name
                 try:
@@ -3586,7 +3641,7 @@ class BlobConvertOperation(BaseOperation):
                     file_bytes = text.encode("utf-8")
 
             # ── Detekter filtype ───────────────────────────────────────────
-            ext, mime = _detect(file_bytes)
+            ext, mime, _ = _detect(file_bytes)
 
             # ── Bestem lob-mappe og filnavn ────────────────────────────────
             lob_counter += 1
