@@ -707,6 +707,62 @@ def _strip_rtf_ole_objects(data: bytes) -> bytes:
     return bytes(out)
 
 
+def _try_decode_utf8_binary(data: bytes) -> bytes | None:
+    """
+    Forsøk å gjenopprette binærinnhold fra UTF-8-kodet binærdata.
+
+    Noen fagsystemer lagrer binærfiler ved å lese innholdet som Windows-1252
+    og deretter skrive det som UTF-8. Resultatet er en gyldig UTF-8-fil uten
+    gjenkjennbare magic-bytes i råformat — men gjenvunne bytes kan detekteres
+    som kjent binærformat (OLE2, PDF, osv.).
+
+    Kodingen er cp1252 med C1-fallback: Python-cp1252 er undefined for bytene
+    0x81, 0x8D, 0x8F, 0x90, 0x9D, men Windows-1252 mapper disse til tilsvarende
+    Unicode-kontrollpunkter (U+0081 osv.).  For disse brukes kodepoint-verdien
+    direkte.  Tegn utenfor U+0000–U+00FF indikerer at innholdet ikke er binær.
+
+    Returnerer gjenvunne bytes, eller None om innholdet sannsynligvis er
+    ren tekst (< 10 ikke-ASCII-bytes i de første 512 bytene) eller inneholder
+    tegn utenfor byte-domenet.
+    """
+    if sum(1 for b in data[:512] if b > 127) < 10:
+        return None
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+    # Rask sti: cp1252 dekker all innholdet direkte (ingen C1-kontrolltegn)
+    try:
+        return text.encode("cp1252")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        pass
+
+    # Sakte sti: Python-cp1252 mangler 0x81, 0x8D, 0x8F, 0x90, 0x9D.
+    # Windows-1252 mapper disse til tilsvarende C1-kontrollpunkter (U+0081 osv.)
+    # — bruk kodepoint-verdien direkte for disse.
+    # Prosesser teksten i chunks mellom de problematiske tegnene for ytelse.
+    _C1_UNDEFINED = frozenset("\x81\x8d\x8f\x90\x9d")
+    result  = bytearray()
+    start   = 0
+    n       = len(text)
+    while start < n:
+        # Finn neste C1-kontrolltegn eller slutt
+        end = start
+        while end < n and text[end] not in _C1_UNDEFINED:
+            end += 1
+        if end > start:
+            try:
+                result.extend(text[start:end].encode("cp1252"))
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                return None   # Tegn utenfor byte-domenet → ikke binær
+        if end < n:
+            result.append(ord(text[end]))   # C1-kontrollpunkt direkte
+            end += 1
+        start = end
+    return bytes(result)
+
+
 def _count_lines(path: Path) -> int:
     """Tell antall linjer i en fil raskt via chunk-basert newline-telling."""
     count = 0
@@ -2153,6 +2209,9 @@ class BlobConvertOperation(BaseOperation):
         # Steg A: Deteksjon parallelt
         _COMPRESSED = {"zip", "gz", "bz2", "tar", "rar", "7z"}
 
+        _utf8_bin_count: list[int] = [0]   # trådsikker teller via GIL-beskyttet int
+        _utf8_bin_lock  = threading.Lock()
+
         def _detect_one(zip_sti: str) -> tuple[str, tuple[str, str, bool]]:
             p = extract_dir / zip_sti
             try:
@@ -2247,6 +2306,29 @@ class BlobConvertOperation(BaseOperation):
                     except Exception:
                         pass
 
+            # ── UTF-8-kodet binærdata ─────────────────────────────────────────
+            # Noen fagsystemer lagrer binærfiler ved å lese som cp1252 og skrive
+            # som UTF-8.  Resultatet er en gyldig UTF-8-fil uten synlige magic-bytes
+            # i binær form — men magic kan fremdeles matche som ASCII (f.eks. %PDF).
+            # Ekte binære PDF-er er ikke gyldig UTF-8 (standard binær-marker
+            # %âãÏÓ = \xe2\xe3... er ugyldig UTF-8), så risiko for falsk positiv er
+            # minimal.  Kjøres for txt/bin (ingen ASCII-magic) og pdf (ASCII-magic).
+            if ext in ("txt", "bin", "pdf"):
+                full_data = p.read_bytes() if len(data) == 65536 else data
+                recovered = _try_decode_utf8_binary(full_data)
+                if recovered is not None:
+                    rec_ext, rec_mime, rec_enc = _detect(recovered[:65536])
+                    if rec_ext not in ("txt", "bin"):
+                        try:
+                            p.write_bytes(recovered)
+                            ext          = rec_ext
+                            mime         = rec_mime
+                            is_encrypted = rec_enc
+                            with _utf8_bin_lock:
+                                _utf8_bin_count[0] += 1
+                        except Exception:
+                            pass
+
             # ── XML-type-hint fra tabell-metadata ────────────────────────────
             basename = PurePosixPath(zip_sti).name
             if ext in ("txt", "bin") and basename in hints:
@@ -2275,6 +2357,9 @@ class BlobConvertOperation(BaseOperation):
                     w(f"  Detektert: {n_detected:,}/{n_total:,} filer ...", "info")
                     progress("phase_progress",
                              done=n_detected, total=n_total)
+
+        if _utf8_bin_count[0]:
+            w(f"  UTF-8-kodet binærdata: {_utf8_bin_count[0]:,} filer gjenopprettet", "info")
 
         # Steg B: Kategoriser
         to_convert:     list[tuple[int, str, str, str]] = []
