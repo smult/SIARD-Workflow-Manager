@@ -11,7 +11,7 @@ from pathlib import Path
 import customtkinter as ctk
 
 from gui.workflow_panel import WorkflowPanel
-from gui.operations_panel import OperationsPanel
+from gui.operations_panel import OperationsPanel, set_current_siard_path
 from gui.log_panel import LogPanel
 from gui.styles import COLORS, FONTS
 from gui.settings_dialog import SettingsDialog
@@ -524,6 +524,7 @@ class App(ctk.CTk):
         """Sett aktiv SIARD-fil (brukes av workflow og logging)."""
         self.siard_path = path
         self._auto_log_dir = path.parent
+        set_current_siard_path(path)
         if self._global_temp_dir is None:
             self._auto_select_temp(path)
         self.workflow_panel.set_file(path)

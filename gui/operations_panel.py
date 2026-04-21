@@ -1,6 +1,10 @@
 from __future__ import annotations
 from typing import Callable
+import csv
+import io
+import json
 import sys
+import threading
 import tkinter as tk
 from pathlib import Path
 import customtkinter as ctk
@@ -14,11 +18,322 @@ from siard_workflow.operations import (
     XMLValidationOperation, MetadataExtractOperation,
     VirusScanOperation, ConditionalOperation,
     UnpackSiardOperation, RepackSiardOperation,
-    WorkflowReportOperation,
+    WorkflowReportOperation, DiasPackageOperation,
 )
 from siard_workflow.systemspecific_operations import CosDocMailMergeOperation
 from settings import save_op_params, save_config, get_config, _SETTINGS_FILE
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Autocomplete-datakilder
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SOURCES_DIR        = Path(__file__).parent.parent / "siard_workflow" / "sources"
+_KOMMUNENUMMER_CSV  = _SOURCES_DIR / "kommunenummer.csv"
+_KILDESYSTEM_CACHE  = _SOURCES_DIR / "kildesystem_cache.json"
+_SHEETS_URL         = ("https://docs.google.com/spreadsheets/d/"
+                       "1JJr_MBt97aZasAInCnvhGmyTcv7OizrYApQCkQOjyLw/export?format=csv")
+
+_kommunenummer_list: list[str] | None = None
+_kildesystem_list:   list[str] | None = None
+
+
+def _get_kommunenummer() -> list[str]:
+    global _kommunenummer_list
+    if _kommunenummer_list is not None:
+        return _kommunenummer_list
+    result = []
+    try:
+        with open(_KOMMUNENUMMER_CSV, encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f, delimiter=";")
+            for row in reader:
+                kode = row.get("Kodeverdi", "").strip()
+                navn = row.get("Navn", "").strip()
+                if kode and navn:
+                    label = f"{kode} - {navn} kommune"
+                    if label not in result:
+                        result.append(label)
+        result.sort()
+    except Exception:
+        pass
+    _kommunenummer_list = result
+    return result
+
+
+def _get_kildesystem() -> list[str]:
+    global _kildesystem_list
+    if _kildesystem_list is not None:
+        return _kildesystem_list
+
+    # Forsøk cache først
+    cached = _load_kildesystem_cache()
+    if cached is not None:
+        _kildesystem_list = cached
+        _refresh_kildesystem_async()   # oppdater i bakgrunnen
+        return cached
+
+    # Ingen cache — hent synkront (første gang)
+    fetched = _fetch_kildesystem()
+    _kildesystem_list = fetched if fetched is not None else []
+    return _kildesystem_list
+
+
+def _load_kildesystem_cache() -> list[str] | None:
+    try:
+        if _KILDESYSTEM_CACHE.exists():
+            data = json.loads(_KILDESYSTEM_CACHE.read_text(encoding="utf-8"))
+            if isinstance(data, list) and data:
+                return data
+    except Exception:
+        pass
+    return None
+
+
+def _fetch_kildesystem() -> list[str] | None:
+    try:
+        import urllib.request
+        with urllib.request.urlopen(_SHEETS_URL, timeout=8) as resp:
+            raw = resp.read().decode("utf-8")
+        result = []
+        reader = csv.DictReader(io.StringIO(raw))
+        for row in reader:
+            navn = (row.get("Navn") or "").strip()
+            lev  = (row.get("Leverandør") or "").strip()
+            if navn:
+                result.append(f"{navn} ({lev})" if lev else navn)
+        result.sort()
+        try:
+            _KILDESYSTEM_CACHE.write_text(
+                json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+        return result
+    except Exception:
+        return None
+
+
+def _refresh_kildesystem_async():
+    def _worker():
+        global _kildesystem_list
+        fetched = _fetch_kildesystem()
+        if fetched:
+            _kildesystem_list = fetched
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def _get_autocomplete_list(source: str) -> list[str]:
+    if source == "kommunenummer":
+        return _get_kommunenummer()
+    if source == "kildesystem":
+        return _get_kildesystem()
+    return []
+
+
+# ── SIARD-metadata-forslag ────────────────────────────────────────────────────
+
+_current_siard_path: "Path | None" = None
+
+
+def set_current_siard_path(path: "Path | None") -> None:
+    global _current_siard_path
+    _current_siard_path = path
+
+
+def _get_siard_suggestions(source: str) -> list[str]:
+    """Henter forslag fra metadata.xml i aktiv SIARD-fil."""
+    if _current_siard_path is None:
+        return []
+    try:
+        import zipfile, xml.etree.ElementTree as ET
+        with zipfile.ZipFile(_current_siard_path, "r") as zf:
+            candidates = [n for n in zf.namelist()
+                          if n.lower().endswith("metadata.xml")]
+            if not candidates:
+                return []
+            xml_bytes = zf.read(candidates[0])
+        root = ET.fromstring(xml_bytes)
+        ns_strip = __import__("re").compile(r"\{[^}]*\}")
+
+        def _text(tag: str) -> str:
+            for el in root.iter():
+                if ns_strip.sub("", el.tag).lower() == tag.lower():
+                    return (el.text or "").strip()
+            return ""
+
+        if source == "kommunenummer":
+            origin = _text("databaseOrigin") or _text("dbOrigin") or _text("archiveName")
+            if not origin:
+                return []
+            full = _get_kommunenummer()
+            low = origin.lower()
+            # Treff på navn-del (etter " - ")
+            return [x for x in full if low in x.split(" - ", 1)[-1].lower()][:10]
+
+        if source == "kildesystem":
+            app = _text("producerApplication") or _text("databaseProduct")
+            if not app:
+                return []
+            full = _get_kildesystem()
+            low = app.lower()
+            return [x for x in full if low in x.lower()][:10]
+
+    except Exception:
+        pass
+    return []
+
+
+# ── Autocomplete-widget ───────────────────────────────────────────────────────
+
+class _AutocompleteEntry(ctk.CTkFrame):
+    """CTkEntry med nedtrekksliste (Listbox-popup) for autocomplete."""
+
+    MIN_CHARS = 3
+    MAX_ITEMS = 60
+
+    def __init__(self, master, full_list: list[str], variable: ctk.StringVar,
+                 siard_source: str = "", width: int = 280, **kwargs):
+        super().__init__(master, fg_color="transparent", width=width, height=32)
+        self._full   = full_list
+        self._var    = variable
+        self._source = siard_source
+        self._popup  = None
+        self._lb     = None
+        self._skip_focusout = False
+
+        self._entry = ctk.CTkEntry(
+            self, textvariable=variable, width=width,
+            fg_color=COLORS["bg"],
+            font=ctk.CTkFont(family=FONTS["mono"], size=11),
+        )
+        self._entry.pack(fill="x", expand=True)
+        self._entry.bind("<KeyRelease>", self._on_key)
+        self._entry.bind("<FocusOut>",   self._on_focusout)
+        self._entry.bind("<Down>",       self._focus_list)
+        self._entry.bind("<Escape>",     lambda e: self._close())
+        self._entry.bind("<Return>",     lambda e: self._close())
+
+    # ── Filtrering ───────────────────────────────────────────────────────────
+
+    def _filtered(self) -> list[str]:
+        text = self._var.get().lower()
+        if not text:
+            return []
+        matches = [x for x in self._full if text in x.lower()]
+        # SIARD-forslag øverst (uthevet med "★ ")
+        if self._source:
+            siard = _get_siard_suggestions(self._source)
+            top = [x for x in siard if text in x.lower()]
+            for x in top:
+                if x in matches:
+                    matches.remove(x)
+            prefixed = [f"★  {x}" for x in top]
+            matches  = prefixed + matches
+        return matches[:self.MAX_ITEMS]
+
+    # ── Tastatur-hendelser ───────────────────────────────────────────────────
+
+    def _on_key(self, event):
+        if len(self._var.get()) >= self.MIN_CHARS:
+            items = self._filtered()
+            if items:
+                self._show(items)
+                return
+        self._close()
+
+    def _focus_list(self, event):
+        if self._lb and self._lb.winfo_exists() and self._lb.size() > 0:
+            self._lb.focus_set()
+            self._lb.selection_set(0)
+            self._lb.activate(0)
+
+    # ── Popup ────────────────────────────────────────────────────────────────
+
+    def _show(self, items: list[str]):
+        inner = self._entry._entry          # underliggende tk.Entry
+        x  = inner.winfo_rootx()
+        y  = inner.winfo_rooty() + inner.winfo_height() + 2
+        w  = inner.winfo_width()
+        n  = min(len(items), 8)
+        lh = 19
+
+        if self._popup is None or not self._popup.winfo_exists():
+            self._popup = tk.Toplevel(self._entry)
+            self._popup.wm_overrideredirect(True)
+            self._popup.configure(bg=COLORS["border"])
+
+            sb = tk.Scrollbar(self._popup, width=12,
+                              troughcolor=COLORS["panel"],
+                              bg=COLORS["border"])
+            sb.pack(side="right", fill="y")
+
+            self._lb = tk.Listbox(
+                self._popup,
+                yscrollcommand=sb.set,
+                bg=COLORS["panel"],
+                fg=COLORS["text"],
+                selectbackground=COLORS["accent"],
+                selectforeground="#ffffff",
+                font=("Courier New", 10),
+                bd=0, highlightthickness=0,
+                activestyle="none",
+                relief="flat",
+            )
+            self._lb.pack(side="left", fill="both", expand=True)
+            sb.config(command=self._lb.yview)
+            self._lb.bind("<<ListboxSelect>>", self._on_select)
+            self._lb.bind("<FocusOut>",        self._on_focusout)
+            self._lb.bind("<Escape>",          lambda e: self._close())
+            self._lb.bind("<Return>",          self._on_select)
+
+        self._popup.geometry(f"{w}x{n * lh + 4}+{x}+{y}")
+        self._popup.lift()
+        self._lb.delete(0, "end")
+        for item in items:
+            self._lb.insert("end", item)
+
+    def _close(self):
+        if self._popup and self._popup.winfo_exists():
+            self._popup.destroy()
+        self._popup = None
+        self._lb    = None
+
+    # ── Valg ─────────────────────────────────────────────────────────────────
+
+    def _on_select(self, event):
+        if not self._lb:
+            return
+        sel = self._lb.curselection()
+        if sel:
+            val = self._lb.get(sel[0])
+            # Fjern "★  "-prefiks fra SIARD-forslag
+            if val.startswith("★  "):
+                val = val[3:]
+            self._var.set(val)
+            self._skip_focusout = True
+            self._close()
+            self._entry.focus_set()
+
+    # ── Fokus ─────────────────────────────────────────────────────────────────
+
+    def _on_focusout(self, event):
+        if self._skip_focusout:
+            self._skip_focusout = False
+            return
+        self.after(120, self._check_focus)
+
+    def _check_focus(self):
+        try:
+            focused = self.focus_get()
+            if self._lb and focused is self._lb:
+                return
+            if hasattr(self._entry, "_entry") and focused is self._entry._entry:
+                return
+            self._close()
+        except Exception:
+            self._close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 class _ToolTip:
     """Balloon-tooltip for tkinter/CustomTkinter-widgets."""
@@ -78,7 +393,7 @@ def _dim(hex_color, factor=0.3):
 
 
 OP_DEFS = [
-    # ── Pipeline-operasjoner ─────────────────────────────────────────────────
+        # ── Pipeline-operasjoner ─────────────────────────────────────────────────
     {
         "cls": UnpackSiardOperation,
         "label": "Pakk ut SIARD",
@@ -109,24 +424,6 @@ OP_DEFS = [
              "type": "bool", "default": False},
         ],
     },
-    # ── Rapport ──────────────────────────────────────────────────────────────
-    {
-        "cls": WorkflowReportOperation,
-        "label": "Kjørerapport (PDF)",
-        "category": "Rapport",
-        "desc": (
-            "Genererer en PDF-sluttrapport med oversikt over alle utførte steg, "
-            "resultater og grafisk fremstilling av nøkkeltall. "
-            "Rapporten lagres automatisk i mappen der kilde-SIARD-filen befinner seg. "
-            "Legg denne operasjonen sist i workflowen for best resultat."
-        ),
-        "status": WorkflowReportOperation.status,
-        "params": [
-            {"key": "report_suffix",   "label": "Filsuffiks rapport",     "type": "str",  "default": "_workflow_rapport"},
-            {"key": "include_charts",  "label": "Inkluder kakediagrammer", "type": "bool", "default": True},
-            {"key": "include_details", "label": "Inkluder detaljseksjoner","type": "bool", "default": True},
-        ],
-    },
     # ── Standard operasjoner ─────────────────────────────────────────────────
     {
         "cls": SHA256Operation,
@@ -137,6 +434,36 @@ OP_DEFS = [
         "params": [
             {"key": "save_to_file", "label": "Lagre .sha256-fil", "type": "bool", "default": False},
             {"key": "chunk_size",   "label": "Chunk-storrelse (bytes)", "type": "int", "default": 8192},
+        ],
+    },
+    {
+        "cls": VirusScanOperation,
+        "label": "Virusskan",
+        "category": "Sikkerhet",
+        "desc": (
+            "Kjører valgfritt antivirus mot SIARD-filen eller utpakket innhold. "
+            "Bruk {FILE} i argumentfeltet som plassholder for skannemålet. "
+            "Tom exe-felt = auto-detect (Windows Defender / clamscan). "
+            "Eksempel args Windows Defender: scan /ScanType:3 /File:{FILE}  "
+            "Eksempel clamscan: --recursive --infected {FILE}"
+        ),
+        "status": VirusScanOperation.status,
+        "params": [
+            {"key": "scan_target",   "label": "Skannemål",
+             "type": "choice", "choices": ["file", "folder"],
+             "default": "file",
+             "hint": "file = SIARD-fila direkte  |  folder = pakk ut til temp-mappe først"},
+            {"key": "av_executable", "label": "AV-program (sti)",
+             "type": "str",  "default": "",
+             "hint": "Tom = hent fra Innstillinger / auto-detect"},
+            {"key": "av_args",       "label": "AV-argumenter",
+             "type": "str",  "default": "",
+             "hint": "Bruk {FILE} som plassholder. Eks: --recursive --infected {FILE}"},
+            {"key": "av_infected_rc","label": "Infisert returkode",
+             "type": "str",  "default": "",
+             "hint": "Tom = hent fra Innstillinger (standard: 1)"},
+            {"key": "keep_temp",     "label": "Behold utpakket mappe",
+             "type": "bool", "default": False},
         ],
     },
     {
@@ -229,34 +556,59 @@ OP_DEFS = [
             {"key": "pdf_suffix",          "label": "PDF-filsuffiks",        "type": "str",  "default": "_metadata_rapport"},
         ],
     },
+    # ── Pakking ──────────────────────────────────────────────────────────────
     {
-        "cls": VirusScanOperation,
-        "label": "Virusskan",
-        "category": "Sikkerhet",
+        "cls": DiasPackageOperation,
+        "label": "DIAS-pakking (SIP/AIC)",
+        "category": "SIP/AIC-Pakking",
         "desc": (
-            "Kjører valgfritt antivirus mot SIARD-filen eller utpakket innhold. "
-            "Bruk {FILE} i argumentfeltet som plassholder for skannemålet. "
-            "Tom exe-felt = auto-detect (Windows Defender / clamscan). "
-            "Eksempel args Windows Defender: scan /ScanType:3 /File:{FILE}  "
-            "Eksempel clamscan: --recursive --infected {FILE}"
+            "Pakker den ferdigbehandlede SIARD-filen inn i et DIAS-pakkeformat "
+            "i henhold til METS- og DIAS_PREMIS-standardene, klar for innsending "
+            "til langtidsbevaringsplatform (ESSArch). Produserer en AIC-mappe med "
+            "SIP, mets.xml, premis.xml, log.xml og komprimert tar-arkiv."
         ),
-        "status": VirusScanOperation.status,
+        "status": DiasPackageOperation.status,
         "params": [
-            {"key": "scan_target",   "label": "Skannemål",
-             "type": "choice", "choices": ["file", "folder"],
-             "default": "file",
-             "hint": "file = SIARD-fila direkte  |  folder = pakk ut til temp-mappe først"},
-            {"key": "av_executable", "label": "AV-program (sti)",
-             "type": "str",  "default": "",
-             "hint": "Tom = hent fra Innstillinger / auto-detect"},
-            {"key": "av_args",       "label": "AV-argumenter",
-             "type": "str",  "default": "",
-             "hint": "Bruk {FILE} som plassholder. Eks: --recursive --infected {FILE}"},
-            {"key": "av_infected_rc","label": "Infisert returkode",
-             "type": "str",  "default": "",
-             "hint": "Tom = hent fra Innstillinger (standard: 1)"},
-            {"key": "keep_temp",     "label": "Behold utpakket mappe",
-             "type": "bool", "default": False},
+            {"key": "submission_agreement", "label": "Submission Agreement",           "type": "str",    "default": DiasPackageOperation.default_params["submission_agreement"]},
+            {"key": "uttrekksdato",         "label": "Uttrekksdato (ÅÅÅÅ-MM-DD)",      "type": "str",    "default": DiasPackageOperation.default_params["uttrekksdato"]},
+            {"key": "label",                "label": "Pakketittel",                    "type": "str",    "default": DiasPackageOperation.default_params["label"]},
+            {"key": "system",               "label": "Kildesystem",                    "type": "autocomplete", "source": "kildesystem", "default": DiasPackageOperation.default_params["system"]},
+            {"key": "system_version",       "label": "Systemversjon",                  "type": "str",    "default": DiasPackageOperation.default_params["system_version"]},
+            {"key": "archivist_type",       "label": "Arkivtype",
+             "type": "choice", "default": DiasPackageOperation.default_params["archivist_type"],
+             "choices": ["SIARD", "NOARK-5", "Postjournaler", "Annet"]},
+            {"key": "period_start",         "label": "Periodens start (ÅÅÅÅ-MM-DD)",   "type": "str",    "default": DiasPackageOperation.default_params["period_start"]},
+            {"key": "period_end",           "label": "Periodens slutt (ÅÅÅÅ-MM-DD)",   "type": "str",    "default": DiasPackageOperation.default_params["period_end"]},
+            {"key": "owner_org",            "label": "Eierorganisasjon",               "type": "autocomplete", "source": "kommunenummer", "default": DiasPackageOperation.default_params["owner_org"]},
+            {"key": "archivist_org",        "label": "Arkivorganisasjon",              "type": "str",    "default": DiasPackageOperation.default_params["archivist_org"]},
+            {"key": "submitter_org",        "label": "Avleverende organisasjon",       "type": "str",    "default": DiasPackageOperation.default_params["submitter_org"]},
+            {"key": "submitter_person",     "label": "Avleverende person",             "type": "str",    "default": DiasPackageOperation.default_params["submitter_person"]},
+            {"key": "producer_org",         "label": "Produsent (org)",                "type": "str",    "default": DiasPackageOperation.default_params["producer_org"]},
+            {"key": "producer_person",      "label": "Produsent (person)",             "type": "str",    "default": DiasPackageOperation.default_params["producer_person"]},
+            {"key": "producer_software",    "label": "Produsent (programvare)",        "type": "str",    "default": DiasPackageOperation.default_params["producer_software"]},
+            {"key": "creator",              "label": "Skaper",                         "type": "str",    "default": DiasPackageOperation.default_params["creator"]},
+            {"key": "preserver",            "label": "Bevaringsansvarlig",             "type": "str",    "default": DiasPackageOperation.default_params["preserver"]},
+            {"key": "username",             "label": "Brukernavn",                     "type": "str",    "default": DiasPackageOperation.default_params["username"]},
+            {"key": "schema_dir",           "label": "Skjemamappe (mets.xsd osv)",     "type": "str",    "default": DiasPackageOperation.default_params["schema_dir"]},
+            {"key": "output_dir",           "label": "Utdatamappe (tom = SIARD-mappe)","type": "str",    "default": DiasPackageOperation.default_params["output_dir"]},
+        ],
+    },
+        # ── Rapport ──────────────────────────────────────────────────────────────
+    {
+        "cls": WorkflowReportOperation,
+        "label": "Kjørerapport (PDF)",
+        "category": "Rapport",
+        "desc": (
+            "Genererer en PDF-sluttrapport med oversikt over alle utførte steg, "
+            "resultater og grafisk fremstilling av nøkkeltall. "
+            "Rapporten lagres automatisk i mappen der kilde-SIARD-filen befinner seg. "
+            "Legg denne operasjonen sist i workflowen for best resultat."
+        ),
+        "status": WorkflowReportOperation.status,
+        "params": [
+            {"key": "report_suffix",   "label": "Filsuffiks rapport",     "type": "str",  "default": "_workflow_rapport"},
+            {"key": "include_charts",  "label": "Inkluder kakediagrammer", "type": "bool", "default": True},
+            {"key": "include_details", "label": "Inkluder detaljseksjoner","type": "bool", "default": True},
         ],
     },
     #{
@@ -286,7 +638,7 @@ class ParamDialog(ctk.CTkToplevel):
         row_h    = 52
         header_h = 120
         footer_h = 70
-        has_wide = any(p.get("type") in ("hw_int",) or p.get("key") == "temp_dir"
+        has_wide = any(p.get("type") in ("hw_int", "autocomplete") or p.get("key") == "temp_dir"
                        for p in op_def.get("params", []))
         width    = 640 if has_wide else 520
         height   = min(header_h + n_params * row_h + footer_h, 720)
@@ -436,8 +788,28 @@ class ParamDialog(ctk.CTkToplevel):
                                   hover_color=COLORS["accent_dim"],
                                   font=ctk.CTkFont(family=FONTS["mono"], size=10),
                                   command=_auto_temp).pack(side="left")
-                else:
+                elif p["type"] == "autocomplete":
                     var = ctk.StringVar(value=str(p["default"]))
+                    ac = _AutocompleteEntry(
+                        frm,
+                        full_list=_get_autocomplete_list(p.get("source", "")),
+                        variable=var,
+                        siard_source=p.get("source", ""),
+                        width=280,
+                    )
+                    ac.grid(row=i, column=1, padx=12, sticky="e")
+                    self._vars[p["key"]] = (var, "str")
+                    continue
+                else:
+                    if (p["key"] == "uttrekksdato"
+                            and _current_siard_path
+                            and _current_siard_path.exists()):
+                        import datetime
+                        _mtime = _current_siard_path.stat().st_mtime
+                        _default = datetime.datetime.fromtimestamp(_mtime).strftime("%Y-%m-%d")
+                    else:
+                        _default = str(p["default"])
+                    var = ctk.StringVar(value=_default)
                     ctk.CTkEntry(frm, textvariable=var, width=200, fg_color=COLORS["bg"],
                                  font=ctk.CTkFont(family=FONTS["mono"], size=11)).grid(row=i, column=1, padx=12, sticky="e")
                 self._vars[p["key"]] = (var, p["type"])

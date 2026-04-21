@@ -257,7 +257,7 @@ def _generate_pdf(
 
     # ── Hjelpefunksjon: kakediagram ───────────────────────────────────────────
     def _pie_chart(labels: list[str], values: list[float],
-                   title: str, slice_colors: list) -> "Drawing | None":
+                   title: str, slice_colors: list) -> "object | None":
         total = sum(values)
         if total <= 0:
             return None
@@ -289,7 +289,7 @@ def _generate_pdf(
         pie.width  = pie_size
         pie.height = pie_size
         pie.data   = values
-        pie.labels = [f"{l}: {v/total*100:.0f}%"
+        pie.labels = [f"{l}: {v/total*100:.2f}%"
                       for l, v in zip(labels, values)]
         pie.simpleLabels        = False
         pie.checkLabelOverlap   = True
@@ -640,7 +640,7 @@ def _op_detail(
 
         out.append(Paragraph("Konverteringsresultat", s_sub))
         rows = [
-            ("Filer identifisert:",            f"{detected:,}"),
+            ("Filer identifisert:",        f"{detected:,}"),
             ("Konvertert til PDF/A:",      f"{converted:,}"),
             ("Beholdt originalformat:",    f"{kept:,}"),
             ("Inline LOBs hentet:",        f"{inline_ex:,}"),

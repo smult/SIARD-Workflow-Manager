@@ -1,0 +1,28 @@
+{
+  "_comment": "Standardverdier for DIAS-pakking (SIP/AIC). Rediger og lagre – verdiene lastes inn automatisk når operasjonen legges til i workflow.",
+
+  "submission_agreement":         "202X-XX/X",
+  "uttrekksdato":                 "ÅÅÅÅ-MM-DD",
+  "label":                        "202X-XX - Eksempelkommune - System (Fra - Til) - SIARD",
+  "system":                       "",
+  "system_version":               "",
+  "archivist_type":               "SIARD",
+  "period_start":                 "ÅÅÅÅ-MM-DD",
+  "period_end":                   "ÅÅÅÅ-MM-DD",
+
+  "owner_org":                    "",
+  "archivist_org":                "KDRS",
+  "submitter_org":                "<Leverandør/DDV/IKTAGDER/Kommune/annet>",
+  "submitter_person":             "Ola Nordmann",
+  "producer_org":                 "<Leverandør/DDV/IKTAGDER/Kommune/annet>",
+  "producer_person":              "Ola Nordmann",
+  "producer_software":            "Full Convert",
+  "creator":                      "Arkivsenter sør IKS",
+  "preserver":                    "",
+
+  "username":                     "",
+  "schema_dir":                   "",
+  "descriptive_metadata_path":    "",
+  "administrative_metadata_path": "",
+  "output_dir":                   ""
+}

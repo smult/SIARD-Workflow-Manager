@@ -1,3 +1,4 @@
+from .dias_package_operation import DiasPackageOperation
 from .sha256_operation import SHA256Operation
 from .blob_check_operation import BlobCheckOperation
 from .blob_convert_operation import BlobConvertOperation
@@ -12,6 +13,7 @@ from .standard_operations import (
 )
 
 __all__ = [
+    "DiasPackageOperation",
     "SHA256Operation",
     "BlobCheckOperation",
     "BlobConvertOperation",
