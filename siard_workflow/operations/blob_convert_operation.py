@@ -1525,15 +1525,12 @@ class BlobConvertOperation(BaseOperation):
     status          = 2
     produces_siard  = True
     requires_unpack = True
-    _hw           = suggest_lo_defaults()
     default_params = {
         "output_suffix":        "_konvertert",
         "libreoffice_bin":      "soffice",
         "lo_timeout":           300,
         "skip_existing_pdf":    True,
         "dry_run":              False,
-        "max_workers":          _hw["max_workers"],
-        "lo_batch_size":        _hw["lo_batch_size"],
         "temp_dir":             "",
         "pdfa_version":         _PDFA_DEFAULT,
     }
@@ -1542,8 +1539,13 @@ class BlobConvertOperation(BaseOperation):
         log = ctx.metadata.get("file_logger")
         pcb = ctx.metadata.get("progress_cb")
 
-        # Normaliser int-parametere — GUI returnerer StringVar som streng
-        for _key in ("max_workers", "lo_batch_size", "lo_timeout"):
+        # Les parallellitet og batch fra globale innstillinger (config.json)
+        from settings import get_config as _get_cfg
+        self.params["max_workers"]  = max(1, int(_get_cfg("max_workers",  4)  or 4))
+        self.params["lo_batch_size"] = max(1, int(_get_cfg("lo_batch_size", 50) or 50))
+
+        # Normaliser øvrige int-parametere
+        for _key in ("lo_timeout",):
             try:
                 self.params[_key] = int(self.params[_key])
             except (ValueError, TypeError):
@@ -2739,7 +2741,7 @@ class BlobConvertOperation(BaseOperation):
             cmd = [
                 lo_bin,
                 f"-env:UserInstallation={_lo_profile_url(profile_dir)}",
-                "--headless",
+                "--headless", "--norestore", "--nofirststartwizard",
                 "--convert-to", pdfa_filter,
                 "--outdir", str(out_dir),
             ] + [str(f) for f, _, _, _ in input_map]
@@ -2815,8 +2817,8 @@ class BlobConvertOperation(BaseOperation):
                 """
                 import time as _time
 
-                ACTIVITY_TIMEOUT = 60   # sekunder uten ny PDF → kill
-                STARTUP_GRACE    = 30   # sekunder før watchdog aktiveres
+                ACTIVITY_TIMEOUT = 30   # sekunder uten ny PDF → kill
+                STARTUP_GRACE    = 15   # sekunder før watchdog aktiveres
 
                 stdout_buf: list[str] = []
                 stderr_buf: list[str] = []
@@ -2849,13 +2851,15 @@ class BlobConvertOperation(BaseOperation):
                         return
                     try:
                         pid = proc.pid
-                        # Lukk pipes FØR kill — frigjør readline()-blokk
+                        # Drep prosessen FØRST — dette sender EOF til pipes og
+                        # unblokker readline() slik at pipe.close() ikke henger
+                        _kill_pid(pid)
+                        # Lukk pipe-handles etter prosessen er drept
                         for pipe in (proc.stdin, proc.stdout, proc.stderr):
                             try:
                                 if pipe: pipe.close()
                             except Exception:
                                 pass
-                        _kill_pid(pid)
                     except Exception:
                         pass
 
@@ -3162,11 +3166,11 @@ class BlobConvertOperation(BaseOperation):
 
         # ── Retry-runde: parallell batch-konvertering av feilede filer ───────
         if retry_list and not stop_ev.is_set():
-            retry_timeout = min(90, self.params["lo_timeout"])
-            retry_batches = [retry_list[i:i + batch_size]
-                             for i in range(0, len(retry_list), batch_size)]
-            w(f"  Nytt forsøk: {len(retry_list)} filer i "
-              f"{len(retry_batches)} batch(er), {max_w} worker(e) "
+            retry_timeout = min(60, self.params["lo_timeout"])
+            # Retry en og en fil — isolerer hengende filer og unngår at én fil
+            # blokkerer hele batchen igjen
+            retry_batches = [[item] for item in retry_list]
+            w(f"  Nytt forsøk: {len(retry_list)} filer enkeltvis, {max_w} worker(e) "
               f"(timeout {retry_timeout}s) ...", "info")
 
             converted_before = stats.get("converted", 0)
