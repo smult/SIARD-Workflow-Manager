@@ -637,11 +637,16 @@ def _wpt_raw_text_to_rtf(wpt_bytes: bytes) -> bytes:
 
 
 def _err_clean(msg: str) -> str:
-    """Fjern intern batch-filinformasjon ('Filer: ...') fra feilmeldinger."""
+    """Fjern intern batch-filinformasjon og berik kjente feilmeldinger."""
     if not msg:
         return msg
+    # Fjern "Filer: ..." (interne batch-filnavn)
     idx = msg.find(". Filer: ")
-    return msg[:idx] if idx >= 0 else msg
+    cleaned = msg[:idx] if idx >= 0 else msg
+    # Legg til hint om passordbeskyttelse ved LibreOffice-lastfeil
+    if "source file could not be loaded" in cleaned:
+        cleaned += ". Trolig grunnet passordbeskyttelse og feil passord."
+    return cleaned
 
 
 def _strip_rtf_ole_objects(data: bytes) -> bytes:
@@ -3234,9 +3239,6 @@ class BlobConvertOperation(BaseOperation):
                                 retry_root / "out", False, err)
                             w(f"    Nytt forsøk feilet: {fname} "
                               f"— beholdes som .{ext}", "warn")
-                            if err_log:
-                                err_log.write(zip_sti, ext,
-                                              f"Retry feilet: {_err_clean(err)}")
 
                     # Filer som ikke kom med i input_map (kopi feilet)
                     for zip_sti, (ext, mime) in expected.items():
