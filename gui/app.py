@@ -159,6 +159,7 @@ class App(ctk.CTk):
         self._load_persistent_profiles()
         self._load_saved_temp()
         self._detect_libreoffice()
+        self._init_worker_config()
         self._poll_log_queue()
 
         # Sjekk for oppdateringer i bakgrunnen (2 sek forsinkelse for at GUI skal være klar)
@@ -576,6 +577,20 @@ class App(ctk.CTk):
             found = _find_libreoffice("")
             if found:
                 set_config("lo_executable", found)
+        except Exception:
+            pass
+
+    def _init_worker_config(self):
+        """Sett max_workers og lo_batch_size fra maskinvare ved første kjøring (verdi == 0)."""
+        try:
+            if int(get_config("max_workers", 0) or 0) == 0:
+                from siard_workflow.operations.blob_convert_operation import suggest_lo_defaults
+                hw = suggest_lo_defaults()
+                from settings import save_config
+                save_config({
+                    "max_workers":   hw["max_workers"],
+                    "lo_batch_size": hw["lo_batch_size"],
+                })
         except Exception:
             pass
 

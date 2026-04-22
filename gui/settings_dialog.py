@@ -166,10 +166,60 @@ class SettingsDialog(ctk.CTkToplevel):
                          row=r, column=0, columnspan=2,
                          padx=14, pady=(0, 4), sticky="w"); r += 1
 
-        _seksjon("Blob-konvertering (LibreOffice)", r); r += 1
-        _rad("Parallelle LO-instanser", "max_workers",   "int", r, default=4);  r += 1
-        _rad("Filer per batch",         "lo_batch_size", "int", r, default=50); r += 1
-        _rad("Tidsavbrudd per batch (s)","lo_timeout",   "int", r, default=300);r += 1
+        _seksjon("Parallellisering (LibreOffice — gjelder alle operasjoner)", r); r += 1
+
+        # max_workers med Auto-knapp
+        ctk.CTkLabel(frm, text="Parallelle LO-instanser",
+                     font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                     text_color=COLORS["text"],
+                     anchor="w").grid(row=r, column=0, padx=(12, 8), pady=6, sticky="w")
+        mw_var  = ctk.StringVar(value=str(cfg.get("max_workers", 4)))
+        lbs_var = ctk.StringVar(value=str(cfg.get("lo_batch_size", 50)))
+        self._vars["max_workers"]  = mw_var
+        self._vars["lo_batch_size"] = lbs_var
+        mw_cell = ctk.CTkFrame(frm, fg_color="transparent")
+        mw_cell.grid(row=r, column=1, padx=12, pady=6, sticky="e")
+        ctk.CTkEntry(mw_cell, textvariable=mw_var, width=80,
+                     fg_color=COLORS["bg"],
+                     font=ctk.CTkFont(family=FONTS["mono"], size=11)
+                     ).pack(side="left", padx=(0, 4))
+
+        def _auto_hw():
+            try:
+                from siard_workflow.operations.blob_convert_operation import suggest_lo_defaults
+                hw = suggest_lo_defaults()
+                mw_var.set(str(hw["max_workers"]))
+                lbs_var.set(str(hw["lo_batch_size"]))
+                from tkinter import messagebox
+                messagebox.showinfo(
+                    "Maskinvare-forslag",
+                    f"Prosessor: {hw['_cpus']} kjerner\n"
+                    f"RAM: {hw['_ram_gb']} GB\n\n"
+                    f"Tråder foreslått: {hw['max_workers']}\n"
+                    f"Batch-størrelse foreslått: {hw['lo_batch_size']}",
+                    parent=self)
+            except Exception as exc:
+                from tkinter import messagebox
+                messagebox.showerror("Feil", str(exc), parent=self)
+
+        ctk.CTkButton(mw_cell, text="Auto", width=52,
+                      fg_color=COLORS["accent"],
+                      hover_color=COLORS["accent_dim"],
+                      font=ctk.CTkFont(family=FONTS["mono"], size=10),
+                      command=_auto_hw).pack(side="left")
+        r += 1
+
+        ctk.CTkLabel(frm, text="Filer per batch",
+                     font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                     text_color=COLORS["text"],
+                     anchor="w").grid(row=r, column=0, padx=(12, 8), pady=6, sticky="w")
+        ctk.CTkEntry(frm, textvariable=lbs_var, width=160,
+                     fg_color=COLORS["bg"],
+                     font=ctk.CTkFont(family=FONTS["mono"], size=11)
+                     ).grid(row=r, column=1, padx=12, pady=6, sticky="e")
+        r += 1
+
+        _rad("Tidsavbrudd per batch (s)", "lo_timeout", "int", r, default=300); r += 1
 
         # lo_convertible som kommaseparert tekstfelt
         ctk.CTkLabel(frm, text="Formater til PDF/A",

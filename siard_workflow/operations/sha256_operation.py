@@ -23,7 +23,7 @@ class SHA256Operation(BaseOperation):
     status = 2
     default_params = {
         "chunk_size": 8192,          # bytes per lesechunk
-        "save_to_file": False,       # skriv .sha256-fil ved siden av SIARD-filen
+        "save_to_file": True,       # skriv .sha256-fil ved siden av SIARD-filen
     }
 
     def run(self, ctx: WorkflowContext) -> OperationResult:

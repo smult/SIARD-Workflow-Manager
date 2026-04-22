@@ -494,8 +494,6 @@ OP_DEFS = [
                  "PDF/A-3b (ISO 19005-3, level B)",
              ]},
             {"key": "lo_timeout",         "label": "LibreOffice timeout (s)",       "type": "int",    "default": 300},
-            {"key": "max_workers",        "label": "Parallelle tråder",             "type": "hw_int", "default": get_config("max_workers"), "hw_key": "max_workers"},
-            {"key": "lo_batch_size",      "label": "Batch-størrelse (filer/batch)", "type": "int",    "default": get_config("lo_batch_size")},
             {"key": "skip_existing_pdf",  "label": "Hopp over eksist. PDF",         "type": "bool",   "default": True},
             {"key": "extract_inline",     "label": "Ekstraher inline NBLOB/NCLOB",  "type": "bool",   "default": True},
             {"key": "dry_run",            "label": "Tørkjøring (ikke skriv)",       "type": "bool",   "default": False},
@@ -528,10 +526,9 @@ OP_DEFS = [
         "params": [
             {"key": "output_suffix", "label": "Suffix ny SIARD-fil",      "type": "str",  "default": "_cosdoc"},
             {"key": "table_name",    "label": "Tabellnavn (Eef_ElFiler)",  "type": "str",  "default": "Eef_ElFiler"},
-            {"key": "lo_executable", "label": "LibreOffice (soffice-sti)", "type": "str",  "default": ""},
-            {"key": "lo_timeout",    "label": "LO timeout per fil (s)",    "type": "int",  "default": 120},
-            {"key": "max_workers",   "label": "Parallelle tråder (0=auto)", "type": "int",  "default": 0},
-            {"key": "dry_run",       "label": "Tørkjøring (ikke skriv)",   "type": "bool", "default": False},
+            {"key": "lo_executable",  "label": "LibreOffice (soffice-sti)", "type": "str",  "default": ""},
+            {"key": "lo_timeout",     "label": "LO timeout per fil (s)",    "type": "int",  "default": 120},
+            {"key": "dry_run",        "label": "Tørkjøring (ikke skriv)",   "type": "bool", "default": False},
         ],
     },
     {
@@ -842,8 +839,8 @@ class ParamDialog(ctk.CTkToplevel):
         if op and op.operation_id:
             try:
                 save_op_params(op.operation_id, kwargs)
-                # Lagre maskinvare- og format-innstillinger til config.json
-                _config_keys = {"max_workers", "lo_batch_size", "pdfa_version"}
+                # Lagre format-innstillinger til config.json
+                _config_keys = {"pdfa_version"}
                 _config_updates = {k: kwargs[k] for k in _config_keys if k in kwargs}
                 if _config_updates:
                     save_config(_config_updates)

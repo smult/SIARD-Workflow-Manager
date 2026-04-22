@@ -248,6 +248,59 @@ def _lo_profile_url(profile_dir: Path) -> str:
     return profile_dir.as_uri()  # gir riktig file:///C:/path/... på alle plattformer
 
 
+def _lo_convert_batch(
+    files: list[Path],
+    dst_dir: Path,
+    to_format: str,
+    lo_exe: str,
+    timeout_per_file: int,
+    profile_base: Path,
+    w,
+) -> dict[Path, Path]:
+    """
+    Konverter flere filer i ett enkelt LO-kall (én oppstart for N filer).
+    Returnerer {input_path: output_path} for vellykket konverterte filer.
+    """
+    if not files:
+        return {}
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    profile_dir = Path(tempfile.mkdtemp(dir=profile_base, prefix="lo_prof_"))
+    ext    = to_format.split(":")[0]
+    result: dict[Path, Path] = {}
+    try:
+        cmd = [
+            lo_exe,
+            f"-env:UserInstallation={_lo_profile_url(profile_dir)}",
+            "--headless", "--norestore",
+            "--convert-to", to_format,
+            "--outdir", str(dst_dir),
+        ] + [str(f) for f in files]
+        subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout_per_file * max(len(files), 1),
+        )
+        for f in files:
+            out = dst_dir / f"{f.stem}.{ext}"
+            if not out.exists():
+                for c in dst_dir.iterdir():
+                    if (c.suffix.lower() == f".{ext}"
+                            and c.stem.lower() == f.stem.lower()):
+                        out = c
+                        break
+            if out.exists():
+                result[f] = out
+    except subprocess.TimeoutExpired:
+        w(f"    LO batch-timeout "
+          f"({timeout_per_file * len(files)}s, {len(files)} filer)", "warn")
+    except Exception as exc:
+        w(f"    LO batch-feil: {exc}", "warn")
+    finally:
+        shutil.rmtree(profile_dir, ignore_errors=True)
+    return result
+
+
 def _lo_convert(
     src: Path,
     dst_dir: Path,
@@ -747,13 +800,12 @@ class CosDocMailMergeOperation(BaseOperation):
     produces_siard = True
 
     default_params: dict = {
-        "dry_run":       False,
-        "output_suffix": "_cosdoc",
-        "table_name":    "Eef_ElFiler",
-        "lo_executable": "",      # soffice-sti — auto-detekteres hvis tom
-        "lo_timeout":    120,     # sekunder per LO-konvertering
-        "max_workers":   0,       # 0 = les fra config.json (max_workers)
-        "temp_dir":      "",      # temp-rotmappe
+        "dry_run":        False,
+        "output_suffix":  "_cosdoc",
+        "table_name":     "Eef_ElFiler",
+        "lo_executable":  "",      # soffice-sti — auto-detekteres hvis tom
+        "lo_timeout":     120,     # sekunder per LO-konvertering
+        "temp_dir":       "",      # temp-rotmappe
     }
 
     def run(self, ctx: WorkflowContext) -> OperationResult:  # noqa: C901
@@ -792,11 +844,10 @@ class CosDocMailMergeOperation(BaseOperation):
         suffix     = str(self.params["output_suffix"] or "_cosdoc")
         table_name = str(self.params["table_name"] or "Eef_ElFiler")
         from settings import get_config as _get_cfg
-        lo_hint    = str(self.params["lo_executable"] or _get_cfg("lo_executable", "") or "soffice")
-        lo_timeout = int(self.params["lo_timeout"] or 120)
-        _cfg_workers = int(_get_cfg("max_workers", 4) or 4)
-        max_workers  = int(self.params.get("max_workers") or 0) or _cfg_workers
-        max_workers  = max(1, min(max_workers, os.cpu_count() or 4))
+        lo_hint       = str(self.params["lo_executable"] or _get_cfg("lo_executable", "") or "soffice")
+        lo_timeout    = int(self.params["lo_timeout"] or 120)
+        max_workers   = max(1, min(int(_get_cfg("max_workers",  4)  or 4), os.cpu_count() or 4))
+        lo_batch_size = max(1, int(_get_cfg("lo_batch_size", 20) or 20))
 
         temp_root_str = str(self.params.get("temp_dir", "") or "")
         if not temp_root_str and hasattr(ctx, "metadata"):
@@ -943,216 +994,312 @@ class CosDocMailMergeOperation(BaseOperation):
               f"enkeltdokumenter (SeqNr 1): {len(singles)}", "info")
             progress("phase_done")
 
-            # ── Fase 3 (pipeline) / Fase 4 (standalone): Prosesser ───────────
+            # ── Fase 3 / 4: Avkrypterer, konverterer, fletter ────────────────
             phase(3 if pipeline_mode else 4, "Avkrypterer og fletter dokumenter")
 
-            # lob_folder er relativt til content/-mappen i SIARD-arkivet
             _lf = Path(lob_folder)
             if _lf.parts and _lf.parts[0].lower() == "content":
                 lob_path = extract_dir / _lf
             else:
                 lob_path = extract_dir / "content" / _lf
+
             xml_updates: dict[int, dict] = {}
             xml_deletes: set[int]        = set()
-            total      = len(pairs) + len(singles)
-            lock       = threading.Lock()
-            done_count = [0]
+            total        = len(pairs) + len(singles)
+            lock         = threading.Lock()
+            done_count   = [0]
+            lo_out_root   = work_dir / "lo_out"
+            lo_out_root.mkdir(exist_ok=True)
 
-            w(f"  Parallellitet: {max_workers} tråder", "info")
+            w(f"  Parallellitet: {max_workers} tråder, "
+              f"LO batch-størrelse: {lo_batch_size}", "info")
 
-            def _do_pair(seq: int, main_row: dict, data_row: dict) -> dict:
-                eef_id_main = int(_get_col(main_row, eefid_col) or "0")
-                eef_id_data = int(_get_col(data_row, eefid_col) or "0")
-                main_fname  = _get_col(main_row, fname_col)
-                data_fname  = _get_col(data_row, fname_col)
-                main_blob   = _get_blob(main_row, blob_col)
-                data_blob   = _get_blob(data_row, blob_col)
-                res = {"type": "pair", "eef_id_main": eef_id_main,
-                       "eef_id_data": eef_id_data, "update": None,
-                       "delete": False, "sd": {}}
+            # ── Steg A: Avkrypter + les binær merge-data (parallell, ingen LO) ─
 
-                w(f"\n  [{seq}/{total}] Par EveID="
-                  f"{_get_col(main_row, eveid_col)}: "
-                  f"{main_fname} + {data_fname}", "step")
+            class _PP:
+                """Forberedt par-objekt."""
+                __slots__ = ("seq", "eef_id_main", "eef_id_data", "eveid",
+                             "main_fname", "data_fname", "main_blob", "data_blob",
+                             "main_dec", "data_dec", "merge_data",
+                             "needs_data_lo", "skip", "sd")
 
-                if not main_blob or not data_blob:
+            class _SP:
+                """Forberedt enkelt-objekt."""
+                __slots__ = ("seq", "eef_id", "fname", "blob",
+                             "dec_path", "is_word", "skip", "sd")
+
+            def _prep_pair(seq: int, main_row: dict, data_row: dict) -> _PP:
+                p               = _PP()
+                p.seq           = seq
+                p.eef_id_main   = int(_get_col(main_row, eefid_col) or "0")
+                p.eef_id_data   = int(_get_col(data_row,  eefid_col) or "0")
+                p.eveid         = _get_col(main_row, eveid_col)
+                p.main_fname    = _get_col(main_row, fname_col)
+                p.data_fname    = _get_col(data_row,  fname_col)
+                p.main_blob     = _get_blob(main_row, blob_col)
+                p.data_blob     = _get_blob(data_row,  blob_col)
+                p.merge_data    = {}
+                p.needs_data_lo = False
+                p.main_dec      = None
+                p.data_dec      = None
+                p.skip          = False
+                p.sd            = {}
+
+                w(f"\n  [{seq}/{total}] Par EveID={p.eveid}: "
+                  f"{p.main_fname} + {p.data_fname}", "step")
+
+                if not p.main_blob or not p.data_blob:
                     w("    HOPPER OVER: manglende blob-referanse", "warn")
-                    return res
-                main_src = lob_path / main_blob["file"]
-                data_src = lob_path / data_blob["file"]
+                    p.skip = True
+                    return p
+                main_src = lob_path / p.main_blob["file"]
+                data_src = lob_path / p.data_blob["file"]
                 if not main_src.exists():
                     w(f"    FEIL: blob ikke funnet: {main_src}", "feil")
-                    return res
+                    p.skip = True
+                    return p
                 if dry_run:
-                    w(f"    Dry-run: ville prosessert {main_fname}", "info")
-                    res["sd"]["pairs_merged"] = 1
-                    return res
+                    p.sd["pairs_merged"] = 1
+                    p.skip = True
+                    return p
 
-                main_pw  = _derive_password(main_fname)
-                data_pw  = _derive_password(data_fname)
-                pair_dir = work_dir / f"pair_{eef_id_main}"
+                pair_dir   = work_dir / f"pair_{p.eef_id_main}"
                 pair_dir.mkdir(exist_ok=True)
-                lo_out   = pair_dir / "lo_out"
-                lo_out.mkdir(exist_ok=True)
-                main_dec = pair_dir / main_fname
-                data_dec = pair_dir / data_fname
+                p.main_dec = pair_dir / p.main_fname
+                p.data_dec = pair_dir / p.data_fname
 
-                w(f"    Avkrypterer {main_fname} (pw={main_pw[:4]}…)", "info")
-                if not _decrypt_file(main_src, main_dec, main_pw, w):
-                    res["sd"]["decrypt_failed"] = 1
+                main_pw = _derive_password(p.main_fname)
+                w(f"    Avkrypterer {p.main_fname} (pw={main_pw[:4]}…)", "info")
+                if not _decrypt_file(main_src, p.main_dec, main_pw, w):
+                    p.sd["decrypt_failed"] = 1
 
-                # Datatkildefiler (_D) er ikke kryptert — kopier direkte
-                data_ok = False
                 if data_src.exists():
-                    shutil.copy2(data_src, data_dec)
-                    data_ok = True
-                    w(f"    Kopierer datakilde {data_fname}", "info")
+                    shutil.copy2(data_src, p.data_dec)
+                    w(f"    Kopierer datakilde {p.data_fname}", "info")
                 else:
                     w(f"    Datakilde ikke funnet: {data_src}", "warn")
 
-                # ── Merge-data: OLE2-binær først, LO-fallback hvis nødvendig ─
-                merge_data: dict[str, str] = {}
-                data_docx = None
-                if data_ok and data_dec.exists():
-                    merge_data = _read_merge_data_from_doc_binary(data_dec, w)
-                    if not merge_data:
-                        data_docx  = _lo_convert(data_dec, lo_out, "docx",
-                                                  lo_exe, lo_timeout, lo_profile_base, w)
-                        if data_docx:
-                            merge_data = _read_merge_data_from_docx(data_docx, w)
-                    if not merge_data:
-                        merge_data = _read_merge_data_via_html(
-                            data_dec, lo_exe, lo_timeout, lo_profile_base, w)
+                if p.data_dec.exists():
+                    p.merge_data = _read_merge_data_from_doc_binary(p.data_dec, w)
+                    if not p.merge_data:
+                        p.needs_data_lo = True
+                return p
 
-                # ── Konverter hoveddokument (alltid nødvendig for mailmerge) ──
-                main_docx = _lo_convert(main_dec, lo_out, "docx",
-                                        lo_exe, lo_timeout, lo_profile_base, w)
-                if main_docx and data_dec.exists():
-                    _patch_docx_datasource(main_docx, data_dec)
+            def _prep_single(seq: int, row: dict) -> _SP:
+                s          = _SP()
+                s.seq      = seq
+                s.eef_id   = int(_get_col(row, eefid_col) or "0")
+                s.fname    = _get_col(row, fname_col)
+                s.blob     = _get_blob(row, blob_col)
+                s.is_word  = _is_word_doc(s.fname)
+                s.dec_path = None
+                s.skip     = False
+                s.sd       = {}
 
-                merged_path = pair_dir / f"merged_{eef_id_main}.docx"
-                merge_ok    = False
-                if main_docx and merge_data:
+                w(f"\n  [{seq}/{total}] Enkelt: {s.fname}", "step")
+
+                if not s.blob:
+                    w("    HOPPER OVER: manglende blob-referanse", "warn")
+                    s.skip = True
+                    return s
+                blob_src = lob_path / s.blob["file"]
+                if not blob_src.exists():
+                    w(f"    FEIL: blob ikke funnet: {blob_src}", "feil")
+                    s.skip = True
+                    return s
+                if dry_run:
+                    s.sd["singles_decrypted"] = 1
+                    s.skip = True
+                    return s
+
+                single_dir = work_dir / f"single_{s.eef_id}"
+                single_dir.mkdir(exist_ok=True)
+                s.dec_path = single_dir / s.fname
+
+                if s.is_word:
+                    pw = _derive_password(s.fname)
+                    w(f"    Avkrypterer {s.fname} (pw={pw[:4]}…)", "info")
+                    if not _decrypt_file(blob_src, s.dec_path, pw, w):
+                        s.sd["decrypt_failed"] = 1
+                else:
+                    shutil.copy2(blob_src, s.dec_path)
+                return s
+
+            pair_preps:   list[_PP] = []
+            single_preps: list[_SP] = []
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=max_workers) as pool:
+                pfuts = {pool.submit(_prep_pair,   i + 1,             mr, dr): i
+                         for i, (mr, dr) in enumerate(pairs)}
+                sfuts = {pool.submit(_prep_single, len(pairs) + i + 1, r):  i
+                         for i, r in enumerate(singles)}
+                all_futs = {**pfuts, **sfuts}
+                for fut in concurrent.futures.as_completed(all_futs):
+                    try:
+                        res = fut.result()
+                    except Exception as exc:
+                        w(f"  Prep-feil: {exc}", "feil")
+                        continue
+                    with lock:
+                        for k, v in res.sd.items():
+                            stats[k] = stats.get(k, 0) + v
+                    if fut in pfuts:
+                        pair_preps.append(res)
+                    else:
+                        single_preps.append(res)
+
+            # ── Steg B: Batch LO-konvertering ─────────────────────────────────
+            # Samle alle filer som trenger konvertering
+            to_convert: list[Path] = []
+            for p in pair_preps:
+                if (not p.skip and p.main_dec and p.main_dec.exists()
+                        and p.main_dec.suffix.lower() != ".docx"):
+                    to_convert.append(p.main_dec)
+            for p in pair_preps:
+                if (not p.skip and p.needs_data_lo
+                        and p.data_dec and p.data_dec.exists()
+                        and p.data_dec.suffix.lower() != ".docx"):
+                    to_convert.append(p.data_dec)
+            for s in single_preps:
+                if (not s.skip and s.is_word
+                        and s.dec_path and s.dec_path.exists()
+                        and s.dec_path.suffix.lower() != ".docx"):
+                    to_convert.append(s.dec_path)
+
+            converted: dict[Path, Path] = {}  # input_path → output_docx
+            if to_convert:
+                batches   = [to_convert[s:s + lo_batch_size]
+                             for s in range(0, len(to_convert), lo_batch_size)]
+                n_batches = len(batches)
+                w(f"\n  LO-konvertering: {len(to_convert)} filer, "
+                  f"{n_batches} batch(er) à {lo_batch_size}, "
+                  f"{max_workers} parallelle LO-prosesser", "step")
+
+                def _run_batch(args: tuple) -> dict[Path, Path]:
+                    bi, batch = args
+                    batch_dir = lo_out_root / f"b{bi}"
+                    batch_dir.mkdir(exist_ok=True)
+                    res = _lo_convert_batch(
+                        batch, batch_dir, "docx",
+                        lo_exe, lo_timeout, lo_profile_base, w)
+                    w(f"  Batch {bi + 1}/{n_batches}: "
+                      f"{len(res)}/{len(batch)} OK", "info")
+                    return res
+
+                with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=max_workers) as pool:
+                    for batch_res in pool.map(_run_batch, enumerate(batches)):
+                        converted.update(batch_res)
+
+            # ── Steg C: Flett og skriv (parallell, ingen LO-kall) ─────────────
+
+            def _merge_pair(p: _PP) -> dict:
+                base = {"type": "pair", "eef_id_main": p.eef_id_main,
+                        "eef_id_data": p.eef_id_data,
+                        "update": None, "delete": False, "sd": dict(p.sd)}
+                if p.skip:
+                    return base
+
+                main_docx = converted.get(p.main_dec)
+
+                if not p.merge_data and p.needs_data_lo:
+                    data_docx = converted.get(p.data_dec) if p.data_dec else None
+                    if data_docx:
+                        p.merge_data = _read_merge_data_from_docx(data_docx, w)
+                    if not p.merge_data and p.data_dec and p.data_dec.exists():
+                        p.merge_data = _read_merge_data_via_html(
+                            p.data_dec, lo_exe, lo_timeout, lo_profile_base, w)
+
+                if main_docx and p.data_dec and p.data_dec.exists():
+                    _patch_docx_datasource(main_docx, p.data_dec)
+
+                merged_path = p.main_dec.parent / f"merged_{p.eef_id_main}.docx"
+                merge_ok = False
+                if main_docx and p.merge_data:
                     merge_ok = _perform_mailmerge(
-                        main_docx, merge_data, merged_path, w)
-                elif main_docx and not merge_data:
-                    w("    Ingen merge-data — lagrer konvertert hoveddokument", "warn")
+                        main_docx, p.merge_data, merged_path, w)
+                elif main_docx and not p.merge_data:
+                    w("    Ingen merge-data — lagrer konvertert hoveddokument",
+                      "warn")
 
                 if not merge_ok:
                     if main_docx and main_docx.exists():
                         shutil.copy2(main_docx, merged_path)
                         w("    Bruker konvertert hoveddokument (uten merge)", "info")
-                    elif main_dec.exists():
-                        merged_path = main_dec
-                        w("    Bruker avkryptert hoveddokument (uten konvertering)", "info")
+                    elif p.main_dec.exists():
+                        merged_path = p.main_dec
+                        w("    Bruker avkryptert hoveddokument (uten konvertering)",
+                          "info")
                     else:
-                        w(f"    Kan ikke produsere output for {main_fname}", "feil")
-                        res["sd"]["merge_failed"] = 1
-                        return res
-                    res["sd"]["merge_failed"] = 1
+                        w(f"    Kan ikke produsere output for {p.main_fname}", "feil")
+                        base["sd"]["merge_failed"] = 1
+                        return base
+                    base["sd"]["merge_failed"] = base["sd"].get("merge_failed", 0) + 1
                 else:
-                    res["sd"]["pairs_merged"] = 1
+                    base["sd"]["pairs_merged"] = base["sd"].get("pairs_merged", 0) + 1
 
-                new_fname     = Path(main_fname).stem + "_flettet.docx"
-                new_blobname  = Path(main_blob["file"]).stem + merged_path.suffix
+                new_fname     = Path(p.main_fname).stem + "_flettet.docx"
+                new_blobname  = Path(p.main_blob["file"]).stem + merged_path.suffix
                 new_blob_path = lob_path / new_blobname
                 merged_bytes  = merged_path.read_bytes()
                 new_blob_path.write_bytes(merged_bytes)
                 w(f"    Lagret: {new_blobname} ({len(merged_bytes):,} bytes)", "ok")
 
-                old_blob = lob_path / main_blob["file"]
+                old_blob = lob_path / p.main_blob["file"]
                 if old_blob != new_blob_path and old_blob.exists():
                     old_blob.unlink()
-                if data_src.exists():
-                    data_src.unlink()
-                    w(f"    Slettet datakilde: {data_blob['file']}", "info")
+                data_src_file = lob_path / p.data_blob["file"]
+                if data_src_file.exists():
+                    data_src_file.unlink()
+                    w(f"    Slettet datakilde: {p.data_blob['file']}", "info")
 
-                res["update"] = {"file": new_blobname, "length": len(merged_bytes),
-                                 "digest": _md5_upper(merged_bytes),
-                                 "new_filename": new_fname}
-                res["delete"] = True
-                return res
+                base["update"] = {"file": new_blobname, "length": len(merged_bytes),
+                                  "digest": _md5_upper(merged_bytes),
+                                  "new_filename": new_fname}
+                base["delete"] = True
+                return base
 
-            def _do_single(seq: int, row: dict) -> dict:
-                eef_id = int(_get_col(row, eefid_col) or "0")
-                fname  = _get_col(row, fname_col)
-                blob   = _get_blob(row, blob_col)
-                res = {"type": "single", "eef_id": eef_id,
-                       "update": None, "sd": {}}
+            def _finish_single(s: _SP) -> dict:
+                base = {"type": "single", "eef_id": s.eef_id,
+                        "update": None, "sd": dict(s.sd)}
+                if s.skip:
+                    return base
 
-                w(f"\n  [{seq}/{total}] Enkelt: {fname}", "step")
-
-                if not blob:
-                    w("    HOPPER OVER: manglende blob-referanse", "warn")
-                    return res
-                blob_src = lob_path / blob["file"]
-                if not blob_src.exists():
-                    w(f"    FEIL: blob ikke funnet: {blob_src}", "feil")
-                    return res
-                if dry_run:
-                    w(f"    Dry-run: ville avkryptert {fname}", "info")
-                    res["sd"]["singles_decrypted"] = 1
-                    return res
-
-                single_dir = work_dir / f"single_{eef_id}"
-                single_dir.mkdir(exist_ok=True)
-                dec_path = single_dir / fname
-
-                is_word = _is_word_doc(fname)
-
-                if is_word:
-                    password = _derive_password(fname)
-                    w(f"    Avkrypterer {fname} (pw={password[:4]}…)", "info")
-                    if not _decrypt_file(blob_src, dec_path, password, w):
-                        res["sd"]["decrypt_failed"] = 1
-                else:
-                    # Ikke et Word-dokument — kopierer uten avkryptering
-                    shutil.copy2(blob_src, dec_path)
-
-                if is_word:
-                    lo_out = single_dir / "lo_out"
-                    lo_out.mkdir(exist_ok=True)
-                    docx_result = _lo_convert(dec_path, lo_out, "docx",
-                                              lo_exe, lo_timeout, lo_profile_base, w)
-                else:
-                    docx_result = None  # beholdes i originalformat
+                docx_result = (converted.get(s.dec_path)
+                               if (s.is_word and s.dec_path) else None)
+                blob_src = lob_path / s.blob["file"]
 
                 if docx_result and docx_result.exists():
-                    new_fname     = Path(fname).stem + ".docx"
-                    new_blobname  = Path(blob["file"]).stem + ".docx"
+                    new_fname     = Path(s.fname).stem + ".docx"
+                    new_blobname  = Path(s.blob["file"]).stem + ".docx"
                     new_blob_path = lob_path / new_blobname
                     new_data      = docx_result.read_bytes()
                     new_blob_path.write_bytes(new_data)
-                    old_blob = lob_path / blob["file"]
+                    old_blob = lob_path / s.blob["file"]
                     if old_blob != new_blob_path and old_blob.exists():
                         old_blob.unlink()
-                    res["update"] = {"file": new_blobname, "length": len(new_data),
-                                     "digest": _md5_upper(new_data),
-                                     "new_filename": new_fname}
                     w(f"    Avkryptert og konvertert: {new_blobname} "
                       f"({len(new_data):,} bytes)", "ok")
-                    res["sd"]["singles_decrypted"] = 1
-                elif dec_path.exists():
-                    new_data = dec_path.read_bytes()
+                    base["update"] = {"file": new_blobname, "length": len(new_data),
+                                      "digest": _md5_upper(new_data),
+                                      "new_filename": new_fname}
+                    base["sd"]["singles_decrypted"] = 1
+                elif s.dec_path and s.dec_path.exists():
+                    new_data = s.dec_path.read_bytes()
                     blob_src.write_bytes(new_data)
-                    res["update"] = {"file": blob["file"], "length": len(new_data),
-                                     "digest": _md5_upper(new_data),
-                                     "new_filename": fname}
-                    action = "Avkryptert" if is_word else "Kopierer"
-                    w(f"    {action} (ikke konvertert): {blob['file']}", "info")
-                    res["sd"]["singles_decrypted"] = 1
-                return res
+                    action = "Avkryptert" if s.is_word else "Kopierer"
+                    w(f"    {action} (ikke konvertert): {s.blob['file']}", "info")
+                    base["update"] = {"file": s.blob["file"], "length": len(new_data),
+                                      "digest": _md5_upper(new_data),
+                                      "new_filename": s.fname}
+                    base["sd"]["singles_decrypted"] = 1
+                return base
 
-            # ── Parallell kjøring ─────────────────────────────────────────────
-            futures: dict = {}
             with concurrent.futures.ThreadPoolExecutor(
                     max_workers=max_workers) as pool:
-                for seq, (mr, dr) in enumerate(pairs, 1):
-                    futures[pool.submit(_do_pair, seq, mr, dr)] = seq
-                for seq, row in enumerate(singles, len(pairs) + 1):
-                    futures[pool.submit(_do_single, seq, row)] = seq
-
-                for fut in concurrent.futures.as_completed(futures):
+                futs = ([pool.submit(_merge_pair,    p) for p in pair_preps]
+                        + [pool.submit(_finish_single, s) for s in single_preps])
+                for fut in concurrent.futures.as_completed(futs):
                     try:
                         res = fut.result()
                     except Exception as exc:
@@ -1172,7 +1319,6 @@ class CosDocMailMergeOperation(BaseOperation):
                         progress("phase_progress",
                                  done=done_count[0], total=total)
 
-            # Oppdater tableX.xml
             if not dry_run and (xml_updates or xml_deletes):
                 w(f"\n  Oppdaterer {tf}.xml …", "step")
                 updated_xml = _update_table_xml(
