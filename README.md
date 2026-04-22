@@ -2,6 +2,11 @@
 
 Rammeverk og GUI for behandling av SIARD-uttrekk.
 
+PS: Brukes på eget ansvar! Utvikler har ikke ansvar for eventuelle feil og mangler 
+som skulle oppstå, eller misbruk av programvaren. 
+
+Ta kontakt hvis du har innspill, kritikk, ros, ønsker, kommentarer etc.
+
 Funksjonalitet omfatter blant annet:
 - Valg av SIARD-filer og arbeidsmapper
 - En del grunnleggende operasjoner for SIARD Workflow Manager, som for eksempel:
