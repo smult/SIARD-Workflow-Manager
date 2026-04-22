@@ -96,7 +96,7 @@ class ConversionErrorLogger:
         self._fh   = open(self._path, "w", encoding="utf-8", newline="")
         self._fh.write(
             f"# Konverteringsfeil — {stem} — {datetime.datetime.now()}\n"
-            f"# Format: [TID]  filnavn  |  ext  |  feilmelding\n"
+            f"# Format: [TID]  filsti (relativ i SIARD)  |  ext  |  feilmelding\n"
             f"# {'='*60}\n")
         self._fh.flush()
         return self
@@ -127,9 +127,8 @@ class ConversionErrorLogger:
         if not self._fh:
             return
         ts  = datetime.datetime.now().strftime("%H:%M:%S")
-        # Klipp lange feilmeldinger til 200 tegn
-        msg = (error_msg or "ukjent feil")[:200].replace("\n", " ")
-        line = f"[{ts}]  {filename:<40}  |  {ext:<8}  |  {msg}\n"
+        msg = (error_msg or "ukjent feil").replace("\n", " ")
+        line = f"[{ts}]  {filename:<60}  |  {ext:<8}  |  {msg}\n"
         with self._lock:
             self._fh.write(line)
             self._fh.flush()

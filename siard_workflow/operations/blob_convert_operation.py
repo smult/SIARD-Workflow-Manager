@@ -636,6 +636,14 @@ def _wpt_raw_text_to_rtf(wpt_bytes: bytes) -> bytes:
         return b""
 
 
+def _err_clean(msg: str) -> str:
+    """Fjern intern batch-filinformasjon ('Filer: ...') fra feilmeldinger."""
+    if not msg:
+        return msg
+    idx = msg.find(". Filer: ")
+    return msg[:idx] if idx >= 0 else msg
+
+
 def _strip_rtf_ole_objects(data: bytes) -> bytes:
     """
     Fjern alle {\\object...} grupper fra RTF-binærdata.
@@ -2981,7 +2989,8 @@ class BlobConvertOperation(BaseOperation):
                       + (f" ({lo_err[:80]})" if lo_err else ""), "warn")
                     # Loggfør til feilogg
                     if err_log:
-                        err_log.write(filename, ext, lo_err or "Ingen PDF produsert")
+                        err_log.write(zip_sti, ext,
+                                      _err_clean(lo_err or "Ingen PDF produsert"))
 
             if csv_log:
                 if file_ok and pdf_sti:
@@ -3226,8 +3235,8 @@ class BlobConvertOperation(BaseOperation):
                             w(f"    Nytt forsøk feilet: {fname} "
                               f"— beholdes som .{ext}", "warn")
                             if err_log:
-                                err_log.write(fname, ext,
-                                              f"Retry feilet: {err}")
+                                err_log.write(zip_sti, ext,
+                                              f"Retry feilet: {_err_clean(err)}")
 
                     # Filer som ikke kom med i input_map (kopi feilet)
                     for zip_sti, (ext, mime) in expected.items():
@@ -3238,7 +3247,7 @@ class BlobConvertOperation(BaseOperation):
                                 stats["failed"] += 1
                             w(f"    Nytt forsøk kopi-feil: {fname}", "warn")
                             if err_log:
-                                err_log.write(fname, ext, "Retry kopi-feil")
+                                err_log.write(zip_sti, ext, "Retry kopi-feil")
 
                     shutil.rmtree(retry_root, ignore_errors=True)
                 finally:
@@ -3376,7 +3385,7 @@ class BlobConvertOperation(BaseOperation):
                         n_fail_ref[0] += 1
                     w(f"  Oppgradering feilet: {blob_path.name} — beholder .{src_ext}", "warn")
                     if err_log:
-                        err_log.write(blob_path.name, src_ext,
+                        err_log.write(zip_sti, src_ext,
                                       f"Oppgradering {src_ext}→{target_ext} feilet")
                     if csv_log:
                         new_name = f"{stem_base}.{src_ext}"
@@ -4209,12 +4218,37 @@ class BlobConvertOperation(BaseOperation):
         # av is_file()-sjekken nedenfor. Gjenopprettes eksplisitt fra orig_namelist.
         orig_dir_entries = sorted(n for n in orig_namelist if n.endswith("/"))
 
+        def _unique_arc_name(name: str, seen: set[str]) -> str:
+            """Returnerer name uendret, eller name med løpenummer hvis duplikat."""
+            if name not in seen:
+                return name
+            # Skill ut katalogdel, stamme og endelse
+            slash = name.rfind("/")
+            prefix = name[:slash + 1] if slash >= 0 else ""
+            tail   = name[slash + 1:]
+            dot    = tail.rfind(".")
+            if dot >= 0:
+                base, ext_part = tail[:dot], tail[dot:]
+            else:
+                base, ext_part = tail, ""
+            counter = 2
+            while True:
+                candidate = f"{prefix}{base}_{counter}{ext_part}"
+                if candidate not in seen:
+                    w(f"    Duplikat i ZIP: {name!r} → {candidate!r}", "warn")
+                    return candidate
+                counter += 1
+
+        written_names: set[str] = set()
+
         with zipfile.ZipFile(dst_path, "w", zipfile.ZIP_DEFLATED,
                              allowZip64=True) as zf:
             # 1. Skriv katalogoppføringer (tomme mapper) fra original ZIP,
             #    med versjonstreng transformert i header-stier.
             for dir_entry in orig_dir_entries:
                 dir_entry_out = _ver_path(dir_entry)
+                dir_entry_out = _unique_arc_name(dir_entry_out, written_names)
+                written_names.add(dir_entry_out)
                 dir_info = zipfile.ZipInfo(dir_entry_out)
                 zf.writestr(dir_info, b"")
                 n_written += 1
@@ -4229,6 +4263,8 @@ class BlobConvertOperation(BaseOperation):
                     continue
                 arc_name = str(file_path.relative_to(extract_dir)).replace("\\", "/")
                 arc_name = _ver_path(arc_name)
+                arc_name = _unique_arc_name(arc_name, written_names)
+                written_names.add(arc_name)
                 try:
                     if is_siard_xml(arc_name):
                         data = file_path.read_bytes()
