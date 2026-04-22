@@ -328,21 +328,25 @@ def _detect_ole2_type(data: bytes) -> tuple[str, str, bool] | None:
     if "PowerPoint Document" in top_names:
         return "ppt", "application/vnd.ms-powerpoint", is_encrypted
 
-    # Fallback 1: Søk hele filen etter OLE2-katalognavn (UTF-16LE) og
+    # Fallback 1: Søk de første 32 KB etter OLE2-katalognavn (UTF-16LE) og
     # CompObj ProgID-strenger (ASCII) — fanger tilfeller der FAT-kjeden
     # gjør at katalogentryene ikke er sammenhengende (se Word.Document.8).
+    # Begrensning til 32 KB unngår falske treff fra innebygde objekter eller
+    # referanser som kan forekomme langt inn i filen (f.eks. "Excel.Sheet"
+    # i et Word-dokument med innebygd regneark).
     # Word-sjekk MÅ komme før PPT-sjekk; et Word-dokument med innebygd
     # PPT-objekt kan ha "Microsoft PowerPoint" tidlig i datastrømmen.
+    _scan = data[:32768]
     _WORD_U16 = b"W\x00o\x00r\x00d\x00D\x00o\x00c\x00u\x00m\x00e\x00n\x00t\x00"
-    if _WORD_U16 in data or b"Word.Document" in data:
+    if _WORD_U16 in _scan or b"Word.Document" in _scan:
         return "doc", "application/msword", is_encrypted
 
     _XLS_U16 = b"W\x00o\x00r\x00k\x00b\x00o\x00o\x00k\x00"
-    if _XLS_U16 in data or b"Excel.Sheet" in data:
+    if _XLS_U16 in _scan or b"Excel.Sheet" in _scan:
         return "xls", "application/vnd.ms-excel", is_encrypted
 
     _PPT_U16 = b"P\x00o\x00w\x00e\x00r\x00P\x00o\x00i\x00n\x00t\x00 \x00D\x00o\x00c\x00u\x00m\x00e\x00n\x00t\x00"
-    if _PPT_U16 in data or b"PowerPoint.Show" in data:
+    if _PPT_U16 in _scan or b"PowerPoint.Show" in _scan:
         return "ppt", "application/vnd.ms-powerpoint", is_encrypted
 
     # Fallback 2: subtype-markører kun i de første 4 KB
