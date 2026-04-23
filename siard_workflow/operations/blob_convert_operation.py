@@ -2391,6 +2391,14 @@ class BlobConvertOperation(BaseOperation):
                 ext  = "csv"
                 mime = "text/csv"
 
+            # Ikke nedgrader .txt til .bin: kildefilen er eksplisitt lagret som
+            # tekst, selv om byteinnholdet ikke er gyldig UTF-8 (kan skyldes
+            # legacy-encoding, partial korrupsjon, eller spesielt tekstformat).
+            # "bin" er catch-all for ukjent binærformat og er strengt dårligere.
+            if ext == "bin" and file_ext == "txt":
+                ext  = "txt"
+                mime = "text/plain"
+
             # Passordbeskyttede filer: ikke konverter — kopier med riktig endelse
             if is_encrypted:
                 to_rename_only.append((idx, zip_sti, ext, mime))
@@ -2985,7 +2993,7 @@ class BlobConvertOperation(BaseOperation):
                       + (f" ({lo_err[:80]})" if lo_err else ""), "warn")
                     # Loggfør til feilogg
                     if err_log:
-                        err_log.write(filename, ext, lo_err or "Ingen PDF produsert")
+                        err_log.write(zip_sti, ext, lo_err or "Ingen PDF produsert")
 
             if csv_log:
                 if file_ok and pdf_sti:
@@ -3229,9 +3237,6 @@ class BlobConvertOperation(BaseOperation):
                                 retry_root / "out", False, err)
                             w(f"    Nytt forsøk feilet: {fname} "
                               f"— beholdes som .{ext}", "warn")
-                            if err_log:
-                                err_log.write(fname, ext,
-                                              f"Retry feilet: {err}")
 
                     # Filer som ikke kom med i input_map (kopi feilet)
                     for zip_sti, (ext, mime) in expected.items():
@@ -3242,7 +3247,7 @@ class BlobConvertOperation(BaseOperation):
                                 stats["failed"] += 1
                             w(f"    Nytt forsøk kopi-feil: {fname}", "warn")
                             if err_log:
-                                err_log.write(fname, ext, "Retry kopi-feil")
+                                err_log.write(zip_sti, ext, "Retry kopi-feil")
 
                     shutil.rmtree(retry_root, ignore_errors=True)
                 finally:
@@ -3380,7 +3385,7 @@ class BlobConvertOperation(BaseOperation):
                         n_fail_ref[0] += 1
                     w(f"  Oppgradering feilet: {blob_path.name} — beholder .{src_ext}", "warn")
                     if err_log:
-                        err_log.write(blob_path.name, src_ext,
+                        err_log.write(zip_sti, src_ext,
                                       f"Oppgradering {src_ext}→{target_ext} feilet")
                     if csv_log:
                         new_name = f"{stem_base}.{src_ext}"
