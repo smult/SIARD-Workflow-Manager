@@ -11,6 +11,14 @@ import customtkinter as ctk
 from gui.styles import COLORS, FONTS, cat_color
 
 
+_STATUS_CFG = {
+    "completed": ("✓", "#3a9a5c"),
+    "failed":    ("✗", COLORS["red"]),
+    "skipped":   ("–", COLORS["muted"]),
+    "pending":   ("",  COLORS["muted"]),
+}
+
+
 class OperationRow(ctk.CTkFrame):
 
     def __init__(self, parent, op, index: int,
@@ -64,6 +72,14 @@ class OperationRow(ctk.CTkFrame):
         btns = ctk.CTkFrame(self, fg_color="transparent", height=1)
         btns.grid(row=0, column=2, padx=(0, 4), pady=2)
         btns.grid_propagate(True)
+
+        # Statusikon (prosjektfil-checkpoint): ✓ / ✗ / –
+        self._status_lbl = ctk.CTkLabel(
+            btns, text="", width=16,
+            font=ctk.CTkFont(family=FONTS["mono"], size=11, weight="bold"),
+            text_color=COLORS["muted"])
+        self._status_lbl.pack(side="left", padx=(0, 4))
+
         btn_cfg = dict(width=20, height=20, corner_radius=4,
                        fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
                        font=ctk.CTkFont(size=10))
@@ -124,15 +140,26 @@ class OperationRow(ctk.CTkFrame):
     def set_index(self, i: int):
         self.idx_label.configure(text=f"{i}.")
 
+    def set_status(self, status: str) -> None:
+        """Vis checkpoint-status ved siden av knappene (✓ / ✗ / –)."""
+        sym, color = _STATUS_CFG.get(status, ("", COLORS["muted"]))
+        self._status_lbl.configure(text=sym, text_color=color)
+
 
 class WorkflowPanel(ctk.CTkFrame):
     def __init__(self, parent, on_run, on_clear, on_save_profile,
-                 on_settings_saved=None):
+                 on_settings_saved=None,
+                 on_open_project:  Callable | None = None,
+                 on_save_project:  Callable | None = None,
+                 on_reset_project: Callable | None = None):
         super().__init__(parent, fg_color="transparent")
-        self._on_run           = on_run
-        self._on_clear         = on_clear
-        self._on_save_profile  = on_save_profile
+        self._on_run            = on_run
+        self._on_clear          = on_clear
+        self._on_save_profile   = on_save_profile
         self._on_settings_saved = on_settings_saved
+        self._on_open_project   = on_open_project
+        self._on_save_project   = on_save_project
+        self._on_reset_project  = on_reset_project
         self._rows: list[OperationRow] = []
         # Drag-reorder tilstand
         self._drag_row: OperationRow | None = None
@@ -171,12 +198,24 @@ class WorkflowPanel(ctk.CTkFrame):
         bottom.grid(row=2, column=0, sticky="ew")
         bottom.grid_columnconfigure(0, weight=1)
 
+        run_row = ctk.CTkFrame(bottom, fg_color="transparent")
+        run_row.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        run_row.grid_columnconfigure(0, weight=1)
+
         self.run_btn = ctk.CTkButton(
-            bottom, text="Kjør workflow",
+            run_row, text="Kjør workflow",
             fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"],
             font=ctk.CTkFont(family=FONTS["mono"], size=13, weight="bold"),
             height=38, command=self._on_run)
-        self.run_btn.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        self.run_btn.grid(row=0, column=0, sticky="ew")
+
+        self._reset_proj_btn = ctk.CTkButton(
+            run_row, text="↻", width=38, height=38, corner_radius=6,
+            fg_color=COLORS["btn"], hover_color="#3d2a0e",
+            text_color="#e0a040",
+            font=ctk.CTkFont(size=18),
+            command=lambda: self._on_reset_project and self._on_reset_project())
+        self._reset_proj_btn.grid(row=0, column=1, padx=(6, 0))
 
         sub = ctk.CTkFrame(bottom, fg_color="transparent")
         sub.grid(row=1, column=0, sticky="ew")
@@ -190,6 +229,28 @@ class WorkflowPanel(ctk.CTkFrame):
                       fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
                       font=ctk.CTkFont(family=FONTS["mono"], size=11),
                       command=self._prompt_save_profile).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+
+        proj = ctk.CTkFrame(bottom, fg_color="transparent")
+        proj.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+        proj.grid_columnconfigure(0, weight=1)
+        proj.grid_columnconfigure(1, weight=1)
+        btn_proj_cfg = dict(height=28, fg_color=COLORS["btn"],
+                            hover_color=COLORS["btn_hover"],
+                            font=ctk.CTkFont(family=FONTS["mono"], size=10))
+        ctk.CTkButton(proj, text="📂 Åpne prosjekt", **btn_proj_cfg,
+                      command=lambda: self._on_open_project and self._on_open_project()
+                      ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self._save_proj_btn = ctk.CTkButton(
+            proj, text="💾 Lagre prosjekt", **btn_proj_cfg,
+            command=lambda: self._on_save_project and self._on_save_project())
+        self._save_proj_btn.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+
+        # Prosjektfil-etikett
+        self._proj_lbl = ctk.CTkLabel(
+            bottom, text="",
+            font=ctk.CTkFont(family=FONTS["mono"], size=10),
+            text_color=COLORS["muted"], anchor="w")
+        self._proj_lbl.grid(row=3, column=0, sticky="ew", pady=(2, 0))
 
     def set_file(self, path: Path):
         short = path.name if len(path.name) < 35 else "..." + path.name[-32:]
@@ -251,6 +312,20 @@ class WorkflowPanel(ctk.CTkFrame):
             row.destroy()
         self._rows.clear()
         self.empty_lbl.grid(row=0, column=0, pady=40)
+
+    def set_step_status(self, idx: int, status: str) -> None:
+        """Sett checkpoint-statusikon (✓/✗/–) for steg idx."""
+        if 0 <= idx < len(self._rows):
+            self._rows[idx].set_status(status)
+
+    def clear_statuses(self) -> None:
+        """Fjern alle checkpoint-statusikoner."""
+        for row in self._rows:
+            row.set_status("pending")
+
+    def set_project_label(self, text: str) -> None:
+        """Vis prosjektfilnavn under prosjektknappene."""
+        self._proj_lbl.configure(text=text)
 
     def set_running(self, running: bool):
         self.run_btn.configure(

@@ -164,6 +164,9 @@ class App(ctk.CTk):
         self._conv_ctx = None
         self._stop_event  = threading.Event()
         self._pause_event = threading.Event()
+        # Prosjektfil-tilstand
+        self._project_file: "ProjectFile | None" = None   # type: ignore[name-defined]
+        self._project_path: Path | None = None
         self._spinner_chars = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
         self._spinner_idx   = 0
 
@@ -204,6 +207,9 @@ class App(ctk.CTk):
             on_clear=self._clear_workflow,
             on_save_profile=self._save_profile,
             on_settings_saved=self._on_settings_saved,
+            on_open_project=self._open_project,
+            on_save_project=self._save_project,
+            on_reset_project=self._reset_project,
         )
         self.workflow_panel.grid(row=1, column=0, padx=10, pady=(0,6), sticky="nsew")
 
@@ -566,6 +572,7 @@ class App(ctk.CTk):
         else:
             self.siard_path = None
             self._update_status_right("")
+            self._clear_project_state()
 
     def _queue_render(self):
         """Tegn kø-listen på nytt."""
@@ -622,6 +629,85 @@ class App(ctk.CTk):
         if self._global_temp_dir is None:
             self._auto_select_temp(path)
         self.workflow_panel.set_file(path)
+        self._sync_project_to_siard(path)
+
+    def _sync_project_to_siard(self, path: Path) -> None:
+        """Synkroniser prosjektfil-tilstand med ny aktiv SIARD.
+
+        Allerede riktig prosjekt: ingen endring.
+        Matchende .siardwf ved siden av ny fil: auto-last.
+        Ingen match: tøm prosjektstatus.
+        """
+        # Allerede riktig prosjekt?
+        if (self._project_file
+                and Path(self._project_file.source_siard) == path):
+            return
+
+        # Finnes det en .siardwf med samme navn ved siden av SIARD-filen?
+        auto_path = path.with_suffix(".siardwf")
+        if auto_path.exists():
+            try:
+                from siard_workflow.core.project_file import ProjectFile
+                pf = ProjectFile.load(auto_path)
+                if Path(pf.source_siard) == path:
+                    self._project_file = pf
+                    self._project_path = auto_path
+                    self.workflow_panel.set_project_label(
+                        f"Prosjekt: {auto_path.name}")
+                    # Oppdater statusikoner for eksisterende operasjoner
+                    for i, op in enumerate(
+                            self.workflow_panel.get_operations()):
+                        status = pf.get_status(op.operation_id)
+                        if status != "pending":
+                            self.workflow_panel.set_step_status(i, status)
+                    self._log(
+                        f"Prosjektfil lastet: {auto_path.name}  "
+                        f"({pf.completed_count}/{len(pf.operations)} steg fullført)",
+                        "info")
+                    return
+            except Exception:
+                pass
+
+        # Ingen matchende prosjektfil — tøm prosjektstatus
+        self._clear_project_state()
+
+    def _reset_project(self) -> None:
+        """Nullstill alle operasjoner i prosjektfilen til 'pending' og start på nytt."""
+        from tkinter import messagebox
+        if self._project_file is None:
+            messagebox.showinfo(
+                "Ingen prosjektfil",
+                "Ingen prosjektfil er lastet. Kjør workflowen for å opprette en.")
+            return
+        svar = messagebox.askyesno(
+            "Start fra steg 1",
+            f"Nullstill alle steg i '{self._project_path.name}' og "
+            f"start workflowen helt fra begynnelsen?\n\n"
+            f"Alle registrerte resultater vil bli fjernet fra prosjektfilen, "
+            f"men output-filer på disk beholdes.")
+        if not svar:
+            return
+        for cp in self._project_file.operations:
+            cp.status       = "pending"
+            cp.output_siard = None
+            cp.completed_at = None
+            cp.error_msg    = None
+            cp.ctx_data     = {}
+        try:
+            self._project_file.save(self._project_path)
+        except Exception as exc:
+            messagebox.showerror("Lagringsfeil", str(exc))
+            return
+        self.workflow_panel.clear_statuses()
+        self._log(f"Prosjekt nullstilt: {self._project_path.name} — alle steg kjøres på nytt", "info")
+
+    def _clear_project_state(self) -> None:
+        """Tøm lastet prosjektfil og nullstill statusikoner."""
+        if self._project_file is not None or self._project_path is not None:
+            self._project_file = None
+            self._project_path = None
+            self.workflow_panel.set_project_label("")
+            self.workflow_panel.clear_statuses()
 
     # ─── Gammel _browse_file beholdt for bakoverkompatibilitet ────────────────
     def _browse_file(self):
@@ -797,6 +883,108 @@ class App(ctk.CTk):
             self._log(f"Workflow importert: {Path(sp).name}  ({len(wf)} operasjoner)", "success")
         except Exception as e:
             messagebox.showerror("Importfeil", str(e))
+
+    # ─── Prosjektfil ──────────────────────────────────────────────────────────
+
+    def _save_project(self):
+        from tkinter import filedialog, messagebox
+        from siard_workflow.core.project_file import ProjectFile
+        ops = list(self.workflow_panel.get_operations())
+        if not ops:
+            messagebox.showinfo("Tom workflow", "Legg til operasjoner først.")
+            return
+        src = self.siard_path or (self.siard_queue[0] if self.siard_queue else None)
+        if not src:
+            messagebox.showinfo("Ingen fil", "Legg til en SIARD-fil i køen først.")
+            return
+        # Bruk eksisterende prosjektfil som utgangspunkt hvis den finnes,
+        # ellers lag ny fra gjeldende operasjoner
+        if self._project_file is None:
+            pf = ProjectFile.from_ops(src, ops)
+        else:
+            pf = self._project_file
+            pf.source_siard = str(src)
+        idir = str(self._project_path.parent) if self._project_path else str(src.parent)
+        ifile = (self._project_path.name
+                 if self._project_path
+                 else src.stem + ".siardwf")
+        sp = filedialog.asksaveasfilename(
+            title="Lagre prosjektfil",
+            initialdir=idir,
+            initialfile=ifile,
+            defaultextension=".siardwf",
+            filetypes=[("SIARD Workflow prosjekt", "*.siardwf"), ("Alle", "*.*")])
+        if not sp:
+            return
+        try:
+            pf.save(Path(sp))
+            self._project_file = pf
+            self._project_path = Path(sp)
+            self.workflow_panel.set_project_label(f"Prosjekt: {Path(sp).name}")
+            self._log(f"Prosjektfil lagret: {sp}", "success")
+        except Exception as exc:
+            messagebox.showerror("Lagringsfeil", str(exc))
+
+    def _open_project(self):
+        from tkinter import filedialog, messagebox
+        from siard_workflow.core.project_file import ProjectFile
+        from gui.operations_panel import OP_DEFS
+        sp = filedialog.askopenfilename(
+            title="Åpne prosjektfil",
+            filetypes=[("SIARD Workflow prosjekt", "*.siardwf"), ("Alle", "*.*")])
+        if not sp:
+            return
+        try:
+            pf = ProjectFile.load(Path(sp))
+        except Exception as exc:
+            messagebox.showerror("Åpningsfeil", f"Kunne ikke lese prosjektfil:\n{exc}")
+            return
+
+        # ── Gjenoppbygg workflow-panel fra prosjektfil ────────────────────────
+        self.workflow_panel.clear()
+        missing = []
+        for cp in pf.operations:
+            op_def = next((d for d in OP_DEFS
+                           if d["cls"].operation_id == cp.operation_id), None)
+            if op_def is None:
+                missing.append(cp.operation_id)
+                continue
+            op = op_def["cls"](**cp.params)
+            self.workflow_panel.add_operation(op)
+
+        if missing:
+            messagebox.showwarning(
+                "Ukjente operasjoner",
+                "Følgende operasjoner i prosjektfilen ble ikke gjenkjent og hoppet over:\n"
+                + "\n".join(f"  • {m}" for m in missing))
+
+        # ── Sett statusikoner for fullførte steg ──────────────────────────────
+        ops_in_panel = list(self.workflow_panel.get_operations())
+        loaded_ids = [op.operation_id for op in ops_in_panel]
+        for i, op_id in enumerate(loaded_ids):
+            status = pf.get_status(op_id)
+            if status != "pending":
+                self.workflow_panel.set_step_status(i, status)
+
+        # ── Legg til kilde-SIARD i køen ───────────────────────────────────────
+        src = Path(pf.source_siard) if pf.source_siard else None
+        if src and src.exists():
+            if src not in self.siard_queue:
+                self._queue_push(src)
+            self._set_active_file(src)
+        elif src:
+            messagebox.showwarning(
+                "Kildefil mangler",
+                f"Kilde-SIARD fra prosjektfilen finnes ikke:\n{src}\n\n"
+                "Legg til riktig SIARD-fil i køen manuelt.")
+
+        self._project_file = pf
+        self._project_path = Path(sp)
+        self.workflow_panel.set_project_label(f"Prosjekt: {Path(sp).name}")
+
+        done = pf.completed_count
+        total = len(pf.operations)
+        self._log(f"Prosjekt åpnet: {Path(sp).name}  ({done}/{total} steg fullført)", "success")
 
     # ─── Rapport ──────────────────────────────────────────────────────────────
 
@@ -1154,14 +1342,18 @@ class App(ctk.CTk):
         # Kjør alle filer i køen sekvensielt i én bakgrunnstråd
         filer = list(self.siard_queue)
         thread = threading.Thread(
-            target=self._run_queue_thread, args=(filer, ops), daemon=True)
+            target=self._run_queue_thread,
+            args=(filer, ops, self._project_file, self._project_path),
+            daemon=True)
         thread.start()
 
-    def _run_queue_thread(self, filer: list, ops: list):
+    def _run_queue_thread(self, filer: list, ops: list,
+                          pf_arg=None, pf_path_arg=None):
         """Kjør workflow sekvensielt på alle filer i køen."""
         import time
         from siard_workflow.core.context import WorkflowContext
         from siard_workflow.core.workflow import WorkflowRun
+        from siard_workflow.core.project_file import ProjectFile
 
         for q_idx, path in enumerate(filer):
             if self._stop_event.is_set():
@@ -1172,6 +1364,55 @@ class App(ctk.CTk):
             wf = Workflow(name=path.stem)
             for op in ops:
                 wf.add(op)
+
+            # ── Prosjektfil-checkpoint ─────────────────────────────────────────
+            # Bruk lastet prosjektfil hvis den gjelder denne kildefilen,
+            # ellers auto-lag checkpoint ved siden av SIARD-filen.
+            _pf: ProjectFile | None = None
+            _pf_path: Path | None   = None
+            if pf_arg and Path(pf_arg.source_siard) == path:
+                _pf      = pf_arg
+                _pf_path = pf_path_arg
+            else:
+                _pf_path = path.with_suffix(".siardwf")
+                _pf      = ProjectFile.from_ops(path, list(wf))
+                try:
+                    _pf.save(_pf_path)
+                    self._log_queue.put(("project_checkpoint_path", str(_pf_path)))
+                except Exception:
+                    _pf = _pf_path = None   # checkpoint mislyktes — fortsett uten
+
+            # ── Temp-mappe-sjekk ──────────────────────────────────────────────
+            # I pipeline-modus: hvis unpack_siard er ferdig men temp-mappen er
+            # borte, nullstill alle temp-avhengige operasjoner til "pending" og
+            # vis advarsel. Operasjoner som ikke bruker temp-mappen (sha256,
+            # xml_validation m.fl.) beholdes som fullført og hoppes over.
+            if _pf:
+                _unpack_cp = _pf._find("unpack_siard")
+                if _unpack_cp and _unpack_cp.status == "completed":
+                    _ext_str = (_unpack_cp.ctx_data or {}).get("extracted_path", "")
+                    _ext_dir = Path(_ext_str) if _ext_str else None
+                    if not _ext_dir or not _ext_dir.is_dir():
+                        _op_map = {op.operation_id: op for op in wf}
+                        _needs_rerun: list[str] = []
+                        for _cp in _pf.operations:
+                            if _cp.status != "completed":
+                                continue
+                            _op = _op_map.get(_cp.operation_id)
+                            _temp_dep = (
+                                _cp.operation_id in ("unpack_siard", "repack_siard")
+                                or (_op is not None
+                                    and getattr(_op, "requires_unpack", False))
+                            )
+                            if _temp_dep:
+                                _cp.status = "pending"
+                                _needs_rerun.append(_cp.label)
+                        if _needs_rerun:
+                            try:
+                                _pf.save(_pf_path)
+                            except Exception:
+                                pass
+                            self._log_queue.put(("project_temp_lost", _needs_rerun))
 
             ctx = WorkflowContext(siard_path=path)
             run = WorkflowRun(path)
@@ -1211,11 +1452,71 @@ class App(ctk.CTk):
                 self._log_queue.put(("step_start", i, op.label))
                 if file_logger:
                     file_logger.log(f"[{i+1}] {op.label}", "step")
+
+                # ── Prosjektfil: hopp over fullførte steg ─────────────────────
+                if _pf and _pf.is_completed(op.operation_id):
+                    _cp       = _pf._find(op.operation_id)
+                    saved_ctx = _cp.ctx_data if _cp else {}
+                    saved_out = _pf.get_output_siard(op.operation_id)
+
+                    # unpack_siard: temp-mappen MÅ fortsatt eksistere for at
+                    # blob_convert (pipeline-modus) og repack_siard skal fungere
+                    if op.operation_id == "unpack_siard":
+                        ext_str  = saved_ctx.get("extracted_path", "")
+                        ext_dir  = Path(ext_str) if ext_str else None
+                        if not ext_dir or not ext_dir.is_dir():
+                            self._log_queue.put((
+                                "log",
+                                "  Temp-mappe fra forrige kjøring er borte — "
+                                "kjører 'Pakk ut SIARD' på nytt",
+                                "warn"))
+                            # Fall gjennom til normal kjøring
+                        else:
+                            ctx.extracted_path = ext_dir
+                            ctx.set_result(op.operation_id, saved_ctx)
+                            out_name = ext_dir.name
+                            self._log_queue.put(("project_skip", i, op.label, out_name))
+                            run.skipped.append(op.operation_id)
+                            if file_logger:
+                                file_logger.log("  Hoppet over (allerede fullført)", "muted")
+                            ctx.metadata["step_results"].append({
+                                "id":       op.operation_id,
+                                "label":    op.label,
+                                "category": getattr(op, "category", ""),
+                                "success":  True,
+                                "message":  "Allerede fullført — hoppet over",
+                                "skipped":  True,
+                                "elapsed":  0.0,
+                            })
+                            continue
+                    elif not op.produces_siard or (saved_out and saved_out.exists()):
+                        if saved_out and saved_out.exists():
+                            ctx.siard_path = saved_out
+                        if saved_ctx:
+                            ctx.set_result(op.operation_id, saved_ctx)
+                        out_name = saved_out.name if saved_out else ""
+                        self._log_queue.put(("project_skip", i, op.label, out_name))
+                        run.skipped.append(op.operation_id)
+                        if file_logger:
+                            file_logger.log("  Hoppet over (allerede fullført)", "muted")
+                        ctx.metadata["step_results"].append({
+                            "id":       op.operation_id,
+                            "label":    op.label,
+                            "category": getattr(op, "category", ""),
+                            "success":  True,
+                            "message":  "Allerede fullført — hoppet over",
+                            "skipped":  True,
+                            "elapsed":  0.0,
+                        })
+                        continue
+
                 if not op.should_run(ctx):
                     self._log_queue.put(("skip", op.operation_id, op.label))
                     run.skipped.append(op.operation_id)
                     if file_logger:
                         file_logger.log("  Hoppet over (vilkår ikke oppfylt)", "muted")
+                    if _pf:
+                        _pf.mark_skipped(op.operation_id)
                     ctx.metadata["step_results"].append({
                         "id":       op.operation_id,
                         "label":    op.label,
@@ -1226,6 +1527,7 @@ class App(ctk.CTk):
                         "elapsed":  0.0,
                     })
                     continue
+
                 t0 = time.time()
                 try:
                     result = op.run(ctx)
@@ -1252,6 +1554,35 @@ class App(ctk.CTk):
                     "skipped":  False,
                     "elapsed":  elapsed,
                 })
+
+                # ── Prosjektfil: lagre status etter steget ────────────────────
+                if _pf and _pf_path:
+                    try:
+                        if result.success:
+                            out_p = result.data.get("output_path")
+                            # Lagre relevant ctx_data: Path-verdier som str,
+                            # skalarer og lister (f.eks. original_namelist for unpack)
+                            _ctx_data = {}
+                            for k, v in result.data.items():
+                                if k == "output_path":
+                                    continue
+                                if isinstance(v, Path):
+                                    _ctx_data[k] = str(v)
+                                elif isinstance(v, (str, int, float, bool)) or v is None:
+                                    _ctx_data[k] = v
+                                elif isinstance(v, list):
+                                    _ctx_data[k] = v
+                            _pf.mark_completed(op.operation_id,
+                                               Path(out_p) if out_p else None,
+                                               ctx_data=_ctx_data)
+                        else:
+                            _pf.mark_failed(op.operation_id, result.message)
+                        _pf.save(_pf_path)
+                        self._log_queue.put(("project_step_saved", i,
+                                             "completed" if result.success else "failed"))
+                    except Exception:
+                        pass
+
                 # Stopp workflowen umiddelbart ved kritisk feil
                 if not result.success and getattr(op, "halt_on_failure", False):
                     self._log_queue.put((
@@ -1289,6 +1620,38 @@ class App(ctk.CTk):
                     self.workflow_panel.highlight_step(idx)
                     self.progress_panel.show_simple(label)
                     needs_redraw = True
+                elif kind == "project_skip":
+                    _, idx, label, out_name = item
+                    suffix = f" → {out_name}" if out_name else ""
+                    self._log(f"      [✓] Allerede fullført — hoppet over{suffix}", "success")
+                    self.workflow_panel.set_step_status(idx, "completed")
+                    self.progress_panel.reset()
+                    needs_redraw = True
+                elif kind == "project_step_saved":
+                    _, idx, status = item
+                    self.workflow_panel.set_step_status(idx, status)
+                    needs_redraw = True
+                elif kind == "project_temp_lost":
+                    _, rerun_labels = item
+                    from tkinter import messagebox
+                    ops_str = "\n".join(f"  • {n}" for n in rerun_labels)
+                    self._log("!" * 56, "error")
+                    self._log("  ADVARSEL: Temp-mappe fra forrige kjøring er borte", "error")
+                    self._log("  Følgende steg kjøres på nytt:", "warn")
+                    for lbl in rerun_labels:
+                        self._log(f"    • {lbl}", "warn")
+                    self._log("  Øvrige steg (SHA-256, XML-validering m.m.) hoppes over.", "info")
+                    self._log("!" * 56, "error")
+                    messagebox.showwarning(
+                        "Temp-mappe borte — delvis gjenopptakelse",
+                        "Temp-mappen fra forrige kjøring finnes ikke lenger.\n\n"
+                        f"Følgende steg må kjøres på nytt:\n{ops_str}\n\n"
+                        "Steg uten temp-avhengighet (SHA-256, XML-validering o.l.) "
+                        "hoppes fortsatt over.")
+                    needs_redraw = True
+                elif kind == "project_checkpoint_path":
+                    _, cp_path = item
+                    self._log(f"  Checkpoint: {cp_path}", "muted")
                 elif kind == "skip":
                     _, op_id, label = item
                     self._log(f"      [-] Hoppet over", "muted")
