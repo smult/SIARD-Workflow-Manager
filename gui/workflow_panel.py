@@ -32,30 +32,30 @@ class OperationRow(ctk.CTkFrame):
         color = cat_color(op.category)
 
         # Fargebar til venstre
-        ctk.CTkFrame(self, width=4, corner_radius=2,
-                     fg_color=color, height=1).grid(
-            row=0, column=0, padx=(4, 0), pady=2, sticky="ns")
+        self._color_bar = ctk.CTkFrame(self, width=4, corner_radius=2,
+                                        fg_color=color, height=1)
+        self._color_bar.grid(row=0, column=0, padx=(4, 0), pady=2, sticky="ns")
 
         # Info: indeks + navn + kategori på én linje
-        info = ctk.CTkFrame(self, fg_color="transparent", height=1)
-        info.grid(row=0, column=1, padx=(4, 2), pady=2, sticky="ew")
-        info.grid_propagate(True)
-        info.grid_columnconfigure(2, weight=1)
+        self._info = ctk.CTkFrame(self, fg_color="transparent", height=1)
+        self._info.grid(row=0, column=1, padx=(4, 2), pady=2, sticky="ew")
+        self._info.grid_propagate(True)
+        self._info.grid_columnconfigure(2, weight=1)
 
         self.idx_label = ctk.CTkLabel(
-            info, text=f"{index}.",
+            self._info, text=f"{index}.",
             font=ctk.CTkFont(family=FONTS["mono"], size=10),
             text_color=COLORS["muted"], width=18, anchor="e")
         self.idx_label.grid(row=0, column=0, sticky="w")
 
         ctk.CTkLabel(
-            info, text=op.label,
+            self._info, text=op.label,
             font=ctk.CTkFont(family=FONTS["mono"], size=11, weight="bold"),
             text_color=COLORS["text"], anchor="w").grid(
                 row=0, column=1, sticky="w", padx=(4, 6))
 
         ctk.CTkLabel(
-            info, text=op.category,
+            self._info, text=op.category,
             font=ctk.CTkFont(family=FONTS["mono"], size=11),
             text_color=color, anchor="w").grid(
                 row=0, column=2, sticky="w")
@@ -134,6 +134,11 @@ class WorkflowPanel(ctk.CTkFrame):
         self._on_save_profile  = on_save_profile
         self._on_settings_saved = on_settings_saved
         self._rows: list[OperationRow] = []
+        # Drag-reorder tilstand
+        self._drag_row: OperationRow | None = None
+        self._drag_start_y: int = 0
+        self._drag_active: bool = False
+        self._drag_target: OperationRow | None = None
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
         self._build()
@@ -200,6 +205,7 @@ class WorkflowPanel(ctk.CTkFrame):
                            on_configure=self._configure_row)
         row.grid(row=len(self._rows), column=0, sticky="ew", pady=3, padx=2)
         self._rows.append(row)
+        self._bind_drag(row)
 
     def _configure_row(self, row: OperationRow):
         """Åpne konfigurasjonsvindu for en eksisterende operasjon."""
@@ -280,6 +286,71 @@ class WorkflowPanel(ctk.CTkFrame):
             return
         self._rows[i], self._rows[i + 1] = self._rows[i + 1], self._rows[i]
         self._reindex()
+
+    # ─── Drag-and-drop reordering ────────────────────────────────────────────
+
+    def _bind_drag(self, row: OperationRow):
+        """Bind drag-reorder-events til rad og dens draggbare deler (ikke knapper)."""
+        targets = [row, row._color_bar, row._info]
+        for child in row._info.winfo_children():
+            targets.append(child)
+        for w in targets:
+            w.bind("<ButtonPress-1>",   lambda e, r=row: self._drag_press(e, r),   add="+")
+            w.bind("<B1-Motion>",       lambda e, r=row: self._drag_motion(e, r),  add="+")
+            w.bind("<ButtonRelease-1>", lambda e, r=row: self._drag_release(e, r), add="+")
+
+    def _drag_press(self, event, row: OperationRow):
+        self._drag_row = row
+        self._drag_start_y = event.y_root
+        self._drag_active = False
+
+    def _drag_motion(self, event, row: OperationRow):
+        if self._drag_row is not row:
+            return
+        if not self._drag_active:
+            if abs(event.y_root - self._drag_start_y) < 6:
+                return
+            self._drag_active = True
+            row.configure(border_color=COLORS["accent"], border_width=2)
+            self.scroll.configure(cursor="hand2")
+        target = self._find_drop_target(event.y_root)
+        if target is row:
+            target = None
+        if target is not self._drag_target:
+            if self._drag_target is not None:
+                self._drag_target.configure(border_color=COLORS["border"], border_width=1)
+            self._drag_target = target
+            if target is not None:
+                target.configure(border_color=COLORS["green"], border_width=2)
+
+    def _drag_release(self, event, row: OperationRow):
+        if self._drag_row is None:
+            return
+        if self._drag_active and self._drag_target is not None:
+            i_src = self._rows.index(row)
+            i_tgt = self._rows.index(self._drag_target)
+            self._rows.pop(i_src)
+            self._rows.insert(i_tgt, row)
+            self._reindex()
+        row.configure(border_color=COLORS["border"], border_width=1)
+        if self._drag_target is not None and self._drag_target in self._rows:
+            self._drag_target.configure(border_color=COLORS["border"], border_width=1)
+        self.scroll.configure(cursor="")
+        self._drag_row = None
+        self._drag_active = False
+        self._drag_target = None
+
+    def _find_drop_target(self, y_root: int) -> OperationRow | None:
+        """Finn hvilken rad musemarkøren er over."""
+        for row in self._rows:
+            try:
+                ry = row.winfo_rooty()
+                rh = row.winfo_height()
+                if ry <= y_root <= ry + rh:
+                    return row
+            except Exception:
+                pass
+        return None
 
     def _prompt_save_profile(self):
         dialog = ctk.CTkInputDialog(text="Gi profilen et navn:", title="Lagre profil")

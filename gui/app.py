@@ -10,6 +10,12 @@ from pathlib import Path
 
 import customtkinter as ctk
 
+try:
+    from tkinterdnd2 import TkinterDnD as _TkinterDnD
+    _HAS_TKDND = True
+except ImportError:
+    _HAS_TKDND = False
+
 from gui.workflow_panel import WorkflowPanel
 from gui.operations_panel import OperationsPanel, set_current_siard_path
 from gui.log_panel import LogPanel
@@ -132,6 +138,12 @@ class App(ctk.CTk):
 
     def __init__(self):
         super().__init__()
+        # Initialiser tkinterdnd2 DnD-støtte på root-vinduet
+        if _HAS_TKDND:
+            try:
+                _TkinterDnD._require(self)
+            except Exception:
+                pass
         self.title(f"{self.TITLE}  v{self.VERSION}")
         self.geometry("1200x780")
         self.minsize(self.MIN_W, self.MIN_H)
@@ -282,9 +294,11 @@ class App(ctk.CTk):
 
     def _build_queue_panel(self, parent):
         """Drag-drop + kø-liste over SIARD-filer øverst i venstre kolonne."""
-        frm = ctk.CTkFrame(parent, fg_color=COLORS["bg"], corner_radius=8)
+        frm = ctk.CTkFrame(parent, fg_color=COLORS["bg"], corner_radius=8,
+                            border_width=1, border_color=COLORS["border"])
         frm.grid(row=0, column=0, padx=10, pady=(10, 4), sticky="ew")
         frm.grid_columnconfigure(0, weight=1)
+        self._queue_panel_frm = frm
 
         # Tittel
         ctk.CTkLabel(frm, text="SIARD-KØ",
@@ -321,15 +335,23 @@ class App(ctk.CTk):
             text_color=COLORS["muted"])
         self._queue_lbl_none.grid(row=0, column=0, pady=4)
 
+        # Utvid DnD til hele kø-panelet
+        if self._dnd_active:
+            self._extend_dnd_to_queue()
+        else:
+            # Fallback: klikk på kø-rammen åpner filvelger
+            self._queue_frame.bind("<Button-1>", lambda e: self._queue_add_file())
+
     def _setup_dnd(self):
         """Sett opp drag-and-drop. Prøver tkinterdnd2, deretter klikk-fallback."""
         # Metode 1: tkinterdnd2
         try:
             self._drop_zone.drop_target_register("DND_Files")   # type: ignore
             self._drop_zone.dnd_bind("<<Drop>>", self._on_dnd_drop)  # type: ignore
-            self._drop_zone.dnd_bind("<<DragEnter>>", self._on_dnd_enter)  # type: ignore
-            self._drop_zone.dnd_bind("<<DragLeave>>", self._on_dnd_leave)  # type: ignore
+            self._drop_zone.dnd_bind("<<DropEnter>>", self._on_dnd_enter)  # type: ignore
+            self._drop_zone.dnd_bind("<<DropLeave>>", self._on_dnd_leave)  # type: ignore
             self._dnd_active = True
+            self._setup_click_on_drop_zone()
             return
         except Exception:
             pass
@@ -342,27 +364,97 @@ class App(ctk.CTk):
             inner.drop_target_register("DND_Files")   # type: ignore
             inner.dnd_bind("<<Drop>>", self._on_dnd_drop)  # type: ignore
             self._dnd_active = True
+            self._setup_click_on_drop_zone()
             return
         except Exception:
             pass
 
-        # Fallback: klikk åpner filvelger
-        self._drop_zone.configure(text="Klikk for å legge til SIARD-filer")
+        # Fallback: kun klikk
+        self._setup_click_on_drop_zone()
+
+    def _setup_click_on_drop_zone(self):
+        """Klikk på drop-sonen åpner alltid filvelgeren — uavhengig av DnD-status."""
+        self._drop_zone.configure(
+            text="Dra og slipp eller klikk for å legge til SIARD-filer",
+            cursor="hand2")
         self._drop_zone.bind("<Button-1>", lambda e: self._queue_add_file())
         self._drop_zone.bind("<Enter>",
             lambda e: self._drop_zone.configure(text_color=COLORS["accent"]))
         self._drop_zone.bind("<Leave>",
             lambda e: self._drop_zone.configure(text_color=COLORS["muted"]))
 
+    def _extend_dnd_to_queue(self):
+        """Registrer hele kø-panelet (liste-feltet) som ekstra drop-target."""
+        for widget in [self._queue_panel_frm, self._queue_frame]:
+            try:
+                widget.drop_target_register("DND_Files")   # type: ignore
+                widget.dnd_bind("<<Drop>>", self._on_dnd_drop)  # type: ignore
+                widget.dnd_bind("<<DropEnter>>", self._on_dnd_enter_queue)  # type: ignore
+                widget.dnd_bind("<<DropLeave>>", self._on_dnd_leave_queue)  # type: ignore
+            except Exception:
+                pass
+
+    @staticmethod
+    def _dnd_is_siard(event) -> bool:
+        """Returner True dersom drag-event inneholder .siard- eller .zip-fil."""
+        import re
+        raw = getattr(event, "data", "") or ""
+        paths = re.findall(r'\{([^}]+)\}|(\S+)', raw)
+        return any(
+            (g[0] or g[1]).strip().lower().endswith((".siard", ".zip"))
+            for g in paths
+        )
+
+    # Bakgrunnsfarger for kø-panelet under drag
+    _DND_BG_HOVER = "#0d1a2a"   # mørk blå — fil holdes over feltet
+    _DND_BG_OK    = "#0a2016"   # mørk grønn — .siard/.zip sluppet
+    _DND_BG_WARN  = "#22080a"   # mørk rød — ugyldig filtype sluppet
+    _DND_BG_NONE  = COLORS["bg"]
+
+    def _dnd_highlight(self):
+        """Visuell feedback mens fil holdes over kø-panelet.
+        event.data er alltid tom i <<DropEnter>>, så filtype kan ikke sjekkes her."""
+        self._drop_zone.configure(fg_color=COLORS["accent_dim"],
+                                   text_color=COLORS["accent"])
+        self._queue_panel_frm.configure(fg_color=self._DND_BG_HOVER,
+                                         border_color=COLORS["accent"], border_width=2)
+        try:
+            self._queue_frame.configure(fg_color=self._DND_BG_HOVER)
+        except Exception:
+            pass
+
+    def _dnd_flash(self, ok: bool):
+        """Kort grønn/rød-blink etter drop for å bekrefte om filen ble akseptert."""
+        bg   = self._DND_BG_OK   if ok else self._DND_BG_WARN
+        bord = COLORS["green"]   if ok else COLORS["red"]
+        self._queue_panel_frm.configure(fg_color=bg, border_color=bord, border_width=2)
+        try:
+            self._queue_frame.configure(fg_color=bg)
+        except Exception:
+            pass
+        self.after(500, self._dnd_reset)
+
+    def _dnd_reset(self):
+        """Tilbakestill all visuell DnD-feedback."""
+        self._drop_zone.configure(fg_color=COLORS["panel"], text_color=COLORS["muted"])
+        self._queue_panel_frm.configure(fg_color=self._DND_BG_NONE,
+                                         border_color=COLORS["border"], border_width=1)
+        try:
+            self._queue_frame.configure(fg_color="transparent")
+        except Exception:
+            pass
+
     def _on_dnd_enter(self, event):
-        self._drop_zone.configure(
-            fg_color=COLORS["accent_dim"] if "accent_dim" in COLORS else COLORS["btn"],
-            text_color=COLORS["accent"])
+        self._dnd_highlight()
 
     def _on_dnd_leave(self, event):
-        self._drop_zone.configure(
-            fg_color=COLORS["panel"],
-            text_color=COLORS["muted"])
+        self._dnd_reset()
+
+    def _on_dnd_enter_queue(self, event):
+        self._dnd_highlight()
+
+    def _on_dnd_leave_queue(self, event):
+        self._dnd_reset()
 
     def _browse_temp(self):
         """Manuell override av global temp-mappe."""
@@ -437,20 +529,21 @@ class App(ctk.CTk):
 
     def _on_dnd_drop(self, event):
         """Håndter drag-and-drop fra tkinterdnd2."""
-        self._on_dnd_leave(event)  # nullstill farge
         raw = event.data
         import re
         # tkinterdnd2: {sti med mellomrom} eller sti\nsti
         paths = re.findall(r'\{([^}]+)\}|(\S+)', raw)
+        accepted = False
         for grp in paths:
             p = (grp[0] or grp[1]).strip()
             if p:
                 path = Path(p)
                 if path.suffix.lower() in (".siard", ".zip") and path.exists():
                     self._queue_push(path)
+                    accepted = True
                 elif path.exists():
-                    # Aksepter uansett filendelse hvis filen finnes
-                    self._queue_push(path)
+                    self._log(f"Ignorert: {path.name} (kun .siard/.zip aksepteres)", "warn")
+        self._dnd_flash(accepted)
 
     def _queue_push(self, path: Path):
         """Legg til én SIARD-fil i køen."""

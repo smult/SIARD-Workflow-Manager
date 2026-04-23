@@ -1287,8 +1287,8 @@ class CosDocMailMergeOperation(BaseOperation):
                 elif s.dec_path and s.dec_path.exists():
                     new_data = s.dec_path.read_bytes()
                     blob_src.write_bytes(new_data)
-                    action = "Avkryptert" if s.is_word else "Kopierer"
-                    w(f"    {action} (ikke konvertert): {s.blob['file']}", "info")
+                    if s.is_word:
+                        w(f"    Avkryptert (ikke konvertert): {s.blob['file']}", "info")
                     base["update"] = {"file": s.blob["file"], "length": len(new_data),
                                       "digest": _md5_upper(new_data),
                                       "new_filename": s.fname}
