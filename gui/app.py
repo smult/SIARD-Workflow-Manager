@@ -699,6 +699,20 @@ class App(ctk.CTk):
             messagebox.showerror("Lagringsfeil", str(exc))
             return
         self.workflow_panel.clear_statuses()
+        # Slett blob-resume-sjekkpunkt slik at neste kjøring starter fra steg 1
+        src = Path(self._project_file.source_siard) if self._project_file.source_siard else None
+        if src:
+            from siard_workflow.operations.blob_convert_operation import _resume_json_path
+            log_dir = src.parent
+            if self._auto_log_dir:
+                log_dir = self._auto_log_dir
+            rjp = _resume_json_path(log_dir, src.stem)
+            if rjp.exists():
+                try:
+                    rjp.unlink()
+                    self._log(f"  Blob-resume-sjekkpunkt slettet: {rjp.name}", "muted")
+                except Exception:
+                    pass
         self._log(f"Prosjekt nullstilt: {self._project_path.name} — alle steg kjøres på nytt", "info")
 
     def _clear_project_state(self) -> None:
@@ -1571,7 +1585,15 @@ class App(ctk.CTk):
                                 elif isinstance(v, (str, int, float, bool)) or v is None:
                                     _ctx_data[k] = v
                                 elif isinstance(v, list):
-                                    _ctx_data[k] = v
+                                    if k == "original_namelist":
+                                        # Behold kun katalogposter (slutter på '/') —
+                                        # det er alt repack_siard trenger, og listen
+                                        # kan ellers inneholde millioner av filnavn
+                                        _ctx_data[k] = [
+                                            e for e in v
+                                            if isinstance(e, str) and e.endswith("/")]
+                                    else:
+                                        _ctx_data[k] = v
                             _pf.mark_completed(op.operation_id,
                                                Path(out_p) if out_p else None,
                                                ctx_data=_ctx_data)

@@ -513,11 +513,12 @@ OP_DEFS = [
     # ── Systemspesifikke operasjoner ─────────────────────────────────────────
     {
         "cls": CosDocMailMergeOperation,
-        "label": "CosDoc: Lås opp og flett dokumenter",
+        "label": "Acos (CosDoc/Barnevern m.fl.): "
+        "Lås opp og flett dokumenter",
         "category": "Systemspesifikt",
         "desc": (
-            "CosDoc-spesifikk: Låser opp passordbeskyttede dokumenter i "
-            "Eef_ElFiler-tabellen og utfører mailmerge for dokumentpar "
+            "Acos (CosDoc/Barnevern m.fl.): Lås opp og flett passordbeskyttede dokumenter i "
+            "<prefix>_ElFiler-tabellen og utfører mailmerge for dokumentpar "
             "(SeqNr 1+2 med samme EveID). "
             "Passord utledes av filnavnet (R + omvendt filstamme). "
             "Krever: msoffcrypto-tool (pip) og docx-mailmerge2 (pip)."
@@ -525,7 +526,7 @@ OP_DEFS = [
         "status": CosDocMailMergeOperation.status,
         "params": [
             {"key": "output_suffix", "label": "Suffix ny SIARD-fil",      "type": "str",  "default": "_cosdoc"},
-            {"key": "table_name",    "label": "Tabellnavn (Eef_ElFiler)",  "type": "str",  "default": "Eef_ElFiler"},
+            {"key": "table_name",    "label": "Tabellnavn (tom = auto)",   "type": "str",  "default": ""},
             {"key": "lo_executable",  "label": "LibreOffice (soffice-sti)", "type": "str",  "default": ""},
             {"key": "lo_timeout",     "label": "LO timeout per fil (s)",    "type": "int",  "default": 120},
             {"key": "dry_run",        "label": "Tørkjøring (ikke skriv)",   "type": "bool", "default": False},

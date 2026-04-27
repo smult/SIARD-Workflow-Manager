@@ -1,6 +1,10 @@
 """
 siard_workflow/systemspecific_operations/cosdoc_operation.py
 
+*** Denne modulen er nå oppdatert for å støtte både CosDoc og andre Acos systemer 
+som for eksempel Acos Barnevern, og er ikke lenger avhengig av 
+CosDoc-spesifikke antagelser. ***
+
 CosDocMailMergeOperation — avkryptering og mailmerge for CosDoc SIARD-arkiver.
 
 CosDoc lagrer dokumenter i tabellen Eef_ElFiler:
@@ -119,7 +123,7 @@ def _find_table_info(metadata_bytes: bytes, table_name: str) -> dict | None:
     Finn tabell med gitt navn i metadata.xml.
 
     Returnerer dict med nøklene:
-      schema_folder, table_folder, col_map  ({col_name: col_index})
+      schema_folder, table_folder, table_name, col_map  ({col_name: col_index})
       lob_folders   ({col_index: lob_folder})  — kun for BLOB-kolonner
     Returnerer None hvis tabellen ikke finnes.
     """
@@ -153,10 +157,49 @@ def _find_table_info(metadata_bytes: bytes, table_name: str) -> dict | None:
                     return {
                         "schema_folder": schema_folder,
                         "table_folder":  table_folder,
+                        "table_name":    name,
                         "col_map":       col_map,
                         "lob_folders":   lob_folders,
                     }
     return None
+
+
+def _find_table_by_suffix(metadata_bytes: bytes, suffix: str) -> dict | None:
+    """
+    Finn første tabell hvis navn slutter på det gitte suffikset
+    (case-insensitivt).  Brukes til auto-deteksjon av ElFiler-tabellen
+    på tvers av systemer (CosDoc → Eef_ElFiler, Acos → NEF_ElFiler, ...).
+    """
+    try:
+        root = ET.fromstring(metadata_bytes)
+    except ET.ParseError:
+        return None
+    suffix_lc = suffix.lower()
+    for schemas_el in root.iter():
+        if _local(schemas_el.tag) != "schemas":
+            continue
+        for schema_el in _iter_children(schemas_el, "schema"):
+            for tables_el in _iter_children(schema_el, "tables"):
+                for table_el in _iter_children(tables_el, "table"):
+                    name = _child_text(table_el, "name")
+                    if not name.lower().endswith(suffix_lc):
+                        continue
+                    return _find_table_info(metadata_bytes, name)
+    return None
+
+
+def _col_by_suffix(col_map: dict[str, int], col_suffix: str) -> tuple[str, int] | tuple[None, None]:
+    """
+    Finn kolonne i col_map der kolonnens navn slutter på _<col_suffix>
+    (case-insensitivt).  Gjør oppslag uavhengig av system-prefiks
+    (Eef_, NEF_, ...).
+    Eks: _col_by_suffix(cm, "EefID") finner "Eef_EefID" eller "NEF_EefID".
+    """
+    target = ("_" + col_suffix).lower()
+    for name, idx in col_map.items():
+        if name.lower().endswith(target):
+            return name, idx
+    return None, None
 
 
 # ── Tabell-XML-parsing ────────────────────────────────────────────────────────
@@ -787,11 +830,13 @@ class CosDocMailMergeOperation(BaseOperation):
     """
 
     operation_id   = "cosdoc_mailmerge"
-    label          = "CosDoc: Lås opp og flett dokumenter"
+    label          = "Acos (CosDoc/Barnevern m.fl.): "
+    "Lås opp og flett dokumenter"
     description    = (
-        "CosDoc-spesifikk: Avkrypterer passordbeskyttede dokumenter i "
-        "Eef_ElFiler-tabellen og utfører mailmerge for dokumentpar "
-        "(Eef_SeqNr 1+2 med samme Eef_EveID). "
+        "Acos-spesifikk (Gjelder CosDoc/Barnevern m.fl.): "
+        "Avkrypterer passordbeskyttede dokumenter i "
+        "<prefix>_ElFiler-tabellen og utfører mailmerge for dokumentpar "
+        "(<prefix>_SeqNr 1+2 med samme <prefix>_EveID). "
         "Passord utledes av filnavnet (R + omvendt filstamme). "
         "Krever msoffcrypto-tool og docx-mailmerge2."
     )
@@ -802,7 +847,7 @@ class CosDocMailMergeOperation(BaseOperation):
     default_params: dict = {
         "dry_run":        False,
         "output_suffix":  "_cosdoc",
-        "table_name":     "Eef_ElFiler",
+        "table_name":     "",      # tom = auto-detect (suffix _elfiler); eksplisitt navn overstyrer
         "lo_executable":  "",      # soffice-sti — auto-detekteres hvis tom
         "lo_timeout":     120,     # sekunder per LO-konvertering
         "temp_dir":       "",      # temp-rotmappe
@@ -842,7 +887,7 @@ class CosDocMailMergeOperation(BaseOperation):
         # ── Parametere ────────────────────────────────────────────────────────
         dry_run    = bool(self.params["dry_run"])
         suffix     = str(self.params["output_suffix"] or "_cosdoc")
-        table_name = str(self.params["table_name"] or "Eef_ElFiler")
+        table_name = str(self.params.get("table_name") or "").strip()
         from settings import get_config as _get_cfg
         lo_hint       = str(self.params["lo_executable"] or _get_cfg("lo_executable", "") or "soffice")
         lo_timeout    = int(self.params["lo_timeout"] or 120)
@@ -926,18 +971,28 @@ class CosDocMailMergeOperation(BaseOperation):
                 progress("phase_done")
 
             # ── Fase 2 (pipeline) / Fase 3 (standalone): Analyser tabell ─────
-            phase(2 if pipeline_mode else 3, f"Analyserer {table_name}")
+            phase(2 if pipeline_mode else 3, "Analyserer metadata.xml")
 
             metadata_path = extract_dir / "header" / "metadata.xml"
             if not metadata_path.exists():
                 return self._fail(
                     "header/metadata.xml ikke funnet i utpakket arkiv.")
 
-            table_info = _find_table_info(metadata_path.read_bytes(), table_name)
-            if not table_info:
-                return self._fail(
-                    f"Tabell '{table_name}' ikke funnet i metadata.xml. "
-                    "Kontroller tabell-navn i operasjonsinnstillingene.")
+            meta_bytes = metadata_path.read_bytes()
+            if table_name:
+                table_info = _find_table_info(meta_bytes, table_name)
+                if not table_info:
+                    return self._fail(
+                        f"Tabell '{table_name}' ikke funnet i metadata.xml. "
+                        "Kontroller tabell-navn i operasjonsinnstillingene.")
+            else:
+                table_info = _find_table_by_suffix(meta_bytes, "_elfiler")
+                if not table_info:
+                    return self._fail(
+                        "Ingen tabell med navn som slutter på '_ElFiler' funnet i "
+                        "metadata.xml. Angi tabellnavnet eksplisitt i innstillingene.")
+                table_name = table_info["table_name"]
+                w(f"  Auto-detektert tabell: {table_name}", "info")
 
             sf   = table_info["schema_folder"]
             tf   = table_info["table_folder"]
@@ -947,20 +1002,28 @@ class CosDocMailMergeOperation(BaseOperation):
             w(f"  Tabell: {sf}/{tf}  ({len(cm)} kolonner, "
               f"{len(lobs)} BLOB-kolonner)", "info")
 
-            required = ("Eef_EefID", "Eef_EveID", "Eef_SeqNr",
-                        "Eef_FilNavn", "Eef_Size", "Eef_ElFil")
-            missing_cols = [c for c in required if c not in cm]
+            # Kolonneoppslag via suffiks — fungerer uansett system-prefiks
+            # (Eef_ for CosDoc, NEF_ for Acos Barnevern, osv.)
+            _REQUIRED_SUFFIXES = ("EefID", "EveID", "SeqNr", "FilNavn", "Size", "ElFil")
+            col_idx: dict[str, int] = {}
+            missing_cols = []
+            for suf in _REQUIRED_SUFFIXES:
+                _, idx = _col_by_suffix(cm, suf)
+                if idx is None:
+                    missing_cols.append(f"*_{suf}")
+                else:
+                    col_idx[suf] = idx
             if missing_cols:
                 return self._fail(
-                    f"Manglende kolonner i {table_name}: "
-                    + ", ".join(missing_cols))
+                    f"Manglende kolonner i {table_name} "
+                    f"(søkte etter suffiks): {', '.join(missing_cols)}")
 
-            eefid_col  = cm["Eef_EefID"]
-            eveid_col  = cm["Eef_EveID"]
-            seqnr_col  = cm["Eef_SeqNr"]
-            fname_col  = cm["Eef_FilNavn"]
-            size_col   = cm["Eef_Size"]
-            blob_col   = cm["Eef_ElFil"]
+            eefid_col  = col_idx["EefID"]
+            eveid_col  = col_idx["EveID"]
+            seqnr_col  = col_idx["SeqNr"]
+            fname_col  = col_idx["FilNavn"]
+            size_col   = col_idx["Size"]
+            blob_col   = col_idx["ElFil"]
             lob_folder = lobs.get(blob_col, f"{sf}/{tf}/lob{blob_col}")
 
             table_xml_path = extract_dir / "content" / sf / tf / f"{tf}.xml"

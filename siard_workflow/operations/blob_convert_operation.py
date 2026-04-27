@@ -28,9 +28,12 @@ Fremdrift via ctx.metadata["progress_cb"]:
 from __future__ import annotations
 
 import concurrent.futures
+import csv
+import datetime
 import hashlib
 import base64
 import io
+import json
 import os
 import re
 import shutil
@@ -901,23 +904,40 @@ def _patch_line_with_digest(
             if key in ren_bytes:
                 new_name = ren_bytes[key]
                 new_path = ren_paths[key]
-                # Erstatt filnavn
-                line = line[:start] + new_name + line[end:]
-                n   += 1
-                pos  = start + len(new_name) + 1
-                # Oppdater length og digest fra ny fil
-                try:
-                    data   = new_path.read_bytes()
-                    size   = str(len(data)).encode()
-                    digest = _hashlib.md5(data).hexdigest().upper().encode()
-                    line = re.sub(rb'length="[^"]*"',  b'length="'  + size   + b'"', line)
-                    line = re.sub(rb"length='[^']*'",  b"length='"  + size   + b"'", line)
-                    line = re.sub(rb'digest="[^"]*"',  b'digest="'  + digest + b'"', line)
-                    line = re.sub(rb"digest='[^']*'",  b"digest='"  + digest + b"'", line)
-                except Exception:
-                    pass   # fil ikke tilgjengelig — behold gammel verdi
+            elif b"/" in key:
+                # Full-sti ref (f.eks. DBPT-format eller ekstern blob):
+                # slå opp på filnavn-delen alene
+                basename = key.rsplit(b"/", 1)[-1]
+                if basename not in ren_bytes:
+                    pos = end + 1
+                    continue
+                new_basename = ren_bytes[basename]
+                new_path     = ren_paths[basename]
+                if key.startswith(b"content/"):
+                    # Intern full-sti: bevar mappe-prefiks, bytt bare filnavn
+                    dir_prefix = key.rsplit(b"/", 1)[0] + b"/"
+                    new_name   = dir_prefix + new_basename
+                else:
+                    # Ekstern ref: filen er nå intern — bruk bare filnavn
+                    new_name = new_basename
             else:
                 pos = end + 1
+                continue
+            # Erstatt filnavn
+            line = line[:start] + new_name + line[end:]
+            n   += 1
+            pos  = start + len(new_name) + 1
+            # Oppdater length og digest fra ny fil
+            try:
+                data   = new_path.read_bytes()
+                size   = str(len(data)).encode()
+                digest = _hashlib.md5(data).hexdigest().upper().encode()
+                line = re.sub(rb'length="[^"]*"',  b'length="'  + size   + b'"', line)
+                line = re.sub(rb"length='[^']*'",  b"length='"  + size   + b"'", line)
+                line = re.sub(rb'digest="[^"]*"',  b'digest="'  + digest + b'"', line)
+                line = re.sub(rb"digest='[^']*'",  b"digest='"  + digest + b"'", line)
+            except Exception:
+                pass   # fil ikke tilgjengelig — behold gammel verdi
     return line, n
 
 
@@ -1520,6 +1540,123 @@ def suggest_lo_defaults() -> dict:
     }
 
 
+# ── Resume-hjelper ────────────────────────────────────────────────────────────
+
+_RESUME_SUFFIX = "_blob_resume.json"
+
+
+def _resume_json_path(log_dir, siard_stem: str) -> Path:
+    return Path(log_dir) / f"{siard_stem}{_RESUME_SUFFIX}"
+
+
+def _load_resume_done_set(resume_json: Path) -> set[str]:
+    """
+    Les ..._blob_resume.json og returner settet av zip_sti-er som er
+    ferdig behandlet i den avbrutte kjøringen.  Returnerer tomt sett
+    ved enhver feil (fil mangler, CSV mangler, parse-feil).
+    """
+    try:
+        data     = json.loads(resume_json.read_text(encoding="utf-8"))
+        csv_path = Path(data.get("csv_path", ""))
+        if not csv_path.exists():
+            return set()
+        done: set[str] = set()
+        with open(csv_path, encoding="utf-8-sig", newline="") as f:
+            reader = csv.reader(f)
+            next(reader, None)          # hopp over overskriftsrad
+            for row in reader:
+                if row:
+                    done.add(row[0])    # fra_fil = full zip_sti
+        return done
+    except Exception:
+        return set()
+
+
+def _collect_external_blobs(
+        table_xml_map: dict[str, str],
+        extract_dir: Path,
+        siard_dir: Path,
+        all_blobs: list[str],
+        w) -> list[str]:
+    """
+    Skann alle tableX.xml-filer for file="..."-referanser som IKKE ble funnet
+    av filsystemskanningen.  Håndterer to tilfeller:
+
+    1. Intern full-sti ref (DBPT-format): filen ligger i extract_dir men ble
+       ikke plukket opp av skannen (f.eks. uvanlig mappestruktur).  Legges
+       direkte til listen.
+
+    2. Ekstern ref: filen ligger utenfor SIARD-arkivet.  Løses opp relativt
+       til siard_dir, kopieres inn i extract_dir under tableX sin mappe og
+       legges til listen.
+
+    Returnerer liste over nye zip_sti-er som ble lagt til.
+    """
+    _known_basenames = {PurePosixPath(p).name for p in all_blobs}
+    _known_paths     = set(all_blobs)
+    extra: list[str] = []
+
+    for table_key, xml_sti in table_xml_map.items():
+        xml_file = extract_dir / xml_sti
+        if not xml_file.exists():
+            continue
+        try:
+            xml_bytes = xml_file.read_bytes()
+        except Exception:
+            continue
+
+        refs = re.findall(rb'file=["\']([^"\']+)["\']', xml_bytes)
+        for ref_b in refs:
+            ref = ref_b.decode("utf-8", errors="replace").replace("\\", "/")
+            basename = PurePosixPath(ref).name
+
+            # Hopp over om allerede funnet (enten full sti eller bare filnavn)
+            if ref in _known_paths or basename in _known_basenames:
+                continue
+
+            # Case 1: intern full-sti — sjekk om filen faktisk finnes
+            candidate_internal = extract_dir / ref
+            if candidate_internal.exists() and candidate_internal.is_file():
+                extra.append(ref)
+                _known_paths.add(ref)
+                _known_basenames.add(basename)
+                w(f"  Intern full-sti blob lagt til: {ref}", "info")
+                continue
+
+            # Case 2: ekstern blob — prøv relativt til SIARD-mappa
+            if not siard_dir or not siard_dir.is_dir():
+                continue
+            candidate_external = (siard_dir / ref).resolve()
+            # Sikkerhet: ikke la ../ navigere utenfor forventet område
+            try:
+                candidate_external.relative_to(siard_dir.resolve().parent)
+            except ValueError:
+                w(f"  Ekstern blob utenfor tillatt sti, ignorert: {ref}", "warn")
+                continue
+
+            if not candidate_external.exists() or not candidate_external.is_file():
+                w(f"  Ekstern blob ikke funnet: {ref}", "warn")
+                continue
+
+            # Kopier inn i extract_dir under tableX sin innholdsmappe
+            schema, table = table_key.split("/", 1)
+            dest_rel = f"content/{schema}/{table}/ext_lob/{basename}"
+            dest     = extract_dir / dest_rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(str(candidate_external), str(dest))
+            except Exception as exc:
+                w(f"  Kunne ikke kopiere ekstern blob {ref}: {exc}", "warn")
+                continue
+
+            extra.append(dest_rel)
+            _known_paths.add(dest_rel)
+            _known_basenames.add(basename)
+            w(f"  Ekstern blob kopiert inn: {ref} → {dest_rel}", "info")
+
+    return extra
+
+
 # ── Hoved-operasjon ───────────────────────────────────────────────────────────
 
 class BlobConvertOperation(BaseOperation):
@@ -1609,6 +1746,30 @@ class BlobConvertOperation(BaseOperation):
         w("=" * 56)
         w("  BLOB-KONVERTERING", "step")
         w("=" * 56)
+
+        # ── Resume-sjekkpunkt ─────────────────────────────────────────────────
+        # Finn evt. uferdig kjøring fra forrige gang.  Finnes resume-filen betyr
+        # det at forrige kjøring ble avbrutt.  Ferdig-settet lastes inn og sendes
+        # via ctx.metadata slik at _process_pipeline / _process kan filtrere
+        # all_blobs.  Finnes den ikke, opprettes den nå (ny kjøring).
+        _resume_json = None
+        _done_set: set[str] = set()
+        if log_dir:
+            _resume_json = _resume_json_path(log_dir, ctx.siard_path.stem if ctx.siard_path else "blob")
+            if _resume_json.exists():
+                _done_set = _load_resume_done_set(_resume_json)
+                if _done_set:
+                    w(f"  Resume: finner {_resume_json.name} — "
+                      f"{len(_done_set):,} filer allerede behandlet vil hoppes over", "info")
+            else:
+                try:
+                    _resume_json.write_text(json.dumps({
+                        "csv_path": str(csv_log.log_path) if csv_log and csv_log.log_path else "",
+                        "started":  datetime.datetime.now().isoformat(timespec="seconds"),
+                    }, indent=2), encoding="utf-8")
+                except Exception:
+                    _resume_json = None   # lagring feilet — fortsett uten
+        ctx.metadata["_blob_resume_done"] = _done_set
 
         # Pipeline-modus: ikke produser ny SIARD — RepackSiard tar seg av det
         pipeline_mode = bool(
@@ -1726,6 +1887,14 @@ class BlobConvertOperation(BaseOperation):
         w("=" * 56)
 
         progress("finish", stats=stats)
+
+        # Slett resume-sjekkpunkt — kjøringen fullførte vellykket
+        if _resume_json and _resume_json.exists():
+            try:
+                _resume_json.unlink()
+            except Exception:
+                pass
+
         return self._ok(
             data={**stats, "output_path": str(dst_path)},
             message=(f"{stats['converted']} konvertert, {stats['kept']} beholdt, "
@@ -1794,6 +1963,14 @@ class BlobConvertOperation(BaseOperation):
                     progress("phase_progress", done=scan_i, total=n_total)
 
         all_blobs = [p for paths in table_blobs.values() for p in paths]
+
+        # Supplerer med blob-er referert i tableX.xml men ikke funnet av skannen
+        # (intern full-sti / DBPT-format, eller eksternt lagrede blobs)
+        _xml_extra = _collect_external_blobs(
+            table_xml_map, extract_dir, ctx.siard_path.parent, all_blobs, w)
+        if _xml_extra:
+            all_blobs.extend(_xml_extra)
+
         ext_counts: dict = {}
         for p in all_blobs:
             e = PurePosixPath(p).suffix.lstrip(".").lower() or "ingen"
@@ -1871,6 +2048,14 @@ class BlobConvertOperation(BaseOperation):
             w("  Avbrutt av bruker", "warn")
             progress("aborted", stats=dict(stats))
             return
+
+        # ── Resume-filtrering ─────────────────────────────────────────────────
+        _done = ctx.metadata.get("_blob_resume_done", set())
+        if _done:
+            _before = len(all_blobs)
+            all_blobs = [z for z in all_blobs if z not in _done]
+            w(f"  Resume: {_before - len(all_blobs):,} allerede behandlet hoppet over, "
+              f"{len(all_blobs):,} gjenstår", "info")
 
         # ── Fase 3: Detekter og konverter blob-filer ──────────────────────────
         total = len(all_blobs)
@@ -2157,6 +2342,21 @@ class BlobConvertOperation(BaseOperation):
                     if col_map:
                         lob_type_map[table_key] = col_map
                         w(f"  {table_key}: kobling {col_map}", "info")
+
+                # Supplerer med blob-er referert i tableX.xml men ikke i ZIP-en
+                # (intern full-sti / DBPT-format, eller eksternt lagrede blobs)
+                _xml_extra = _collect_external_blobs(
+                    table_xml_map, extract_dir, src_path.parent, all_blobs, w)
+                if _xml_extra:
+                    all_blobs.extend(_xml_extra)
+
+                # ── Resume-filtrering ─────────────────────────────────────────
+                _done = ctx.metadata.get("_blob_resume_done", set())
+                if _done:
+                    _before = len(all_blobs)
+                    all_blobs = [z for z in all_blobs if z not in _done]
+                    w(f"  Resume: {_before - len(all_blobs):,} allerede behandlet hoppet over, "
+                      f"{len(all_blobs):,} gjenstår", "info")
 
                 # ── Fase 3+4: Detekter og konverter .bin/.txt ────────────────
                 total = len(all_blobs)
@@ -2589,8 +2789,8 @@ class BlobConvertOperation(BaseOperation):
                 else:
                     kommentar = f"Detektert som {ext}"
                 csv_log.write(
-                    PurePosixPath(zip_sti).name, fra_sz, src_ext,
-                    PurePosixPath(new_sti).name,  til_sz, ext,
+                    zip_sti, fra_sz, src_ext,
+                    new_sti, til_sz, ext,
                     kommentar)
 
             if (i + 1) % REPORT_INTERVAL == 0 or i == len(to_rename_only) - 1:
@@ -2676,7 +2876,7 @@ class BlobConvertOperation(BaseOperation):
                     res_name = (f"{stem}.wpt + {stem}_ext_wpt.rtf → PDF/A"
                                 if rtf_ok else f"{stem}.wpt")
                     csv_log.write(
-                        PurePosixPath(zip_sti).name, fra_sz, src_ext,
+                        zip_sti, fra_sz, src_ext,
                         res_name, til_sz, "wpt+rtf→pdf",
                         kommentar)
 
@@ -3019,8 +3219,9 @@ class BlobConvertOperation(BaseOperation):
                              else f"Konvertering feilet: {lo_err[:80]}" if lo_err
                              else "Ingen PDF produsert — mulig korrupt fil")
                 csv_log.write(
-                    PurePosixPath(zip_sti).name, fra_sz, src_ext,
-                    Path(str(til_file)).name, til_sz, result_ext,
+                    zip_sti, fra_sz, src_ext,
+                    str(PurePosixPath(zip_sti).parent / Path(str(til_file)).name),
+                    til_sz, result_ext,
                     kommentar)
 
             with lock:
@@ -3381,7 +3582,7 @@ class BlobConvertOperation(BaseOperation):
                         w(f"  Oppgradert: {blob_path.name} → {new_name}", "ok")
                         if csv_log:
                             csv_log.write(
-                                PurePosixPath(zip_sti).name, fra_sz, src_ext,
+                                zip_sti, fra_sz, src_ext,
                                 new_name, til_sz, target_ext,
                                 f"Oppgradert {src_ext.upper()}→{target_ext.upper()}")
                     except Exception as exc:
@@ -3402,7 +3603,7 @@ class BlobConvertOperation(BaseOperation):
                     if csv_log:
                         new_name = f"{stem_base}.{src_ext}"
                         csv_log.write(
-                            PurePosixPath(zip_sti).name, fra_sz, src_ext,
+                            zip_sti, fra_sz, src_ext,
                             new_name, fra_sz, src_ext,
                             f"Oppgradering {src_ext.upper()}→{target_ext.upper()} feilet")
 
