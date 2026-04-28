@@ -53,6 +53,7 @@ from siard_workflow.core.siard_format import (
     detect_siard_version, siard_version_transform,
     get_target_siard_version, is_siard_xml,
     sanitize_metadata_schema_names,
+    restore_xml_header, find_root_tag_start,
 )
 
 # ── Magic-byte signaturer ─────────────────────────────────────────────────────
@@ -360,6 +361,32 @@ def _detect_ole2_type(data: bytes) -> tuple[str, str, bool] | None:
             return ext, mime, is_encrypted
 
     return None
+
+
+# Signaturer som kun finnes i ekte Word OLE2-filer, ikke i innebygde objekter
+_WORD_TAIL_SIGS = (
+    # UTF-16LE navn på rot-nivå strøm i Word .doc
+    b"W\x00o\x00r\x00d\x00D\x00o\x00c\x00u\x00m\x00e\x00n\x00t\x00",
+    # ASCII ProgID i \x01CompObj-strøm
+    b"Word.Document",
+    # Navn på Word-spesifikke tabell-strømmer (finnes ikke i XLS/PPT)
+    b"1\x00T\x00a\x00b\x00l\x00e\x00",   # UTF-16LE "1Table"
+    b"0\x00T\x00a\x00b\x00l\x00e\x00",   # UTF-16LE "0Table"
+)
+
+
+def _ole2_tail_is_word(data: bytes, tail_size: int = 16384) -> bool:
+    """
+    Sjekk om halen av en OLE2-fil inneholder Word-spesifikke signaturer.
+
+    Brukes som tiebreaker når vanlig deteksjon feilidentifiserer en Word-fil
+    med innebygde Excel/PPT-objekter som XLS eller PPT.  I slike tilfeller
+    ligger "Workbook"-directory-entryen tidlig i filen (fra det innebygde
+    objektet), mens Word-rottstrømmene (WordDocument, 1Table) kan ligge i
+    sektorer lenger ut — og dukker dermed opp i halen.
+    """
+    tail = data[-tail_size:] if len(data) > tail_size else data
+    return any(sig in tail for sig in _WORD_TAIL_SIGS)
 
 
 def _detect(data: bytes) -> tuple[str, str, bool]:
@@ -824,39 +851,9 @@ def _inject_conversion_comment(data: bytes) -> bytes:
     return data
 
 
-def _restore_xml_header(original: bytes, et_output: bytes) -> bytes:
-    """
-    ET.write() fjerner kommentarer og omskriver namespace-prefiks.
-    Denne funksjonen erstatter det ET produserte opp til og med rot-elementets
-    åpnings-tag med originalen — slik bevares BOM, XML-deklarasjon,
-    kommentarer og namespace slik de var.
-    """
-    # Finn rot-element i ET-output (første '<' som ikke er '<?' eller '<!--')
-    et_root_start = _find_root_tag_start(et_output)
-    orig_root_start = _find_root_tag_start(original)
-    if et_root_start == -1 or orig_root_start == -1:
-        return et_output
-    # Behold original header, lim på ET-body fra og med rot-tag
-    return original[:orig_root_start] + et_output[et_root_start:]
-
-
-def _find_root_tag_start(data: bytes) -> int:
-    """Finn byte-offset til første ekte element-tag (ikke PI eller kommentar)."""
-    i = 0
-    n = len(data)
-    while i < n:
-        idx = data.find(b"<", i)
-        if idx == -1:
-            return -1
-        if data[idx:idx+4] == b"<!--":
-            end = data.find(b"-->", idx + 4)
-            i = end + 3 if end != -1 else n
-        elif data[idx:idx+2] == b"<?":
-            end = data.find(b"?>", idx + 2)
-            i = end + 2 if end != -1 else n
-        else:
-            return idx
-    return -1
+# Alias for bakoverkompatibilitet — funksjonene er nå i siard_format.py
+_restore_xml_header  = restore_xml_header
+_find_root_tag_start = find_root_tag_start
 
 
 def _conversion_comment(version: str = "?") -> bytes:
@@ -1577,24 +1574,28 @@ def _collect_external_blobs(
         extract_dir: Path,
         siard_dir: Path,
         all_blobs: list[str],
-        w) -> list[str]:
+        table_blobs: dict,
+        w) -> tuple[list[str], dict[str, str]]:
     """
     Skann alle tableX.xml-filer for file="..."-referanser som IKKE ble funnet
     av filsystemskanningen.  Håndterer to tilfeller:
 
     1. Intern full-sti ref (DBPT-format): filen ligger i extract_dir men ble
        ikke plukket opp av skannen (f.eks. uvanlig mappestruktur).  Legges
-       direkte til listen.
+       direkte til listen og table_blobs.
 
     2. Ekstern ref: filen ligger utenfor SIARD-arkivet.  Løses opp relativt
        til siard_dir, kopieres inn i extract_dir under tableX sin mappe og
-       legges til listen.
+       legges til listen og table_blobs.
 
-    Returnerer liste over nye zip_sti-er som ble lagt til.
+    Returnerer (extra_blobs, ext_ref_map) der ext_ref_map er
+    {orig_ref: new_dest_rel} for eksternt kopierte filer — brukes til
+    forhånds-patch av XML slik at standard _patch_all_xml håndterer resten.
     """
     _known_basenames = {PurePosixPath(p).name for p in all_blobs}
     _known_paths     = set(all_blobs)
-    extra: list[str] = []
+    extra:       list[str]      = []
+    ext_ref_map: dict[str, str] = {}
 
     for table_key, xml_sti in table_xml_map.items():
         xml_file = extract_dir / xml_sti
@@ -1620,6 +1621,8 @@ def _collect_external_blobs(
                 extra.append(ref)
                 _known_paths.add(ref)
                 _known_basenames.add(basename)
+                if ref not in table_blobs.get(table_key, []):
+                    table_blobs[table_key].append(ref)
                 w(f"  Intern full-sti blob lagt til: {ref}", "info")
                 continue
 
@@ -1652,9 +1655,48 @@ def _collect_external_blobs(
             extra.append(dest_rel)
             _known_paths.add(dest_rel)
             _known_basenames.add(basename)
+            table_blobs[table_key].append(dest_rel)
+            ext_ref_map[ref] = dest_rel
             w(f"  Ekstern blob kopiert inn: {ref} → {dest_rel}", "info")
 
-    return extra
+    return extra, ext_ref_map
+
+
+def _prepatch_external_refs(
+        table_xml_map: dict[str, str],
+        extract_dir: Path,
+        ext_ref_map: dict[str, str],
+        w) -> None:
+    """
+    Erstatt eksterne file-stier med nye interne stier i tableX.xml-filene,
+    FØR _convert_all kjøres.
+
+    Dette normaliserer f.eks. file="../../external/record.bin" til
+    file="content/schema1/table3/ext_lob/record.bin" slik at standard
+    _patch_all_xml og _patch_line_with_digest håndterer resten via
+    full-sti-logikken (starter med "content/").
+    """
+    for xml_sti in table_xml_map.values():
+        xml_path = extract_dir / xml_sti
+        if not xml_path.exists():
+            continue
+        try:
+            data = xml_path.read_bytes()
+        except Exception:
+            continue
+        changed = False
+        for orig, new in ext_ref_map.items():
+            old_b = orig.encode("utf-8")
+            new_b = new.encode("utf-8")
+            if old_b in data:
+                data    = data.replace(old_b, new_b)
+                changed = True
+                w(f"  Pre-patch ekstern ref: '{orig}' → '{new}' i {xml_sti}", "info")
+        if changed:
+            try:
+                xml_path.write_bytes(data)
+            except Exception as exc:
+                w(f"  Pre-patch skriving feilet for {xml_sti}: {exc}", "warn")
 
 
 # ── Hoved-operasjon ───────────────────────────────────────────────────────────
@@ -1946,19 +1988,29 @@ class BlobConvertOperation(BaseOperation):
             for scan_i, fp in enumerate(all_paths, 1):
                 if not fp.is_file():
                     continue
-                rel_parts = fp.relative_to(extract_dir).parts
-                if (len(rel_parts) < 4
-                        or rel_parts[0].lower() != "content"
-                        or not schema_re.match(rel_parts[1])
-                        or not table_re.match(rel_parts[2])):
-                    continue
-                table_key  = f"{rel_parts[1]}/{rel_parts[2]}"
+                rel_parts  = fp.relative_to(extract_dir).parts
                 fname_lower = fp.name.lower()
                 arc_name   = str(fp.relative_to(extract_dir)).replace("\\", "/")
-                if len(rel_parts) == 4 and fname_lower.endswith(".xml"):
-                    table_xml_map[table_key] = arc_name
-                elif not fname_lower.endswith(".xml") and not fname_lower.endswith(".xsd"):
-                    table_blobs[table_key].append(arc_name)
+                _c = len(rel_parts) >= 1 and rel_parts[0].lower() == "content"
+                # Standard SIARD: content/schemaX/tableX/...
+                _s = (_c and len(rel_parts) >= 4
+                      and schema_re.match(rel_parts[1])
+                      and table_re.match(rel_parts[2]))
+                # No-schema SIARD: content/tableX/...
+                _t = (_c and not _s and len(rel_parts) >= 3
+                      and table_re.match(rel_parts[1]))
+                if _s:
+                    table_key = f"{rel_parts[1]}/{rel_parts[2]}"
+                    if len(rel_parts) == 4 and fname_lower.endswith(".xml"):
+                        table_xml_map[table_key] = arc_name
+                    elif not fname_lower.endswith(".xml") and not fname_lower.endswith(".xsd"):
+                        table_blobs[table_key].append(arc_name)
+                elif _t:
+                    table_key = f"{rel_parts[1]}/{rel_parts[1]}"
+                    if len(rel_parts) == 3 and fname_lower.endswith(".xml"):
+                        table_xml_map[table_key] = arc_name
+                    elif not fname_lower.endswith(".xml") and not fname_lower.endswith(".xsd"):
+                        table_blobs[table_key].append(arc_name)
                 if scan_i % max(1, n_total // 20) == 0 or scan_i == n_total:
                     progress("phase_progress", done=scan_i, total=n_total)
 
@@ -1966,10 +2018,13 @@ class BlobConvertOperation(BaseOperation):
 
         # Supplerer med blob-er referert i tableX.xml men ikke funnet av skannen
         # (intern full-sti / DBPT-format, eller eksternt lagrede blobs)
-        _xml_extra = _collect_external_blobs(
-            table_xml_map, extract_dir, ctx.siard_path.parent, all_blobs, w)
+        _xml_extra, _ext_ref_map = _collect_external_blobs(
+            table_xml_map, extract_dir, ctx.siard_path.parent,
+            all_blobs, table_blobs, w)
         if _xml_extra:
             all_blobs.extend(_xml_extra)
+        if _ext_ref_map:
+            _prepatch_external_refs(table_xml_map, extract_dir, _ext_ref_map, w)
 
         ext_counts: dict = {}
         for p in all_blobs:
@@ -2177,19 +2232,28 @@ class BlobConvertOperation(BaseOperation):
                 SCAN_REPORT  = max(1, n_total_scan // 20)  # 5% intervaller
                 for scan_i, name in enumerate(namelist, 1):
                     parts = PurePosixPath(name).parts
-                    if len(parts) < 4 or parts[0].lower() != "content":
-                        pass
-                    elif not schema_re.match(parts[1]) or not table_re.match(parts[2]):
-                        pass
-                    else:
+                    fname_lower = parts[-1].lower() if parts else ""
+                    _c = len(parts) >= 1 and parts[0].lower() == "content"
+                    # Standard SIARD: content/schemaX/tableX/...
+                    _s = (_c and len(parts) >= 4
+                          and schema_re.match(parts[1])
+                          and table_re.match(parts[2]))
+                    # No-schema SIARD: content/tableX/...
+                    _t = (_c and not _s and len(parts) >= 3
+                          and table_re.match(parts[1]))
+                    if _s:
                         table_key = f"{parts[1]}/{parts[2]}"
-                        fname_lower = parts[-1].lower()
                         if len(parts) == 4 and fname_lower.endswith(".xml"):
                             table_xml_map[table_key] = name
                         elif len(parts) >= 4:
-                            # Samle ALLE filer i tabell-undermapper som blobs
-                            # (ikke bare .bin og .txt — SIARD tillater .lob,
-                            # ingen endelse, og direkte filendelser som .doc)
+                            if not fname_lower.endswith(".xml") and \
+                               not fname_lower.endswith(".xsd"):
+                                table_blobs[table_key].append(name)
+                    elif _t:
+                        table_key = f"{parts[1]}/{parts[1]}"
+                        if len(parts) == 3 and fname_lower.endswith(".xml"):
+                            table_xml_map[table_key] = name
+                        elif len(parts) >= 3:
                             if not fname_lower.endswith(".xml") and \
                                not fname_lower.endswith(".xsd"):
                                 table_blobs[table_key].append(name)
@@ -2345,10 +2409,13 @@ class BlobConvertOperation(BaseOperation):
 
                 # Supplerer med blob-er referert i tableX.xml men ikke i ZIP-en
                 # (intern full-sti / DBPT-format, eller eksternt lagrede blobs)
-                _xml_extra = _collect_external_blobs(
-                    table_xml_map, extract_dir, src_path.parent, all_blobs, w)
+                _xml_extra, _ext_ref_map = _collect_external_blobs(
+                    table_xml_map, extract_dir, src_path.parent,
+                    all_blobs, table_blobs, w)
                 if _xml_extra:
                     all_blobs.extend(_xml_extra)
+                if _ext_ref_map:
+                    _prepatch_external_refs(table_xml_map, extract_dir, _ext_ref_map, w)
 
                 # ── Resume-filtrering ─────────────────────────────────────────
                 _done = ctx.metadata.get("_blob_resume_done", set())
@@ -2484,6 +2551,46 @@ class BlobConvertOperation(BaseOperation):
                             pass
                     # inner_ext == "txt" eller "bin": dekoding ga ingenting nyttig
                     # — behold original og behandle som vanlig txt
+
+            # ── Hex-dekoding ─────────────────────────────────────────────────
+            # Noen fagsystemer lagrer binærfiler som hex-strenger i LOB-felt
+            # (f.eks. BZip2-komprimerte dokumenter kodet som ren hex-tekst).
+            # Forsøk kun hvis ext fortsatt er txt etter base64-sjekken.
+            if ext == "txt":
+                raw = full_data.strip()
+                # Krav: jevnt antall tegn, minst 32 (= 16 byte dekoded), kun hex
+                if len(raw) >= 32 and len(raw) % 2 == 0:
+                    try:
+                        decoded_hex = bytes.fromhex(raw.decode("ascii"))
+                        hex_ext, hex_mime, hex_enc = _detect(decoded_hex[:65536])
+                        if hex_ext in _COMPRESSED:
+                            _tmp_hex = p.with_suffix(".hextmp")
+                            try:
+                                _tmp_hex.write_bytes(decoded_hex)
+                                unpacked = _unpack_single_file(_tmp_hex)
+                                if unpacked is not None:
+                                    unpacked_data, unpacked_name = unpacked
+                                    u_ext, u_mime, u_enc = _detect(unpacked_data[:65536])
+                                    p.write_bytes(unpacked_data)
+                                    w(f"    Hex+utpakket: {PurePosixPath(zip_sti).name} "
+                                      f"({PurePosixPath(unpacked_name).name} → {u_ext})", "info")
+                                    return zip_sti, (u_ext, u_mime, u_enc)
+                                else:
+                                    p.write_bytes(decoded_hex)
+                                    w(f"    Hex→{hex_ext}: {PurePosixPath(zip_sti).name}", "info")
+                                    return zip_sti, (hex_ext, hex_mime, hex_enc)
+                            except Exception:
+                                pass
+                            finally:
+                                _tmp_hex.unlink(missing_ok=True)
+                        elif hex_ext not in ("txt", "bin"):
+                            p.write_bytes(decoded_hex)
+                            ext          = hex_ext
+                            mime         = hex_mime
+                            is_encrypted = hex_enc
+                            w(f"    Hex→{ext}: {PurePosixPath(zip_sti).name}", "info")
+                    except (ValueError, UnicodeDecodeError):
+                        pass   # Ikke hex-innhold — vanlig tekst
 
             # ── Utpakking av komprimerte filer ───────────────────────────────
             elif ext in _COMPRESSED:
@@ -3591,21 +3698,56 @@ class BlobConvertOperation(BaseOperation):
                             stats["kept"] += 1
                             n_fail_ref[0] += 1
                 else:
-                    # Behold original med korrekt endelse
-                    self._rename_file(extract_dir, zip_sti, src_ext)
-                    with lock:
-                        stats["kept"] += 1
-                        n_fail_ref[0] += 1
-                    w(f"  Oppgradering feilet: {blob_path.name} — beholder .{src_ext}", "warn")
-                    if err_log:
-                        err_log.write(zip_sti, src_ext,
-                                      f"Oppgradering {src_ext}→{target_ext} feilet")
-                    if csv_log:
-                        new_name = f"{stem_base}.{src_ext}"
-                        csv_log.write(
-                            zip_sti, fra_sz, src_ext,
-                            new_name, fra_sz, src_ext,
-                            f"Oppgradering {src_ext.upper()}→{target_ext.upper()} feilet")
+                    # ── Retry: sjekk om filen er en feilidentifisert Word-fil ──
+                    # XLS/PPT-upgrade feiler ofte på Word-filer med innebygde
+                    # Excel/PPT-objekter (Workbook-strøm tidlig i OLE2 gir
+                    # falskt XLS/PPT-treff).  Finn ekte type i filhalen og
+                    # prøv Word→DOCX-konvertering i stedet.
+                    _retry_ok = False
+                    if src_ext in ("xls", "xlt", "ppt", "pot"):
+                        try:
+                            _file_data = blob_path.read_bytes()
+                            if _ole2_tail_is_word(_file_data):
+                                _work2 = tmp_base / f"upg_{idx}_{stem_base}_doc"
+                                _work2.mkdir(parents=True, exist_ok=True)
+                                _retry_file = _lo_convert(blob_path, "docx", _work2)
+                                if _retry_file:
+                                    _new_name = f"{stem_base}.doc.docx"
+                                    _new_path = blob_path.parent / _new_name
+                                    shutil.move(str(_retry_file), str(_new_path))
+                                    blob_path.unlink(missing_ok=True)
+                                    _til_sz = _new_path.stat().st_size if _new_path.exists() else 0
+                                    with lock:
+                                        stats["converted"] += 1
+                                        n_ok_ref[0] += 1
+                                    w(f"  Re-identifisert som Word: {blob_path.name} "
+                                      f"(var {src_ext.upper()}) → {_new_name}", "ok")
+                                    if csv_log:
+                                        csv_log.write(
+                                            zip_sti, fra_sz, src_ext,
+                                            _new_name, _til_sz, "docx",
+                                            f"Re-identifisert {src_ext.upper()}→DOC"
+                                            f" (Word-fil med innebygd {src_ext.upper()}-objekt)")
+                                    _retry_ok = True
+                        except Exception:
+                            pass
+
+                    if not _retry_ok:
+                        # Behold original med korrekt endelse
+                        self._rename_file(extract_dir, zip_sti, src_ext)
+                        with lock:
+                            stats["kept"] += 1
+                            n_fail_ref[0] += 1
+                        w(f"  Oppgradering feilet: {blob_path.name} — beholder .{src_ext}", "warn")
+                        if err_log:
+                            err_log.write(zip_sti, src_ext,
+                                          f"Oppgradering {src_ext}→{target_ext} feilet")
+                        if csv_log:
+                            new_name = f"{stem_base}.{src_ext}"
+                            csv_log.write(
+                                zip_sti, fra_sz, src_ext,
+                                new_name, fra_sz, src_ext,
+                                f"Oppgradering {src_ext.upper()}→{target_ext.upper()} feilet")
 
             # Teller-referanser for bruk i closure
             n_ok_ref   = [0]
@@ -3953,7 +4095,9 @@ class BlobConvertOperation(BaseOperation):
           - Direkte bytes (UTF-8 eller latin-1)
         """
         try:
-            tree = ET.parse(io.BytesIO(xml_bytes))
+            # insert_comments=True (Python 3.8+) bevarer <!--...--> i treet
+            _parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
+            tree = ET.parse(io.BytesIO(xml_bytes), _parser)
             root = tree.getroot()
         except ET.ParseError as e:
             w(f"    XML-parsefeil {xml_sti}: {e}", "feil")
@@ -3978,6 +4122,8 @@ class BlobConvertOperation(BaseOperation):
         base_path   = str(PurePosixPath(xml_sti).parent)
 
         for elem in root.iter():
+            if not isinstance(elem.tag, str):
+                continue   # hopp over ET.Comment / ET.ProcessingInstruction
             tag_local = _local(elem.tag).lower()
 
             # Bestem om dette elementet er et LOB-felt
@@ -4063,6 +4209,15 @@ class BlobConvertOperation(BaseOperation):
 
         if n_extracted == 0:
             return xml_bytes, {}, 0
+
+        # Strip namespace fra alle elementer FØR serialisering — forhindrer at
+        # ET skriver ns0:row/ns0:c5 etc. som er inkompatibelt med originalens
+        # xmlns="..." på rot-elementet. restore_xml_header beholder originalens
+        # fulle <table ...> åpnings-tag, så kroppen trenger ingen ns-prefiks.
+        # ET.Comment-noder har ikke str-tag — sjekk isinstance for å unngå feil.
+        for elem in root.iter():
+            if isinstance(elem.tag, str) and "}" in elem.tag:
+                elem.tag = elem.tag.split("}", 1)[1]
 
         out = io.BytesIO()
         tree.write(out, xml_declaration=True, encoding="utf-8")

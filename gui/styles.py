@@ -10,9 +10,9 @@ COLORS = {
     "green":      "#2ecc71",
     "yellow":     "#f0c040",
     "red":        "#e05252",
-    "muted":      "#5a637a",
+    "muted":      "#8a95b0",
     "text":       "#d4daf0",
-    "text_sub":   "#7a849e",
+    "text_sub":   "#b7bcc8",
     "btn":        "#1e2333",
     "btn_hover":  "#252b3a",
     # Kategorifarge per operasjonsdtype
@@ -32,12 +32,12 @@ FONTS = {
 }
 
 LOG_COLORS = {
-    "info":    "#7a849e",
+    "info":    "#9aa4bc",
     "step":    "#4f8ef7",
     "success": "#2ecc71",
     "warn":    "#f0c040",
     "error":   "#e05252",
-    "muted":   "#3d4560",
+    "muted":   "#5c6880",
 }
 
 def cat_color(category: str) -> str:

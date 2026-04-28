@@ -432,7 +432,7 @@ OP_DEFS = [
         "desc": "Beregner SHA-256 sjekksum for hele SIARD-filen.",
         "status": SHA256Operation.status,
         "params": [
-            {"key": "save_to_file", "label": "Lagre .sha256-fil", "type": "bool", "default": False},
+            {"key": "save_to_file", "label": "Lagre .sha256-fil", "type": "bool", "default": True},
             {"key": "chunk_size",   "label": "Chunk-storrelse (bytes)", "type": "int", "default": 8192},
         ],
     },
@@ -556,9 +556,10 @@ OP_DEFS = [
     },
     # ── Pakking ──────────────────────────────────────────────────────────────
     {
-        "cls": DiasPackageOperation,
-        "label": "DIAS-pakking (SIP/AIC)",
-        "category": "SIP/AIC-Pakking",
+        "cls":           DiasPackageOperation,
+        "custom_dialog": "DiasParamDialog",
+        "label":         "DIAS-pakking (SIP/AIC)",
+        "category":      "SIP/AIC-Pakking",
         "desc": (
             "Pakker den ferdigbehandlede SIARD-filen inn i et DIAS-pakkeformat "
             "i henhold til METS- og DIAS_PREMIS-standardene, klar for innsending "
@@ -956,6 +957,9 @@ class OperationCard(ctk.CTkFrame):
     def _clicked(self, op_def, on_add, on_saved=None):
         if op_def.get("special") == "conditional":
             _ConditionalDialog(self, on_add)
+        elif op_def.get("custom_dialog") == "DiasParamDialog":
+            from gui.dias_dialog import DiasParamDialog
+            DiasParamDialog(self, op_def, on_confirm=on_add, on_saved=on_saved)
         elif op_def.get("params"):
             ParamDialog(self, op_def, on_confirm=on_add, on_saved=on_saved)
         else:

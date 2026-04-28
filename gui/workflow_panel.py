@@ -297,7 +297,11 @@ class WorkflowPanel(ctk.CTkFrame):
             if self._on_settings_saved:
                 self._on_settings_saved(op_id, params, settings_path, error)
 
-        ParamDialog(self, live_def, on_confirm=_on_confirm, on_saved=_on_saved)
+        if op_def.get("custom_dialog") == "DiasParamDialog":
+            from gui.dias_dialog import DiasParamDialog
+            DiasParamDialog(self, live_def, on_confirm=_on_confirm, on_saved=_on_saved)
+        else:
+            ParamDialog(self, live_def, on_confirm=_on_confirm, on_saved=_on_saved)
 
     def load_workflow(self, wf):
         self.clear()

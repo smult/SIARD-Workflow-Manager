@@ -55,6 +55,7 @@ _DIAS_KEYS: dict[str, str] = {
     "administrative_metadata_path": "",
     "schema_dir":                   "",
     "output_dir":                   "",
+    "extra_files":                  "[]",  # JSON: [{src, dest}, ...]
 }
 
 
@@ -617,6 +618,26 @@ def _build_dias_package(
                 shutil.copy2(src, dst)
             else:
                 logger.warning("Skjemafil ikke funnet: %s", src)
+
+    # Kopier ekstra filer (logg, SHA256, rapport, prosjektfil etc.) FØR
+    # _gather_file_info slik at de inkluderes automatisk i METS/PREMIS
+    extra_files_raw = meta.get("extra_files", "[]")
+    try:
+        extra_files = json.loads(extra_files_raw) if isinstance(extra_files_raw, str) else []
+    except Exception:
+        extra_files = []
+    for ef in extra_files:
+        try:
+            src  = Path(ef["src"])
+            dest = tarfile_dir / ef["dest"]
+            if src.exists():
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dest)
+                log_fn(f"  Ekstra fil inkludert: {ef['dest']}")
+            else:
+                log_fn(f"  Advarsel: Ekstra fil ikke funnet: {src}")
+        except Exception as exc:
+            log_fn(f"  Feil ved kopiering av ekstra fil: {exc}")
 
     # Kopier valgfrie metadata-mapper
     desc_path = meta.get("descriptive_metadata_path", "").strip()

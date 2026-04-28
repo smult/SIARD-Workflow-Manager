@@ -27,10 +27,27 @@ from siard_workflow.core.base_operation import BaseOperation
 from siard_workflow.core.siard_format import (
     detect_siard_version, siard_version_transform,
     get_target_siard_version, is_siard_xml,
+    extract_table_non_row_content,
 )
 
 
 # ── Hjelpefunksjoner ──────────────────────────────────────────────────────────
+
+def _extract_xml_preamble(xml_bytes: bytes) -> bytes:
+    """
+    Returner alt fra starten av filen opp til og med avslutnings->
+    for <table...>-åpningstaggen.
+
+    Bevarer XML-deklarasjon, kommentarer og alle attributter/namespace-
+    deklarasjoner i <table>-taggen slik de var i originalfilen.
+    """
+    idx = xml_bytes.find(b"<table")
+    if idx == -1:
+        return b'<?xml version="1.0" encoding="utf-8"?>\n<table>'
+    end = xml_bytes.find(b">", idx)
+    if end == -1:
+        return b'<?xml version="1.0" encoding="utf-8"?>\n<table>'
+    return xml_bytes[:end + 1]
 
 def _strip_ns(tag: str) -> str:
     return tag.split("}")[-1] if "}" in tag else tag
@@ -186,11 +203,16 @@ def _process_table_fs(
     tmp_path = Path(tmp_path_str)
 
     try:
-        with open(xml_path, "rb") as f_in, open(tmp_path, "wb") as out:
-            out.write(b'<?xml version="1.0" encoding="utf-8"?>\n')
-            out.write(b"<table>\n")
+        # Les kilde-bytes én gang for header, pre/post-innhold og iterparse
+        xml_src_bytes = xml_path.read_bytes()
+        preamble = _extract_xml_preamble(xml_src_bytes)
+        pre_content, post_content = extract_table_non_row_content(xml_src_bytes)
 
-            context = ET.iterparse(f_in, events=("start", "end"))
+        with open(tmp_path, "wb") as out:
+            out.write(preamble + b"\n")
+            out.write(pre_content)   # bevarer <!--Row count: N--> o.l.
+
+            context = ET.iterparse(io.BytesIO(xml_src_bytes), events=("start", "end"))
             for event, elem in context:
                 if _strip_ns(elem.tag) != "row" or event != "end":
                     continue
@@ -250,6 +272,7 @@ def _process_table_fs(
                 out.write(ET.tostring(elem, encoding="utf-8"))
                 elem.clear()
 
+            out.write(post_content)  # bevarer <!--Finished at: ...-> o.l.
             out.write(b"</table>")
 
         if not dry_run:
@@ -303,13 +326,17 @@ def _process_table(
     os.close(tmp_fd)
 
     try:
-        with zin.open(xml_arc_path) as f_in, \
-             open(tmp_path, "wb") as out:
+        # Les ZIP-entry til bytes én gang: header, pre/post-innhold og iterparse
+        with zin.open(xml_arc_path) as f_src:
+            xml_src_bytes = f_src.read()
+        preamble = _extract_xml_preamble(xml_src_bytes)
+        pre_content, post_content = extract_table_non_row_content(xml_src_bytes)
 
-            out.write(b'<?xml version="1.0" encoding="utf-8"?>\n')
-            out.write(b"<table>\n")
+        with open(tmp_path, "wb") as out:
+            out.write(preamble + b"\n")
+            out.write(pre_content)   # bevarer <!--Row count: N--> o.l.
 
-            context = ET.iterparse(f_in, events=("start", "end"))
+            context = ET.iterparse(io.BytesIO(xml_src_bytes), events=("start", "end"))
 
             for event, elem in context:
                 if _strip_ns(elem.tag) != "row" or event != "end":
@@ -371,6 +398,7 @@ def _process_table(
                 out.write(ET.tostring(elem, encoding="utf-8"))
                 elem.clear()
 
+            out.write(post_content)  # bevarer <!--Finished at: ...-> o.l.
             out.write(b"</table>")
 
         if not dry_run and zout is not None:

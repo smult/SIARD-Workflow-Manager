@@ -1,11 +1,11 @@
 {
-  "global_temp_dir": "C:\\",
+  "global_temp_dir": "",
   "av_executable": "",
   "lo_executable": "C:\\Program Files\\LibreOffice\\program\\soffice.exe",
   "av_args": [],
   "av_infected_rc": 1,
   "av_timeout": 300,
-  "max_workers": "6",
+  "max_workers": 4,
   "lo_batch_size": 50,
   "lo_timeout": 300,
   "lo_convertible": [
@@ -74,5 +74,5 @@
   "pdfa_version": "PDF/A-2u (ISO 19005-2, level U)",
   "disk_overhead_factor": 1.5,
   "siard_output_version": "2.1",
-  "min_operation_status": 2
+  "min_operation_status": 1
 }

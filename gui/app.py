@@ -1401,7 +1401,9 @@ class App(ctk.CTk):
             # borte, nullstill alle temp-avhengige operasjoner til "pending" og
             # vis advarsel. Operasjoner som ikke bruker temp-mappen (sha256,
             # xml_validation m.fl.) beholdes som fullført og hoppes over.
-            if _pf:
+            # Unntak: hvis alle operasjoner er fullført er jobben ferdig —
+            # ingen grunn til å gi varsel om manglende temp-mappe.
+            if _pf and not _pf.is_fully_completed:
                 _unpack_cp = _pf._find("unpack_siard")
                 if _unpack_cp and _unpack_cp.status == "completed":
                     _ext_str = (_unpack_cp.ctx_data or {}).get("extracted_path", "")

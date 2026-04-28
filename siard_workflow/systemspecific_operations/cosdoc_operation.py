@@ -53,6 +53,7 @@ from siard_workflow.core.context import WorkflowContext
 from siard_workflow.core.siard_format import (
     detect_siard_version, siard_version_transform,
     get_target_siard_version, is_siard_xml,
+    restore_xml_header,
 )
 
 
@@ -190,14 +191,17 @@ def _find_table_by_suffix(metadata_bytes: bytes, suffix: str) -> dict | None:
 
 def _col_by_suffix(col_map: dict[str, int], col_suffix: str) -> tuple[str, int] | tuple[None, None]:
     """
-    Finn kolonne i col_map der kolonnens navn slutter på _<col_suffix>
-    (case-insensitivt).  Gjør oppslag uavhengig av system-prefiks
-    (Eef_, NEF_, ...).
-    Eks: _col_by_suffix(cm, "EefID") finner "Eef_EefID" eller "NEF_EefID".
+    Finn kolonne i col_map der delen ETTER FØRSTE UNDERSCORE er NØYAKTIG
+    lik col_suffix (case-insensitivt).  Fungerer uavhengig av system-prefiks
+    (Eef_, NEF_, ...) men skiller f.eks. «FilNavn» fra «OrigFilNavn».
+
+    Eks: _col_by_suffix(cm, "FilNavn") finner "Eef_FilNavn" eller "NEF_FilNavn"
+         men IKKE "Eef_OrigFilNavn" (som ellers ville gitt feil passord).
     """
-    target = ("_" + col_suffix).lower()
+    target = col_suffix.lower()
     for name, idx in col_map.items():
-        if name.lower().endswith(target):
+        parts = name.split("_", 1)
+        if len(parts) == 2 and parts[1].lower() == target:
             return name, idx
     return None, None
 
@@ -753,7 +757,9 @@ def _update_table_xml(
     Bruker byte-nivå serialisering via ET for å bevare XML-deklarasjon.
     """
     try:
-        root = ET.fromstring(xml_bytes)
+        # insert_comments=True (Python 3.8+) bevarer <!--...--> i treet
+        _parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
+        root = ET.fromstring(xml_bytes, _parser)
     except ET.ParseError as exc:
         w(f"    XML-parse-feil: {exc}", "feil")
         return xml_bytes
@@ -805,12 +811,19 @@ def _update_table_xml(
     w(f"    XML: {len(updates)} rad(er) oppdatert, "
       f"{len(rows_to_remove)} rad(er) fjernet", "info")
 
-    # Serialiser tilbake
+    # Strip namespace fra alle elementer FØR serialisering — forhindrer
+    # at ET skriver ns0:row etc. restore_xml_header bevarer originalens
+    # fulle <table ...> åpnings-tag, kroppen trenger ingen ns-prefiks.
+    # ET.Comment-noder har ikke str-tag — sjekk isinstance for å unngå feil.
+    for elem in root.iter():
+        if isinstance(elem.tag, str) and "}" in elem.tag:
+            elem.tag = elem.tag.split("}", 1)[1]
+
     ET.indent(root, space="\t")
     tree = ET.ElementTree(root)
     buf = io.BytesIO()
     tree.write(buf, encoding="utf-8", xml_declaration=True)
-    return buf.getvalue()
+    return restore_xml_header(xml_bytes, buf.getvalue())
 
 
 # ── Hoved-operasjon ───────────────────────────────────────────────────────────

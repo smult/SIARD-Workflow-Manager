@@ -164,3 +164,88 @@ def is_siard_xml(arc_name: str) -> bool:
     """
     name_lower = arc_name.lower()
     return name_lower.endswith(".xml") or name_lower.endswith(".xsd")
+
+
+# ── XML header-restaurering (delt av flere operasjoner) ───────────────────────
+
+def find_root_tag_start(data: bytes) -> int:
+    """Finn byte-offset til første ekte element-tag (ikke PI eller kommentar)."""
+    i = 0
+    n = len(data)
+    while i < n:
+        idx = data.find(b"<", i)
+        if idx == -1:
+            return -1
+        if data[idx:idx+4] == b"<!--":
+            end = data.find(b"-->", idx + 4)
+            i = end + 3 if end != -1 else n
+        elif data[idx:idx+2] == b"<?":
+            end = data.find(b"?>", idx + 2)
+            i = end + 2 if end != -1 else n
+        else:
+            return idx
+    return -1
+
+
+def extract_table_non_row_content(xml_bytes: bytes) -> tuple[bytes, bytes]:
+    """
+    Returner (pre_content, post_content) fra en tableX.xml:
+      pre_content  = bytes mellom slutten av <table...> og første <row
+      post_content = bytes mellom siste </row> og </ (dvs. </table>)
+
+    Bevarer kommentarer (f.eks. <!--Row count: 0-->) og mellomrom som
+    finnes mellom åpnings-/avslutnings-tag og radene.
+    """
+    # Finn slutten av <table...> åpnings-taggen
+    t_start = xml_bytes.find(b"<table")
+    if t_start == -1:
+        return b"", b""
+    t_end = xml_bytes.find(b">", t_start)
+    if t_end == -1:
+        return b"", b""
+    body_start = t_end + 1   # rett etter >
+
+    first_row  = xml_bytes.find(b"<row", body_start)
+    last_row_e = xml_bytes.rfind(b"</row>")
+
+    if first_row == -1:
+        # Ingen rader — alt mellom <table...> og </table> er pre-innhold
+        close_tag = xml_bytes.rfind(b"</")
+        pre = xml_bytes[body_start:close_tag] if close_tag > body_start else b""
+        return pre, b""
+
+    pre  = xml_bytes[body_start:first_row]
+    post = b""
+    if last_row_e != -1:
+        after_last = last_row_e + len(b"</row>")
+        close_tag  = xml_bytes.rfind(b"</")
+        if close_tag > after_last:
+            post = xml_bytes[after_last:close_tag]
+    return pre, post
+
+
+def restore_xml_header(original: bytes, et_output: bytes) -> bytes:
+    """
+    Bevar originalens XML-deklarasjon, kommentarer OG rot-elementets åpnings-tag
+    (med alle attributter og namespace-deklarasjoner).  Kun elementkroppen
+    (barn-elementer og avslutnings-tag) hentes fra ET-outputen.
+
+    ET.write() fjerner kommentarer, omskriver namespace-prefiks og stripper
+    attributter fra rot-taggen; denne funksjonen reverserer dette ved å:
+      1. Ta alt fra original opp til og med '>' på rot-åpnings-taggen
+      2. Lime på ET-kroppen fra og med tegnet etter '>' på rot-åpnings-taggen
+    """
+    orig_root_start = find_root_tag_start(original)
+    et_root_start   = find_root_tag_start(et_output)
+    if orig_root_start == -1 or et_root_start == -1:
+        return et_output
+
+    # Finn avsluttende '>' for rot-åpnings-taggen i begge
+    orig_root_end = original.find(b">", orig_root_start)
+    et_root_end   = et_output.find(b">", et_root_start)
+    if orig_root_end == -1 or et_root_end == -1:
+        return et_output
+
+    # Original: alt opp til og med '>' (inkl. full <table ...> med attributter)
+    # ET-output: kroppen etter '>' (barn-elementer + avslutnings-tag)
+    return original[:orig_root_end + 1] + et_output[et_root_end + 1:]
