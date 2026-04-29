@@ -4261,14 +4261,24 @@ class BlobConvertOperation(BaseOperation):
 
             old_blobs = table_blobs.get(table_key, [])
             renames: dict[str, Path] = {}
+            # Kolonnespesifikke renames for filnavn som finnes i flere lob-mapper
+            col_renames: dict[int, dict[str, Path]] = {}
 
             if old_blobs:
                 from collections import defaultdict
-                by_parent: dict[Path, list[tuple[str, str]]] = defaultdict(list)
+
+                # Detekter filnavn-kollisjoner: samme filnavn i flere lob-mapper
+                _fname_count: dict[str, int] = {}
+                for _sti in old_blobs:
+                    _fn = PurePosixPath(_sti).name
+                    _fname_count[_fn] = _fname_count.get(_fn, 0) + 1
+                collision_names = {fn for fn, cnt in _fname_count.items() if cnt > 1}
+
+                by_parent: dict[Path, list[tuple[str, str, str]]] = defaultdict(list)
                 for zip_sti in old_blobs:
                     p   = PurePosixPath(zip_sti)
                     pdir = extract_dir / str(p.parent)
-                    by_parent[pdir].append((p.stem, p.name))
+                    by_parent[pdir].append((p.stem, p.name, zip_sti))
 
                 for parent_dir, stem_names in by_parent.items():
                     if not parent_dir.exists():
@@ -4295,13 +4305,27 @@ class BlobConvertOperation(BaseOperation):
                             if f.suffix.lower() == ".pdf" and existing.suffix.lower() != ".pdf":
                                 stem_to_file[rot] = f
 
-                    for stem, orig_name in stem_names:
+                    for stem, orig_name, zip_sti in stem_names:
                         if stem in stem_to_file:
-                            renames[orig_name] = stem_to_file[stem]
+                            new_path = stem_to_file[stem]
                         else:
                             orig = parent_dir / orig_name
-                            if orig.exists():
-                                renames[orig_name] = orig
+                            new_path = orig if orig.exists() else None
+                        if new_path is None:
+                            continue
+                        if orig_name in collision_names:
+                            # Filnavnet er ikke unikt på tvers av lob-mapper — bruk
+                            # kolonne-indeks fra lob-mappenavnet (lob12 → col 12)
+                            _m = re.match(r'lob(\d+)$',
+                                          PurePosixPath(zip_sti).parent.name,
+                                          re.IGNORECASE)
+                            if _m:
+                                col_renames.setdefault(
+                                    int(_m.group(1)), {})[orig_name] = new_path
+                            else:
+                                renames[orig_name] = new_path   # fallback
+                        else:
+                            renames[orig_name] = new_path
 
             # Finn type-kolonne-kobling for denne tabellen
             col_map  = _lob_type_map.get(table_key, {})
@@ -4310,7 +4334,7 @@ class BlobConvertOperation(BaseOperation):
             digest_cols  = tbl_meta.get("digest_cols",     [])
             digesttype_cols = tbl_meta.get("digesttype_cols", [])
 
-            if not renames and xml_sti not in xml_pre:
+            if not renames and not col_renames and xml_sti not in xml_pre:
                 with lock:
                     n_xml_done += 1
                     progress("phase_progress", done=n_xml_done, total=n_xml_total)
@@ -4347,7 +4371,8 @@ class BlobConvertOperation(BaseOperation):
                                                   col_map=col_map,
                                                   mime_col_idxs=mime_cols,
                                                   digest_col_idxs=digest_cols,
-                                                  lob_col_idxs=list(tbl_meta.get("lob_cols", {}).keys()))
+                                                  lob_col_idxs=list(tbl_meta.get("lob_cols", {}).keys()),
+                                                  col_renames=col_renames)
                 with lock:
                     xml_updated += n
                     n_xml_done  += 1
@@ -4356,7 +4381,8 @@ class BlobConvertOperation(BaseOperation):
 
             # Liten/middels fil eller pre-patchet: les inn, patch, skriv tilbake
             patched, n = self._patch_xml_bytes(xml_bytes, xml_sti, renames,
-                                               extract_dir, w)
+                                               extract_dir, w,
+                                               col_renames=col_renames)
 
             # Skriv tilbake
             if n > 0 or xml_sti in xml_pre:
@@ -4383,7 +4409,9 @@ class BlobConvertOperation(BaseOperation):
 
     def _patch_xml_bytes(self, xml_bytes: bytes, xml_sti: str,
                           renames: dict[str, Path],
-                          extract_dir: Path, w) -> tuple[bytes, int]:
+                          extract_dir: Path, w,
+                          col_renames: "dict[int, dict[str, Path]] | None" = None,
+                          ) -> tuple[bytes, int]:
         """
         Patch tableX.xml for omdøpte blob-filer.
 
@@ -4395,10 +4423,12 @@ class BlobConvertOperation(BaseOperation):
         SIZE_THRESHOLD = 50 * 1024 * 1024
 
         if len(xml_bytes) >= SIZE_THRESHOLD:
-            return self._patch_xml_streaming(xml_bytes, xml_sti, renames, w)
+            return self._patch_xml_streaming(xml_bytes, xml_sti, renames, w,
+                                             col_renames=col_renames)
 
         # Bytes-streaming for rename-referanser (bevarer alt originalt innhold)
-        patched, updates = self._patch_xml_streaming(xml_bytes, xml_sti, renames, w)
+        patched, updates = self._patch_xml_streaming(xml_bytes, xml_sti, renames, w,
+                                                     col_renames=col_renames)
 
         if updates == 0:
             return xml_bytes, 0
@@ -4432,12 +4462,16 @@ class BlobConvertOperation(BaseOperation):
             xml_bytes: bytes,
             xml_sti: str,
             renames: dict[str, Path],
-            w) -> tuple[bytes, int]:
+            w,
+            col_renames: "dict[int, dict[str, Path]] | None" = None,
+    ) -> tuple[bytes, int]:
         """
         Linje-for-linje patch av XML-bytes.
         Oppdaterer file=, length= og digest= i filreferanse-noder.
+        col_renames: {col_idx: {orig_name: new_path}} for filnavn som
+        kolliderer på tvers av lob-mapper — brukes til kolonnebevissst patching.
         """
-        if not renames:
+        if not renames and not col_renames:
             return xml_bytes, 0
 
         ren_bytes = {k.encode("utf-8"): v.name.encode("utf-8")
@@ -4446,15 +4480,38 @@ class BlobConvertOperation(BaseOperation):
         ren_paths = {k.encode("utf-8"): v
                      for k, v in renames.items()
                      if k != v.name}
-        if not ren_bytes:
+
+        # Pre-bygg per-kolonne bytes-dicts for kollisjons-oppslag
+        col_ren_bytes: dict[int, dict[bytes, bytes]] = {}
+        col_ren_paths: dict[int, dict[bytes, Path]]  = {}
+        if col_renames:
+            for col_idx, cr in col_renames.items():
+                col_ren_bytes[col_idx] = {k.encode("utf-8"): v.name.encode("utf-8")
+                                          for k, v in cr.items() if k != v.name}
+                col_ren_paths[col_idx] = {k.encode("utf-8"): v
+                                          for k, v in cr.items() if k != v.name}
+
+        if not ren_bytes and not col_ren_bytes:
             return xml_bytes, 0
 
+        _COL_RE = re.compile(rb'<c(\d+)\b')
         updates = 0
         out_buf = io.BytesIO()
 
         for line in io.BytesIO(xml_bytes):
             if b'file' in line or b'href' in line:
-                new_line, n = _patch_line_with_digest(line, ren_bytes, ren_paths)
+                # Kolonnebevissst oppslag: finn <cN> i linjen og bruk
+                # kolonne-spesifikke renames for kollisjons-filnavn
+                eff_bytes = ren_bytes
+                eff_paths = ren_paths
+                if col_ren_bytes:
+                    _m = _COL_RE.search(line)
+                    if _m:
+                        col_idx = int(_m.group(1))
+                        if col_idx in col_ren_bytes:
+                            eff_bytes = {**ren_bytes, **col_ren_bytes[col_idx]}
+                            eff_paths = {**ren_paths, **col_ren_paths[col_idx]}
+                new_line, n = _patch_line_with_digest(line, eff_bytes, eff_paths)
                 if n > 0:
                     line = new_line
                     updates += n
@@ -4473,6 +4530,7 @@ class BlobConvertOperation(BaseOperation):
             xml_path: Path,
             renames: dict[str, Path],
             w,
+            col_renames: "dict[int, dict[str, Path]] | None" = None,
             **kwargs) -> int:
         """
         Patch stor tableX.xml direkte på disk.
@@ -4481,6 +4539,7 @@ class BlobConvertOperation(BaseOperation):
           - length="GAMMEL"   → length="NY" (fra ny PDF-fil)
           - digest="GAMMEL"   → digest="NY MD5" (beregnet fra ny PDF-fil)
         Linje-for-linje, ingen full fil i RAM. O(1) dict-oppslag per linje.
+        col_renames: {col_idx: {orig_name: new_path}} for kollisjons-filnavn.
         """
         import hashlib as _hashlib
 
@@ -4494,7 +4553,17 @@ class BlobConvertOperation(BaseOperation):
             for k, v in renames.items()
             if k != v.name
         }
-        if not ren_bytes:
+
+        col_ren_bytes: dict[int, dict[bytes, bytes]] = {}
+        col_ren_paths: dict[int, dict[bytes, Path]]  = {}
+        if col_renames:
+            for _ci, _cr in col_renames.items():
+                col_ren_bytes[_ci] = {k.encode("utf-8"): v.name.encode("utf-8")
+                                      for k, v in _cr.items() if k != v.name}
+                col_ren_paths[_ci] = {k.encode("utf-8"): v
+                                      for k, v in _cr.items() if k != v.name}
+
+        if not ren_bytes and not col_ren_bytes:
             return 0
 
         tmp_path    = xml_path.with_suffix(".tmp_patch")
@@ -4503,6 +4572,8 @@ class BlobConvertOperation(BaseOperation):
         file_sz     = xml_path.stat().st_size
         total_lines = _count_lines(xml_path)
         REPORT      = max(1, total_lines // 10)
+
+        _COL_RE_IP = re.compile(rb'<c(\d+)\b')
 
         try:
             comment_written = False
@@ -4514,8 +4585,17 @@ class BlobConvertOperation(BaseOperation):
                     line_no += 1
 
                     if b'file' in line or b'href' in line:
+                        eff_bytes = ren_bytes
+                        eff_paths = ren_paths
+                        if col_ren_bytes:
+                            _m = _COL_RE_IP.search(line)
+                            if _m:
+                                _ci = int(_m.group(1))
+                                if _ci in col_ren_bytes:
+                                    eff_bytes = {**ren_bytes, **col_ren_bytes[_ci]}
+                                    eff_paths = {**ren_paths, **col_ren_paths[_ci]}
                         new_line, n = _patch_line_with_digest(
-                            line, ren_bytes, ren_paths)
+                            line, eff_bytes, eff_paths)
                         if n > 0:
                             line = new_line
                             updates += n

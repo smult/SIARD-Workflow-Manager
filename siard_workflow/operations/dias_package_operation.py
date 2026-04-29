@@ -34,7 +34,6 @@ _DIAS_JSON   = _PROGRAM_DIR / "dias.json"
 # Alle kjente feltnøkler med hardkodede fallback-verdier
 _DIAS_KEYS: dict[str, str] = {
     "submission_agreement":         "",
-    "uttrekksdato":                 "",
     "label":                        "",
     "system":                       "",
     "system_version":               "",
@@ -50,10 +49,8 @@ _DIAS_KEYS: dict[str, str] = {
     "producer_software":            "SIARD Workflow Manager",
     "creator":                      "",
     "preserver":                    "",
-    "username":                     "admin",
     "descriptive_metadata_path":    "",
     "administrative_metadata_path": "",
-    "schema_dir":                   "",
     "output_dir":                   "",
     "extra_files":                  "[]",  # JSON: [{src, dest}, ...]
 }
@@ -71,6 +68,133 @@ def _load_dias_json() -> dict[str, str]:
     except Exception:
         logger.warning("Kunne ikke lese %s — bruker hardkodede standardverdier", _DIAS_JSON)
     return base
+
+
+def read_meta_from_mets(mets_path) -> dict:
+    """
+    Les metadata fra en eksisterende METS-fil (info.xml, mets.xml eller annet navn).
+
+    Returnerer dict med nøkler fra _DIAS_KEYS der verdier finnes i filen.
+    Kaster ValueError ved ugyldig XML.
+    """
+    import xml.etree.ElementTree as ET
+    _NS = "http://www.loc.gov/METS/"
+
+    def _tag(local):
+        return f"{{{_NS}}}{local}"
+
+    def _name(agent_el):
+        n = agent_el.find(_tag("name"))
+        return (n.text or "").strip() if n is not None else ""
+
+    try:
+        root = ET.parse(str(mets_path)).getroot()
+    except ET.ParseError as exc:
+        raise ValueError(f"Ugyldig XML: {exc}") from exc
+
+    result: dict = {}
+
+    label = root.get("LABEL", "")
+    if label:
+        result["label"] = label
+
+    hdr = root.find(_tag("metsHdr"))
+    if hdr is None:
+        return result
+
+    for ar in hdr.findall(_tag("altRecordID")):
+        val = (ar.text or "").strip()
+        t = ar.get("TYPE", "")
+        if t == "SUBMISSIONAGREEMENT":
+            result["submission_agreement"] = val
+        elif t == "STARTDATE":
+            result["period_start"] = val
+        elif t == "ENDDATE":
+            result["period_end"] = val
+
+    sw_archivists: list[str] = []
+    for agent in hdr.findall(_tag("agent")):
+        typ       = agent.get("TYPE", "")
+        role      = agent.get("ROLE", "")
+        otherrole = agent.get("OTHERROLE", "")
+        othertype = agent.get("OTHERTYPE", "")
+        name = _name(agent)
+
+        if typ == "ORGANIZATION" and role == "ARCHIVIST":
+            result["archivist_org"] = name
+        elif typ == "OTHER" and othertype == "SOFTWARE" and role == "ARCHIVIST":
+            sw_archivists.append(name)
+        elif typ == "ORGANIZATION" and role == "CREATOR":
+            result["creator"] = name
+        elif role == "OTHER" and otherrole == "PRODUCER":
+            if typ == "ORGANIZATION":
+                result["producer_org"] = name
+            elif typ == "INDIVIDUAL":
+                result["producer_person"] = name
+            elif typ == "OTHER" and othertype == "SOFTWARE":
+                result["producer_software"] = name
+        elif role == "OTHER" and otherrole == "SUBMITTER":
+            if typ == "ORGANIZATION":
+                result["submitter_org"] = name
+            elif typ == "INDIVIDUAL":
+                result["submitter_person"] = name
+        elif typ == "ORGANIZATION" and role == "IPOWNER":
+            result["owner_org"] = name
+        elif typ == "ORGANIZATION" and role == "PRESERVATION":
+            result["preserver"] = name
+
+    for key, val in zip(("system", "system_version", "archivist_type"), sw_archivists):
+        result[key] = val
+
+    return result
+
+
+def _resolve_pending(token: str, siard_path: Path, ctx) -> "Path | None":
+    """
+    Løs opp [[pending:{token}]] til reell filsti, eller None hvis ikke funnet.
+    Brukes av DiasPackageOperation.run() rett før ekstra-filer kopieres.
+    """
+    base = siard_path.stem
+    _suffixes = ("_konvertert", "_hex_extracted", "_cosdoc", "_blob", "_dias")
+    changed = True
+    while changed:
+        changed = False
+        for suf in _suffixes:
+            if base.lower().endswith(suf.lower()):
+                base = base[: -len(suf)]
+                changed = True
+
+    parent = siard_path.parent
+    meta   = ctx.metadata if ctx and ctx.metadata else {}
+    log_dir_str = meta.get("log_dir", "")
+    log_dir = Path(log_dir_str) if log_dir_str else None
+
+    def _newest(*dirs, pattern: str) -> "Path | None":
+        candidates: list[Path] = []
+        for d in dirs:
+            if d and d.is_dir():
+                candidates.extend(d.glob(pattern))
+        return max(candidates, key=lambda p: p.stat().st_mtime, default=None)
+
+    if token == "workflow_log":
+        fl = meta.get("file_logger")
+        if fl and hasattr(fl, "log_path"):
+            lp = Path(fl.log_path)
+            if lp.exists():
+                return lp
+        return _newest(parent, log_dir, pattern=f"{base}_*.log")
+
+    if token == "blob_csv":
+        return _newest(parent, log_dir, pattern=f"{base}_*_blob_konvertering.csv")
+
+    if token == "konvertering_feil":
+        return _newest(parent, log_dir, pattern=f"{base}_*_konvertering_feil.log")
+
+    if token == "sha256":
+        p = parent / f"{base}.sha256"
+        return p if p.exists() else None
+
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -113,6 +237,28 @@ class DiasPackageOperation(BaseOperation):
         out_root = Path(self.params.get("output_dir") or siard_path.parent)
         out_root.mkdir(parents=True, exist_ok=True)
 
+        # Løs opp [[pending:*]]-tokens i extra_files til reelle filstier
+        try:
+            raw_list = json.loads(self.params.get("extra_files", "[]") or "[]")
+        except Exception:
+            raw_list = []
+        resolved_list = []
+        for ef in raw_list:
+            src = ef.get("src", "")
+            if src.startswith("[[pending:") and src.endswith("]]"):
+                token = src[10:-2]
+                real  = _resolve_pending(token, siard_path, ctx)
+                if real:
+                    dest_dir = ef.get("dest", "").rstrip("/")
+                    resolved_list.append({"src": str(real),
+                                          "dest": f"{dest_dir}/{real.name}"})
+                    logger.info("Pending token '%s' løst til: %s", token, real)
+                else:
+                    logger.warning("Pending token '%s' — fil ikke funnet, hopper over", token)
+            else:
+                resolved_list.append(ef)
+        meta = {**self.params, "extra_files": json.dumps(resolved_list, ensure_ascii=False)}
+
         # Lag en midlertidig content-mappe med kun SIARD-filen
         with tempfile.TemporaryDirectory() as tmp_content:
             content_dir = Path(tmp_content) / siard_path.stem
@@ -123,8 +269,7 @@ class DiasPackageOperation(BaseOperation):
                 aic_path = _build_dias_package(
                     content_path = content_dir,
                     out_root     = out_root,
-                    meta         = self.params,
-                    schema_dir   = self.params.get("schema_dir") or "",
+                    meta         = meta,
                     log_fn       = lambda msg: logger.info(msg),
                 )
             except Exception as exc:
@@ -262,10 +407,6 @@ def _write_sip_log(path: str, sip_id: str, create_date: str, meta: dict):
         <premis:eventOutcomeDetailNote>Success to create logfile</premis:eventOutcomeDetailNote>
       </premis:eventOutcomeDetail>
     </premis:eventOutcomeInformation>
-    <premis:linkingAgentIdentifier>
-      <premis:linkingAgentIdentifierType>NO/RA</premis:linkingAgentIdentifierType>
-      <premis:linkingAgentIdentifierValue>{meta["username"]}</premis:linkingAgentIdentifierValue>
-    </premis:linkingAgentIdentifier>
     <premis:linkingObjectIdentifier>
       <premis:linkingObjectIdentifierType>NO/RA</premis:linkingObjectIdentifierType>
       <premis:linkingObjectIdentifierValue>{sip_id}</premis:linkingObjectIdentifierValue>
@@ -399,7 +540,6 @@ def _write_sip_mets(mets_path: str, premis_path: str, sip_id: str,
         f'        <mets:altRecordID TYPE="SUBMISSIONAGREEMENT">{meta["submission_agreement"]}</mets:altRecordID>',
         f'        <mets:altRecordID TYPE="STARTDATE">{meta["period_start"]}</mets:altRecordID>',
         f'        <mets:altRecordID TYPE="ENDDATE">{meta["period_end"]}</mets:altRecordID>',
-        f'        <mets:altRecordID TYPE="EXTRACTDATE">{meta.get("uttrekksdato", "")}</mets:altRecordID>',
         f'        <mets:metsDocumentID>mets.xml</mets:metsDocumentID>',
         f'    </mets:metsHdr>',
         f'    <mets:amdSec ID="amdSec001">',
@@ -472,7 +612,6 @@ def _write_sip_info(info_path: str, tar_path: str, sip_id: str,
         <mets:altRecordID TYPE="SUBMISSIONAGREEMENT">{meta["submission_agreement"]}</mets:altRecordID>
         <mets:altRecordID TYPE="STARTDATE">{meta["period_start"]}</mets:altRecordID>
         <mets:altRecordID TYPE="ENDDATE">{meta["period_end"]}</mets:altRecordID>
-        <mets:altRecordID TYPE="EXTRACTDATE">{meta.get("uttrekksdato", "")}</mets:altRecordID>
         <mets:metsDocumentID>info.xml</mets:metsDocumentID>
     </mets:metsHdr>
     <mets:fileSec>
@@ -559,10 +698,6 @@ def _write_aic_log(path: str, aic_id: str, sip_id: str, create_date: str, meta: 
         <premis:eventOutcomeDetailNote>Success to create logfile</premis:eventOutcomeDetailNote>
       </premis:eventOutcomeDetail>
     </premis:eventOutcomeInformation>
-    <premis:linkingAgentIdentifier>
-      <premis:linkingAgentIdentifierType>NO/RA</premis:linkingAgentIdentifierType>
-      <premis:linkingAgentIdentifierValue>{meta["username"]}</premis:linkingAgentIdentifierValue>
-    </premis:linkingAgentIdentifier>
     <premis:linkingObjectIdentifier>
       <premis:linkingObjectIdentifierType>NO/RA</premis:linkingObjectIdentifierType>
       <premis:linkingObjectIdentifierValue>{sip_id}</premis:linkingObjectIdentifierValue>
@@ -578,7 +713,6 @@ def _build_dias_package(
     content_path: Path,
     out_root:     Path,
     meta:         dict,
-    schema_dir:   str,
     log_fn,
 ) -> Path:
     """
@@ -592,7 +726,7 @@ def _build_dias_package(
             administrative_metadata/repository_operations/
             descriptive_metadata/
             content/
-              {sip_id}/        ← SIP-innhold (XSD, premis, mets, log, content/)
+              {sip_id}/        ← SIP-innhold (premis, mets, log, content/)
                 {sip_id}.tar   ← komprimert innhold
     """
     log_fn("Bygger mappestruktur...")
@@ -605,19 +739,6 @@ def _build_dias_package(
     (tarfile_dir / "administrative_metadata").mkdir(parents=True)
     (tarfile_dir / "descriptive_metadata").mkdir(parents=True)
     (tarfile_dir / "content").mkdir(parents=True)
-
-    # Kopier XSD-skjemafiler hvis schema_dir er satt
-    if schema_dir:
-        sd = Path(schema_dir)
-        for fname, dst in [
-            ("mets.xsd",        tarfile_dir / "mets.xsd"),
-            ("DIAS_PREMIS.xsd", tarfile_dir / "administrative_metadata" / "DIAS_PREMIS.xsd"),
-        ]:
-            src = sd / fname
-            if src.exists():
-                shutil.copy2(src, dst)
-            else:
-                logger.warning("Skjemafil ikke funnet: %s", src)
 
     # Kopier ekstra filer (logg, SHA256, rapport, prosjektfil etc.) FØR
     # _gather_file_info slik at de inkluderes automatisk i METS/PREMIS

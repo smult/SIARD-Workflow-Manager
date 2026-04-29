@@ -36,6 +36,27 @@ _FOLDERS = {
     "desc":     "descriptive_metadata",
 }
 
+# Operasjoner som produserer filer relevant for DIAS-pakken
+_PENDING_BY_OP: dict[str, list[dict]] = {
+    "blob_convert": [
+        {"token": "blob_csv",          "name": "Blob-konvertering logg (CSV)",
+         "folder_id": "repo_ops"},
+        {"token": "konvertering_feil", "name": "Blob-konvertering feillogg",
+         "folder_id": "repo_ops"},
+    ],
+    "sha256": [
+        {"token": "sha256",            "name": "SHA256-sjekksum",
+         "folder_id": "adm"},
+    ],
+}
+
+# Alltid med — kjørelogg starter uansett hvilke operasjoner som er i workflow
+_ALWAYS_PENDING: list[dict] = [
+    {"token": "workflow_log",
+     "name": "Kjørelogg (ufullstendig – pågående kjøring)",
+     "folder_id": "repo_ops"},
+]
+
 # Kjente operasjonssuffikser som strippes for å finne opprinnelig arkivnavn
 _OP_SUFFIXES = [
     "_konvertert", "_hex_extracted", "_cosdoc", "_blob", "_dias",
@@ -160,7 +181,11 @@ class DiasParamDialog(ctk.CTkToplevel):
         self._op_def      = op_def
         self._on_confirm  = on_confirm
         self._on_saved    = on_saved
-        self._vars: dict  = {}
+        self._vars: dict       = {}
+        self._validators: list = []
+
+        from gui.operations_panel import _current_upstream_op_ids
+        self._upstream_op_ids: list[str] = list(_current_upstream_op_ids)
 
         # Filtre-data: item_id → {src, dest, folder_id, tag, name}
         self._file_entries: dict[str, dict] = {}
@@ -262,18 +287,27 @@ class DiasParamDialog(ctk.CTkToplevel):
 
         _inp = dict(padx=(6, 12), sticky="ew")   # felles plasseringsargumenter
 
+        # Rad 0: knapp for å lese inn metadata fra METS-fil
+        mets_row = ctk.CTkFrame(frm, fg_color="transparent")
+        mets_row.grid(row=0, column=0, columnspan=2, padx=6, pady=(4, 6), sticky="w")
+        ctk.CTkButton(mets_row, text="Les inn fra METS-fil …",
+                      fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+                      font=ctk.CTkFont(family=FONTS["mono"], size=12),
+                      command=self._load_from_mets).pack(side="left")
+
+        # Params starter på rad 1 (rad 0 er METS-importknappen)
         for i, p in enumerate(self._op_def.get("params", [])):
             ctk.CTkLabel(frm, text=p["label"],
                          font=ctk.CTkFont(family=FONTS["mono"], size=12),
                          text_color=COLORS["text"]
-                         ).grid(row=i, column=0, padx=(10, 4), pady=5, sticky="w")
+                         ).grid(row=i+1, column=0, padx=(10, 4), pady=5, sticky="w")
 
             if p["type"] == "bool":
                 var = ctk.BooleanVar(value=p["default"])
                 ctk.CTkSwitch(frm, text="", variable=var,
                               onvalue=True, offvalue=False,
                               button_color=COLORS["accent"]
-                              ).grid(row=i, column=1, **_inp)
+                              ).grid(row=i+1, column=1, **_inp)
                 self._vars[p["key"]] = (var, "bool")
                 continue
 
@@ -287,9 +321,9 @@ class DiasParamDialog(ctk.CTkToplevel):
                     button_hover_color=COLORS["accent_dim"],
                     dropdown_fg_color=COLORS["panel"],
                     font=ctk.CTkFont(family=FONTS["mono"], size=12),
-                    width=1,          # minimumverdi — grid stretcher til kolonne-bredde
+                    width=1,
                     dynamic_resizing=False,
-                ).grid(row=i, column=1, **_inp)
+                ).grid(row=i+1, column=1, **_inp)
                 self._vars[p["key"]] = (var, "choice")
 
             elif p["type"] == "autocomplete":
@@ -299,8 +333,8 @@ class DiasParamDialog(ctk.CTkToplevel):
                     full_list=_get_autocomplete_list(p.get("source", "")),
                     variable=var,
                     siard_source=p.get("source", ""),
-                    width=1)          # minimumverdi — grid stretcher til kolonne-bredde
-                ac.grid(row=i, column=1, **_inp)
+                    width=1)
+                ac.grid(row=i+1, column=1, **_inp)
                 self._vars[p["key"]] = (var, "str")
                 continue
 
@@ -310,24 +344,80 @@ class DiasParamDialog(ctk.CTkToplevel):
                              fg_color=COLORS["bg"],
                              font=ctk.CTkFont(family=FONTS["mono"], size=12),
                              justify="left",
-                             ).grid(row=i, column=1, **_inp)
+                             ).grid(row=i+1, column=1, **_inp)
 
             else:
-                if (p["key"] == "uttrekksdato"
-                        and self._siard_path
-                        and self._siard_path.exists()):
-                    mtime    = self._siard_path.stat().st_mtime
-                    _default = datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d")
-                else:
-                    _default = str(p["default"])
+                _default = str(p["default"])
                 var = ctk.StringVar(value=_default)
-                ctk.CTkEntry(frm, textvariable=var, width=1,
-                             fg_color=COLORS["bg"],
-                             font=ctk.CTkFont(family=FONTS["mono"], size=12),
-                             justify="left",
-                             ).grid(row=i, column=1, **_inp)
+                if p["key"] == "output_dir":
+                    hf = ctk.CTkFrame(frm, fg_color="transparent")
+                    hf.grid(row=i+1, column=1, **_inp)
+                    hf.grid_columnconfigure(0, weight=1)
+                    ctk.CTkEntry(hf, textvariable=var, fg_color=COLORS["bg"],
+                                 font=ctk.CTkFont(family=FONTS["mono"], size=12),
+                                 justify="left").grid(row=0, column=0, sticky="ew")
+                    def _pick_dir(v=var):
+                        d = filedialog.askdirectory(title="Velg utdatamappe")
+                        if d:
+                            v.set(d)
+                    ctk.CTkButton(hf, text="…", width=32,
+                                  fg_color=COLORS["btn"],
+                                  hover_color=COLORS["btn_hover"],
+                                  font=ctk.CTkFont(family=FONTS["mono"], size=12),
+                                  command=_pick_dir).grid(row=0, column=1, padx=(4, 0))
+                    self._vars[p["key"]] = (var, p["type"])
+                    continue
+                _entry = ctk.CTkEntry(frm, textvariable=var, width=1,
+                                      fg_color=COLORS["bg"],
+                                      font=ctk.CTkFont(family=FONTS["mono"], size=12),
+                                      justify="left")
+                _entry.grid(row=i+1, column=1, **_inp)
+                if p["key"] in ("period_start", "period_end"):
+                    def _make_validator(e=_entry, v=var, key=p["key"]):
+                        def _validate():
+                            val = v.get().strip()
+                            ok = not val
+                            if not ok:
+                                try:
+                                    datetime.datetime.strptime(val, "%Y-%m-%d")
+                                    ok = True
+                                except ValueError:
+                                    try:
+                                        datetime.datetime.strptime(val, "%Y")
+                                        suffix = "-01-01" if key == "period_start" else "-12-31"
+                                        v.set(val + suffix)
+                                        ok = True
+                                    except ValueError:
+                                        pass
+                            e.configure(border_color=COLORS["border"] if ok else COLORS["red"])
+                            return ok
+                        return _validate
+                    _fn = _make_validator()
+                    self._validators.append(_fn)
+                    _entry.bind("<FocusOut>", lambda _, f=_fn: f())
 
             self._vars[p["key"]] = (var, p["type"])
+
+    # ── METS-innlesing ────────────────────────────────────────────────────────
+
+    def _load_from_mets(self):
+        path = filedialog.askopenfilename(
+            title="Velg METS-fil",
+            filetypes=[("XML-filer", "*.xml"), ("Alle filer", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            from siard_workflow.operations.dias_package_operation import read_meta_from_mets
+            meta = read_meta_from_mets(path)
+        except Exception as exc:
+            import tkinter.messagebox as mb
+            mb.showerror("Feil ved innlesing", str(exc), parent=self)
+            return
+        for key, val in meta.items():
+            if key in self._vars:
+                var, _ = self._vars[key]
+                var.set(val)
 
     # ── Filtrestruktur ────────────────────────────────────────────────────────
 
@@ -375,7 +465,7 @@ class DiasParamDialog(ctk.CTkToplevel):
 
         # Legende
         ctk.CTkLabel(parent,
-                     text="🟡 Auto-oppdaget   ⚪ Manuelt lagt til   🔒 Låst",
+                     text="🟡 Auto-oppdaget   ⏳ Produseres underveis   ⚪ Manuelt lagt til   🔒 Låst",
                      font=ctk.CTkFont(family=FONTS["mono"], size=11),
                      text_color=COLORS["muted"]
                      ).grid(row=3, column=0, padx=10, pady=(0, 8), sticky="w")
@@ -439,10 +529,11 @@ class DiasParamDialog(ctk.CTkToplevel):
                                open=False, tags=("folder",))
         self._folder_ids["desc"] = desc_id
 
-        tree.tag_configure("folder", foreground="#4f8ef7")
-        tree.tag_configure("locked", foreground=COLORS["muted"])
-        tree.tag_configure("auto",   foreground="#f0c040")
-        tree.tag_configure("user",   foreground=COLORS["text"])
+        tree.tag_configure("folder",    foreground="#4f8ef7")
+        tree.tag_configure("locked",    foreground=COLORS["muted"])
+        tree.tag_configure("auto",      foreground="#f0c040")
+        tree.tag_configure("user",      foreground=COLORS["text"])
+        tree.tag_configure("pending",   foreground=COLORS["muted"])
         tree.tag_configure("drag_hover", foreground="#2ecc71")
 
         if content_siard:
@@ -454,12 +545,14 @@ class DiasParamDialog(ctk.CTkToplevel):
                 tag="locked")
             for ef in _discover_files(self._siard_path):
                 self._insert_file(**ef)
+            self._add_pending_dummies()
 
     def _insert_file(self, src: str, dest: str, folder_id: str,
                      name: str = "", tag: str = "user") -> str:
         if not name:
             name = Path(src).name
-        label   = f"{_mime_icon(name)}  {name}"
+        icon  = "⏳" if tag == "pending" else _mime_icon(name)
+        label = f"{icon}  {name}"
         parent  = self._folder_ids.get(folder_id, self._folder_ids["adm"])
         item_id = self._tree.insert(parent, "end", text=label,
                                      values=(src,), tags=(tag,))
@@ -469,14 +562,29 @@ class DiasParamDialog(ctk.CTkToplevel):
         }
         return item_id
 
+    def _add_pending_dummies(self):
+        pending_defs = list(_ALWAYS_PENDING)
+        for op_id in self._upstream_op_ids:
+            pending_defs.extend(_PENDING_BY_OP.get(op_id, []))
+        for pd in pending_defs:
+            dest_dir = _FOLDERS[pd["folder_id"]]
+            self._insert_file(
+                src=f"[[pending:{pd['token']}]]",
+                dest=f"{dest_dir}/",
+                folder_id=pd["folder_id"],
+                name=pd["name"],
+                tag="pending",
+            )
+
     def _refresh_auto(self):
         for item_id, info in list(self._file_entries.items()):
-            if info["tag"] == "auto":
+            if info["tag"] in ("auto", "pending"):
                 self._tree.delete(item_id)
                 del self._file_entries[item_id]
         if self._siard_path:
             for ef in _discover_files(self._siard_path):
                 self._insert_file(**ef)
+            self._add_pending_dummies()
 
     # ── Legg til / fjern ──────────────────────────────────────────────────────
 
@@ -552,6 +660,8 @@ class DiasParamDialog(ctk.CTkToplevel):
     # ── Bekreft ───────────────────────────────────────────────────────────────
 
     def _confirm(self):
+        if not all(fn() for fn in self._validators):
+            return
         kwargs: dict = {}
         for key, (var, typ) in self._vars.items():
             val = var.get()

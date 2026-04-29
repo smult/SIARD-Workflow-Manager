@@ -224,7 +224,8 @@ class App(ctk.CTk):
         right.grid_columnconfigure(0, weight=1)
 
         self.ops_panel = OperationsPanel(right, on_add=self._add_operation,
-                                          on_saved=self._on_settings_saved)
+                                          on_saved=self._on_settings_saved,
+                                          get_workflow_ops=self.workflow_panel.get_operations)
         self.ops_panel.grid(row=0, column=0, pady=(0,8), sticky="ew")
 
         self.progress_panel = ProgressPanel(right)

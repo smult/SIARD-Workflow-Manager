@@ -298,7 +298,10 @@ class WorkflowPanel(ctk.CTkFrame):
                 self._on_settings_saved(op_id, params, settings_path, error)
 
         if op_def.get("custom_dialog") == "DiasParamDialog":
+            from gui.operations_panel import set_upstream_op_ids
             from gui.dias_dialog import DiasParamDialog
+            row_idx = self._rows.index(row)
+            set_upstream_op_ids([r.op.operation_id for r in self._rows[:row_idx]])
             DiasParamDialog(self, live_def, on_confirm=_on_confirm, on_saved=_on_saved)
         else:
             ParamDialog(self, live_def, on_confirm=_on_confirm, on_saved=_on_saved)

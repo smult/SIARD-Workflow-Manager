@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing import Callable
 import csv
+import datetime
 import io
 import json
 import sys
@@ -132,11 +133,17 @@ def _get_autocomplete_list(source: str) -> list[str]:
 # ── SIARD-metadata-forslag ────────────────────────────────────────────────────
 
 _current_siard_path: "Path | None" = None
+_current_upstream_op_ids: list = []
 
 
 def set_current_siard_path(path: "Path | None") -> None:
     global _current_siard_path
     _current_siard_path = path
+
+
+def set_upstream_op_ids(ids: list) -> None:
+    global _current_upstream_op_ids
+    _current_upstream_op_ids = list(ids)
 
 
 def _get_siard_suggestions(source: str) -> list[str]:
@@ -569,7 +576,6 @@ OP_DEFS = [
         "status": DiasPackageOperation.status,
         "params": [
             {"key": "submission_agreement", "label": "Submission Agreement",           "type": "str",    "default": DiasPackageOperation.default_params["submission_agreement"]},
-            {"key": "uttrekksdato",         "label": "Uttrekksdato (ÅÅÅÅ-MM-DD)",      "type": "str",    "default": DiasPackageOperation.default_params["uttrekksdato"]},
             {"key": "label",                "label": "Pakketittel",                    "type": "str",    "default": DiasPackageOperation.default_params["label"]},
             {"key": "system",               "label": "Kildesystem",                    "type": "autocomplete", "source": "kildesystem", "default": DiasPackageOperation.default_params["system"]},
             {"key": "system_version",       "label": "Systemversjon",                  "type": "str",    "default": DiasPackageOperation.default_params["system_version"]},
@@ -587,8 +593,6 @@ OP_DEFS = [
             {"key": "producer_software",    "label": "Produsent (programvare)",        "type": "str",    "default": DiasPackageOperation.default_params["producer_software"]},
             {"key": "creator",              "label": "Skaper",                         "type": "str",    "default": DiasPackageOperation.default_params["creator"]},
             {"key": "preserver",            "label": "Bevaringsansvarlig",             "type": "str",    "default": DiasPackageOperation.default_params["preserver"]},
-            {"key": "username",             "label": "Brukernavn",                     "type": "str",    "default": DiasPackageOperation.default_params["username"]},
-            {"key": "schema_dir",           "label": "Skjemamappe (mets.xsd osv)",     "type": "str",    "default": DiasPackageOperation.default_params["schema_dir"]},
             {"key": "output_dir",           "label": "Utdatamappe (tom = SIARD-mappe)","type": "str",    "default": DiasPackageOperation.default_params["output_dir"]},
         ],
     },
@@ -631,7 +635,8 @@ class ParamDialog(ctk.CTkToplevel):
         self._op_def    = op_def
         self._on_confirm = on_confirm
         self._on_saved   = on_saved   # kalles med (operation_id, params, settings_path)
-        self._vars = {}
+        self._vars       = {}
+        self._validators: list = []
         self._build()
         n_params = len(op_def.get("params", []))
         row_h    = 52
@@ -800,17 +805,34 @@ class ParamDialog(ctk.CTkToplevel):
                     self._vars[p["key"]] = (var, "str")
                     continue
                 else:
-                    if (p["key"] == "uttrekksdato"
-                            and _current_siard_path
-                            and _current_siard_path.exists()):
-                        import datetime
-                        _mtime = _current_siard_path.stat().st_mtime
-                        _default = datetime.datetime.fromtimestamp(_mtime).strftime("%Y-%m-%d")
-                    else:
-                        _default = str(p["default"])
+                    _default = str(p["default"])
                     var = ctk.StringVar(value=_default)
-                    ctk.CTkEntry(frm, textvariable=var, width=200, fg_color=COLORS["bg"],
-                                 font=ctk.CTkFont(family=FONTS["mono"], size=11)).grid(row=i, column=1, padx=12, sticky="e")
+                    _entry = ctk.CTkEntry(frm, textvariable=var, width=200, fg_color=COLORS["bg"],
+                                         font=ctk.CTkFont(family=FONTS["mono"], size=11))
+                    _entry.grid(row=i, column=1, padx=12, sticky="e")
+                    if p["key"] in ("period_start", "period_end"):
+                        def _make_validator(e=_entry, v=var, key=p["key"]):
+                            def _validate():
+                                val = v.get().strip()
+                                ok = not val
+                                if not ok:
+                                    try:
+                                        datetime.datetime.strptime(val, "%Y-%m-%d")
+                                        ok = True
+                                    except ValueError:
+                                        try:
+                                            datetime.datetime.strptime(val, "%Y")
+                                            suffix = "-01-01" if key == "period_start" else "-12-31"
+                                            v.set(val + suffix)
+                                            ok = True
+                                        except ValueError:
+                                            pass
+                                e.configure(border_color=COLORS["border"] if ok else COLORS["red"])
+                                return ok
+                            return _validate
+                        _fn = _make_validator()
+                        self._validators.append(_fn)
+                        _entry.bind("<FocusOut>", lambda _, f=_fn: f())
                 self._vars[p["key"]] = (var, p["type"])
         btns = ctk.CTkFrame(self, fg_color="transparent")
         btns.grid(row=10, column=0, padx=16, pady=(0,16), sticky="e")
@@ -824,6 +846,8 @@ class ParamDialog(ctk.CTkToplevel):
                       command=self._confirm).pack(side="left")
 
     def _confirm(self):
+        if not all(fn() for fn in self._validators):
+            return
         kwargs = {}
         for key, (var, typ) in self._vars.items():
             val = var.get()
@@ -919,7 +943,8 @@ class _ConditionalDialog(ctk.CTkToplevel):
 
 
 class OperationCard(ctk.CTkFrame):
-    def __init__(self, parent, op_def, on_add, on_saved=None):
+    def __init__(self, parent, op_def, on_add, on_saved=None, get_workflow_ops=None):
+        self._get_workflow_ops = get_workflow_ops
         color = cat_color(op_def["category"])
         super().__init__(parent,
                          fg_color=COLORS["panel"],
@@ -959,6 +984,9 @@ class OperationCard(ctk.CTkFrame):
             _ConditionalDialog(self, on_add)
         elif op_def.get("custom_dialog") == "DiasParamDialog":
             from gui.dias_dialog import DiasParamDialog
+            if self._get_workflow_ops:
+                set_upstream_op_ids(
+                    [op.operation_id for op in self._get_workflow_ops()])
             DiasParamDialog(self, op_def, on_confirm=on_add, on_saved=on_saved)
         elif op_def.get("params"):
             ParamDialog(self, op_def, on_confirm=on_add, on_saved=on_saved)
@@ -968,10 +996,11 @@ class OperationCard(ctk.CTkFrame):
 
 
 class OperationsPanel(ctk.CTkFrame):
-    def __init__(self, parent, on_add, on_saved=None):
+    def __init__(self, parent, on_add, on_saved=None, get_workflow_ops=None):
         super().__init__(parent, fg_color=COLORS["surface"], corner_radius=10)
-        self._on_add   = on_add
-        self._on_saved = on_saved
+        self._on_add          = on_add
+        self._on_saved        = on_saved
+        self._get_workflow_ops = get_workflow_ops
         self.grid_columnconfigure(0, weight=1)
         self._build()
 
@@ -1010,5 +1039,6 @@ class OperationsPanel(ctk.CTkFrame):
             for i, op_def in enumerate(ops):
                 OperationCard(tab, op_def,
                               on_add=self._on_add,
-                              on_saved=self._on_saved).grid(
+                              on_saved=self._on_saved,
+                              get_workflow_ops=self._get_workflow_ops).grid(
                     row=i // 3, column=i % 3, padx=4, pady=4, sticky="ew")
