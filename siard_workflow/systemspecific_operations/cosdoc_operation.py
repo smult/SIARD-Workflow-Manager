@@ -100,7 +100,9 @@ def _md5_upper(data: bytes) -> str:
 
 # ── XML-navnehjelper ──────────────────────────────────────────────────────────
 
-def _local(tag: str) -> str:
+def _local(tag) -> str:
+    if not isinstance(tag, str):
+        return ""
     return tag.split("}")[-1] if "}" in tag else tag
 
 
