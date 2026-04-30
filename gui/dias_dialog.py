@@ -39,6 +39,8 @@ _FOLDERS = {
 # Operasjoner som produserer filer relevant for DIAS-pakken
 _PENDING_BY_OP: dict[str, list[dict]] = {
     "blob_convert": [
+        {"token": "konvertert_siard",  "name": "_konvertert.siard (konvertert SIARD)",
+         "folder_id": "content", "skip_if_suffix": "_konvertert.siard"},
         {"token": "blob_csv",          "name": "Blob-konvertering logg (CSV)",
          "folder_id": "repo_ops"},
         {"token": "konvertering_feil", "name": "Blob-konvertering feillogg",
@@ -47,6 +49,14 @@ _PENDING_BY_OP: dict[str, list[dict]] = {
     "sha256": [
         {"token": "sha256",            "name": "SHA256-sjekksum",
          "folder_id": "adm"},
+    ],
+    "metadata_extract": [
+        {"token": "metadata_rapport",  "name": "Metadata-rapport (PDF)",
+         "folder_id": "repo_ops", "skip_if_suffix": "_metadata_rapport.pdf"},
+    ],
+    "workflow_report": [
+        {"token": "workflow_rapport",  "name": "Kjørerapport (PDF)",
+         "folder_id": "repo_ops", "skip_if_suffix": "_workflow_rapport.pdf"},
     ],
 }
 
@@ -116,7 +126,10 @@ def _discover_files(siard_path: Path) -> list[dict]:
     for path in sorted(parent.glob(f"{base}_*_konvertering_feil.log")):
         _add(path, "repo_ops")
 
-    for path in sorted(parent.glob(f"{base}_*_workflow_rapport_*.html")):
+    for path in sorted(parent.glob(f"{base}*_workflow_rapport*.pdf")):
+        _add(path, "repo_ops")
+
+    for path in sorted(parent.glob(f"{base}*_metadata_rapport.pdf")):
         _add(path, "repo_ops")
 
     # Workflow-logg: {base}_YYYYMMDD_HHMMSS.log — ekskluder feilogg-varianter
@@ -129,31 +142,6 @@ def _discover_files(siard_path: Path) -> list[dict]:
     _add(parent / f"{base}.siardwf", "adm")
 
     return found
-
-
-def _find_content_siard(siard_path: Path) -> Path:
-    """
-    Finn SIARD-filen som faktisk skal pakkes.
-
-    Returnerer den nyeste prosesserte varianten (f.eks. _konvertert.siard)
-    hvis den finnes i samme mappe.  Faller tilbake til kilde-SIARD hvis
-    ingen prosessert variant eksisterer.
-    """
-    parent = siard_path.parent
-    base   = _base_stem(siard_path.stem)
-
-    # Finn alle SIARD-filer i mappen som starter med base og har suffiks
-    candidates = [
-        p for p in parent.glob(f"{base}_*.siard")
-        if p.is_file()
-    ]
-
-    if candidates:
-        # Velg nyeste (mest nylig prosesserte)
-        return max(candidates, key=lambda p: p.stat().st_mtime)
-
-    return siard_path
-
 
 def _mime_icon(name: str) -> str:
     ext = Path(name).suffix.lower().lstrip(".")
@@ -465,7 +453,7 @@ class DiasParamDialog(ctk.CTkToplevel):
 
         # Legende
         ctk.CTkLabel(parent,
-                     text="🟡 Auto-oppdaget   ⏳ Produseres underveis   ⚪ Manuelt lagt til   🔒 Låst",
+                     text="🟦 Kilde-SIARD   🟡 Auto-oppdaget   ⏳ Produseres underveis   ⚪ Manuelt lagt til   🔒 Låst",
                      font=ctk.CTkFont(family=FONTS["mono"], size=11),
                      text_color=COLORS["muted"]
                      ).grid(row=3, column=0, padx=10, pady=(0, 8), sticky="w")
@@ -500,12 +488,22 @@ class DiasParamDialog(ctk.CTkToplevel):
             tree.delete(item)
         self._file_entries.clear()
 
-        # Bruk prosessert SIARD (_konvertert etc.) hvis den finnes, ellers kilde
-        content_siard = (
-            _find_content_siard(self._siard_path)
-            if self._siard_path else None)
-        siard_name = content_siard.name if content_siard else "arkiv.siard"
-        pkg_label  = _base_stem(siard_name.replace(".siard", ""))
+        # Utled originalt arkivnavn og derived paths
+        if self._siard_path:
+            base          = _base_stem(self._siard_path.stem)
+            parent        = self._siard_path.parent
+            original_siard   = parent / f"{base}.siard"
+            if not original_siard.exists():
+                original_siard = self._siard_path  # fallback
+            konvertert_siard = parent / f"{base}_konvertert.siard"
+            has_konvertert   = konvertert_siard.exists()
+            has_blob_convert = "blob_convert" in self._upstream_op_ids
+        else:
+            base = "arkiv"
+            original_siard = konvertert_siard = None
+            has_konvertert = has_blob_convert = False
+
+        pkg_label = base
 
         self._folder_ids: dict[str, str] = {}
 
@@ -529,20 +527,33 @@ class DiasParamDialog(ctk.CTkToplevel):
                                open=False, tags=("folder",))
         self._folder_ids["desc"] = desc_id
 
-        tree.tag_configure("folder",    foreground="#4f8ef7")
-        tree.tag_configure("locked",    foreground=COLORS["muted"])
-        tree.tag_configure("auto",      foreground="#f0c040")
-        tree.tag_configure("user",      foreground=COLORS["text"])
-        tree.tag_configure("pending",   foreground=COLORS["muted"])
-        tree.tag_configure("drag_hover", foreground="#2ecc71")
+        tree.tag_configure("folder",       foreground="#4f8ef7")
+        tree.tag_configure("locked",       foreground=COLORS["muted"])
+        tree.tag_configure("source_siard", foreground=COLORS["accent"])
+        tree.tag_configure("auto",         foreground="#f0c040")
+        tree.tag_configure("user",         foreground=COLORS["text"])
+        tree.tag_configure("pending",      foreground=COLORS["muted"])
+        tree.tag_configure("drag_hover",   foreground="#2ecc71")
 
-        if content_siard:
+        if original_siard:
+            # Original SIARD: låst hvis kun én SIARD finnes, ellers kan fjernes
+            original_tag = "source_siard" if (has_konvertert or has_blob_convert) else "locked"
             self._insert_file(
-                src=str(content_siard),
-                dest=f"content/{siard_name}",
+                src=str(original_siard),
+                dest=f"content/{original_siard.name}",
                 folder_id="content",
-                name=siard_name,
-                tag="locked")
+                name=original_siard.name,
+                tag=original_tag)
+
+            # Konvertert SIARD: auto-oppdaget hvis den finnes på disk
+            if has_konvertert:
+                self._insert_file(
+                    src=str(konvertert_siard),
+                    dest=f"content/{konvertert_siard.name}",
+                    folder_id="content",
+                    name=konvertert_siard.name,
+                    tag="auto")
+
             for ef in _discover_files(self._siard_path):
                 self._insert_file(**ef)
             self._add_pending_dummies()
@@ -563,16 +574,37 @@ class DiasParamDialog(ctk.CTkToplevel):
         return item_id
 
     def _add_pending_dummies(self):
+        # Bygg sett av allerede auto-oppdagede navn per mappe
+        auto_in_folder: dict[str, set[str]] = {}
+        for info in self._file_entries.values():
+            if info["tag"] == "auto":
+                auto_in_folder.setdefault(info["folder_id"], set()).add(
+                    info["name"].lower())
+
         pending_defs = list(_ALWAYS_PENDING)
         for op_id in self._upstream_op_ids:
             pending_defs.extend(_PENDING_BY_OP.get(op_id, []))
+
         for pd in pending_defs:
+            # Hopp over hvis tilsvarende fil allerede er auto-oppdaget
+            skip_suffix = pd.get("skip_if_suffix", "")
+            if skip_suffix:
+                folder_autos = auto_in_folder.get(pd["folder_id"], set())
+                if any(n.endswith(skip_suffix.lower()) for n in folder_autos):
+                    continue
+
             dest_dir = _FOLDERS[pd["folder_id"]]
+            # For konvertert_siard: bygg filnavnet fra base-stammen
+            if pd["token"] == "konvertert_siard" and self._siard_path:
+                base = _base_stem(self._siard_path.stem)
+                display_name = f"{base}_konvertert.siard"
+            else:
+                display_name = pd["name"]
             self._insert_file(
                 src=f"[[pending:{pd['token']}]]",
                 dest=f"{dest_dir}/",
                 folder_id=pd["folder_id"],
-                name=pd["name"],
+                name=display_name,
                 tag="pending",
             )
 
@@ -582,6 +614,27 @@ class DiasParamDialog(ctk.CTkToplevel):
                 self._tree.delete(item_id)
                 del self._file_entries[item_id]
         if self._siard_path:
+            # Re-sjekk om konvertert SIARD nå finnes på disk
+            base           = _base_stem(self._siard_path.stem)
+            konvertert     = self._siard_path.parent / f"{base}_konvertert.siard"
+            has_konvertert = konvertert.exists()
+            if has_konvertert:
+                self._insert_file(
+                    src=str(konvertert),
+                    dest=f"content/{konvertert.name}",
+                    folder_id="content",
+                    name=konvertert.name,
+                    tag="auto")
+            # Oppdater original SIARD-tag basert på ny tilstand
+            has_blob_convert = "blob_convert" in self._upstream_op_ids
+            for item_id, info in self._file_entries.items():
+                if info["tag"] in ("locked", "source_siard") and \
+                        info["dest"].startswith("content/") and \
+                        info["name"].endswith(".siard"):
+                    new_tag = "source_siard" if (has_konvertert or has_blob_convert) else "locked"
+                    if info["tag"] != new_tag:
+                        info["tag"] = new_tag
+                        self._tree.item(item_id, tags=(new_tag,))
             for ef in _discover_files(self._siard_path):
                 self._insert_file(**ef)
             self._add_pending_dummies()
@@ -619,7 +672,7 @@ class DiasParamDialog(ctk.CTkToplevel):
     def _drag_press(self, event):
         item = self._tree.identify_row(event.y)
         tags = self._tree.item(item, "tags") if item else ()
-        self._drag_item         = item if ("auto" in tags or "user" in tags) else None
+        self._drag_item         = item if ("auto" in tags or "user" in tags or "source_siard" in tags) else None
         self._drag_folder_hover = None
 
     def _drag_motion(self, event):

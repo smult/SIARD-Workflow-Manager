@@ -194,10 +194,17 @@ def _resolve_pending(token: str, siard_path: Path, ctx) -> "Path | None":
         p = parent / f"{base}.sha256"
         return p if p.exists() else None
 
+    if token == "konvertert_siard":
+        p = parent / f"{base}_konvertert.siard"
+        return p if p.exists() else None
+
+    if token == "metadata_rapport":
+        return _newest(parent, log_dir, pattern=f"{base}*_metadata_rapport.pdf")
+
+    if token == "workflow_rapport":
+        return _newest(parent, log_dir, pattern=f"{base}*_workflow_rapport*.pdf")
+
     return None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 
 class DiasPackageOperation(BaseOperation):
     """Pakker SIARD-fil inn i DIAS/SIP-format (METS + PREMIS) for ESSArch."""
@@ -257,20 +264,128 @@ class DiasPackageOperation(BaseOperation):
                     logger.warning("Pending token '%s' — fil ikke funnet, hopper over", token)
             else:
                 resolved_list.append(ef)
-        meta = {**self.params, "extra_files": json.dumps(resolved_list, ensure_ascii=False)}
+        # Skill ut SIARD-filer bestemt for content/ fra øvrige metadata-filer
+        content_siard_extras: list[dict] = []
+        metadata_extras:      list[dict] = []
+        for ef in resolved_list:
+            dest = ef.get("dest", "").lstrip("/")
+            if dest.startswith("content/") and ef["src"].lower().endswith(".siard"):
+                content_siard_extras.append(ef)
+            else:
+                metadata_extras.append(ef)
 
-        # Lag en midlertidig content-mappe med kun SIARD-filen
+        # ── Garantert auto-inkludering av kjente filer fra denne kjøringen ──────
+        # Kjører uavhengig av pending-token-systemet slik at filer ikke mangler
+        # selv om dialogens extra_files er tom eller tokens feiler å løse.
+        base = siard_path.stem
+        for _suf in ("_konvertert", "_hex_extracted", "_cosdoc", "_blob", "_dias"):
+            if base.lower().endswith(_suf.lower()):
+                base = base[: -len(_suf)]
+        _ctx_meta  = ctx.metadata or {}
+        _log_dir_s = _ctx_meta.get("log_dir", "")
+        _log_dir   = Path(_log_dir_s) if _log_dir_s else None
+
+        def _auto_newest(*dirs, pattern: str) -> "Path | None":
+            cands: list[Path] = []
+            for d in dirs:
+                if d and Path(d).is_dir():
+                    cands.extend(Path(d).glob(pattern))
+            return max(cands, key=lambda p: p.stat().st_mtime, default=None)
+
+        _fl        = _ctx_meta.get("file_logger")
+        _existing_srcs = {ef["src"] for ef in metadata_extras}
+
+        def _wlog(msg: str) -> None:
+            logger.info(msg)
+            if _fl:
+                _fl.log(msg, "info")
+
+        def _auto_add(path, dest_dir: str, label: str = "") -> None:
+            if not path:
+                _wlog(f"  Auto-inkludering: {label or dest_dir} — ikke funnet")
+                return
+            p = Path(path)
+            if not p.exists():
+                _wlog(f"  Auto-inkludering: {p.name} — fil finnes ikke")
+                return
+            if str(p) in _existing_srcs:
+                return   # allerede inkludert via extra_files
+            metadata_extras.append({"src": str(p),
+                                     "dest": f"{dest_dir}/{p.name}"})
+            _existing_srcs.add(str(p))
+            _wlog(f"  Auto-inkludert: {p.name}")
+
+        _repo = "administrative_metadata/repository_operations"
+        _adm  = "administrative_metadata"
+
+        # Kjørelogg
+        if _fl and hasattr(_fl, "log_path") and _fl.log_path:
+            _auto_add(_fl.log_path, _repo, "kjørelogg")
+        else:
+            _auto_add(_auto_newest(siard_path.parent, _log_dir,
+                                   pattern=f"{base}_*.log"), _repo, "kjørelogg")
+
+        # Blob-konvertering CSV og feillogg
+        _auto_add(_auto_newest(siard_path.parent, _log_dir,
+                               pattern=f"{base}_*_blob_konvertering.csv"),
+                  _repo, "blob-konvertering CSV")
+        _auto_add(_auto_newest(siard_path.parent, _log_dir,
+                               pattern=f"{base}_*_konvertering_feil.log"),
+                  _repo, "blob-konvertering feillogg")
+
+        # Metadata-rapport og kjørerapport (PDF)
+        _auto_add(_auto_newest(siard_path.parent, _log_dir,
+                               pattern=f"{base}*_metadata_rapport.pdf"),
+                  _repo, "metadata-rapport")
+        _auto_add(_auto_newest(siard_path.parent, _log_dir,
+                               pattern=f"{base}*_workflow_rapport*.pdf"),
+                  _repo, "kjørerapport")
+
+        # SHA256 (finnes alltid i SIARD-mappen)
+        _auto_add(siard_path.parent / f"{base}.sha256", _adm, "SHA256")
+        _wlog(f"  Totalt {len(metadata_extras)} ekstra filer klar for pakking")
+        # ─────────────────────────────────────────────────────────────────────
+
+        meta = {**self.params,
+                "extra_files": json.dumps(metadata_extras, ensure_ascii=False)}
+
+        # Bygg content-mappa: kilde-SIARD og eventuelle konverterte varianter
         with tempfile.TemporaryDirectory() as tmp_content:
             content_dir = Path(tmp_content) / siard_path.stem
             content_dir.mkdir()
-            shutil.copy2(siard_path, content_dir / siard_path.name)
+
+            if content_siard_extras:
+                # Dialogbrukeren har eksplisitt valgt hvilke SIARD-filer som skal med
+                for ef in content_siard_extras:
+                    src = Path(ef["src"])
+                    if src.exists():
+                        shutil.copy2(src, content_dir / src.name)
+                        logger.info("Content SIARD inkludert: %s", src.name)
+                    else:
+                        logger.warning("Content SIARD ikke funnet: %s", src)
+                # Hvis original ikke er blant de valgte, ikke legg den til på nytt
+            else:
+                # Ingen eksplisitte content-valg: bruk kilde-SIARD (eksisterende atferd)
+                shutil.copy2(siard_path, content_dir / siard_path.name)
+
+            _file_log = (ctx.metadata or {}).get("file_logger")
+
+            def _log_fn(msg: str) -> None:
+                logger.info(msg)
+                if _file_log:
+                    _file_log.log(msg, "info")
+
+            # Hent temp-base fra ctx.metadata (satt av app.py) eller bruk systemtemp
+            _temp_base_s = (_ctx_meta.get("temp_dir") or "").strip()
+            _temp_base   = Path(_temp_base_s) if _temp_base_s and Path(_temp_base_s).is_dir() else None
 
             try:
                 aic_path = _build_dias_package(
                     content_path = content_dir,
                     out_root     = out_root,
                     meta         = meta,
-                    log_fn       = lambda msg: logger.info(msg),
+                    log_fn       = _log_fn,
+                    temp_base    = _temp_base,
                 )
             except Exception as exc:
                 logger.exception("DIAS-pakking feilet")
@@ -714,6 +829,7 @@ def _build_dias_package(
     out_root:     Path,
     meta:         dict,
     log_fn,
+    temp_base:    "Path | None" = None,
 ) -> Path:
     """
     Bygger full DIAS AIC/SIP-pakke og returnerer stien til AIC-mappen.
@@ -728,10 +844,17 @@ def _build_dias_package(
             content/
               {sip_id}/        ← SIP-innhold (premis, mets, log, content/)
                 {sip_id}.tar   ← komprimert innhold
+
+    Arbeidsarbeid gjøres i en kort systemtempmappe (temp_base eller %TEMP%) for
+    å unngå WinError 206 «filnavnet er for langt» når out_root har dyp katalogsti.
+    Resultatet flyttes til out_root til slutt.
     """
     log_fn("Bygger mappestruktur...")
-    sip_id      = str(uuid1())
-    tmp_out     = out_root / f"_dias_tmp_{sip_id}"
+    sip_id = str(uuid1())
+
+    # Opprett kortbane-arbeidskatalog for å unngå Windows MAX_PATH-problemer
+    _tmp_work = tempfile.mkdtemp(dir=temp_base)  # kort sti i %TEMP% eller angitt dir
+    tmp_out     = Path(_tmp_work) / "d"          # én bokstav — minimer stiidybde
     tarfile_dir = tmp_out / sip_id / "content" / sip_id
 
     (tmp_out / sip_id / "administrative_metadata" / "repository_operations").mkdir(parents=True)
@@ -797,7 +920,14 @@ def _build_dias_package(
     log_fn("Oppretter AIC-struktur...")
     aic_id   = str(uuid1())
     aic_path = out_root / aic_id
-    tmp_out.rename(aic_path)
+    try:
+        # Forsøk rask rename (kun mulig på samme filsystem)
+        tmp_out.rename(aic_path)
+    except OSError:
+        # Faller tilbake til copy+delete ved kryssfilsystem-move (f.eks. C: → X:)
+        shutil.move(str(tmp_out), str(aic_path))
+    finally:
+        shutil.rmtree(_tmp_work, ignore_errors=True)
 
     log_fn("Skriver AIC log.xml...")
     _write_aic_log(str(aic_path / sip_id / "log.xml"), aic_id, sip_id, _ts(), meta)

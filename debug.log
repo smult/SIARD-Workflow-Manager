@@ -1,0 +1,4 @@
+[0423/233516.434:ERROR:third_party\crashpad\crashpad\util\win\registration_protocol_win.cc:108] CreateFile: Systemet finner ikke angitt fil. (0x2)
+[0423/233518.143:ERROR:third_party\crashpad\crashpad\util\win\registration_protocol_win.cc:108] CreateFile: Systemet finner ikke angitt fil. (0x2)
+[0427/131953.295:ERROR:third_party\crashpad\crashpad\util\win\registration_protocol_win.cc:108] CreateFile: Systemet finner ikke angitt fil. (0x2)
+[0427/174849.259:ERROR:third_party\crashpad\crashpad\util\win\registration_protocol_win.cc:108] CreateFile: Systemet finner ikke angitt fil. (0x2)

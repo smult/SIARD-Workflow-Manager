@@ -18,6 +18,7 @@ def _op_map() -> dict:
     )
     from siard_workflow.operations.blob_convert_operation import BlobConvertOperation
     from siard_workflow.operations.hex_extract_operation import HexExtractOperation
+    from siard_workflow.operations.dias_package_operation import DiasPackageOperation
     from siard_workflow.systemspecific_operations.cosdoc_operation import (
         CosDocMailMergeOperation,
     )
@@ -33,6 +34,7 @@ def _op_map() -> dict:
         "repack_siard":       RepackSiardOperation,
         "workflow_report":    WorkflowReportOperation,
         "cosdoc_mailmerge":   CosDocMailMergeOperation,
+        "dias_package":       DiasPackageOperation,
     }
 
 
