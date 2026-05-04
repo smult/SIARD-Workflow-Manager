@@ -407,8 +407,9 @@ def _ts() -> str:
 def _gather_file_info(directory: str, prefix: str, log_fn) -> dict:
     """SHA-256, MIME-type, størrelse og endringstidspunkt for alle filer i mappen."""
     log_fn(f"Beregner sjekksummer for {prefix}...")
+    _use_magic = False
     try:
-        import magic as _magic
+        import magic as _magic  # type: ignore
         _use_magic = True
     except ImportError:
         _use_magic = False

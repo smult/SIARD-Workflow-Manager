@@ -881,8 +881,8 @@ def generate_metadata_pdf(
                 # ── Kolonnetabell ────────────────────────────────────────
                 col_headers = ["Pos", "Kolonne", "SQL-type", "Orig.type",
                                "LOB", "Beskrivelse"]
-                cw = [10*mm, 50*mm, 24*mm, 24*mm, 10*mm,
-                      CONTENT_W - 138*mm]
+                cw = [10*mm, 44*mm, 22*mm, 22*mm, 10*mm,
+                      CONTENT_W - 108*mm]
 
                 col_rows = [col_headers]
                 col_row_styles = []
@@ -893,8 +893,6 @@ def generate_metadata_pdf(
                     lob_flag = "Ja" if is_lob else ""
                     mime = (col_info.get("mime_type") or "").strip() or "–"
                     cdesc = (col_info.get("description") or "").strip()
-                    if len(cdesc) > 50:
-                        cdesc = cdesc[:48] + "…"
                     orig_t = _abbrev_type(col_info.get("type_original", ""))
 
                     col_rows.append([
@@ -903,7 +901,7 @@ def generate_metadata_pdf(
                         _abbrev_type(col_info.get("type", "")),
                         orig_t or "–",
                         lob_flag,
-                        cdesc,
+                        _p(cdesc),
                     ])
                     if is_lob:
                         col_row_styles.append(
@@ -919,7 +917,8 @@ def generate_metadata_pdf(
                 col_ts.add("FONTSIZE", (0, 0), (-1, -1), 7.5)
                 col_ts.add("LEADING", (0, 0), (-1, -1), 9)
                 col_ts.add("ALIGN", (0, 1), (0, -1), "CENTER")
-                col_ts.add("ALIGN", (4, 1), (5, -1), "CENTER")
+                col_ts.add("ALIGN", (4, 1), (4, -1), "CENTER")
+                col_ts.add("VALIGN", (5, 1), (5, -1), "TOP")
                 ct.setStyle(col_ts)
                 tbl_block.append(ct)
 
