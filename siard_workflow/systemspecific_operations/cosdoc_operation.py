@@ -738,6 +738,52 @@ def _pack_zip(
       "ok")
 
 
+# ── Tekstbasert injeksjon av XML-kommentarer ──────────────────────────────────
+
+def _inject_conversion_notes(
+    xml_bytes: bytes,
+    notes: dict[int, str],   # {eef_id: conversion_note}
+    eefid_col: int,
+    fname_col: int,
+) -> bytes:
+    """
+    Setter inn <!-- conversion_note --> etter FilNavn-kolonnen i oppdaterte rader.
+
+    Gjøres på tekst-nivå etter ET-serialisering fordi ET.write() ikke alltid
+    bevarer manuelt innsatte ET.Comment-noder.
+    Innsettingene samles opp og appliseres baklengs så posisjoner forblir gyldige.
+    """
+    text = xml_bytes.decode("utf-8")
+    eefid_open  = f"<c{eefid_col}>"
+    eefid_close = f"</c{eefid_col}>"
+    fname_close = f"</c{fname_col}>"
+
+    insertions: list[tuple[int, str]] = []
+
+    for eef_id, note in notes.items():
+        eefid_pattern = f"{eefid_open}{eef_id}{eefid_close}"
+        eefid_pos = text.find(eefid_pattern)
+        if eefid_pos == -1:
+            continue
+
+        row_start = text.rfind("<row>", 0, eefid_pos)
+        row_end   = text.find("</row>", eefid_pos)
+        if row_start == -1 or row_end == -1:
+            continue
+
+        fname_rel = text.find(fname_close, row_start, row_end)
+        if fname_rel == -1:
+            continue
+
+        insert_at = fname_rel + len(fname_close)
+        insertions.append((insert_at, f"\n\t\t<!-- {note} -->"))
+
+    for pos, comment in sorted(insertions, key=lambda x: x[0], reverse=True):
+        text = text[:pos] + comment + text[pos:]
+
+    return text.encode("utf-8")
+
+
 # ── Oppdatering av tableX.xml ─────────────────────────────────────────────────
 
 def _update_table_xml(
@@ -804,11 +850,7 @@ def _update_table_xml(
                     child.set("digest",     upd["digest"])
                     child.text = None
                 elif idx == filename_col:
-                    # *_FilNavn skal ikke endres — brukes til oppslag i eksterne systemer.
-                    # Legg inn XML-kommentar om konverteringsløp etter feltet.
-                    note = upd.get("conversion_note", "")
-                    if note:
-                        row_el.insert(ci + 1, ET.Comment(f" {note} "))
+                    pass  # *_FilNavn røres ikke; kommentar injiseres i post-steg
                 elif idx == size_col:
                     child.text = str(upd["length"])
 
@@ -830,7 +872,18 @@ def _update_table_xml(
     tree = ET.ElementTree(root)
     buf = io.BytesIO()
     tree.write(buf, encoding="utf-8", xml_declaration=True)
-    return restore_xml_header(xml_bytes, buf.getvalue())
+    result = restore_xml_header(xml_bytes, buf.getvalue())
+
+    # ET.write() serialiserer ikke alltid Comment-noder korrekt; gjør i stedet
+    # tekstbasert injeksjon av konverterings-kommentarer etter serialisering.
+    notes = {
+        eef_id: upd["conversion_note"]
+        for eef_id, upd in updates.items()
+        if upd.get("conversion_note")
+    }
+    if notes:
+        result = _inject_conversion_notes(result, notes, eefid_col, filename_col)
+    return result
 
 
 # ── Hoved-operasjon ───────────────────────────────────────────────────────────
