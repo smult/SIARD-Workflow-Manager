@@ -131,6 +131,16 @@ class SettingsDialog(ctk.CTkToplevel):
                          row=r, column=0, columnspan=2,
                          padx=14, pady=(0, 4), sticky="w"); r += 1
 
+        _seksjon("SIARDMapper", r);        r += 1
+        _rad("JSON-mal-mappe", "json_template_dir", "str", r,
+             default="", browse_dir=True);  r += 1
+        ctk.CTkLabel(frm,
+                     text="Mappe med JSON-mal-filer for metadata-berikelse",
+                     font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                     text_color=COLORS["muted"]).grid(
+                         row=r, column=0, columnspan=2,
+                         padx=14, pady=(0, 4), sticky="w"); r += 1
+
         _seksjon("Antivirus", r);          r += 1
         _rad("Sti til AV-program", "av_executable", "str", r,
              default="", browse_file=True); r += 1

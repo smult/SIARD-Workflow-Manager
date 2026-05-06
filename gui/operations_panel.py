@@ -20,7 +20,7 @@ from siard_workflow.operations import (
     VirusScanOperation, ConditionalOperation,
     UnpackSiardOperation, RepackSiardOperation,
     WorkflowReportOperation, DiasPackageOperation,
-    LobFolderFixOperation,
+    LobFolderFixOperation, SiardMapperOperation,
 )
 from siard_workflow.systemspecific_operations import CosDocMailMergeOperation
 from settings import save_op_params, save_config, get_config, _SETTINGS_FILE
@@ -568,6 +568,25 @@ OP_DEFS = [
             {"key": "pdf_suffix",          "label": "PDF-filsuffiks",        "type": "str",  "default": "_metadata_rapport"},
         ],
     },
+    {
+        "cls":           SiardMapperOperation,
+        "custom_dialog": "SiardMapperParamDialog",
+        "label": "Berik SIARD-metadata (SIARDMapper)",
+        "category": "Metadata",
+        "desc": (
+            "Beriker header/metadata.xml med tabell- og kolonnebeskrivelser fra en "
+            "JSON-mal produsert av KDRS SIARDMapper-verktøyet. "
+            "I pipeline-modus oppdateres metadata.xml direkte. "
+            "Standalone: skrives ny <original>_beriket.siard. Krever lxml>=4.9.0."
+        ),
+        "status": SiardMapperOperation.status,
+        "params": [
+            {"key": "json_template",      "label": "JSON-malfil (sti)",
+             "type": "str", "default": ""},
+            {"key": "overwrite_existing", "label": "Overstyr eksisterende beskrivelser",
+             "type": "bool", "default": False},
+        ],
+    },
     # ── Pakking ──────────────────────────────────────────────────────────────
     {
         "cls":           DiasPackageOperation,
@@ -995,6 +1014,9 @@ class OperationCard(ctk.CTkFrame):
                 set_upstream_op_ids(
                     [op.operation_id for op in self._get_workflow_ops()])
             DiasParamDialog(self, op_def, on_confirm=on_add, on_saved=on_saved)
+        elif op_def.get("custom_dialog") == "SiardMapperParamDialog":
+            from gui.siardmapper_param_dialog import SiardMapperParamDialog
+            SiardMapperParamDialog(self, op_def, on_confirm=on_add, on_saved=on_saved)
         elif op_def.get("params"):
             ParamDialog(self, op_def, on_confirm=on_add, on_saved=on_saved)
         else:

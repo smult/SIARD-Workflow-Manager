@@ -24,6 +24,7 @@ _CONFIG_FILE  = _PROGRAM_DIR / "config.json"
 
 _CONFIG_DEFAULTS: dict = {
     "font_offset":      0,           # font-skalering: avvik fra standard (lagres per maskin)
+    "json_template_dir": "",         # mappe med JSON-mal-filer for SIARDMapper
     "global_temp_dir":  "",          # tom = auto-velg ved filvalg
     "av_executable":    "",          # sti til antivirus-program
     "lo_executable":    "",          # sti til LibreOffice soffice (auto-detektert ved oppstart)

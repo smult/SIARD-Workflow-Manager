@@ -1541,8 +1541,9 @@ class App(ctk.CTk):
             ctx.metadata["stopped"]      = False
             self._stop_event.clear()
             self._pause_event.clear()
-            ctx.metadata["stop_event"]   = self._stop_event
-            ctx.metadata["pause_event"]  = self._pause_event
+            ctx.metadata["stop_event"]          = self._stop_event
+            ctx.metadata["pause_event"]         = self._pause_event
+            ctx.metadata["siardmapper_dialog_cb"] = self._siardmapper_dialog_cb
             if self._global_temp_dir:
                 ctx.metadata["temp_dir"] = str(self._global_temp_dir)
             if self._output_dir_override:
@@ -1835,6 +1836,21 @@ class App(ctk.CTk):
                         "Undersøk filen manuelt før du fortsetter.",
                     )
                     needs_redraw = True
+                elif kind == "siardmapper_dialog":
+                    (_, matches, siard_path, extracted_path,
+                     json_path, suggestion_map,
+                     done_event, result_holder) = item
+                    from gui.siardmapper_dialog import SiardMapperDialog, build_dialog_tables
+                    tables = build_dialog_tables(matches)
+                    dlg = SiardMapperDialog(
+                        self, tables, siard_path, extracted_path,
+                        json_path=json_path,
+                        suggestion_map=suggestion_map or {},
+                    )
+                    self.wait_window(dlg)
+                    result_holder[0] = dlg.get_result()
+                    done_event.set()
+                    needs_redraw = True
                 elif kind == "workflow_step_stopped":
                     step_label = item[2]
                     self._log(
@@ -1993,6 +2009,24 @@ class App(ctk.CTk):
         self._stop_event.clear()
         self._step_resume_event.set()
         self._log("Gjenopptar workflow ...", "info")
+
+    def _siardmapper_dialog_cb(self, matches, siard_path, extracted_path,
+                               json_path=None, suggestion_map=None):
+        """
+        Kalles fra bakgrunnstråden (SiardMapperOperation) ved delvis JSON-treff.
+        Poster dialog-forespørsel til hoved-tråden via _log_queue og blokkerer
+        til dialog er lukket.
+        """
+        result_event  = threading.Event()
+        result_holder = [None]
+        self._log_queue.put((
+            "siardmapper_dialog",
+            matches, siard_path, extracted_path,
+            json_path, suggestion_map,
+            result_event, result_holder,
+        ))
+        result_event.wait()
+        return result_holder[0]
 
     def _font_scale(self, delta: int) -> None:
         """Juster font-størrelse for alle widgets dynamisk."""

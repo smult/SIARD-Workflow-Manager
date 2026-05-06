@@ -298,6 +298,9 @@ class WorkflowPanel(ctk.CTkFrame):
             row_idx = self._rows.index(row)
             set_upstream_op_ids([r.op.operation_id for r in self._rows[:row_idx]])
             DiasParamDialog(self, live_def, on_confirm=_on_confirm, on_saved=_on_saved)
+        elif op_def.get("custom_dialog") == "SiardMapperParamDialog":
+            from gui.siardmapper_param_dialog import SiardMapperParamDialog
+            SiardMapperParamDialog(self, live_def, on_confirm=_on_confirm, on_saved=_on_saved)
         else:
             ParamDialog(self, live_def, on_confirm=_on_confirm, on_saved=_on_saved)
 
