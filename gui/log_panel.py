@@ -15,7 +15,9 @@ class LogPanel(ctk.CTkFrame):
         super().__init__(parent, fg_color=COLORS["surface"], corner_radius=10)
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
-        self._live_mode = False
+        self._live_mode  = False
+        self._show_all   = False
+        self._show_all_cb = None
         self._line_count = 0
         self._build()
 
@@ -32,12 +34,19 @@ class LogPanel(ctk.CTkFrame):
             hdr, text="",
             font=ctk.CTkFont(family=FONTS["mono"], size=11),
             text_color=COLORS["accent"])
-        self._mode_lbl.grid(row=0, column=1, padx=(0, 8))
+        self._mode_lbl.grid(row=0, column=1, padx=(0, 6))
+
+        self._show_all_btn = ctk.CTkButton(
+            hdr, text="Vis alle", width=64, height=22,
+            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+            font=ctk.CTkFont(family=FONTS["mono"], size=10),
+            command=self._toggle_show_all)
+        self._show_all_btn.grid(row=0, column=2, padx=(0, 4))
 
         ctk.CTkButton(hdr, text="Tøm", width=50, height=22,
                       fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
                       font=ctk.CTkFont(family=FONTS["mono"], size=10),
-                      command=self.clear).grid(row=0, column=2)
+                      command=self.clear).grid(row=0, column=3)
 
         self._text = ctk.CTkTextbox(
             self,
@@ -53,38 +62,72 @@ class LogPanel(ctk.CTkFrame):
         for level, color in LOG_COLORS.items():
             self._text.tag_config(level, foreground=color)
 
-    def set_live_mode(self, active: bool):
+    # ── Offentlige metoder ────────────────────────────────────────────────────
+
+    def set_show_all_callback(self, cb) -> None:
+        self._show_all_cb = cb
+
+    def set_live_mode(self, active: bool) -> None:
         """
-        Live-modus: vis kun siste LIVE_LINES linjer.
+        Live-modus: vis kun siste LIVE_LINES linjer (med mindre show_all er på).
         Aktiveres når konvertering starter, deaktiveres når den er ferdig.
         """
         self._live_mode = active
-        if active:
-            self._mode_lbl.configure(text=f"● live ({self.LIVE_LINES} linjer)")
-        else:
-            self._mode_lbl.configure(text="")
+        self._update_mode_label()
 
-    def append(self, msg: str, level: str = "info"):
+    def append(self, msg: str, level: str = "info") -> None:
         self._text.configure(state="normal")
 
-        if self._live_mode:
-            # I live-modus: slett øverste linje hvis over grensen
-            current = int(self._text.index("end-1c").split(".")[0])
-            if current >= self.LIVE_LINES:
-                self._text.delete("1.0", "2.0")
-        else:
-            # I normal modus: slett øverste linje hvis over MAX_LINES
-            current = int(self._text.index("end-1c").split(".")[0])
-            if current >= self.MAX_LINES:
-                self._text.delete("1.0", "2.0")
+        if not self._show_all:
+            if self._live_mode:
+                current = int(self._text.index("end-1c").split(".")[0])
+                if current >= self.LIVE_LINES:
+                    self._text.delete("1.0", "2.0")
+            else:
+                current = int(self._text.index("end-1c").split(".")[0])
+                if current >= self.MAX_LINES:
+                    self._text.delete("1.0", "2.0")
 
         self._text.insert("end", msg + "\n", level)
         self._text.configure(state="disabled")
         self._text.see("end")
         self._line_count += 1
 
-    def clear(self):
+    def redraw_all(self, entries: list) -> None:
+        """Tegn om tekstboksen med alle logg-oppføringer (ignorerer LIVE_LINES)."""
+        self._text.configure(state="normal")
+        self._text.delete("1.0", "end")
+        for level, msg in entries[-self.MAX_LINES:]:
+            self._text.insert("end", msg + "\n", level)
+        self._text.configure(state="disabled")
+        self._text.see("end")
+
+    def clear(self) -> None:
         self._text.configure(state="normal")
         self._text.delete("1.0", "end")
         self._text.configure(state="disabled")
         self._line_count = 0
+
+    # ── Interne metoder ───────────────────────────────────────────────────────
+
+    def _toggle_show_all(self) -> None:
+        self._show_all = not self._show_all
+        if self._show_all:
+            self._show_all_btn.configure(
+                text="Vis siste", fg_color=COLORS["accent"],
+                hover_color=COLORS["accent_dim"])
+        else:
+            self._show_all_btn.configure(
+                text="Vis alle", fg_color=COLORS["btn"],
+                hover_color=COLORS["btn_hover"])
+        self._update_mode_label()
+        if self._show_all_cb:
+            self._show_all_cb(self._show_all)
+
+    def _update_mode_label(self) -> None:
+        if self._show_all:
+            self._mode_lbl.configure(text="● alle linjer")
+        elif self._live_mode:
+            self._mode_lbl.configure(text=f"● live ({self.LIVE_LINES} linjer)")
+        else:
+            self._mode_lbl.configure(text="")

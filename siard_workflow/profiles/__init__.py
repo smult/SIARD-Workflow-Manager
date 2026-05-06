@@ -1,9 +1,7 @@
-from .builtin import StandardProfile, BlobProfile, QuickProfile, FullProfile, BUILTIN_PROFILES
+from .builtin import StandardkjøringProfile, StandardkjøringDIASProfile, BUILTIN_PROFILES
 
 __all__ = [
-    "StandardProfile",
-    "BlobProfile",
-    "QuickProfile",
-    "FullProfile",
+    "StandardkjøringProfile",
+    "StandardkjøringDIASProfile",
     "BUILTIN_PROFILES",
 ]

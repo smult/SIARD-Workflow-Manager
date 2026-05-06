@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from gui.styles import COLORS, FONTS, cat_color
 from siard_workflow.operations import (
-    SHA256Operation, BlobCheckOperation, BlobConvertOperation,
+    SHA256Operation, BlobConvertOperation,
     HexExtractOperation,
     XMLValidationOperation, MetadataExtractOperation,
     VirusScanOperation, ConditionalOperation,
@@ -472,16 +472,6 @@ OP_DEFS = [
              "hint": "Tom = hent fra Innstillinger (standard: 1)"},
             {"key": "keep_temp",     "label": "Behold utpakket mappe",
              "type": "bool", "default": False},
-        ],
-    },
-    {
-        "cls": BlobCheckOperation,
-        "label": "BLOB/CLOB Kontroll",
-        "category": "Innhold",
-        "desc": "Sjekker om uttrekket inneholder binærfiler i Content/SchemaX/tableX.",
-        "status": BlobCheckOperation.status,
-        "params": [
-            {"key": "content_prefix", "label": "Content-prefiks", "type": "str", "default": "content/"},
         ],
     },
     {

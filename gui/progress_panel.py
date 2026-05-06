@@ -105,6 +105,8 @@ class ProgressPanel(ctk.CTkFrame):
         self._start_ts  = 0.0
         self._pause_cb  = None
         self._stop_cb   = None
+        self._resume_cb = None
+        self._step_stopped_state = False
         self._current_phase  = 0
         self._phase_state:    list[str]   = []
         self._phase_progress: list[float] = []
@@ -285,17 +287,23 @@ class ProgressPanel(ctk.CTkFrame):
     # Callbacks
     # ─────────────────────────────────────────────────────────────────────────
 
-    def set_callbacks(self, pause_cb, stop_cb):
-        self._pause_cb = pause_cb
-        self._stop_cb  = stop_cb
+    def set_callbacks(self, pause_cb, stop_cb, resume_cb=None):
+        self._pause_cb  = pause_cb
+        self._stop_cb   = stop_cb
+        self._resume_cb = resume_cb
 
     def _on_pause(self):
         if self._pause_cb:
             self._pause_cb()
 
     def _on_stop(self):
-        if self._stop_cb:
-            self._stop_cb()
+        if self._step_stopped_state:
+            # Knappen viser "▶ Fortsett" — kall resume
+            if self._resume_cb:
+                self._resume_cb()
+        else:
+            if self._stop_cb:
+                self._stop_cb()
 
     # ─────────────────────────────────────────────────────────────────────────
     # Offentlige metoder — modusbytte
@@ -372,10 +380,14 @@ class ProgressPanel(ctk.CTkFrame):
         for key in self._counters:
             self._counters[key].configure(text="0")
 
+        self._step_stopped_state = False
         self._pause_btn.configure(state="disabled", text="⏸ Pause",
                                    fg_color=COLORS["btn"])
-        self._pause_btn.grid()   # gjenopprett knapp til header
-        self._stop_btn.configure(state="disabled")
+        self._pause_btn.grid()
+        self._stop_btn.configure(state="disabled", text="⏹ Stopp",
+                                  fg_color="#3d1a1a", hover_color="#5a2020",
+                                  text_color=COLORS["red"])
+        self._stop_btn.grid()   # gjenopprett synlighet
 
         self._simple_frame.grid_remove()
         self._blob_frame.grid_remove()
@@ -556,9 +568,30 @@ class ProgressPanel(ctk.CTkFrame):
                                        fg_color=COLORS["btn"],
                                        hover_color=COLORS["btn_hover"])
 
+    def set_step_stopped(self, stopped: bool) -> None:
+        """Veksle Stopp-knappen mellom 'Stopp' og '▶ Fortsett' ved steg-pause."""
+        self._step_stopped_state = stopped
+        if stopped:
+            self._stop_btn.configure(
+                text="▶ Fortsett",
+                fg_color=COLORS["accent"],
+                hover_color=COLORS["accent_dim"],
+                text_color=COLORS["text"],
+                state="normal")
+        else:
+            self._stop_btn.configure(
+                text="⏹ Stopp",
+                fg_color="#3d1a1a",
+                hover_color="#5a2020",
+                text_color=COLORS["red"],
+                state="normal")
+            self._stop_btn.grid()
+
     def set_stopped(self):
+        self._step_stopped_state = False
         self._pause_btn.configure(state="disabled")
         self._stop_btn.configure(state="disabled")
+        self._stop_btn.grid_remove()
 
     def update_spinner(self):
         """Animasjon for ubestemt progressbar i simple-modus."""

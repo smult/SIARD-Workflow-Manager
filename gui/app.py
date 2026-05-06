@@ -162,8 +162,10 @@ class App(ctk.CTk):
         self._global_temp_dir: Path | None = None
         self._output_dir_override: str = ""   # satt av preflight hvis output-disk har lite plass
         self._conv_ctx = None
-        self._stop_event  = threading.Event()
-        self._pause_event = threading.Event()
+        self._stop_event        = threading.Event()
+        self._pause_event       = threading.Event()
+        self._step_resume_event = threading.Event()
+        self._step_stopped      = False
         # Prosjektfil-tilstand
         self._project_file: "ProjectFile | None" = None   # type: ignore[name-defined]
         self._project_path: Path | None = None
@@ -171,6 +173,11 @@ class App(ctk.CTk):
         self._spinner_idx   = 0
 
         self._build_ui()
+        # Last lagret font-offset og appliser
+        from gui.styles import FontRegistry
+        _saved_offset = get_config("font_offset") or 0
+        if _saved_offset:
+            FontRegistry.set_offset(int(_saved_offset))
         self._load_persistent_profiles()
         self._load_saved_temp()
         self._detect_libreoffice()
@@ -233,9 +240,11 @@ class App(ctk.CTk):
         self.progress_panel.grid_remove()   # skjult ved oppstart; grid-info er lagret
         self.progress_panel.set_callbacks(
             pause_cb=self._conv_pause,
-            stop_cb=self._conv_stop)
+            stop_cb=self._conv_stop,
+            resume_cb=self._conv_resume)
 
         self.log_panel = LogPanel(right)
+        self.log_panel.set_show_all_callback(self._on_log_show_all)
         self.log_panel.grid(row=2, column=0, sticky="nsew")
 
     def _build_topbar(self):
@@ -265,14 +274,24 @@ class App(ctk.CTk):
 
         col = 2
         for label, cmd in [
-            ("Endre temp",   self._browse_temp),
-            ("Rapport",      self._export_report),
-            ("Logg til fil", self._toggle_auto_log),
+            ("Endre temp-mappe",   self._browse_temp),
+            #("Rapport",      self._export_report),
             ("Innstillinger",self._open_settings),
         ]:
             ctk.CTkButton(bar, text=label, command=cmd, **menu_cfg).grid(
                 row=0, column=col, padx=4, pady=8)
             col += 1
+
+        # Font-skalering A− / A+
+        font_frm = ctk.CTkFrame(bar, fg_color="transparent")
+        font_frm.grid(row=0, column=col, padx=(8, 16), pady=8)
+        for txt, delta in [("A−", -1), ("A+", +1)]:
+            ctk.CTkButton(
+                font_frm, text=txt, width=32, height=26, corner_radius=5,
+                fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+                font=ctk.CTkFont(family=FONTS["mono"], size=10),
+                command=lambda d=delta: self._font_scale(d),
+            ).pack(side="left", padx=2)
 
     def _build_statusbar(self):
         """Statuslinje nederst i vinduet — temp-info + spinner."""
@@ -317,12 +336,15 @@ class App(ctk.CTk):
         self._drop_zone = ctk.CTkLabel(
             frm,
             text="Dra og slipp SIARD-filer hit",
-            font=ctk.CTkFont(family=FONTS["mono"], size=10),
+            font=ctk.CTkFont(family=FONTS["mono"], size=11),
             text_color=COLORS["muted"],
-            fg_color=COLORS["panel"],
+            fg_color=COLORS["dropzone"],
             corner_radius=6,
-            height=44)
+            wraplength=180,
+            height=52)
         self._drop_zone.grid(row=1, column=0, padx=8, pady=(2, 4), sticky="ew")
+        # Oppdater wraplength én gang etter at layout er ferdig — unngår Configure-loop
+        self.after(200, self._update_dropzone_wrap)
 
         # Prøv tkinterdnd2 først, deretter Windows shell DnD, deretter klikk-fallback
         self._dnd_active = False
@@ -443,11 +465,20 @@ class App(ctk.CTk):
 
     def _dnd_reset(self):
         """Tilbakestill all visuell DnD-feedback."""
-        self._drop_zone.configure(fg_color=COLORS["panel"], text_color=COLORS["muted"])
+        self._drop_zone.configure(fg_color=COLORS["dropzone"], text_color=COLORS["muted"])
         self._queue_panel_frm.configure(fg_color=self._DND_BG_NONE,
                                          border_color=COLORS["border"], border_width=1)
         try:
             self._queue_frame.configure(fg_color="transparent")
+        except Exception:
+            pass
+
+    def _update_dropzone_wrap(self):
+        """Sett wraplength til faktisk labelbredde. Kalles én gang etter layout."""
+        try:
+            w = self._drop_zone.winfo_width()
+            if w > 20:
+                self._drop_zone.configure(wraplength=max(60, w - 16))
         except Exception:
             pass
 
@@ -1533,6 +1564,15 @@ class App(ctk.CTk):
             ctx.metadata["step_results"] = []
 
             for i, op in enumerate(wf):
+                # Sjekk stop FØR hvert nytt steg — blokker til Fortsett klikkes
+                if self._stop_event.is_set():
+                    self._log_queue.put(("workflow_step_stopped", i, op.label))
+                    self._step_resume_event.clear()
+                    self._step_resume_event.wait()   # blokkerer bakgrunnstråden
+                    if self._stop_event.is_set():
+                        break   # fortsatt stoppet etter venting = hard abort
+                    self._log_queue.put(("workflow_step_resumed",))
+
                 self._log_queue.put(("step_start", i, op.label))
                 if file_logger:
                     file_logger.log(f"[{i+1}] {op.label}", "step")
@@ -1795,10 +1835,22 @@ class App(ctk.CTk):
                         "Undersøk filen manuelt før du fortsetter.",
                     )
                     needs_redraw = True
+                elif kind == "workflow_step_stopped":
+                    step_label = item[2]
+                    self._log(
+                        f"  ⏸ Stoppet — neste steg: {step_label}. "
+                        "Klikk '▶ Fortsett' for å gjenoppta.", "warn")
+                    self.progress_panel.set_step_stopped(True)
+                    needs_redraw = True
+                elif kind == "workflow_step_resumed":
+                    self.progress_panel.set_step_stopped(False)
+                    needs_redraw = True
                 elif kind == "queue_done":
                     self._running = False
+                    self._step_stopped = False
                     self.workflow_panel.set_running(False)
                     self.workflow_panel.highlight_step(-1)
+                    self.progress_panel.reset()   # skjuler panel og Stopp-knapp
                     self._log("=" * 56, "muted")
                     self._log("Kø fullført", "success")
                     self._log("=" * 56, "muted")
@@ -1927,11 +1979,32 @@ class App(ctk.CTk):
     def _conv_stop(self):
         self._stop_event.set()
         self._pause_event.clear()   # frigjør pause-loop
+        self._step_stopped = True
+        self._step_resume_event.clear()
         if self._conv_ctx:
             self._conv_ctx.metadata["stopped"] = True
             self._conv_ctx.metadata["paused"]  = False
         self.progress_panel.set_stopped()
-        self._log("Stopper konvertering ...", "warn")
+        self._log("Stopper workflow ...", "warn")
+
+    def _conv_resume(self):
+        """Gjenoppta workflow fra neste steg etter steg-nivå stopp."""
+        self._step_stopped = False
+        self._stop_event.clear()
+        self._step_resume_event.set()
+        self._log("Gjenopptar workflow ...", "info")
+
+    def _font_scale(self, delta: int) -> None:
+        """Juster font-størrelse for alle widgets dynamisk."""
+        from gui.styles import FontRegistry
+        from settings import save_config
+        FontRegistry.scale(delta)
+        save_config({"font_offset": FontRegistry.current_offset()})
+
+    def _on_log_show_all(self, show_all: bool) -> None:
+        """Callback fra LogPanel når 'Vis alle/Vis siste'-toggle trykkes."""
+        if show_all:
+            self.log_panel.redraw_all(self._log_entries)
 
     def _log(self, msg: str, level: str = "info"):
         self.log_panel.append(msg, level)

@@ -10,7 +10,7 @@ from .workflow import Workflow
 
 def _op_map() -> dict:
     from siard_workflow.operations import (
-        SHA256Operation, BlobCheckOperation,
+        SHA256Operation,
         XMLValidationOperation, MetadataExtractOperation,
         VirusScanOperation, ConditionalOperation,
         UnpackSiardOperation, RepackSiardOperation,
@@ -19,12 +19,12 @@ def _op_map() -> dict:
     from siard_workflow.operations.blob_convert_operation import BlobConvertOperation
     from siard_workflow.operations.hex_extract_operation import HexExtractOperation
     from siard_workflow.operations.dias_package_operation import DiasPackageOperation
+    from siard_workflow.operations.lobfolder_fix_operation import LobFolderFixOperation
     from siard_workflow.systemspecific_operations.cosdoc_operation import (
         CosDocMailMergeOperation,
     )
     return {
         "sha256":             SHA256Operation,
-        "blob_check":         BlobCheckOperation,
         "xml_validation":     XMLValidationOperation,
         "metadata_extract":   MetadataExtractOperation,
         "virus_scan":         VirusScanOperation,
@@ -35,6 +35,7 @@ def _op_map() -> dict:
         "workflow_report":    WorkflowReportOperation,
         "cosdoc_mailmerge":   CosDocMailMergeOperation,
         "dias_package":       DiasPackageOperation,
+        "lobfolder_fix":      LobFolderFixOperation,
     }
 
 

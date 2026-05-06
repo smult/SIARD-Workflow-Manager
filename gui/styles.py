@@ -5,6 +5,7 @@ COLORS = {
     "surface":    "#13161e",
     "panel":      "#191d28",
     "border":     "#252b3a",
+    "dropzone":   "#1a2640",   # blåtonet drop-zone, skilt fra panel
     "accent":     "#4f8ef7",
     "accent_dim": "#3a70d4",
     "green":      "#2ecc71",
@@ -42,3 +43,64 @@ LOG_COLORS = {
 
 def cat_color(category: str) -> str:
     return COLORS.get(f"cat_{category}", COLORS["accent"])
+
+
+# ── Font-skalering ────────────────────────────────────────────────────────────
+
+FONT_MIN_SIZE = 10   # tidl. 9; bumpes til 10 som minimum for alle tekster
+
+
+class FontRegistry:
+    """Holder styr på alle CTkFont-instanser for dynamisk størrelsesjustering."""
+    _fonts: list = []   # [(weakref(font), base_size)]
+    _offset: int = 0
+
+    @classmethod
+    def _apply(cls) -> None:
+        dead = []
+        for i, (wr, base) in enumerate(cls._fonts):
+            f = wr()
+            if f is None:
+                dead.append(i)
+            else:
+                try:
+                    f.configure(size=max(FONT_MIN_SIZE, base + cls._offset))
+                except Exception:
+                    pass
+        for i in reversed(dead):
+            del cls._fonts[i]
+
+    @classmethod
+    def scale(cls, delta: int) -> None:
+        cls._offset = max(-3, min(8, cls._offset + delta))
+        cls._apply()
+
+    @classmethod
+    def current_offset(cls) -> int:
+        return cls._offset
+
+    @classmethod
+    def set_offset(cls, offset: int) -> None:
+        cls._offset = max(-3, min(8, int(offset)))
+        cls._apply()
+
+
+def _install_font_wrapper() -> None:
+    """Monkey-patch ctk.CTkFont så alle instanser auto-registreres."""
+    import customtkinter as ctk
+    import weakref
+    if getattr(ctk, "_font_wrapper_installed", False):
+        return
+    _Orig = ctk.CTkFont
+
+    def _make_font(family=None, size=12, weight="normal", **kw):
+        actual = max(FONT_MIN_SIZE, size + FontRegistry._offset)
+        f = _Orig(family=family, size=actual, weight=weight, **kw)
+        FontRegistry._fonts.append((weakref.ref(f), size))
+        return f
+
+    ctk.CTkFont = _make_font
+    ctk._font_wrapper_installed = True
+
+
+_install_font_wrapper()

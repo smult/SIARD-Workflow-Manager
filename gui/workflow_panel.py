@@ -177,10 +177,6 @@ class WorkflowPanel(ctk.CTkFrame):
         ctk.CTkLabel(hdr, text="WORKFLOW",
                      font=ctk.CTkFont(family=FONTS["mono"], size=10, weight="bold"),
                      text_color=COLORS["muted"]).grid(row=0, column=0, sticky="w")
-        self.file_lbl = ctk.CTkLabel(hdr, text="Ingen fil",
-                                      font=ctk.CTkFont(family=FONTS["mono"], size=10),
-                                      text_color=COLORS["muted"])
-        self.file_lbl.grid(row=1, column=0, sticky="w")
 
         self.scroll = ctk.CTkScrollableFrame(self, fg_color=COLORS["bg"],
                                               corner_radius=8,
@@ -253,8 +249,7 @@ class WorkflowPanel(ctk.CTkFrame):
         self._proj_lbl.grid(row=3, column=0, sticky="ew", pady=(2, 0))
 
     def set_file(self, path: Path):
-        short = path.name if len(path.name) < 35 else "..." + path.name[-32:]
-        self.file_lbl.configure(text=f"{short}", text_color=COLORS["green"])
+        pass
 
     def add_operation(self, op):
         self.empty_lbl.grid_remove()

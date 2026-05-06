@@ -8,16 +8,16 @@ Rask start::
     from siard_workflow import create_manager
 
     manager = create_manager()
-    result = manager.run_profile("uttrekk.siard", profile="standard")
+    result = manager.run_profile("uttrekk.siard", profile="standardkjoring")
 
 Eller manuell workflow::
 
     from siard_workflow import WorkflowManager
-    from siard_workflow.operations import SHA256Operation, BlobCheckOperation
+    from siard_workflow.operations import SHA256Operation, BlobConvertOperation
 
     manager = WorkflowManager()
     wf = manager.create_workflow("uttrekk.siard")
-    wf.add(SHA256Operation()).add(BlobCheckOperation())
+    wf.add(SHA256Operation()).add(BlobConvertOperation())
     result = manager.run(wf, "uttrekk.siard")
 """
 
