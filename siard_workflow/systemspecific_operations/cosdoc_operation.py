@@ -742,7 +742,7 @@ def _pack_zip(
 
 def _update_table_xml(
     xml_bytes: bytes,
-    updates: dict[int, dict],    # {eef_id: {file, length, digest, new_filename}}
+    updates: dict[int, dict],    # {eef_id: {file, length, digest, conversion_note}}
     deletes: set[int],           # {eef_id} for rader som skal slettes
     eefid_col: int,
     filename_col: int,
@@ -790,7 +790,8 @@ def _update_table_xml(
 
         if eef_id in updates:
             upd = updates[eef_id]
-            for child in row_el:
+            children_list = list(row_el)
+            for ci, child in enumerate(children_list):
                 tag = _local(child.tag)
                 m = re.match(r"^c(\d+)$", tag, re.IGNORECASE)
                 if not m:
@@ -803,7 +804,11 @@ def _update_table_xml(
                     child.set("digest",     upd["digest"])
                     child.text = None
                 elif idx == filename_col:
-                    child.text = upd["new_filename"]
+                    # *_FilNavn skal ikke endres — brukes til oppslag i eksterne systemer.
+                    # Legg inn XML-kommentar om konverteringsløp etter feltet.
+                    note = upd.get("conversion_note", "")
+                    if note:
+                        row_el.insert(ci + 1, ET.Comment(f" {note} "))
                 elif idx == size_col:
                     child.text = str(upd["length"])
 
@@ -1316,12 +1321,50 @@ class CosDocMailMergeOperation(BaseOperation):
                 else:
                     base["sd"]["pairs_merged"] = base["sd"].get("pairs_merged", 0) + 1
 
-                new_fname     = Path(p.main_fname).stem + "_flettet.docx"
-                new_blobname  = Path(p.main_blob["file"]).stem + merged_path.suffix
+                # Konverter til PDF (doc/docx → pdf via LibreOffice)
+                final_path = merged_path
+                if (merged_path.exists()
+                        and merged_path.suffix.lower() in (".docx", ".doc")):
+                    pdf_out = _lo_convert(
+                        merged_path, merged_path.parent,
+                        "pdf", lo_exe, lo_timeout, lo_profile_base, w)
+                    if pdf_out and pdf_out.exists():
+                        final_path = pdf_out
+                        w(f"    Konvertert til PDF: {final_path.name}", "ok")
+                    else:
+                        w("    PDF-konvertering feilet — beholder .docx-format", "warn")
+
+                # Conversion_note basert på faktisk utfall
+                final_ext = final_path.suffix.lower()
+                if merge_ok:
+                    if final_ext == ".pdf":
+                        conversion_note = (
+                            "Flettet: avkryptert, konvertert til .docx, flettet med "
+                            "datakilde (mailmerge) og konvertert til PDF"
+                        )
+                    else:
+                        conversion_note = (
+                            "Flettet: avkryptert, konvertert til .docx og flettet "
+                            "med datakilde (mailmerge)"
+                        )
+                elif main_docx and main_docx.exists():
+                    if final_ext == ".pdf":
+                        conversion_note = "Konvertert til PDF (flettefeil - ingen flettedata)"
+                    else:
+                        conversion_note = "Konvertert til .docx (flettefeil - ingen flettedata)"
+                else:
+                    conversion_note = "Avkryptert (uten konvertering)"
+
+                # Blob-navngiving: <blob-stem><original-dok-ext><final-ext>
+                # Eks: rec14.bin + 2013000007.doc → rec14.doc.pdf
+                original_ext  = Path(p.main_fname).suffix
+                new_blobname  = (
+                    Path(p.main_blob["file"]).stem + original_ext + final_path.suffix
+                )
                 new_blob_path = lob_path / new_blobname
-                merged_bytes  = merged_path.read_bytes()
-                new_blob_path.write_bytes(merged_bytes)
-                w(f"    Lagret: {new_blobname} ({len(merged_bytes):,} bytes)", "ok")
+                final_bytes   = final_path.read_bytes()
+                new_blob_path.write_bytes(final_bytes)
+                w(f"    Lagret: {new_blobname} ({len(final_bytes):,} bytes)", "ok")
 
                 old_blob = lob_path / p.main_blob["file"]
                 if old_blob != new_blob_path and old_blob.exists():
@@ -1331,9 +1374,9 @@ class CosDocMailMergeOperation(BaseOperation):
                     data_src_file.unlink()
                     w(f"    Slettet datakilde: {p.data_blob['file']}", "info")
 
-                base["update"] = {"file": new_blobname, "length": len(merged_bytes),
-                                  "digest": _md5_upper(merged_bytes),
-                                  "new_filename": new_fname}
+                base["update"] = {"file": new_blobname, "length": len(final_bytes),
+                                  "digest": _md5_upper(final_bytes),
+                                  "conversion_note": conversion_note}
                 base["delete"] = True
                 return base
 
@@ -1348,7 +1391,6 @@ class CosDocMailMergeOperation(BaseOperation):
                 blob_src = lob_path / s.blob["file"]
 
                 if docx_result and docx_result.exists():
-                    new_fname     = Path(s.fname).stem + ".docx"
                     new_blobname  = Path(s.blob["file"]).stem + ".docx"
                     new_blob_path = lob_path / new_blobname
                     new_data      = docx_result.read_bytes()
@@ -1360,7 +1402,7 @@ class CosDocMailMergeOperation(BaseOperation):
                       f"({len(new_data):,} bytes)", "ok")
                     base["update"] = {"file": new_blobname, "length": len(new_data),
                                       "digest": _md5_upper(new_data),
-                                      "new_filename": new_fname}
+                                      "conversion_note": "Konvertert: avkryptert og konvertert til .docx"}
                     base["sd"]["singles_decrypted"] = 1
                 elif s.dec_path and s.dec_path.exists():
                     new_data = s.dec_path.read_bytes()
@@ -1369,7 +1411,7 @@ class CosDocMailMergeOperation(BaseOperation):
                         w(f"    Avkryptert (ikke konvertert): {s.blob['file']}", "info")
                     base["update"] = {"file": s.blob["file"], "length": len(new_data),
                                       "digest": _md5_upper(new_data),
-                                      "new_filename": s.fname}
+                                      "conversion_note": ""}
                     base["sd"]["singles_decrypted"] = 1
                 return base
 

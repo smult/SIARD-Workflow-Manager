@@ -1917,7 +1917,7 @@ class BlobConvertOperation(BaseOperation):
             "converted":        "Konvertert til PDF/A",
             "kept":             "Beholdt originalformat",
             "failed":           "Konvertering feilet",
-            "xml_updated":      "XML-filer oppdatert",
+            "xml_updated":      "XML-noder oppdatert",
             "inline_extracted": "Inline NBLOB/NCLOB",
         }
         for k, v in stats.items():
