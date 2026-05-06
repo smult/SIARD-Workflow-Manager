@@ -306,6 +306,31 @@ class WorkflowPanel(ctk.CTkFrame):
         else:
             ParamDialog(self, live_def, on_confirm=_on_confirm, on_saved=_on_saved)
 
+    def insert_operation_after(self, op, after_id: str) -> None:
+        """Sett inn operasjon rett etter den med gitt operation_id.
+        Faller tilbake til add_operation() dersom after_id ikke finnes."""
+        insert_idx = None
+        for i, row in enumerate(self._rows):
+            if row.op.operation_id == after_id:
+                insert_idx = i + 1
+                break
+        if insert_idx is None:
+            self.add_operation(op)
+            return
+
+        self.empty_lbl.grid_remove()
+        new_row = OperationRow(
+            self.scroll, op, insert_idx + 1,
+            on_remove=self._remove_row,
+            on_move_up=self._move_up,
+            on_move_down=self._move_down,
+            on_configure=self._configure_row,
+        )
+        self._rows.insert(insert_idx, new_row)
+        for i, row in enumerate(self._rows):
+            row.grid(row=i, column=0, sticky="ew", pady=3, padx=2)
+        self._bind_drag(new_row)
+
     def load_workflow(self, wf):
         self.clear()
         for op in wf:

@@ -20,6 +20,7 @@ from siard_workflow.operations import (
     VirusScanOperation, ConditionalOperation,
     UnpackSiardOperation, RepackSiardOperation,
     WorkflowReportOperation, DiasPackageOperation,
+    LobFolderFixOperation,
 )
 from siard_workflow.systemspecific_operations import CosDocMailMergeOperation
 from settings import save_op_params, save_config, get_config, _SETTINGS_FILE
@@ -538,6 +539,22 @@ OP_DEFS = [
             {"key": "lo_timeout",     "label": "LO timeout per fil (s)",    "type": "int",  "default": 120},
             {"key": "dry_run",        "label": "Tørkjøring (ikke skriv)",   "type": "bool", "default": False},
         ],
+    },
+    # ── Kompatibilitet ───────────────────────────────────────────────────────
+    {
+        "cls": LobFolderFixOperation,
+        "label": "Korriger lobFolder (SCFC→DBPTK)",
+        "category": "Kompatibilitet",
+        "desc": (
+            "Retter tre lobFolder-inkompatibiliteter i SCFC-produserte SIARD-filer "
+            "som hindrer LOB-indeksering i DBPTK (issue #1 / DBPTK #749): "
+            "legger til database-nivå <lobFolder>content</lobFolder>, "
+            "fjerner 'content/'-prefiks og avsluttende '/' fra kolonne-nivå lobFolder. "
+            "I pipeline-modus: modifiserer metadata.xml i den utpakkede mappen. "
+            "Standalone: skriver ny <original>_lobfix.siard."
+        ),
+        "status": LobFolderFixOperation.status,
+        "params": [],
     },
     {
         "cls": XMLValidationOperation,

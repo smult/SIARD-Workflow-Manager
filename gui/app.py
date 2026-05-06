@@ -1157,6 +1157,67 @@ class App(ctk.CTk):
         # Avbrutt
         return False
 
+    def _lobfolder_preflight(self, ops: list) -> bool:
+        """
+        Skanner SIARD-filen(e) for lobFolder-inkompatibiliteter (SCFC→DBPTK).
+        Viser dialog og tilbyr å sette inn LobFolderFixOperation automatisk
+        rett etter UnpackSiardOperation.
+
+        Returnerer True = fortsett kjøring, False = avbryt.
+        """
+        from siard_workflow.operations import UnpackSiardOperation
+        from siard_workflow.operations.lobfolder_fix_operation import (
+            LobFolderFixOperation, scan_lobfolder_issues)
+
+        # Kun relevant i pipeline-modus
+        if not any(isinstance(op, UnpackSiardOperation) for op in ops):
+            return True
+
+        # Allerede lagt til — ikke spør igjen
+        if any(isinstance(op, LobFolderFixOperation) for op in ops):
+            return True
+
+        # Rask skanning av SIARD-filene i køen
+        all_issues: dict = {}
+        for path in self.siard_queue:
+            found = scan_lobfolder_issues(path)
+            if found:
+                all_issues[path] = found
+
+        if not all_issues:
+            return True
+
+        lines = [
+            "lobFolder-inkompatibiliteter ble oppdaget i SIARD-filen(e).\n",
+            "Dette er et kjent problem med SCFC-uttrekk (se issue #1 / DBPTK #749)",
+            "som gjør at LOBs ikke lar seg indeksere i DBPTK.\n",
+        ]
+        for path, issues in all_issues.items():
+            lines.append(f"  {path.name}:")
+            for issue in issues:
+                lines.append(f"    • {issue}")
+        lines += [
+            "",
+            "Vil du legge til «Rett lobFolder» automatisk etter «Pakk ut SIARD»?",
+        ]
+
+        dialog = _PipelineSuggestionDialog(self, "\n".join(lines))
+        dialog.title("lobFolder-problemer oppdaget")
+        self.wait_window(dialog)
+
+        if dialog.result == "ja":
+            self.workflow_panel.insert_operation_after(
+                LobFolderFixOperation(), "unpack_siard")
+            self._log(
+                "«Rett lobFolder (SCFC→DBPTK)» lagt til etter «Pakk ut SIARD»",
+                "ok")
+            return True  # ops re-hentes av kalleren
+
+        if dialog.result == "nei":
+            return True  # operatøren avslo — fortsett uten
+
+        return False  # avbrutt
+
     def _report_preflight(self, ops: list) -> bool:
         """
         Spør om brukeren vil legge til 'Kjørerapport (PDF)' dersom den ikke
@@ -1327,6 +1388,12 @@ class App(ctk.CTk):
 
         # Re-hent ops etter preflight — pipeline_preflight kan ha lagt til
         # UnpackSiardOperation og RepackSiardOperation i panelet
+        ops = list(self.workflow_panel.get_operations())
+
+        if not self._lobfolder_preflight(ops):
+            return
+
+        # Re-hent ops i tilfelle lobfolder_fix ble lagt til
         ops = list(self.workflow_panel.get_operations())
 
         if not self._report_preflight(ops):

@@ -1,4 +1,5 @@
 from .dias_package_operation import DiasPackageOperation
+from .lobfolder_fix_operation import LobFolderFixOperation
 from .sha256_operation import SHA256Operation
 from .blob_check_operation import BlobCheckOperation
 from .blob_convert_operation import BlobConvertOperation
@@ -14,6 +15,7 @@ from .standard_operations import (
 
 __all__ = [
     "DiasPackageOperation",
+    "LobFolderFixOperation",
     "SHA256Operation",
     "BlobCheckOperation",
     "BlobConvertOperation",

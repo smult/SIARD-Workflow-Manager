@@ -1398,17 +1398,17 @@ class CosDocMailMergeOperation(BaseOperation):
                     old_blob = lob_path / s.blob["file"]
                     if old_blob != new_blob_path and old_blob.exists():
                         old_blob.unlink()
-                    w(f"    Avkryptert og konvertert: {new_blobname} "
+                    w(f"    Fjernet passord og konvertert: {new_blobname} "
                       f"({len(new_data):,} bytes)", "ok")
                     base["update"] = {"file": new_blobname, "length": len(new_data),
                                       "digest": _md5_upper(new_data),
-                                      "conversion_note": "Konvertert: avkryptert og konvertert til .docx"}
+                                      "conversion_note": "Konvertert: fjernt passord og konvertert til .docx"}
                     base["sd"]["singles_decrypted"] = 1
                 elif s.dec_path and s.dec_path.exists():
                     new_data = s.dec_path.read_bytes()
                     blob_src.write_bytes(new_data)
                     if s.is_word:
-                        w(f"    Avkryptert (ikke konvertert): {s.blob['file']}", "info")
+                        w(f"    Fjernet passord (ikke konvertert): {s.blob['file']}", "info")
                     base["update"] = {"file": s.blob["file"], "length": len(new_data),
                                       "digest": _md5_upper(new_data),
                                       "conversion_note": ""}
