@@ -58,12 +58,15 @@ class WorkflowReportOperation(BaseOperation):
         ts     = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         pdf_path = siard_path.parent / f"{siard_path.stem}{suffix}_{ts}.pdf"
 
+        format_counts: dict = dict(ctx.metadata.get("format_counts", {}))
+
         try:
             _generate_pdf(
                 pdf_path        = pdf_path,
                 siard_path      = siard_path,
                 step_results    = step_results,
                 ctx_results     = dict(ctx.results),
+                format_counts   = format_counts,
                 include_charts  = bool(self.params.get("include_charts", True)),
                 include_details = bool(self.params.get("include_details", True)),
             )
@@ -123,6 +126,7 @@ def _generate_pdf(
     siard_path:      Path,
     step_results:    list[dict],
     ctx_results:     dict,
+    format_counts:   dict | None = None,
     include_charts:  bool = True,
     include_details: bool = True,
 ) -> None:
@@ -153,6 +157,7 @@ def _generate_pdf(
     C_ERROR_BG   = colors.HexColor("#fadbd8")
     C_SKIP_BG    = colors.HexColor("#eaecee")
     C_WHITE      = colors.white
+    C_ALT_ROW    = colors.HexColor("#f0f4f8")
 
     # ── Beregn samlet status ──────────────────────────────────────────────────
     now          = datetime.datetime.now()
@@ -458,6 +463,137 @@ def _generate_pdf(
                 ]
         sum_tbl.setStyle(TableStyle(style_cmds))
         story.append(sum_tbl)
+
+    # ══ FILTYPE-DIAGRAM ═══════════════════════════════════════════════════════
+    if format_counts:
+        all_sorted = sorted(format_counts.items(), key=lambda x: -x[1])
+        total_files = sum(v for _, v in all_sorted)
+
+        if total_files > 0:
+            story.append(Spacer(1, 0.8 * cm))
+            story.append(Paragraph("Identifiserte filtyper", s_section))
+            story.append(HRFlowable(width="100%", thickness=1.5, color=C_ACCENT,
+                                    spaceAfter=6))
+            n_types = len(all_sorted)
+            story.append(Paragraph(
+                f"Totalt {total_files:,} fil(er) fordelt på {n_types} format(er).",
+                s_body))
+            story.append(Spacer(1, 0.4 * cm))
+
+            # Farger per filtype
+            _FC = {
+                "pdf": "#e74c3c", "pdfa": "#e74c3c",
+                "doc": "#2980b9", "docx": "#2980b9",
+                "odt": "#5dade2", "rtf": "#85c1e9",
+                "xls": "#27ae60", "xlsx": "#27ae60", "ods": "#52be80",
+                "csv": "#a9dfbf",
+                "ppt": "#e67e22", "pptx": "#e67e22", "odp": "#f0b27a",
+                "jpg": "#8e44ad", "jpeg": "#8e44ad", "png": "#9b59b6",
+                "tif": "#af7ac5", "tiff": "#af7ac5", "bmp": "#c39bd3",
+                "gif": "#d2b4de", "jp2": "#6c3483",
+                "mp3": "#17a589", "wav": "#1abc9c", "flac": "#76d7c4",
+                "mp4": "#2471a3", "mpg": "#2e86c1", "avi": "#5dade2",
+                "xml": "#f1c40f", "json": "#f4d03f", "html": "#f9e79f",
+                "txt": "#aab7b8", "msg": "#717d7e", "eml": "#717d7e",
+                "zip": "#7f8c8d", "7z": "#7f8c8d", "rar": "#7f8c8d",
+                "bin": "#566573", "ingen": "#4d5656",
+            }
+            _DEF_CLR = "#4f8ef7"
+            _ANDRE_CLR = "#95a5a6"
+
+            def _hex(ext):
+                return _FC.get(ext.lower(), _DEF_CLR)
+
+            # ── Kakediagram: topp 8 + "Andre" ────────────────────────────────
+            if include_charts:
+                PIE_TOP = 8
+                pie_slices = all_sorted[:PIE_TOP]
+                andre_count = sum(v for _, v in all_sorted[PIE_TOP:])
+
+                pie_labels  = [f".{e}" if e != "ingen" else "(ingen)"
+                               for e, _ in pie_slices]
+                pie_values  = [float(v) for _, v in pie_slices]
+                pie_colors  = [colors.HexColor(_hex(e)) for e, _ in pie_slices]
+
+                if andre_count > 0:
+                    pie_labels.append(f"Andre ({n_types - PIE_TOP})")
+                    pie_values.append(float(andre_count))
+                    pie_colors.append(colors.HexColor(_ANDRE_CLR))
+
+                pie = _pie_chart(pie_labels, pie_values,
+                                 "Fordeling av filtyper", pie_colors)
+                if pie:
+                    story.append(pie)
+                    story.append(Spacer(1, 0.5 * cm))
+
+            # ── Tabell: alle filtyper med stolpe ─────────────────────────────
+            show_fc = all_sorted[:25]
+            max_cnt = show_fc[0][1] if show_fc else 1
+
+            BAR_W = inner_w * 0.38
+            ext_col = 2.0 * cm
+            bar_col = BAR_W + 0.2 * cm
+            cnt_col = 1.6 * cm
+            pct_col = 1.5 * cm
+
+            bar_rows  = [["Format", "", "Antall", "Andel"]]
+            bar_style = [
+                ("BACKGROUND",    (0, 0), (-1, 0), C_PRIMARY),
+                ("TEXTCOLOR",     (0, 0), (-1, 0), C_WHITE),
+                ("FONTNAME",      (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE",      (0, 0), (-1, -1), 8),
+                ("ALIGN",         (0, 0), (-1, 0),  "CENTER"),
+                ("ALIGN",         (0, 1), (0, -1),  "RIGHT"),
+                ("ALIGN",         (2, 1), (3, -1),  "RIGHT"),
+                ("TOPPADDING",    (0, 0), (-1, -1), 3),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                ("LEFTPADDING",   (0, 0), (-1, -1), 5),
+                ("RIGHTPADDING",  (0, 0), (-1, -1), 5),
+                ("GRID",          (0, 0), (-1, -1), 0.3,
+                 colors.HexColor("#c8d6e5")),
+            ]
+
+            for ri, (ext, cnt) in enumerate(show_fc, 1):
+                pct   = cnt / total_files * 100
+                bar_w = max(1, BAR_W * cnt / max_cnt)
+                clr   = colors.HexColor(_hex(ext))
+
+                bar_cell = Table([[""]], colWidths=[bar_w], rowHeights=[10])
+                bar_cell.setStyle(TableStyle([
+                    ("BACKGROUND",    (0, 0), (0, 0), clr),
+                    ("TOPPADDING",    (0, 0), (0, 0), 0),
+                    ("BOTTOMPADDING", (0, 0), (0, 0), 0),
+                    ("LEFTPADDING",   (0, 0), (0, 0), 0),
+                    ("RIGHTPADDING",  (0, 0), (0, 0), 0),
+                ]))
+                bar_rows.append([
+                    f".{ext}" if ext != "ingen" else "(ingen)",
+                    bar_cell,
+                    f"{cnt:,}",
+                    f"{pct:.1f} %",
+                ])
+                bg = C_ALT_ROW if ri % 2 == 0 else C_WHITE
+                bar_style += [
+                    ("BACKGROUND", (0, ri), (0, ri), clr),
+                    ("TEXTCOLOR",  (0, ri), (0, ri), C_WHITE),
+                    ("BACKGROUND", (1, ri), (3, ri), bg),
+                ]
+
+            bt = Table(bar_rows, colWidths=[ext_col, bar_col, cnt_col, pct_col])
+            bt.setStyle(TableStyle(bar_style))
+            story.append(bt)
+
+            if n_types > 25:
+                story.append(Spacer(1, 0.2 * cm))
+                story.append(Paragraph(
+                    f"Viser 25 av {n_types} filtyper. "
+                    "Stolpe-bredde er relativ til den mest vanlige filtypen.",
+                    s_caption))
+            else:
+                story.append(Spacer(1, 0.2 * cm))
+                story.append(Paragraph(
+                    "Stolpe-bredde er relativ til den mest vanlige filtypen.",
+                    s_caption))
 
     # ══ DETALJSEKSJONER ═══════════════════════════════════════════════════════
     if include_details and step_results:

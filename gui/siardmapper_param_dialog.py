@@ -73,50 +73,79 @@ def _scan_siard_tables(siard_path: Path) -> tuple[list[str], dict[str, list[str]
     return tables, cols
 
 
-def _match_pct(json_path: Path,
-               siard_tables: list[str],
-               siard_cols: dict[str, list[str]]) -> tuple[int, int]:
+def _analyze_template(json_path: Path,
+                      siard_tables: list[str],
+                      siard_cols: dict[str, list[str]]) -> dict:
     """
-    Returnerer (tabell_pct, kolonne_pct) [0-100] for en JSON-mal mot SIARD-data.
+    Leser JSON-malfil én gang og returnerer match-prosenter + mal-metadata.
+    Nøkler: tbl_pct, col_pct, desc_count, total_fields,
+            name, description, systemName, systemVersjon
     """
-    if not siard_tables:
-        return 0, 0
+    total_fields = len(siard_tables) + sum(len(v) for v in siard_cols.values())
+    result = {
+        "tbl_pct": 0, "col_pct": 0, "desc_count": 0, "total_fields": total_fields,
+        "name": "", "description": "",
+        "systemName": "", "systemVersjon": "", "modelVersion": "",
+    }
+
+    # Les JSON-filen alltid — metadata trengs uavhengig av om SIARD har tabeller
     try:
         data = json.loads(json_path.read_text(encoding="utf-8"))
     except Exception:
-        return 0, 0
+        return result
 
-    def _extract(d):
-        if isinstance(d, list):
-            return d
-        if isinstance(d, dict):
-            for k in ("tables", "tabeller"):
-                if k in d and isinstance(d[k], list):
-                    return d[k]
-            s = d.get("templateSchema")
-            if isinstance(s, dict) and "tables" in s:
-                return s["tables"]
-            for v in d.values():
-                if isinstance(v, dict) and "tables" in v:
-                    return v["tables"]
-        return []
+    if not isinstance(data, dict):
+        return result
 
-    try:
-        tbl_list = _extract(data)
-    except Exception:
-        return 0, 0
+    # Finn schema-objektet (kan ligge på toppnivå eller nestet under f.eks. templateSchema)
+    def _find_schema(d: dict):
+        for k in ("tables", "tabeller"):
+            if isinstance(d.get(k), list):
+                return d, d[k]
+        for v in d.values():
+            if isinstance(v, dict):
+                for k in ("tables", "tabeller"):
+                    if isinstance(v.get(k), list):
+                        return v, v[k]
+        return d, []
 
-    json_tbls: dict[str, list[str]] = {}
+    schema, tbl_list = _find_schema(data)
+
+    # Hent metadata fra schema-objektet; faller tilbake til rot-objektet
+    def _get(*keys: str) -> str:
+        for k in keys:
+            v = schema.get(k) or data.get(k)
+            if v and isinstance(v, str):
+                return v.strip()
+        return ""
+
+    result["name"]          = _get("name")
+    result["description"]   = _get("description")
+    result["systemName"]    = _get("systemName")
+    result["systemVersjon"] = _get("systemVersjon", "systemVersion")
+    result["modelVersion"]  = _get("modelVersion", "modelVersjon")
+
+    # Hopp over match-beregning om SIARD-filen ikke har tabeller
+    if not siard_tables:
+        return result
+
+    json_tbls:  dict[str, list[str]] = {}
+    json_descs: dict[str, dict]      = {}
     for t in tbl_list:
         if not isinstance(t, dict):
             continue
         tn = t.get("name", "").strip().lower()
-        if tn:
-            json_tbls[tn] = [
-                c.get("name", "").strip().lower()
-                for c in t.get("columns", [])
-                if isinstance(c, dict) and c.get("name")
-            ]
+        if not tn:
+            continue
+        json_tbls[tn] = []
+        json_descs[tn] = {"__tbl__": (t.get("description") or "").strip()}
+        for c in t.get("columns", []):
+            if not isinstance(c, dict):
+                continue
+            cn = c.get("name", "").strip().lower()
+            if cn:
+                json_tbls[tn].append(cn)
+                json_descs[tn][cn] = (c.get("description") or "").strip()
 
     matched_t = sum(1 for t in siard_tables if t in json_tbls)
     tbl_pct   = round(matched_t / len(siard_tables) * 100) if siard_tables else 0
@@ -128,7 +157,21 @@ def _match_pct(json_path: Path,
         matched_c += sum(1 for c in cn_list if c in jcols)
     col_pct = round(matched_c / total_c * 100) if total_c else 0
 
-    return tbl_pct, col_pct
+    desc_count = 0
+    siard_set = set(siard_tables)
+    for tn in siard_set:
+        if tn not in json_descs:
+            continue
+        if json_descs[tn].get("__tbl__"):
+            desc_count += 1
+        siard_cn_set = set(siard_cols.get(tn, []))
+        for cn, desc in json_descs[tn].items():
+            if cn != "__tbl__" and cn in siard_cn_set and desc:
+                desc_count += 1
+
+    result.update(tbl_pct=tbl_pct, col_pct=col_pct,
+                  desc_count=desc_count, total_fields=total_fields)
+    return result
 
 
 # ── Param-dialog ──────────────────────────────────────────────────────────────
@@ -160,9 +203,14 @@ class SiardMapperParamDialog(ctk.CTkToplevel):
         # Intern state
         self._siard_tables: list[str] = []
         self._siard_cols:   dict[str, list[str]] = {}
-        self._template_entries: list[dict] = []   # {path, tbl_pct, col_pct}
+        self._template_entries: list[dict] = []   # {path, tbl_pct, col_pct, name, ...}
         self._list_items:  list[str] = []          # display strings i listbox
         self._loading = False
+
+        # Tooltip-state
+        self._tooltip_win:   tk.Toplevel | None = None
+        self._tooltip_after: str | None = None
+        self._tooltip_idx = -1
 
         self.title("Berik SIARD-metadata — innstillinger")
         self.resizable(True, False)
@@ -201,22 +249,22 @@ class SiardMapperParamDialog(ctk.CTkToplevel):
         ).grid(row=r, column=0, sticky="w", **PAD)
         r += 1
 
-        siard_row = ctk.CTkFrame(body, fg_color="transparent")
-        siard_row.grid(row=r, column=0, sticky="ew", padx=16, pady=(0, 4))
-        siard_row.grid_columnconfigure(0, weight=1)
-        self._siard_entry = ctk.CTkEntry(
-            siard_row, textvariable=self._siard_var,
-            font=ctk.CTkFont(family=FONTS["mono"], size=10),
-            fg_color=COLORS["surface"], border_color=COLORS["border"],
-        )
-        self._siard_entry.grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        ctk.CTkButton(
-            siard_row, text="Bla…", width=54, height=28,
-            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
-            font=ctk.CTkFont(family=FONTS["mono"], size=10),
-            command=self._browse_siard,
-        ).grid(row=0, column=1)
-        r += 1
+        #siard_row = ctk.CTkFrame(body, fg_color="transparent")
+        #siard_row.grid(row=r, column=0, sticky="ew", padx=16, pady=(0, 4))
+        #siard_row.grid_columnconfigure(0, weight=1)
+        #self._siard_entry = ctk.CTkEntry(
+        #    siard_row, textvariable=self._siard_var,
+        #    font=ctk.CTkFont(family=FONTS["mono"], size=10),
+        #    fg_color=COLORS["surface"], border_color=COLORS["border"],
+        #)
+        #self._siard_entry.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        #ctk.CTkButton(
+        #    siard_row, text="Bla…", width=54, height=28,
+        #    fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+        #    font=ctk.CTkFont(family=FONTS["mono"], size=10),
+        #    command=self._browse_siard,
+        #).grid(row=0, column=1)
+        #r += 1
 
         # ── JSON-mal-liste ────────────────────────────────────────────────────
         tdir_txt = (f"JSON-maler fra: {self._template_dir}"
@@ -248,6 +296,8 @@ class SiardMapperParamDialog(ctk.CTkToplevel):
         sb.grid(row=0, column=1, sticky="ns", pady=1)
         self._listbox.bind("<<ListboxSelect>>", self._on_list_select)
         self._listbox.bind("<Double-1>", lambda _: self._ok())
+        self._listbox.bind("<Motion>", self._on_list_motion)
+        self._listbox.bind("<Leave>",  self._on_list_leave)
         r += 1
 
         btn_row = ctk.CTkFrame(body, fg_color="transparent")
@@ -376,17 +426,49 @@ class SiardMapperParamDialog(ctk.CTkToplevel):
                          args=(Path(siard),), daemon=True).start()
 
     def _do_refresh(self, siard_path: Path):
+        from concurrent.futures import ThreadPoolExecutor
+        from settings import get_config
+
         tables, cols = _scan_siard_tables(siard_path)
-        entries: list[dict] = []
         json_files = sorted(self._template_dir.glob("*.json"))
-        for jf in json_files:
-            tp, cp = _match_pct(jf, tables, cols)
-            entries.append({"path": jf, "tbl_pct": tp, "col_pct": cp})
-        # Sorter: høyest kombinert % øverst
-        entries.sort(key=lambda e: e["tbl_pct"] + e["col_pct"], reverse=True)
+        total = len(json_files)
+
+        if not total:
+            self.after(0, lambda: self._apply_refresh(tables, cols, []))
+            return
+
+        max_workers = max(1, int(get_config("max_workers") or 4))
+        done_count = [0]
+
+        def _match_one(jf):
+            try:
+                entry = _analyze_template(jf, tables, cols)
+            except Exception:
+                entry = {"tbl_pct": 0, "col_pct": 0, "desc_count": 0,
+                         "total_fields": 0, "name": "", "description": "",
+                         "systemName": "", "systemVersjon": ""}
+            entry["path"] = jf
+            done_count[0] += 1
+            n = done_count[0]
+            self.after(0, lambda: self._set_status(f"Matcher {n}/{total}…"))
+            return entry
+
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            entries = list(ex.map(_match_one, json_files))
+
+        # Sorter: strukturell treff først, deretter beskrivelsesdekning
+        entries.sort(
+            key=lambda e: (e["tbl_pct"] + e["col_pct"], e["desc_count"]),
+            reverse=True)
         self.after(0, lambda: self._apply_refresh(tables, cols, entries))
 
     def _apply_refresh(self, tables, cols, entries):
+        self._hide_tooltip()
+        if self._tooltip_after:
+            self.after_cancel(self._tooltip_after)
+            self._tooltip_after = None
+        self._tooltip_idx = -1
+
         self._siard_tables = tables
         self._siard_cols   = cols
         self._template_entries = entries
@@ -401,19 +483,43 @@ class SiardMapperParamDialog(ctk.CTkToplevel):
 
         for i, e in enumerate(entries):
             tp, cp = e["tbl_pct"], e["col_pct"]
+            dc, tf = e["desc_count"], e["total_fields"]
+
             if tp == 0 and cp == 0:
-                pct_str = "    0 % treff"
+                pct_str  = "0% treff"
+                desc_str = ""
             else:
-                pct_str = f"  {tp:3d}% tab  {cp:3d}% kol"
-            line = f"  {e['path'].name:<36}  {pct_str}"
+                pct_str = f"{tp:3d}% tab  {cp:3d}% kol"
+                if tf > 0:
+                    dp = round(dc / tf * 100)
+                    desc_str = f"  {dp:3d}% beskrevet ({dc}/{tf})"
+                else:
+                    desc_str = ""
+
+            sys_name  = e.get("systemName", "")
+            sys_ver   = e.get("systemVersjon", "")
+            mdl_ver   = e.get("modelVersion", "")
+            parts = []
+            if sys_name:
+                parts.append(f"{sys_name} ({sys_ver})" if sys_ver else sys_name)
+            if mdl_ver:
+                parts.append(mdl_ver)
+            name_part = " - ".join(parts) if parts else e["path"].stem
+            if len(name_part) > 44:
+                name_part = name_part[:41] + "…"
+            line = f"  {name_part:<44}  {pct_str}{desc_str}"
             self._listbox.insert("end", line)
             self._list_items.append(str(e["path"]))
-            # Farge basert på score
+
+            # Grønt kun om 100% strukturell treff OG alle felt er beskrevet
+            fully_described = (tf > 0 and dc == tf)
             combined = tp + cp
-            if combined == 200:
-                fg = "#2ecc71"     # grønn — 100% match
+            if combined == 200 and fully_described:
+                fg = "#2ecc71"          # grønn — 100% match og beskrevet
+            elif combined == 200:
+                fg = "#7ec8e3"          # lys blå — 100% match men mangler beskrivelser
             elif combined >= 120:
-                fg = "#f0c040"     # gul — god match
+                fg = "#f0c040"          # gul — god match
             elif combined >= 40:
                 fg = COLORS["text_sub"]
             else:
@@ -422,6 +528,13 @@ class SiardMapperParamDialog(ctk.CTkToplevel):
             # Forhåndsvelg om dette er gjeldende valg
             if current and str(e["path"]) == current:
                 sel_idx = i
+
+        # Auto-velg øverste mal om den har noen treffprosent og ingenting er forhåndsvalgt
+        if sel_idx is None and entries:
+            top = entries[0]
+            if top["tbl_pct"] > 0 or top["col_pct"] > 0:
+                sel_idx = 0
+                self._json_path_var.set(self._list_items[0])
 
         if sel_idx is not None:
             self._listbox.selection_set(sel_idx)
@@ -435,6 +548,70 @@ class SiardMapperParamDialog(ctk.CTkToplevel):
             self._status_lbl.configure(text=txt)
         except Exception:
             pass
+
+    # ── Tooltip ───────────────────────────────────────────────────────────────
+
+    def _on_list_motion(self, event):
+        idx = self._listbox.nearest(event.y)
+        if idx == self._tooltip_idx:
+            return
+        self._tooltip_idx = idx
+        if self._tooltip_after:
+            self.after_cancel(self._tooltip_after)
+            self._tooltip_after = None
+        self._hide_tooltip()
+        if 0 <= idx < len(self._template_entries):
+            rx = self._listbox.winfo_rootx() + event.x + 14
+            ry = self._listbox.winfo_rooty() + event.y + 14
+            self._tooltip_after = self.after(
+                400, lambda e=self._template_entries[idx], x=rx, y=ry:
+                     self._show_tooltip(e, x, y))
+
+    def _on_list_leave(self, _=None):
+        self._tooltip_idx = -1
+        if self._tooltip_after:
+            self.after_cancel(self._tooltip_after)
+            self._tooltip_after = None
+        self._hide_tooltip()
+
+    def _show_tooltip(self, entry: dict, x: int, y: int):
+        self._hide_tooltip()
+        lines = []
+        name = entry.get("name", "")
+        if name:
+            lines.append(f"Navn:         {name}")
+        desc = entry.get("description", "")
+        if desc:
+            lines.append(f"Beskrivelse:  {desc}")
+        sys_name  = entry.get("systemName", "")
+        sys_ver   = entry.get("systemVersjon", "")
+        mdl_ver   = entry.get("modelVersion", "")
+        if sys_name or sys_ver:
+            lines.append(f"System:       {' '.join(filter(None, [sys_name, sys_ver]))}")
+        if mdl_ver:
+            lines.append(f"Mal-versjon:  {mdl_ver}")
+        lines.append(f"Fil:          {entry['path'].name}")
+
+        win = tk.Toplevel(self)
+        win.wm_overrideredirect(True)
+        win.wm_geometry(f"+{x}+{y}")
+        win.configure(bg="#2a2a3a")
+        tk.Label(
+            win, text="\n".join(lines),
+            bg="#2a2a3a", fg="#e0e0e0",
+            font=("Courier New", 9),
+            justify="left", padx=10, pady=6,
+            wraplength=440,
+        ).pack()
+        self._tooltip_win = win
+
+    def _hide_tooltip(self):
+        if self._tooltip_win:
+            try:
+                self._tooltip_win.destroy()
+            except Exception:
+                pass
+            self._tooltip_win = None
 
     def _on_list_select(self, _=None):
         sel = self._listbox.curselection()

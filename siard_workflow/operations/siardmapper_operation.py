@@ -22,6 +22,7 @@ Standalone-modus:
 
 from __future__ import annotations
 
+import html as _html
 import io
 import json
 import threading
@@ -36,6 +37,19 @@ from siard_workflow.core.context import WorkflowContext
 # ── SIARD-namespace ───────────────────────────────────────────────────────────
 
 _SIARD_NS  = "http://www.bar.admin.ch/xmlns/siard/2/metadata.xsd"
+
+
+def _decode(text: str) -> str:
+    """Dekod HTML-entiteter iterativt (håndterer dobbel-enkoding som &amp;oslash;)."""
+    if not text:
+        return text
+    result = text
+    for _ in range(4):   # maks 4 pass dekoder selv 4-gangs enkoding
+        decoded = _html.unescape(result)
+        if decoded == result:
+            break
+        result = decoded
+    return result.strip()
 _NS        = {"s": _SIARD_NS}
 _METADATA_PATHS = ("header/metadata.xml", "metadata.xml")
 
@@ -169,12 +183,13 @@ def _match(tables: List[_Table], json_lookup: Dict[str, dict]) -> List[_Match]:
         if entry:
             for ce in entry.get("columns", []):
                 col_name = ce.get("name", "").strip()
-                col_desc = ce.get("description", "").strip()
+                col_desc = _decode(ce.get("description", ""))
                 if col_name and col_desc:
                     col_descs[col_name.lower()] = col_desc
+        tbl_desc_raw = (entry.get("description", "") or "") if entry else ""
         matches.append(_Match(
             table=tbl,
-            json_table_desc=(entry.get("description", "") or "").strip() if entry else None,
+            json_table_desc=_decode(tbl_desc_raw) or None,
             col_descs=col_descs,
         ))
     return matches

@@ -1,4 +1,8 @@
 {
+  "font_offset": 0,
+  "json_template_dir": "",
+  "siardmapper_show_data": true,
+  "siardmapper_rows": 5,
   "global_temp_dir": "",
   "av_executable": "",
   "lo_executable": "",

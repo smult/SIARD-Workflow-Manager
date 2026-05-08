@@ -1535,6 +1535,16 @@ class App(ctk.CTk):
 
             def _progress_cb(event, **kw):
                 self._log_queue.put(("conv_" + event, kw))
+                # Akkumuler filtype-data i bakgrunnstråden — tilgjengelig for rapport-operasjonen
+                if event == "file_done":
+                    ext = kw.get("detected_ext", "")
+                    if ext:
+                        fc = ctx.metadata.setdefault("format_counts", {})
+                        fc[ext] = fc.get(ext, 0) + 1
+                elif event == "rename_format_counts":
+                    fc = ctx.metadata.setdefault("format_counts", {})
+                    for e, c in kw.get("counts", {}).items():
+                        fc[e] = fc.get(e, 0) + c
 
             ctx.metadata["progress_cb"]  = _progress_cb
             ctx.metadata["paused"]       = False

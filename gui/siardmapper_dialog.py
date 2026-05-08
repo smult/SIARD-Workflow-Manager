@@ -13,6 +13,7 @@ Flat redigeringstabell à la original SIARDMapper:
 
 from __future__ import annotations
 
+import html as _html_mod
 import json
 import tkinter as tk
 import xml.etree.ElementTree as ET
@@ -295,10 +296,38 @@ class SiardMapperDialog(ctk.CTkToplevel):
         self._save_path: Optional[Path] = None
         if json_path and json_path.exists():
             stem = json_path.stem
-            if stem.endswith("_metadata_mal"):
-                self._save_path = json_path          # generert fil
+            if stem.endswith("_metadata_mal") or stem.endswith("_egendefinert"):
+                self._save_path = json_path          # generert eller allerede egendefinert
             else:
                 self._save_path = json_path.with_name(stem + "_egendefinert.json")
+
+        # Mal-metadata redigert av bruker (topp-nivå-felt unntatt tables/tabeller).
+        # Lastes fra _save_path hvis den allerede finnes (bevarer forrige sessions endringer),
+        # ellers fra _json_path (base-malen).
+        self._meta_overrides: dict = {}
+        _meta_src = (self._save_path
+                     if (self._save_path and self._save_path.exists())
+                     else json_path)
+        if _meta_src and _meta_src.exists():
+            try:
+                _raw = json.loads(_meta_src.read_text(encoding="utf-8"))
+                if isinstance(_raw, dict):
+                    self._meta_overrides = {
+                        k: v for k, v in _raw.items()
+                        if k not in ("tables", "tabeller")
+                        and isinstance(v, (str, int, float))
+                    }
+            except Exception:
+                pass
+
+        # Les innstillinger fra config
+        try:
+            from settings import get_config
+            self._show_data = bool(get_config("siardmapper_show_data", True))
+            self._data_rows = int(get_config("siardmapper_rows", 5) or 5)
+        except Exception:
+            self._show_data = True
+            self._data_rows = 5
 
         self.title("SIARDMapper — berik metadata")
         self.configure(fg_color=COLORS["bg"])
@@ -315,8 +344,7 @@ class SiardMapperDialog(ctk.CTkToplevel):
     # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build(self):
-        self.grid_rowconfigure(1, weight=3)
-        self.grid_rowconfigure(2, weight=1)
+        self.grid_rowconfigure(1, weight=1)   # PanedWindow tar all plass
         self.grid_columnconfigure(0, weight=1)
 
         # ── Statistikkrad ─────────────────────────────────────────────────────
@@ -339,15 +367,31 @@ class SiardMapperDialog(ctk.CTkToplevel):
         self._save_lbl.grid(row=0, column=1, padx=8, pady=7)
 
         ctk.CTkButton(
+            hdr, text="✎ Endre metadata for mal", height=26, width=190,
+            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+            font=ctk.CTkFont(family=FONTS["mono"], size=10),
+            command=self._edit_meta,
+        ).grid(row=0, column=2, padx=(8, 6), pady=7)
+
+        ctk.CTkButton(
             hdr, text="↺ Re-match mot JSON", height=26, width=160,
             fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
             font=ctk.CTkFont(family=FONTS["mono"], size=10),
             command=self._rematch,
-        ).grid(row=0, column=2, padx=(8, 14), pady=7)
+        ).grid(row=0, column=3, padx=(0, 14), pady=7)
 
-        # ── Hovedtabell ───────────────────────────────────────────────────────
-        tbl_frm = tk.Frame(self, bg=COLORS["bg"])
-        tbl_frm.grid(row=1, column=0, sticky="nsew", padx=6, pady=(4, 0))
+        # ── PanedWindow: tabell (topp) + datavisning (bunn) ──────────────────
+        self._paned = tk.PanedWindow(
+            self, orient="vertical",
+            sashwidth=5, sashrelief="flat",
+            bg=COLORS["border"],    # sash-fargen = tynn linje
+            handlesize=0,           # skjul håndtaks-firkant
+        )
+        self._paned.grid(row=1, column=0, sticky="nsew", padx=6, pady=(4, 0))
+
+        # ── Topp-pane: hovedtabell ────────────────────────────────────────────
+        tbl_frm = tk.Frame(self._paned, bg=COLORS["bg"])
+        self._paned.add(tbl_frm, stretch="always", minsize=100)
         tbl_frm.grid_rowconfigure(0, weight=1)
         tbl_frm.grid_columnconfigure(0, weight=1)
 
@@ -363,10 +407,10 @@ class SiardMapperDialog(ctk.CTkToplevel):
         self._tree.heading(self._COL_STATUS, text="",                        anchor="center")
         self._tree.heading(self._COL_JSON,   text="JSON-beskrivelse",         anchor="w")
         self._tree.heading(self._COL_CUSTOM, text="✎  Egendefinert beskrivelse", anchor="w")
-        self._tree.column("#0",              width=200, minwidth=100, stretch=False)
-        self._tree.column(self._COL_STATUS,  width=28,  minwidth=28,  stretch=False)
-        self._tree.column(self._COL_JSON,    width=310, minwidth=100, stretch=True)
-        self._tree.column(self._COL_CUSTOM,  width=310, minwidth=100, stretch=True)
+        self._tree.column("#0",              width=250, minwidth=250, stretch=True)
+        self._tree.column(self._COL_STATUS,  width=25,  minwidth=25,  stretch=False)
+        self._tree.column(self._COL_JSON,    width=305, minwidth=100, stretch=True)
+        self._tree.column(self._COL_CUSTOM,  width=308, minwidth=100, stretch=True)
 
         vsb = ttk.Scrollbar(tbl_frm, orient="vertical",
                              command=lambda *a: (self._tree.yview(*a),
@@ -393,32 +437,82 @@ class SiardMapperDialog(ctk.CTkToplevel):
         self._tree.bind("<Configure>",    lambda _: self._editor.reposition())
         self._tree.bind("<MouseWheel>",   lambda _: self._editor.reposition())
         self._tree.bind("<Motion>",       self._on_motion)
+        self._tree.bind("<Leave>",        self._hide_tooltip)
+        self._tree.bind("<Button-3>",     self._on_right_click)
 
-        # ── Datatabell ────────────────────────────────────────────────────────
-        data_frm = tk.Frame(self, bg=COLORS["bg"])
-        data_frm.grid(row=2, column=0, sticky="nsew", padx=6, pady=(3, 0))
-        data_frm.grid_rowconfigure(1, weight=1)
-        data_frm.grid_columnconfigure(0, weight=1)
+        # Tooltip-tilstand
+        self._tooltip_win:  tk.Toplevel | None = None
+        self._tooltip_after: str | None = None
+        self._tooltip_cell = (None, None)   # (iid, col)
+
+        # ── Bunn-pane: datatabell (kontrollrad + tabell) ─────────────────────
+        data_outer = tk.Frame(self._paned, bg=COLORS["bg"])
+        self._paned.add(data_outer, stretch="never", minsize=50, height=180)
+        data_outer.grid_rowconfigure(1, weight=1)
+        data_outer.grid_columnconfigure(0, weight=1)
+
+        # Kontrollrad: [☐ Vis data]  [Antall rader: ___]  EKSEMPELDATA
+        ctrl = tk.Frame(data_outer, bg=COLORS["bg"])
+        ctrl.grid(row=0, column=0, sticky="ew", pady=(0, 2))
+
+        self._show_data_var = tk.BooleanVar(value=self._show_data)
+        tk.Checkbutton(
+            ctrl,
+            text="Vis data",
+            variable=self._show_data_var,
+            command=self._on_show_data_toggle,
+            bg=COLORS["bg"], fg=COLORS["text"],
+            activebackground=COLORS["bg"], activeforeground=COLORS["accent"],
+            selectcolor=COLORS["surface"],
+            font=("Courier New", 9, "bold"),
+            bd=0, highlightthickness=0,
+        ).pack(side="left", padx=(0, 12))
+
+        tk.Label(ctrl, text="Antall rader:",
+                 bg=COLORS["bg"], fg=COLORS["muted"],
+                 font=("Courier New", 9)).pack(side="left")
+
+        self._rows_var = tk.StringVar(value=str(self._data_rows))
+        tk.Entry(
+            ctrl,
+            textvariable=self._rows_var,
+            width=4,
+            bg=COLORS["surface"], fg=COLORS["text"],
+            insertbackground=COLORS["accent"],
+            relief="flat", font=("Courier New", 9), bd=1,
+        ).pack(side="left", padx=(4, 0))
+        self._rows_var.trace_add("write", self._on_rows_changed)
 
         self._data_hdr = tk.Label(
-            data_frm, text="EKSEMPELDATA",
+            ctrl, text="   EKSEMPELDATA",
             bg=COLORS["bg"], fg=COLORS["muted"],
             font=("Courier New", 8, "bold"), anchor="w")
-        self._data_hdr.grid(row=0, column=0, columnspan=2, sticky="w", pady=(2, 1))
+        self._data_hdr.pack(side="left", padx=(12, 0))
+
+        # Dataramme som skjules/vises av avkrysningsboksen
+        self._data_frm = tk.Frame(data_outer, bg=COLORS["bg"])
+        self._data_frm.grid(row=1, column=0, sticky="nsew")
+        self._data_frm.grid_rowconfigure(0, weight=1)
+        self._data_frm.grid_columnconfigure(0, weight=1)
 
         self._data_tree = ttk.Treeview(
-            data_frm, style="Data.Treeview", show="headings", height=5)
-        dvsb = ttk.Scrollbar(data_frm, orient="vertical",   command=self._data_tree.yview)
-        dhsb = ttk.Scrollbar(data_frm, orient="horizontal", command=self._data_tree.xview)
+            self._data_frm, style="Data.Treeview", show="headings",
+            height=self._data_rows)
+        dvsb = ttk.Scrollbar(self._data_frm, orient="vertical",   command=self._data_tree.yview)
+        dhsb = ttk.Scrollbar(self._data_frm, orient="horizontal", command=self._data_tree.xview)
         self._data_tree.configure(yscrollcommand=dvsb.set, xscrollcommand=dhsb.set)
-        self._data_tree.grid(row=1, column=0, sticky="nsew")
-        dvsb.grid(row=1, column=1, sticky="ns")
-        dhsb.grid(row=2, column=0, sticky="ew")
+        self._data_tree.grid(row=0, column=0, sticky="nsew")
+        dvsb.grid(row=0, column=1, sticky="ns")
+        dhsb.grid(row=1, column=0, sticky="ew")
         self._data_cols: List[str] = []
+
+        # Anvend starttilstand fra config
+        if not self._show_data:
+            self._data_frm.grid_remove()
 
         # ── Footer ────────────────────────────────────────────────────────────
         foot = ctk.CTkFrame(self, fg_color=COLORS["panel"], corner_radius=0)
-        foot.grid(row=3, column=0, sticky="ew")
+        foot.grid(row=2, column=0, sticky="ew")
         foot.grid_columnconfigure(1, weight=1)
 
         ctk.CTkButton(
@@ -487,31 +581,54 @@ class SiardMapperDialog(ctk.CTkToplevel):
 
     # ── Populer ───────────────────────────────────────────────────────────────
 
+    def _has_desc(self, iid: str, json_desc: str) -> bool:
+        """Et felt har beskrivelse hvis egendefinert ELLER JSON ikke er tom."""
+        return bool(self._edits.get(iid, "").strip() or json_desc)
+
+    def _tbl_completion(self, tbl: _TblItem) -> float:
+        """Andel beskrevne felt [0.0–1.0] — brukes til sortering."""
+        total = 1 + len(tbl.columns)
+        done  = int(self._has_desc(f"T:{tbl.norm}", tbl.json_desc))
+        done += sum(1 for c in tbl.columns
+                    if self._has_desc(f"C:{tbl.norm}:{c.norm}", c.json_desc))
+        return done / total if total else 1.0
+
     def _populate(self, preserve_open: Optional[Dict[str, bool]] = None):
         """Bygg tabelltred. preserve_open={tbl_norm: is_open} bevarer kollapstilstand."""
         for iid in self._tree.get_children():
             self._tree.delete(iid)
         self._items.clear()
 
+        # Fargekodet: grønn for ferdig, rød for mangler, gul for delvis
         self._tree.tag_configure("table",
             background=self._BG_TBL, foreground=self._FG_TBL,
             font=("Courier New", 10, "bold"))
-        self._tree.tag_configure("col",    background=self._BG_COL)
-        self._tree.tag_configure("tbl_ok", background=self._CLR_OK)
-        self._tree.tag_configure("tbl_par",background=self._CLR_PAR)
-        self._tree.tag_configure("tbl_bad",background=self._CLR_BAD)
-        self._tree.tag_configure("col_ok", background=self._CLR_COK)
-        self._tree.tag_configure("col_bad",background=self._CLR_CBAD)
+        self._tree.tag_configure("col",     background=self._BG_COL)
+        self._tree.tag_configure("tbl_ok",  background="#1a4d2a", foreground="#7eeea0",
+                                  font=("Courier New", 10, "bold"))
+        self._tree.tag_configure("tbl_par", background="#3d3515", foreground="#e8d57e",
+                                  font=("Courier New", 10, "bold"))
+        self._tree.tag_configure("tbl_bad", background="#4d1515", foreground="#ee7e7e",
+                                  font=("Courier New", 10, "bold"))
+        self._tree.tag_configure("col_ok",  background="#0f2914", foreground="#7eeea0")
+        self._tree.tag_configure("col_bad", background="#2e1010", foreground="#ee8080")
 
-        for tbl in self._tables:
-            t_iid   = f"T:{tbl.norm}"
-            ed_tbl  = self._edits.get(t_iid, tbl.json_desc)
+        # Sorter: uferdige tabeller øverst (A–Å), ferdige nederst (A–Å)
+        sorted_tables = sorted(
+            self._tables,
+            key=lambda t: (self._tbl_completion(t) >= 1.0, t.name.lower())
+        )
+
+        for tbl in sorted_tables:
+            t_iid  = f"T:{tbl.norm}"
+            ed_tbl = self._edits.get(t_iid, "")
             if t_iid not in self._edits:
-                self._edits[t_iid] = tbl.json_desc
+                self._edits[t_iid] = ""   # egendefinert starter tom
 
             n_cm   = sum(1 for c in tbl.columns
-                         if self._edits.get(f"C:{tbl.norm}:{c.norm}", c.json_desc))
-            has_td = bool(ed_tbl)
+                         if self._has_desc(f"C:{tbl.norm}:{c.norm}", c.json_desc))
+            has_td = self._has_desc(t_iid, tbl.json_desc)
+
             if has_td and n_cm == len(tbl.columns):
                 t_tag, ico = "tbl_ok",  "✓"
             elif has_td or n_cm > 0:
@@ -521,9 +638,10 @@ class SiardMapperDialog(ctk.CTkToplevel):
 
             is_complete = (has_td and n_cm == len(tbl.columns))
             if preserve_open is None:
-                open_state = not is_complete   # lukk fullstendige ved oppstart
+                open_state = not is_complete
             else:
                 open_state = preserve_open.get(tbl.norm, not is_complete)
+
             self._tree.insert("", "end", iid=t_iid,
                 text=tbl.name,
                 values=(ico, _shorten(tbl.json_desc), _shorten(ed_tbl) or "─"),
@@ -535,10 +653,10 @@ class SiardMapperDialog(ctk.CTkToplevel):
 
             for col in tbl.columns:
                 c_iid  = f"C:{tbl.norm}:{col.norm}"
-                ed_col = self._edits.get(c_iid, col.json_desc)
+                ed_col = self._edits.get(c_iid, "")
                 if c_iid not in self._edits:
-                    self._edits[c_iid] = col.json_desc
-                has_c  = bool(ed_col)
+                    self._edits[c_iid] = ""   # egendefinert starter tom
+                has_c  = self._has_desc(c_iid, col.json_desc)
                 c_tag  = "col_ok" if has_c else "col_bad"
                 self._tree.insert(t_iid, "end", iid=c_iid,
                     text=f"  {col.name}",
@@ -553,11 +671,11 @@ class SiardMapperDialog(ctk.CTkToplevel):
     def _update_stats(self):
         n_t  = len(self._tables)
         n_td = sum(1 for t in self._tables
-                   if self._edits.get(f"T:{t.norm}", "").strip())
+                   if self._has_desc(f"T:{t.norm}", t.json_desc))
         n_c  = sum(len(t.columns) for t in self._tables)
         n_cd = sum(
             sum(1 for c in t.columns
-                if self._edits.get(f"C:{t.norm}:{c.norm}", "").strip())
+                if self._has_desc(f"C:{t.norm}:{c.norm}", c.json_desc))
             for t in self._tables)
         self._stats_lbl.configure(
             text=f"Tabeller: {n_td}/{n_t} beskrevet   "
@@ -586,9 +704,115 @@ class SiardMapperDialog(ctk.CTkToplevel):
             self._on_row_selected(sel[0])
 
     def _on_motion(self, event):
-        """Endre kursor til tekstkursor over custom-kolonnen for å antyde editering."""
         col = self._tree.identify_column(event.x)
+        iid = self._tree.identify_row(event.y)
         self._tree.configure(cursor="xterm" if col == "#3" else "")
+        # Tooltip ved hovering over avkortede celler
+        cell = (iid, col)
+        if cell != self._tooltip_cell:
+            self._hide_tooltip()
+            self._tooltip_cell = cell
+            if iid and col in ("#0", "#2", "#3"):
+                xr, yr = event.x_root, event.y_root
+                self._tooltip_after = self._tree.after(
+                    550, lambda: self._show_tooltip(xr, yr, iid, col))
+
+    def _show_tooltip(self, xr: int, yr: int, iid: str, col: str):
+        text = self._full_cell_text(iid, col)
+        if not text or len(text) <= 55:
+            return
+        self._hide_tooltip()
+        tip = tk.Toplevel(self._tree)
+        tip.wm_overrideredirect(True)
+        tip.wm_geometry(f"+{xr + 14}+{yr + 18}")
+        # Plasser innenfor skjermen
+        lbl = tk.Label(
+            tip, text=text,
+            justify="left", wraplength=480,
+            bg="#1e2535", fg="#d4daf0",
+            font=("Courier New", 10),
+            relief="flat", bd=1, padx=10, pady=5,
+        )
+        lbl.pack()
+        self._tooltip_win = tip
+
+    def _hide_tooltip(self, _=None):
+        if self._tooltip_after:
+            try:
+                self._tree.after_cancel(self._tooltip_after)
+            except Exception:
+                pass
+            self._tooltip_after = None
+        if self._tooltip_win:
+            self._tooltip_win.destroy()
+            self._tooltip_win = None
+        self._tooltip_cell = (None, None)
+
+    def _full_cell_text(self, iid: str, col: str) -> str:
+        """Returner fullstendig tekst for en celle."""
+        if not iid:
+            return ""
+        info = next((it for it in self._items if it["iid"] == iid), None)
+        if not info:
+            return ""
+        if col == "#0":
+            # Navn fra treet
+            return self._tree.item(iid, "text").strip()
+        elif col == "#2":
+            # JSON-beskrivelse
+            if info["type"] == "col" and info["col"]:
+                return info["col"].json_desc
+            return info["tbl"].json_desc if info["type"] == "table" else ""
+        elif col == "#3":
+            # Egendefinert beskrivelse
+            return self._edits.get(iid, "")
+        return ""
+
+    # ── Høyreklikk-meny ───────────────────────────────────────────────────────
+
+    def _on_right_click(self, event):
+        iid = self._tree.identify_row(event.y)
+        if not iid:
+            return
+        info = next((it for it in self._items if it["iid"] == iid), None)
+        if not info:
+            return
+        json_desc = ""
+        if info["type"] == "col" and info["col"]:
+            json_desc = info["col"].json_desc
+        elif info["type"] == "table":
+            json_desc = info["tbl"].json_desc
+        if not json_desc:
+            return
+
+        menu = tk.Menu(
+            self._tree, tearoff=0,
+            bg=COLORS["surface"], fg=COLORS["text"],
+            activebackground=COLORS["accent_dim"],
+            activeforeground="#ffffff",
+            font=("Courier New", 10),
+            relief="flat", bd=1,
+        )
+        menu.add_command(
+            label="📋  Kopier JSON-beskrivelse → Egendefinert",
+            command=lambda i=iid, d=json_desc: self._copy_json_to_custom(i, d),
+        )
+        menu.post(event.x_root, event.y_root)
+        menu.bind("<FocusOut>", lambda _: menu.destroy())
+
+    def _copy_json_to_custom(self, iid: str, json_desc: str):
+        self._edits[iid] = json_desc
+        vals = list(self._tree.item(iid, "values"))
+        if len(vals) >= 3:
+            vals[2] = _shorten(json_desc)
+            self._tree.item(iid, values=vals)
+        self._refresh_status(iid)
+        self._update_stats()
+        self._autosave()
+        self._auto_close_if_complete(iid)
+        # Oppdater editor om den er aktiv på denne raden
+        if self._editor.current_iid() == iid:
+            self._editor._var.set(json_desc)
 
     def _open_editor(self, iid: str):
         custom = self._edits.get(iid, "")
@@ -642,7 +866,20 @@ class SiardMapperDialog(ctk.CTkToplevel):
             return
         self._on_row_selected(iid)
 
-        # Samle unike forslag for kolonnen
+        # Finn json-beskrivelse for dette feltet
+        json_desc_for_field = ""
+        if info["type"] == "col" and info["col"]:
+            json_desc_for_field = info["col"].json_desc
+        elif info["type"] == "table":
+            json_desc_for_field = info["tbl"].json_desc
+
+        # Ikke foreslå når feltet allerede har json-beskrivelse —
+        # da trenger operatøren bare å bekrefte eller overstyre manuelt.
+        if json_desc_for_field:
+            self._suggestions.hide()
+            return
+
+        # Samle unike forslag kun for felt uten json-beskrivelse
         suggestions: List[str] = []
         if info["type"] == "col" and info["col"]:
             col_norm = info["col"].norm
@@ -665,7 +902,6 @@ class SiardMapperDialog(ctk.CTkToplevel):
         if not suggestions:
             self._suggestions.hide()
         elif len(suggestions) == 1:
-            # Fyll inn direkte kun om feltet er tomt
             if not current:
                 entry.delete(0, "end")
                 entry.insert(0, suggestions[0])
@@ -712,9 +948,9 @@ class SiardMapperDialog(ctk.CTkToplevel):
                 if t not in ("tbl_ok","tbl_par","tbl_bad","col_ok","col_bad")]
 
         if info["type"] == "table":
-            has_d = bool(self._edits.get(iid, "").strip())
+            has_d = self._has_desc(iid, tbl.json_desc)
             n_cm  = sum(1 for c in tbl.columns
-                        if self._edits.get(f"C:{tbl.norm}:{c.norm}", "").strip())
+                        if self._has_desc(f"C:{tbl.norm}:{c.norm}", c.json_desc))
             if has_d and n_cm == len(tbl.columns):
                 ico, tag = "✓", "tbl_ok"
             elif has_d or n_cm > 0:
@@ -743,6 +979,7 @@ class SiardMapperDialog(ctk.CTkToplevel):
                 tbl.folder or tbl.name,
                 len(tbl.columns),
                 self._siard, self._extracted,
+                limit=self._data_rows,
             )
         return self._cache[tbl.norm]
 
@@ -774,6 +1011,42 @@ class SiardMapperDialog(ctk.CTkToplevel):
 
     # ── Autolagring ───────────────────────────────────────────────────────────
 
+    # ── Vis-data-innstillinger ────────────────────────────────────────────────
+
+    def _on_show_data_toggle(self):
+        show = self._show_data_var.get()
+        self._show_data = show
+        if show:
+            self._data_frm.grid()
+        else:
+            self._data_frm.grid_remove()
+        self._save_data_settings()
+
+    def _on_rows_changed(self, *_):
+        try:
+            n = int(self._rows_var.get())
+            if n < 1 or n > 100:
+                return
+        except ValueError:
+            return
+        self._data_rows = n
+        # Tøm cache så neste oppslag leser riktig antall rader
+        self._cache.clear()
+        sel = self._tree.selection()
+        if sel:
+            self._on_row_selected(sel[0])
+        self._save_data_settings()
+
+    def _save_data_settings(self):
+        try:
+            from settings import save_config
+            save_config({
+                "siardmapper_show_data": self._show_data,
+                "siardmapper_rows":      self._data_rows,
+            })
+        except Exception:
+            pass
+
     def _autosave(self):
         if not self._save_path:
             return
@@ -791,30 +1064,171 @@ class SiardMapperDialog(ctk.CTkToplevel):
             return
         tbl = info["tbl"]
         t_iid = f"T:{tbl.norm}"
-        has_tbl = bool(self._edits.get(t_iid, "").strip())
+        has_tbl = self._has_desc(t_iid, tbl.json_desc)
         n_done  = sum(1 for c in tbl.columns
-                      if self._edits.get(f"C:{tbl.norm}:{c.norm}", "").strip())
+                      if self._has_desc(f"C:{tbl.norm}:{c.norm}", c.json_desc))
         if has_tbl and n_done == len(tbl.columns):
             self._tree.item(t_iid, open=False)
 
     def _build_json(self) -> dict:
+        """Bygg JSON med alle beskrivelser: egendefinert overstyrer json-mal, json-mal er fallback.
+        Topp-nivå-metadata fra opprinnelig mal (name, description, systemName, osv.) bevares.
+        """
+        # Start med topp-nivå-felt fra opprinnelig mal — bevar alt unntatt tabellister
+        base: dict = {}
+        src = self._json_path
+        if src and src.exists():
+            try:
+                raw = json.loads(src.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    base = {k: v for k, v in raw.items()
+                            if k not in ("tables", "tabeller")}
+            except Exception:
+                pass
+        # Brukerens metadata-endringer overstyrer mal-feltene
+        base.update(self._meta_overrides)
+
         tables = []
         for tbl in self._tables:
-            t_iid = f"T:{tbl.norm}"
-            tbl_desc = self._edits.get(t_iid, tbl.json_desc)
+            t_iid    = f"T:{tbl.norm}"
+            tbl_desc = self._edits.get(t_iid, "").strip() or tbl.json_desc
             cols = []
             for col in tbl.columns:
-                c_iid = f"C:{tbl.norm}:{col.norm}"
+                c_iid    = f"C:{tbl.norm}:{col.norm}"
+                col_desc = self._edits.get(c_iid, "").strip() or col.json_desc
                 cols.append({
                     "name":        col.name,
-                    "description": self._edits.get(c_iid, col.json_desc),
+                    "description": col_desc,
                 })
             tables.append({
                 "name":        tbl.name,
                 "description": tbl_desc,
                 "columns":     cols,
             })
-        return {"tables": tables}
+        base["tables"] = tables
+        return base
+
+    # ── Rediger mal-metadata ──────────────────────────────────────────────────
+
+    def _edit_meta(self):
+        """Åpne dialog for å redigere topp-nivå-metadata i JSON-malen."""
+        # Bygg visningsdata: mal-base + brukerens in-session overrides
+        _KNOWN = [
+            ("name",          "Navn"),
+            ("description",   "Beskrivelse"),
+            ("systemName",    "System/applikasjon"),
+            ("systemVersjon", "Systemversjon"),
+            ("modelVersion",  "Mal-versjon"),
+        ]
+        _KNOWN_KEYS = {k for k, _ in _KNOWN}
+
+        # Hent alle skalare topp-nivå-felt fra malen
+        base_meta: dict = {}
+        if self._json_path and self._json_path.exists():
+            try:
+                raw = json.loads(self._json_path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    base_meta = {k: v for k, v in raw.items()
+                                 if k not in ("tables", "tabeller")
+                                 and isinstance(v, (str, int, float))}
+            except Exception:
+                pass
+        # Brukerens overrides tar presedens for visning
+        current: dict = {**base_meta, **{
+            k: v for k, v in self._meta_overrides.items()
+            if isinstance(v, (str, int, float))
+        }}
+
+        # Ekstrafelter (ikke blant kjente)
+        extras = [(k, k) for k in current if k not in _KNOWN_KEYS]
+        fields = _KNOWN + extras
+
+        win = ctk.CTkToplevel(self)
+        win.title("Rediger mal-metadata")
+        win.configure(fg_color=COLORS["bg"])
+        win.grab_set()
+        win.lift()
+
+        meta_hdr = ctk.CTkFrame(win, fg_color=COLORS["panel"], corner_radius=0)
+        meta_hdr.pack(fill="x")
+        ctk.CTkLabel(
+            meta_hdr,
+            text="  Rediger mal-metadata",
+            font=ctk.CTkFont(family=FONTS["mono"], size=13, weight="bold"),
+            text_color=COLORS["accent"], anchor="w",
+        ).pack(side="left", padx=12, pady=10)
+
+        scroll = ctk.CTkScrollableFrame(win, fg_color=COLORS["bg"])
+        scroll.pack(fill="both", expand=True, padx=12, pady=8)
+        scroll.grid_columnconfigure(0, weight=1)
+
+        widgets: dict[str, tk.StringVar | ctk.CTkTextbox] = {}
+
+        for r, (key, label) in enumerate(fields):
+            val = str(current.get(key, ""))
+            ctk.CTkLabel(
+                scroll, text=f"{label}:",
+                font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                text_color=COLORS["text_sub"], anchor="w",
+            ).grid(row=r * 2, column=0, sticky="w", pady=(8, 1))
+
+            if key == "description":
+                tb = ctk.CTkTextbox(
+                    scroll, height=80,
+                    font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                    fg_color=COLORS["surface"],
+                    border_color=COLORS["border"], border_width=1,
+                )
+                tb.grid(row=r * 2 + 1, column=0, sticky="ew", pady=(0, 2))
+                tb.insert("1.0", val)
+                widgets[key] = tb
+            else:
+                sv = tk.StringVar(value=val)
+                ctk.CTkEntry(
+                    scroll, textvariable=sv,
+                    font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                    fg_color=COLORS["surface"],
+                    border_color=COLORS["border"],
+                ).grid(row=r * 2 + 1, column=0, sticky="ew", pady=(0, 2))
+                widgets[key] = sv
+
+        btn_frm = ctk.CTkFrame(win, fg_color="transparent")
+        btn_frm.pack(fill="x", padx=12, pady=(4, 14))
+        btn_frm.grid_columnconfigure((0, 1), weight=1)
+
+        def _ok():
+            overrides = {}
+            for key, widget in widgets.items():
+                if isinstance(widget, ctk.CTkTextbox):
+                    overrides[key] = widget.get("1.0", "end-1c").strip()
+                else:
+                    overrides[key] = widget.get().strip()
+            self._meta_overrides = overrides
+            self._autosave()
+            win.destroy()
+
+        ctk.CTkButton(
+            btn_frm, text="OK",
+            fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"],
+            font=ctk.CTkFont(family=FONTS["mono"], size=11, weight="bold"),
+            height=34, command=_ok,
+        ).grid(row=0, column=0, padx=(0, 6), sticky="ew")
+
+        ctk.CTkButton(
+            btn_frm, text="Avbryt",
+            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+            font=ctk.CTkFont(family=FONTS["mono"], size=11),
+            height=34, command=win.destroy,
+        ).grid(row=0, column=1, sticky="ew")
+
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
+        win.update_idletasks()
+        w = 520
+        h = min(620, win.winfo_reqheight() + 60)
+        x = self.winfo_x() + (self.winfo_width()  - w) // 2
+        y = self.winfo_y() + (self.winfo_height() - h) // 2
+        win.geometry(f"{w}x{h}+{x}+{y}")
+        win.resizable(True, True)
 
     # ── Re-match ──────────────────────────────────────────────────────────────
 
@@ -846,24 +1260,7 @@ class SiardMapperDialog(ctk.CTkToplevel):
                     if d not in self._smap[c.norm]:
                         self._smap[c.norm].append(d)
 
-        # Oppdater tabelldata med nye JSON-treff, men bevar brukerediteringer
-        for m in new_matches:
-            t_iid = f"T:{m.table.norm}"
-            existing = self._edits.get(t_iid, "")
-            if not existing:
-                self._edits[t_iid] = m.json_table_desc or ""
-            for col in m.table.columns:
-                c_iid = f"C:{m.table.norm}:{col.norm}"
-                existing_c = self._edits.get(c_iid, "")
-                if not existing_c:
-                    self._edits[c_iid] = m.col_descs.get(col.norm, "")
-            # Oppdater json_desc på tabellobjektene
-            m.table.description = m.json_table_desc
-            for col in m.table.columns:
-                col.description = m.col_descs.get(col.norm, "")
-
-        # Gjenbygg tabelltred med bevart tilstand
-        # Oppdater _tables med nye JSON-beskrivelser fra matches
+        # Oppdater kun json_desc på _TblItem/_ColItem — _edits (egendefinert) røres ikke
         for m in new_matches:
             tbl = next((t for t in self._tables if t.norm == m.table.norm), None)
             if tbl:
@@ -916,13 +1313,26 @@ def _shorten(text: str, n: int = 55) -> str:
 
 # ── Fabrikk ───────────────────────────────────────────────────────────────────
 
+def _decode_desc(text: str) -> str:
+    """Dekod HTML-entiteter iterativt (sikkerhetsnett i dialogen)."""
+    if not text:
+        return ""
+    result = text
+    for _ in range(4):
+        decoded = _html_mod.unescape(result)
+        if decoded == result:
+            break
+        result = decoded
+    return result.strip()
+
+
 def build_dialog_tables(matches) -> List[_TblItem]:
     result = []
     for m in matches:
         tbl = _TblItem(
             name=m.table.name,
             norm=m.table.norm,
-            json_desc=m.json_table_desc or "",
+            json_desc=_decode_desc(m.json_table_desc or ""),
             folder=getattr(m.table, "folder", None) or m.table.name,
             matched=m.json_table_desc is not None,
         )
@@ -930,7 +1340,7 @@ def build_dialog_tables(matches) -> List[_TblItem]:
             tbl.columns.append(_ColItem(
                 name=col.name,
                 norm=col.norm,
-                json_desc=m.col_descs.get(col.norm, ""),
+                json_desc=_decode_desc(m.col_descs.get(col.norm, "")),
                 col_index=i,
             ))
         result.append(tbl)
