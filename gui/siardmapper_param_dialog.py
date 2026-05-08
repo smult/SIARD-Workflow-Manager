@@ -185,7 +185,9 @@ class SiardMapperParamDialog(ctk.CTkToplevel):
         self._on_saved = on_saved
 
         from settings import get_config
-        self._template_dir = Path(get_config("json_template_dir") or "")
+        _tdir_raw = (get_config("json_template_dir") or "").strip()
+        self._template_dir = Path(_tdir_raw) if _tdir_raw else Path("\x00")
+        self._template_dir_ok = bool(_tdir_raw and self._template_dir.is_dir())
 
         # Hent gjeldende parameterverdier
         existing = {p["key"]: p.get("default", "")
@@ -219,8 +221,9 @@ class SiardMapperParamDialog(ctk.CTkToplevel):
         self._build()
         self._center()
 
-        # Last SIARD-tabeller og JSON-maler i bakgrunn
-        if initial_siard and Path(initial_siard).exists():
+        if not self._template_dir_ok:
+            self.after(200, self._prompt_template_dir)
+        elif initial_siard and Path(initial_siard).exists():
             self.after(100, self._refresh_async)
 
     # ── Bygging ───────────────────────────────────────────────────────────────
@@ -268,7 +271,7 @@ class SiardMapperParamDialog(ctk.CTkToplevel):
 
         # ── JSON-mal-liste ────────────────────────────────────────────────────
         tdir_txt = (f"JSON-maler fra: {self._template_dir}"
-                    if self._template_dir and self._template_dir.is_dir()
+                    if self._template_dir_ok
                     else "JSON-maler (ingen mappe konfigurert i innstillinger)")
         self._dir_lbl = ctk.CTkLabel(
             body, text=tdir_txt,
@@ -409,6 +412,29 @@ class SiardMapperParamDialog(ctk.CTkToplevel):
             self._siard_var.set(p)
             self._refresh_async()
 
+    def _prompt_template_dir(self):
+        """Vis melding og la bruker velge JSON-mal-mappe om den ikke er konfigurert."""
+        ok = messagebox.askokcancel(
+            "JSON-mal-mappe ikke valgt",
+            "Ingen mappe for JSON-maler er konfigurert.\n\n"
+            "Trykk OK for å velge mappen nå.",
+            parent=self,
+        )
+        if not ok:
+            return
+        chosen = filedialog.askdirectory(
+            title="Velg mappe for JSON-maler",
+            parent=self,
+        )
+        if not chosen:
+            return
+        from settings import save_config
+        save_config({"json_template_dir": chosen})
+        self._template_dir = Path(chosen)
+        self._template_dir_ok = True
+        self._dir_lbl.configure(text=f"JSON-maler fra: {self._template_dir}")
+        self._refresh_async()
+
     def _refresh_async(self):
         if self._loading:
             return
@@ -416,7 +442,7 @@ class SiardMapperParamDialog(ctk.CTkToplevel):
         if not siard or not Path(siard).exists():
             self._set_status("Velg en gyldig SIARD-fil")
             return
-        if not self._template_dir or not self._template_dir.is_dir():
+        if not self._template_dir_ok:
             self._set_status("Ingen JSON-mal-mappe konfigurert i innstillinger")
             return
         self._loading = True
@@ -430,7 +456,10 @@ class SiardMapperParamDialog(ctk.CTkToplevel):
         from settings import get_config
 
         tables, cols = _scan_siard_tables(siard_path)
-        json_files = sorted(self._template_dir.glob("*.json"))
+        json_files = sorted(
+            f for f in self._template_dir.iterdir()
+            if f.is_file() and f.suffix.lower() == ".json"
+        )
         total = len(json_files)
 
         if not total:
@@ -638,8 +667,7 @@ class SiardMapperParamDialog(ctk.CTkToplevel):
             return
 
         # Bestem målmappe
-        target_dir = self._template_dir if (
-            self._template_dir and self._template_dir.is_dir()) else None
+        target_dir = self._template_dir if self._template_dir_ok else None
 
         if target_dir is None:
             # Be bruker velge mappe og lagre som ny json_template_dir
@@ -652,6 +680,7 @@ class SiardMapperParamDialog(ctk.CTkToplevel):
             from settings import save_config
             save_config({"json_template_dir": str(target_dir)})
             self._template_dir = target_dir
+            self._template_dir_ok = True
             self._dir_lbl.configure(text=f"JSON-maler fra: {target_dir}")
 
         stem = Path(siard_path_str).stem
