@@ -6,6 +6,7 @@ from .blob_convert_operation import BlobConvertOperation
 from .hex_extract_operation import HexExtractOperation
 from .virus_scan_operation import VirusScanOperation
 from .pipeline_operations import UnpackSiardOperation, RepackSiardOperation
+from .standardize_ext_operation import StandardizeExtOperation
 from .workflow_report_operation import WorkflowReportOperation
 from .standard_operations import (
     XMLValidationOperation,
@@ -23,6 +24,7 @@ __all__ = [
     "VirusScanOperation",
     "UnpackSiardOperation",
     "RepackSiardOperation",
+    "StandardizeExtOperation",
     "WorkflowReportOperation",
     "XMLValidationOperation",
     "MetadataExtractOperation",

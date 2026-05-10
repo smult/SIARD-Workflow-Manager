@@ -113,7 +113,45 @@ class UnpackSiardOperation(BaseOperation):
             "original_namelist": original_namelist,
             "files_extracted":   n_done,
         }
+
+        # ── Sjekk for ikke-standard LOB-filendelser ────────────────────────────
+        non_std = self._count_non_standard_lob_files(tmp)
+        if non_std > 0:
+            w(f"  ADVARSEL: {non_std} LOB-fil(er) med ikke-standard endelse "
+              f"(ikke .bin/.txt) funnet. Kan gi utfordringer i KDRS Søk & Vis.",
+              "warn")
+            ask_cb = ctx.metadata.get("ask_standardize_cb")
+            if ask_cb:
+                try:
+                    if ask_cb(non_std):
+                        from siard_workflow.operations.standardize_ext_operation \
+                            import StandardizeExtOperation
+                        ctx.metadata["_insert_after_current"] = StandardizeExtOperation()
+                        w("  Legger til 'Standardiser filendelser' i arbeidsflyten.",
+                          "ok")
+                except Exception as exc:
+                    w(f"  Advarsel: could not invoke ask_standardize_cb: {exc}", "warn")
+
         return self._ok(data, f"{n_done:,} filer pakket ut til {tmp}")
+
+    @staticmethod
+    def _count_non_standard_lob_files(extract_dir: Path) -> int:
+        """Teller LOB-filer med ikke-standard endelse (ikke .bin/.txt)."""
+        import re as _re
+        count = 0
+        content = extract_dir / "content"
+        if not content.exists():
+            return 0
+        lob_re = _re.compile(r"lob\d+", _re.IGNORECASE)
+        for lob_dir in content.rglob("*"):
+            if not lob_dir.is_dir() or not lob_re.fullmatch(lob_dir.name):
+                continue
+            for f in lob_dir.iterdir():
+                if f.is_file():
+                    low = f.name.lower()
+                    if not (low.endswith(".bin") or low.endswith(".txt")):
+                        count += 1
+        return count
 
 
 # ─────────────────────────────────────────────────────────────────────────────

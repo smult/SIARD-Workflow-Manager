@@ -32,8 +32,8 @@ class SettingsDialog(ctk.CTkToplevel):
         self._on_save = on_save
         self._vars: dict[str, ctk.Variable] = {}
         self._build()
-        self.geometry("780x580")
-        self.minsize(780, 480)
+        self.geometry("780x650")
+        self.minsize(780, 540)
 
     def _build(self):
         from settings import load_config, _CONFIG_FILE
@@ -318,6 +318,16 @@ class SettingsDialog(ctk.CTkToplevel):
         ).grid(row=r, column=1, padx=12, pady=6, sticky="e"); r += 1
         ctk.CTkLabel(frm,
                      text="Versjon for eksportert SIARD-arkiv etter blob-konvertering",
+                     font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                     text_color=COLORS["muted"]).grid(
+                         row=r, column=0, columnspan=2,
+                         padx=14, pady=(0, 4), sticky="w"); r += 1
+
+        _seksjon("BLOB-filendelser", r); r += 1
+        _rad("Standardiser .bin som filetternavn",
+             "standardize_bin_ext", "bool", r, default=True); r += 1
+        ctk.CTkLabel(frm,
+                     text="Konverterte og omdøpte LOB-filer lagres med .bin-endelse (anbefalt for KDRS Søk & Vis)",
                      font=ctk.CTkFont(family=FONTS["mono"], size=11),
                      text_color=COLORS["muted"]).grid(
                          row=r, column=0, columnspan=2,

@@ -21,6 +21,7 @@ from siard_workflow.operations import (
     UnpackSiardOperation, RepackSiardOperation,
     WorkflowReportOperation, DiasPackageOperation,
     LobFolderFixOperation, SiardMapperOperation,
+    StandardizeExtOperation,
 )
 from siard_workflow.systemspecific_operations import CosDocMailMergeOperation
 from settings import save_op_params, save_config, get_config, _SETTINGS_FILE
@@ -545,6 +546,23 @@ OP_DEFS = [
         ),
         "status": LobFolderFixOperation.status,
         "params": [],
+    },
+    {
+        "cls": StandardizeExtOperation,
+        "label": "Standardiser filendelser",
+        "category": "Kompatibilitet",
+        "desc": (
+            "Omdøper alle LOB-filer med ikke-standard endelser til .bin i SIARD-strukturen "
+            "og oppdaterer XML-referansene tilsvarende med XML-kommentarer. "
+            "Legges automatisk til etter 'Pakk ut SIARD' dersom ikke-standard filer oppdages. "
+            "Gjør ingenting hvis 'Standardiser .bin' er deaktivert i globale innstillinger. "
+            "Støtter pipeline-modus og standalone-modus."
+        ),
+        "status": StandardizeExtOperation.status,
+        "params": [
+            {"key": "output_suffix", "label": "Suffix ny SIARD-fil",
+             "type": "str", "default": "_stdext"},
+        ],
     },
     {
         "cls": XMLValidationOperation,

@@ -1554,6 +1554,13 @@ class App(ctk.CTk):
             ctx.metadata["stop_event"]          = self._stop_event
             ctx.metadata["pause_event"]         = self._pause_event
             ctx.metadata["siardmapper_dialog_cb"] = self._siardmapper_dialog_cb
+            # Registrer callback for "Standardiser filendelser" kun hvis
+            # operasjonen ikke allerede er i workflowen
+            _has_stdext = any(
+                getattr(op, "operation_id", "") == "standardize_ext"
+                for op in wf)
+            if not _has_stdext:
+                ctx.metadata["ask_standardize_cb"] = self._ask_add_standardize_ext
             if self._global_temp_dir:
                 ctx.metadata["temp_dir"] = str(self._global_temp_dir)
             if self._output_dir_override:
@@ -1672,6 +1679,18 @@ class App(ctk.CTk):
                     if new_siard:
                         self._log_queue.put(("log",
                             f"  ↪ Neste steg bruker: {new_siard.name}", "info"))
+                    # Dynamisk innlegg av operasjon (f.eks. StandardizeExtOperation)
+                    _to_insert = ctx.metadata.pop("_insert_after_current", None)
+                    if _to_insert is not None:
+                        wf.insert(i + 1, _to_insert)
+                        self._log_queue.put(("log",
+                            f"  ✚ Lagt til i arbeidsflyt: {_to_insert.label}", "ok"))
+                        _label = _to_insert.label
+                        self.after(0, lambda lbl=_label:
+                                   self._workflow_panel.refresh_from_ops(
+                                       list(wf._operations))
+                                   if hasattr(self._workflow_panel, "refresh_from_ops")
+                                   else None)
                 except Exception as exc:
                     result = op._fail(str(exc))
                 elapsed = time.time() - t0
@@ -2019,6 +2038,29 @@ class App(ctk.CTk):
         self._stop_event.clear()
         self._step_resume_event.set()
         self._log("Gjenopptar workflow ...", "info")
+
+    def _ask_add_standardize_ext(self, count: int) -> bool:
+        """
+        Kalles fra bakgrunnstråden (UnpackSiardOperation) når ikke-standard
+        LOB-filer oppdages. Poster spørsmål til hoved-tråden og blokkerer til svar.
+        """
+        result_event  = __import__("threading").Event()
+        result_holder = [False]
+
+        def _show_dialog():
+            from tkinter import messagebox
+            ans = messagebox.askyesno(
+                "Ikke-standard LOB-filer funnet",
+                f"{count} LOB-fil(er) har ikke .bin-endelse.\n\n"
+                "Dette kan gi utfordringer i innsynsprogramvaren KDRS Søk & Vis.\n\n"
+                "Vil du legge til «Standardiser filendelser» i arbeidsflyten?",
+                parent=self)
+            result_holder[0] = bool(ans)
+            result_event.set()
+
+        self.after(0, _show_dialog)
+        result_event.wait()
+        return result_holder[0]
 
     def _siardmapper_dialog_cb(self, matches, siard_path, extracted_path,
                                json_path=None, suggestion_map=None):

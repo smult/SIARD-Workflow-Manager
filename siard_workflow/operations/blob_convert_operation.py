@@ -828,27 +828,20 @@ def _count_lines(path: Path) -> int:
 
 def _inject_conversion_comment(data: bytes) -> bytes:
     """
-    Sett inn konverteringskommentar etter siste eksisterende kommentar
-    i XML-headeren (dvs. etter '-->' på siste kommentar-linje).
-    Hvis ingen kommentar finnes: sett inn etter XML-deklarasjonen.
+    Sett inn konverteringskommentar rett etter XML-deklarasjonen (?>) —
+    alltid på linje 2 i headeren, aldri midt i datastrukturen.
+
+    Bruker ?> som anker (ikke -->) for å unngå at per-fil inline-kommentarer
+    (<!-- Filinnhold konvertert ... -->) i datadelen styrer plasseringen.
     """
     comment = _conversion_comment()
-    # Finn siste --> i headeren (dvs. avslutning av siste kommentar)
-    # Søk bare i de første 4096 bytes — kommentarer er alltid i headeren
-    header = data[:4096]
-    last_end = header.rfind(b"-->")
-    if last_end != -1:
-        # Finn linjeskift etter -->
-        nl = data.find(b"\n", last_end)
-        if nl != -1:
-            return data[:nl+1] + comment + data[nl+1:]
-    # Fallback: sett inn etter XML-deklarasjonen
     pi_end = data.find(b"?>")
     if pi_end != -1:
         nl = data.find(b"\n", pi_end)
         if nl != -1:
             return data[:nl+1] + comment + data[nl+1:]
-    return data
+    # Ytterste fallback: ingen XML-deklarasjon funnet — legg til øverst
+    return comment + data
 
 
 # Alias for bakoverkompatibilitet — funksjonene er nå i siard_format.py
@@ -868,6 +861,23 @@ def _conversion_comment(version: str = "?") -> bytes:
         pass
     return (f"<!--Dokumentkonvertering utfort av SIARD Manager v{version}"
             f" / {ts} / {hostname}-->\r\n").encode("utf-8")
+
+
+def _get_standardize_bin_ext() -> bool:
+    """Les 'standardize_bin_ext' fra config.json (default True)."""
+    try:
+        from settings import get_config
+        val = get_config("standardize_bin_ext", True)
+        return bool(val)
+    except Exception:
+        return True
+
+
+def _append_xml_comment_to_line(line: bytes, comment: str) -> bytes:
+    """Legg XML-kommentar etter node-innholdet, før linjeskift."""
+    stripped = line.rstrip(b'\r\n')
+    newline  = line[len(stripped):]
+    return stripped + f' <!-- {comment} -->'.encode('utf-8') + newline
 
 
 def _patch_line_with_digest(
@@ -902,21 +912,18 @@ def _patch_line_with_digest(
                 new_name = ren_bytes[key]
                 new_path = ren_paths[key]
             elif b"/" in key:
-                # Full-sti ref (f.eks. DBPT-format eller ekstern blob):
-                # slå opp på filnavn-delen alene
+                # Sti-ref (content/..., seg0/rec3.txt, lob4/rec1.bin, osv.):
+                # Slå opp på filnavn-delen alene, men bevar alltid mappe-prefikset.
+                # Slik forblir referansen konsistent: seg0/rec3.txt → seg0/rec3.bin,
+                # og content/schema0/.../rec3.txt → content/schema0/.../rec3.bin.
                 basename = key.rsplit(b"/", 1)[-1]
                 if basename not in ren_bytes:
                     pos = end + 1
                     continue
                 new_basename = ren_bytes[basename]
                 new_path     = ren_paths[basename]
-                if key.startswith(b"content/"):
-                    # Intern full-sti: bevar mappe-prefiks, bytt bare filnavn
-                    dir_prefix = key.rsplit(b"/", 1)[0] + b"/"
-                    new_name   = dir_prefix + new_basename
-                else:
-                    # Ekstern ref: filen er nå intern — bruk bare filnavn
-                    new_name = new_basename
+                dir_prefix   = key.rsplit(b"/", 1)[0] + b"/"
+                new_name     = dir_prefix + new_basename
             else:
                 pos = end + 1
                 continue
@@ -1255,10 +1262,26 @@ def _build_type_hints_from_xml(xml_path: Path,
 def _unescape_siard(text: str) -> bytes:
     """
     Dekod SIARD unicode-escaped tekst til bytes.
+
     SIARD bruker \\uXXXX for å escape spesialtegn i tekst-noder,
     f.eks. \\u005c = \\ (backslash). RTF-innhold lagres slik.
+
+    SIARD dobbelt-enkoder noen ganger apostrofer: RTF-sekvensen \\'c5 lagres
+    som \\u005c&amp;apos;c5 i XML. ElementTree løser opp &amp; → & men lar
+    &apos; stå som literal tekst. Vi resolver derfor XML-entiteter manuelt
+    FØRST (i riktig rekkefølge), deretter \\uXXXX-sekvensene.
     """
     import re as _re
+    # Steg 1: resolver XML-entiteter som ble igjen etter ElementTree-parsing.
+    # &amp; må erstattes FØRST slik at &amp;apos; → &apos; → '
+    # og ikke &amp; → & alene (som ville la &apos; stå).
+    text = (text
+            .replace("&amp;",  "&")    # must be first
+            .replace("&apos;", "'")
+            .replace("&lt;",   "<")
+            .replace("&gt;",   ">")
+            .replace("&quot;", '"'))
+    # Steg 2: dekod SIARD \\uXXXX-escaping (f.eks. \\u005c → \)
     unescaped = _re.sub(
         r'\\u([0-9a-fA-F]{4})',
         lambda m: chr(int(m.group(1), 16)),
@@ -1268,6 +1291,31 @@ def _unescape_siard(text: str) -> bytes:
         return unescaped.encode("latin-1")
     except (UnicodeEncodeError, ValueError):
         return unescaped.encode("utf-8", errors="replace")
+
+
+def _is_wpt_inline_text(text: str) -> bool:
+    """
+    Sjekk om tekststrengen er inline RTF lagret i SIARD unicode-escaped format.
+
+    SIARD-formatet bruker \\uXXXX-escaping for spesialtegn:
+      backslash \\ → \\u005c  (6 tegn)
+    Slik lagres {\\rtf1 som {\\u005crtf1 i XML-tekst-noden.
+
+    Søkemønster er den LITERALE sekvensen '\\u005crtf1' (10 tegn),
+    ikke Python-strengen '\\rtf1' (5 tegn med escaped backslash).
+    """
+    if not text or len(text) < 10:
+        return False
+    tl = text[:400].lower()
+    # Sjekk for SIARD unicode-escaped RTF: '\rtf1' er 10 literale tegn
+    # (\, u, 0, 0, 5, c, r, t, f, 1) — matches {\ \rtf1 i XML-tekst
+    if "\\u005crtf1" in tl:
+        return True
+    # Direkte RTF uten unicode-escaping: {\ rtf1 som bytes/tekst
+    stripped = text.lstrip()
+    if stripped.startswith('{\\rtf1'):
+        return True
+    return False
 
 
 def _read_col_metadata(metadata_path: Path) -> dict[str, dict]:
@@ -2099,6 +2147,55 @@ class BlobConvertOperation(BaseOperation):
             phase(2, "Inline-ekstraksjon hoppet over")
             progress("phase_done")
 
+        # ── WPT/RTF inline-skann (alltid aktiv) ──────────────────────────────
+        # Detekterer og ekstraherer inline WPT/RTF-innhold i <cN>-noder
+        # uavhengig av 'extract_inline'-parameteren, som et supplement/fallback.
+        # Les col_meta hvis den ikke allerede er lest (extract_inline=False-tilfelle)
+        if not col_meta and metadata_xml.exists():
+            col_meta = _read_col_metadata(metadata_xml)
+        _wpt_lob_cols = {k: v["lob_cols"] for k, v in col_meta.items()}
+
+        _wpt_scan_total = 0
+        for table_key_wpt, xml_sti_wpt in table_xml_map.items():
+            if xml_sti_wpt in xml_pre:
+                continue   # allerede behandlet av extract_inline-fasen
+            xml_file_wpt = extract_dir / xml_sti_wpt
+            if not xml_file_wpt.exists():
+                continue
+            try:
+                xml_bytes_wpt = xml_file_wpt.read_bytes()
+            except Exception:
+                continue
+            # Rask pre-sjekk: finnes inline RTF i fila? (bytes-søk, ingen parsing)
+            if b"\\u005crtf1" not in xml_bytes_wpt.lower():
+                continue
+            w(f"  Fant inline WPT/RTF i {xml_sti_wpt} — ekstraherer ...", "info")
+            patched_wpt, new_files_wpt, n_wpt = self._extract_inline(
+                xml_bytes_wpt, xml_sti_wpt, table_key_wpt, stats, w,
+                lob_cols=_wpt_lob_cols)  # faktiske lob_cols — korrekt lobFolder
+            if n_wpt > 0:
+                xml_pre[xml_sti_wpt] = patched_wpt
+                inline_new.update(new_files_wpt)
+                for lob_sti_wpt, lob_data_wpt in new_files_wpt.items():
+                    lob_path_wpt = extract_dir / lob_sti_wpt
+                    lob_path_wpt.parent.mkdir(parents=True, exist_ok=True)
+                    lob_path_wpt.write_bytes(lob_data_wpt)
+                    # Registrer i table_blobs/all_blobs for konvertering
+                    rel_parts_wpt = PurePosixPath(lob_sti_wpt).parts
+                    if (len(rel_parts_wpt) >= 4
+                            and schema_re.match(rel_parts_wpt[1])
+                            and table_re.match(rel_parts_wpt[2])):
+                        tk_wpt = f"{rel_parts_wpt[1]}/{rel_parts_wpt[2]}"
+                        table_blobs[tk_wpt].append(lob_sti_wpt)
+                        all_blobs.append(lob_sti_wpt)
+                _wpt_scan_total += n_wpt
+                w(f"  {table_key_wpt}: {n_wpt} WPT/RTF inline ekstrahert", "ok")
+            else:
+                w(f"  ADVARSEL: Fant \\u005crtf1 i {xml_sti_wpt} "
+                  f"men ekstraherte 0 elementer — sjekk log", "warn")
+        if _wpt_scan_total > 0:
+            w(f"  WPT/RTF inline totalt: {_wpt_scan_total} ekstrahert", "ok")
+
         if stop_ev.is_set():
             w("  Avbrutt av bruker", "warn")
             progress("aborted", stats=dict(stats))
@@ -2114,6 +2211,8 @@ class BlobConvertOperation(BaseOperation):
 
         # ── Fase 3: Detekter og konverter blob-filer ──────────────────────────
         total = len(all_blobs)
+        _pipeline_creg: dict = {}
+        _pipeline_creg_lock = threading.Lock()
         if total == 0:
             w("  Ingen blob-filer å behandle", "info")
             phase(3, "Konvertering hoppet over (ingen blobs)")
@@ -2125,7 +2224,9 @@ class BlobConvertOperation(BaseOperation):
                 all_blobs, extract_dir, stats, w, progress,
                 lo_bin, stop_ev, pause_ev, csv_log,
                 xml_type_hints=xml_type_hints,
-                err_log=err_log)
+                err_log=err_log,
+                conversion_registry=_pipeline_creg,
+                creg_lock=_pipeline_creg_lock)
             progress("phase_done")
 
         if stop_ev.is_set():
@@ -2139,7 +2240,8 @@ class BlobConvertOperation(BaseOperation):
             table_xml_map, table_blobs, extract_dir,
             inline_new, xml_pre, stats, w, progress,
             lob_type_map=lob_type_map,
-            col_meta=col_meta)
+            col_meta=col_meta,
+            conversion_registry=_pipeline_creg)
         progress("phase_done")
 
         w("  Pipeline-modus: repakking overlates til 'Pakk sammen SIARD'.", "info")
@@ -2427,6 +2529,8 @@ class BlobConvertOperation(BaseOperation):
 
                 # ── Fase 3+4: Detekter og konverter .bin/.txt ────────────────
                 total = len(all_blobs)
+                _standalone_creg: dict = {}
+                _standalone_creg_lock = threading.Lock()
                 if total == 0:
                     w("  Ingen blob-filer å behandle", "info")
                 else:
@@ -2435,7 +2539,9 @@ class BlobConvertOperation(BaseOperation):
                         all_blobs, extract_dir, stats, w, progress,
                         lo_bin, stop_ev, pause_ev, csv_log,
                         xml_type_hints=xml_type_hints,
-                        err_log=err_log)
+                        err_log=err_log,
+                        conversion_registry=_standalone_creg,
+                        creg_lock=_standalone_creg_lock)
                     progress("phase_done")
 
                 if stop_ev.is_set():
@@ -2449,7 +2555,8 @@ class BlobConvertOperation(BaseOperation):
                     table_xml_map, table_blobs, extract_dir,
                     inline_new, xml_pre, stats, w, progress,
                     lob_type_map=lob_type_map,
-                    col_meta=col_meta)
+                    col_meta=col_meta,
+                    conversion_registry=_standalone_creg)
                 progress("phase_done")
 
                 # ── Fase 5: Pakk ny SIARD ─────────────────────────────────────
@@ -2483,7 +2590,9 @@ class BlobConvertOperation(BaseOperation):
                      pause_ev: threading.Event,
                      csv_log=None,
                      xml_type_hints: dict | None = None,
-                     err_log=None) -> None:
+                     err_log=None,
+                     conversion_registry: "dict | None" = None,
+                     creg_lock: "threading.Lock | None" = None) -> None:
         """
         Deteksjon parallelt + LO batch-konvertering med unik brukerprofil per instans.
         xml_type_hints: {filnavn: ext} fra type-kolonner i tableX.xml.
@@ -2491,6 +2600,10 @@ class BlobConvertOperation(BaseOperation):
         lock  = threading.Lock()
         max_w = max(1, min(self.params["max_workers"], os.cpu_count() or 2))
         hints = xml_type_hints or {}
+        _standardize_bin = _get_standardize_bin_ext()
+        # WPT-remap: {rtf_sti → {"orig_zip_sti", "wpt_sti", "src_ext"}}
+        # Populeres i Steg C2, leses av _process_file_result (trådsikkert — read-only etter C2)
+        _wpt_remap: dict = {}
 
         # Steg A: Deteksjon parallelt
         _COMPRESSED = {"zip", "gz", "bz2", "tar", "rar", "7z"}
@@ -2868,26 +2981,51 @@ class BlobConvertOperation(BaseOperation):
         # Send kun periodiske stats-oppdateringer for å holde GUI responsiv
         REPORT_INTERVAL = 200   # oppdater GUI hver N fil
         rename_ext_counts: dict[str, int] = {}   # teller per detektert ext
+        _standardize_bin = _get_standardize_bin_ext()
         for i, (idx, zip_sti, ext, mime) in enumerate(to_rename_only):
             if stop_ev.is_set():
                 break
-            src_file = extract_dir / zip_sti
-            fra_sz   = src_file.stat().st_size if src_file.exists() else 0
-            src_ext  = PurePosixPath(zip_sti).suffix.lstrip(".").lower()
+            src_file      = extract_dir / zip_sti
+            fra_sz        = src_file.stat().st_size if src_file.exists() else 0
+            src_ext       = PurePosixPath(zip_sti).suffix.lstrip(".").lower()
+            orig_basename = PurePosixPath(zip_sti).name
 
-            self._rename_file(extract_dir, zip_sti, ext)
+            if _standardize_bin and src_ext != "bin":
+                # Standardiser til .bin — bruk rotstamme (alt før første punktum)
+                # for å håndtere multi-extension filnavn korrekt (f.eks. rec1.txt.rtf.pdf)
+                root_stem = orig_basename.split('.')[0]
+                new_sti   = str(PurePosixPath(zip_sti).parent / f"{root_stem}.bin")
+                new_path  = extract_dir / new_sti
+                old_path  = extract_dir / zip_sti
+                if old_path.exists() and new_sti != zip_sti:
+                    try:
+                        old_path.rename(new_path)
+                    except Exception:
+                        pass
+                result_ext = "bin"
+                if conversion_registry is not None and creg_lock is not None:
+                    comment = (f"Filinnhold : {ext} - "
+                               f"Filendelse endret fra .{src_ext} til .bin")
+                    with creg_lock:
+                        conversion_registry[orig_basename] = (new_path, comment)
+            else:
+                self._rename_file(extract_dir, zip_sti, ext)
+                stem       = PurePosixPath(zip_sti).stem
+                new_sti    = str(PurePosixPath(zip_sti).parent / f"{stem}.{ext}")
+                result_ext = ext
+
             with lock:
                 stats["kept"] += 1
             rename_ext_counts[ext] = rename_ext_counts.get(ext, 0) + 1
 
             # Etter rename: finn ny filsti
-            stem     = PurePosixPath(zip_sti).stem
-            new_sti  = str(PurePosixPath(zip_sti).parent / f"{stem}.{ext}")
             new_file = extract_dir / new_sti
             til_sz   = new_file.stat().st_size if new_file.exists() else fra_sz
 
             if csv_log:
-                if ext == src_ext:
+                if result_ext == "bin" and src_ext != "bin":
+                    kommentar = f"Detektert som {ext} - standardisert til .bin"
+                elif ext == src_ext:
                     kommentar = "Beholdt originalformat"
                 elif ext == "pdf":
                     kommentar = "Allerede PDF - ingen konvertering"
@@ -2897,7 +3035,7 @@ class BlobConvertOperation(BaseOperation):
                     kommentar = f"Detektert som {ext}"
                 csv_log.write(
                     zip_sti, fra_sz, src_ext,
-                    new_sti, til_sz, ext,
+                    new_sti, til_sz, result_ext,
                     kommentar)
 
             if (i + 1) % REPORT_INTERVAL == 0 or i == len(to_rename_only) - 1:
@@ -2964,6 +3102,13 @@ class BlobConvertOperation(BaseOperation):
                                                "application/rtf"))
                         rtf_ok = True
                         kommentar = "WPTools native — RTF tekstuttrekk sendt til PDF/A"
+                        # Registrer mapping slik at _process_file_result kan
+                        # navngi sluttfil etter originalens rotstamme (rec13.bin)
+                        _wpt_remap[rtf_sti] = {
+                            "orig_zip_sti": zip_sti,   # f.eks. ".../rec13.txt"
+                            "wpt_sti":      wpt_sti,   # f.eks. ".../rec13.wpt"
+                            "src_ext":      src_ext,   # f.eks. "txt"
+                        }
                     else:
                         w(f"    [WPT] {stem}.wpt — tekstuttrekk tomt", "warn")
                         kommentar = "WPTools native — tekstuttrekk feilet, beholdt original"
@@ -3267,7 +3412,8 @@ class BlobConvertOperation(BaseOperation):
                 batch_file: Path, zip_sti: str, ext: str,
                 out_dir: Path, lo_ok: bool, lo_err: str) -> None:
             """Håndter resultatet for én fil: flytt PDF eller behold original."""
-            filename  = PurePosixPath(zip_sti).name
+            filename      = PurePosixPath(zip_sti).name
+            orig_basename = PurePosixPath(zip_sti).name
             pdf_path  = out_dir / (batch_file.stem + ".pdf")
             ok_this   = pdf_path.exists()
 
@@ -3276,25 +3422,64 @@ class BlobConvertOperation(BaseOperation):
             src_ext   = PurePosixPath(zip_sti).suffix.lstrip(".").lower()
             pdf_sti   = None  # settes i ok_this-blokken
 
-            if ok_this:
-                # Alltid inkluder detektert format i filnavnet:
-                # record001.bin (doc) → record001.doc.pdf
-                # record001.doc (doc) → record001.doc.pdf
-                # record001.txt (rtf) → record001.rtf.pdf
-                stem_base  = PurePosixPath(zip_sti).stem
-                final_stem = f"{stem_base}.{ext}"
+            # WPT-spesialbehandling: RTF-filen ble generert fra en WPT-kilde
+            _wpt_info = _wpt_remap.get(zip_sti) if _standardize_bin else None
 
-                pdf_sti    = str(PurePosixPath(zip_sti).parent /
-                                 (final_stem + ".pdf"))
+            if ok_this:
+                stem_base = PurePosixPath(zip_sti).stem
+
+                if _standardize_bin:
+                    if _wpt_info:
+                        # WPT-konvertert: sluttfil navngis etter ORIGINAL blob-stamme
+                        # f.eks. rec13.txt → rec13.bin (ikke rec13_ext_wpt.bin)
+                        orig_zip_sti   = _wpt_info["orig_zip_sti"]
+                        orig_src_ext   = _wpt_info["src_ext"]
+                        creg_basename  = PurePosixPath(orig_zip_sti).name
+                        root_stem      = creg_basename.split('.')[0]
+                        pdf_sti        = str(PurePosixPath(orig_zip_sti).parent
+                                             / f"{root_stem}.bin")
+                        _creg_comment  = (f"Filinnhold konvertert : .wpt til .pdf"
+                                          f" - Filendelse endret fra .{orig_src_ext}"
+                                          f" til .bin")
+                    else:
+                        # Normal standardize: sluttfil heter <rotstamme>.bin
+                        creg_basename  = orig_basename
+                        root_stem      = orig_basename.split('.')[0]
+                        pdf_sti        = str(PurePosixPath(zip_sti).parent
+                                             / f"{root_stem}.bin")
+                        if src_ext == "bin":
+                            _creg_comment = (f"Filinnhold konvertert : .{ext} til .pdf"
+                                             f" - Filendelse (.bin) beholdt")
+                        else:
+                            _creg_comment = (f"Filinnhold konvertert : .{ext} til .pdf"
+                                             f" - Filendelse endret fra .{src_ext} til .bin")
+                else:
+                    # Standard: record001.bin (doc) → record001.doc.pdf
+                    creg_basename  = orig_basename
+                    final_stem     = f"{stem_base}.{ext}"
+                    pdf_sti        = str(PurePosixPath(zip_sti).parent /
+                                         (final_stem + ".pdf"))
+                    _creg_comment  = None
+
                 pdf_target = extract_dir / pdf_sti
                 pdf_target.parent.mkdir(parents=True, exist_ok=True)
                 try:
                     shutil.move(str(pdf_path), str(pdf_target))
+                    # Slett kildefilen (RTF-temp for WPT, original for vanlig konvertering)
                     orig = extract_dir / zip_sti
                     if orig.exists():
                         orig.unlink()
-                    result_ext = "pdf"
+                    # WPT: slett også .wpt-filen slik at kun .bin gjenstår
+                    if _wpt_info:
+                        _wpt_path = extract_dir / _wpt_info["wpt_sti"]
+                        _wpt_path.unlink(missing_ok=True)
+                    result_ext = "bin" if _standardize_bin else "pdf"
                     file_ok    = True
+                    if _standardize_bin and conversion_registry is not None \
+                            and creg_lock is not None and _creg_comment:
+                        with creg_lock:
+                            conversion_registry[creg_basename] = (pdf_target,
+                                                                   _creg_comment)
                 except Exception as exc:
                     w(f"    Flytt feilet {filename}: {exc}", "feil")
                     result_ext = ext
@@ -3307,9 +3492,24 @@ class BlobConvertOperation(BaseOperation):
                 if file_ok:
                     stats["converted"] += 1
                 else:
-                    self._rename_file(extract_dir, zip_sti, ext)
+                    if _standardize_bin:
+                        # Konvertering feilet — omdøp til .bin (rotstamme) uansett
+                        _fail_root = orig_basename.split('.')[0]
+                        _fail_new  = str(PurePosixPath(zip_sti).parent
+                                         / f"{_fail_root}.bin")
+                        _fail_old  = extract_dir / zip_sti
+                        _fail_tgt  = extract_dir / _fail_new
+                        if _fail_old.exists() and _fail_new != zip_sti:
+                            try:
+                                _fail_old.rename(_fail_tgt)
+                            except Exception:
+                                pass
+                        result_ext = "bin"
+                    else:
+                        self._rename_file(extract_dir, zip_sti, ext)
                     stats["failed"] += 1
-                    w(f"  Konvertering feilet: {filename} — beholder som .{ext}"
+                    w(f"  Konvertering feilet: {filename} — beholder som "
+                      f".{'bin' if _standardize_bin else ext}"
                       + (f" ({lo_err[:80]})" if lo_err else ""), "warn")
                     # Loggfør til feilogg
                     if err_log:
@@ -3317,6 +3517,10 @@ class BlobConvertOperation(BaseOperation):
             if csv_log:
                 if file_ok and pdf_sti:
                     til_file = extract_dir / pdf_sti
+                elif _standardize_bin:
+                    _r = orig_basename.split('.')[0]
+                    til_file = extract_dir / str(PurePosixPath(zip_sti).parent
+                                                 / f"{_r}.bin")
                 else:
                     til_file = extract_dir / (
                         str(PurePosixPath(zip_sti).parent /
@@ -4127,11 +4331,13 @@ class BlobConvertOperation(BaseOperation):
             tag_local = _local(elem.tag).lower()
 
             # Bestem om dette elementet er et LOB-felt
-            is_inline_tag = tag_local in _INLINE_TAGS
-            is_lob_col    = False
-            lob_folder    = ""
+            is_inline_tag  = tag_local in _INLINE_TAGS
+            is_lob_col     = False
+            is_wpt_inline  = False
+            wpt_col_idx    = 0
+            lob_folder     = ""
             if not is_inline_tag and lob_col_map:
-                # Sjekk om tagnavn er cN der N er i lob_col_map
+                # B) Sjekk om tagnavn er cN der N er i lob_col_map
                 if tag_local.startswith("c") and tag_local[1:].isdigit():
                     col_idx = int(tag_local[1:])
                     if col_idx in lob_col_map:
@@ -4139,6 +4345,16 @@ class BlobConvertOperation(BaseOperation):
                         lob_folder = lob_col_map[col_idx]
 
             if not is_inline_tag and not is_lob_col:
+                # C) Detekter inline WPT/RTF i vilkårlig <cN> (ikke metadata-definert LOB)
+                if tag_local.startswith("c") and tag_local[1:].isdigit():
+                    _preview = (elem.text or "").strip()
+                    if len(_preview) > 20 and _is_wpt_inline_text(_preview):
+                        is_wpt_inline = True
+                        wpt_col_idx   = int(tag_local[1:])
+                        w(f"    [{xml_sti}] Detektert inline RTF i <{tag_local}> "
+                          f"({len(_preview)} tegn)", "info")
+
+            if not is_inline_tag and not is_lob_col and not is_wpt_inline:
                 continue
 
             # Hopp over hvis allerede ekstern referanse
@@ -4179,8 +4395,12 @@ class BlobConvertOperation(BaseOperation):
             # ── Bestem lob-mappe og filnavn ────────────────────────────────
             lob_counter += 1
             if lob_folder:
-                # Bruk lobFolder fra metadata som rotmappe
+                # Bruk lobFolder fra metadata som rotmappe (sti B)
                 lob_dir  = lob_folder
+                filename = f"rec{lob_counter}.{ext}"
+            elif is_wpt_inline:
+                # Sti C: kolonne-spesifikk lob-mappe basert på kolonneindeks
+                lob_dir  = f"{base_path}/lob{wpt_col_idx}"
                 filename = f"rec{lob_counter}.{ext}"
             else:
                 lob_dir  = f"{base_path}/lob{lob_counter}"
@@ -4190,17 +4410,28 @@ class BlobConvertOperation(BaseOperation):
 
             new_files[zip_sti_lob] = file_bytes
             elem.text = None
-            elem.set("file", filename)
 
-            # Oppdater søsken-elementer (mimeType, length, checksum)
-            parent = self._find_parent(root, elem)
-            if parent is not None:
-                self._update_sibling(parent, "mimeType",    mime,                 w)
-                self._update_sibling(parent, "length",      str(len(file_bytes)), w)
-                for cs_tag in _CHECKSUM_TAGS:
-                    node = self._find_sibling_tag(parent, cs_tag)
-                    if node is not None:
-                        node.text = _checksum(file_bytes, cs_tag)
+            if is_wpt_inline:
+                # Sett fil-attributter direkte på elementet.
+                # Bare filnavn — IKKE lob{N}/-prefiks — siden KDRS Søk & Vis
+                # resolver file-ref som lobFolder + filnavn (fra metadata.xml).
+                # lob{N}/-prefiks ville gi dobbel-path: lob3/lob3/rec1.bin.
+                import hashlib as _hashlib
+                elem.set("file",       filename)
+                elem.set("length",     str(len(file_bytes)))
+                elem.set("digestType", "MD5")
+                elem.set("digest",     _hashlib.md5(file_bytes).hexdigest().upper())
+            else:
+                elem.set("file", filename)
+                # Oppdater søsken-elementer (mimeType, length, checksum)
+                parent = self._find_parent(root, elem)
+                if parent is not None:
+                    self._update_sibling(parent, "mimeType",    mime,                 w)
+                    self._update_sibling(parent, "length",      str(len(file_bytes)), w)
+                    for cs_tag in _CHECKSUM_TAGS:
+                        node = self._find_sibling_tag(parent, cs_tag)
+                        if node is not None:
+                            node.text = _checksum(file_bytes, cs_tag)
 
             n_extracted += 1
             stats["inline_extracted"] += 1
@@ -4231,11 +4462,13 @@ class BlobConvertOperation(BaseOperation):
                        inline_new: dict, xml_pre: dict,
                        stats: dict, w, progress,
                        lob_type_map: dict | None = None,
-                       col_meta: dict | None = None) -> None:
+                       col_meta: dict | None = None,
+                       conversion_registry: "dict | None" = None) -> None:
         """
         Patch alle tableX.xml parallelt.
-        lob_type_map: {table_key: {lob_col: [type_cols]}} fra XML-analyse.
-        col_meta:     {table_key: {mime_cols, digest_cols, ...}} fra metadata.xml.
+        lob_type_map:        {table_key: {lob_col: [type_cols]}} fra XML-analyse.
+        col_meta:            {table_key: {mime_cols, digest_cols, ...}} fra metadata.xml.
+        conversion_registry: {orig_basename: (new_path, comment)} fra konverteringsfasene.
         """
         n_xml_total = len(table_xml_map)
         if n_xml_total == 0:
@@ -4327,6 +4560,17 @@ class BlobConvertOperation(BaseOperation):
                         else:
                             renames[orig_name] = new_path
 
+            # Supplement / overstyr renames fra konverteringsregisteret
+            # (håndterer bl.a. standardize_bin der alle sluttfiler er .bin)
+            line_comments: dict[str, str] = {}
+            if conversion_registry and old_blobs:
+                for zip_sti_old in old_blobs:
+                    orig_name = PurePosixPath(zip_sti_old).name
+                    if orig_name in conversion_registry:
+                        new_path, comment = conversion_registry[orig_name]
+                        renames[orig_name] = new_path
+                        line_comments[orig_name] = comment
+
             # Finn type-kolonne-kobling for denne tabellen
             col_map  = _lob_type_map.get(table_key, {})
             tbl_meta = _col_meta.get(table_key, {})
@@ -4334,7 +4578,7 @@ class BlobConvertOperation(BaseOperation):
             digest_cols  = tbl_meta.get("digest_cols",     [])
             digesttype_cols = tbl_meta.get("digesttype_cols", [])
 
-            if not renames and not col_renames and xml_sti not in xml_pre:
+            if not renames and not col_renames and not line_comments and xml_sti not in xml_pre:
                 with lock:
                     n_xml_done += 1
                     progress("phase_progress", done=n_xml_done, total=n_xml_total)
@@ -4372,7 +4616,8 @@ class BlobConvertOperation(BaseOperation):
                                                   mime_col_idxs=mime_cols,
                                                   digest_col_idxs=digest_cols,
                                                   lob_col_idxs=list(tbl_meta.get("lob_cols", {}).keys()),
-                                                  col_renames=col_renames)
+                                                  col_renames=col_renames,
+                                                  line_comments=line_comments)
                 with lock:
                     xml_updated += n
                     n_xml_done  += 1
@@ -4382,7 +4627,8 @@ class BlobConvertOperation(BaseOperation):
             # Liten/middels fil eller pre-patchet: les inn, patch, skriv tilbake
             patched, n = self._patch_xml_bytes(xml_bytes, xml_sti, renames,
                                                extract_dir, w,
-                                               col_renames=col_renames)
+                                               col_renames=col_renames,
+                                               line_comments=line_comments)
 
             # Skriv tilbake
             if n > 0 or xml_sti in xml_pre:
@@ -4411,6 +4657,7 @@ class BlobConvertOperation(BaseOperation):
                           renames: dict[str, Path],
                           extract_dir: Path, w,
                           col_renames: "dict[int, dict[str, Path]] | None" = None,
+                          line_comments: "dict[str, str] | None" = None,
                           ) -> tuple[bytes, int]:
         """
         Patch tableX.xml for omdøpte blob-filer.
@@ -4424,11 +4671,13 @@ class BlobConvertOperation(BaseOperation):
 
         if len(xml_bytes) >= SIZE_THRESHOLD:
             return self._patch_xml_streaming(xml_bytes, xml_sti, renames, w,
-                                             col_renames=col_renames)
+                                             col_renames=col_renames,
+                                             line_comments=line_comments)
 
         # Bytes-streaming for rename-referanser (bevarer alt originalt innhold)
         patched, updates = self._patch_xml_streaming(xml_bytes, xml_sti, renames, w,
-                                                     col_renames=col_renames)
+                                                     col_renames=col_renames,
+                                                     line_comments=line_comments)
 
         if updates == 0:
             return xml_bytes, 0
@@ -4464,22 +4713,25 @@ class BlobConvertOperation(BaseOperation):
             renames: dict[str, Path],
             w,
             col_renames: "dict[int, dict[str, Path]] | None" = None,
+            line_comments: "dict[str, str] | None" = None,
     ) -> tuple[bytes, int]:
         """
         Linje-for-linje patch av XML-bytes.
         Oppdaterer file=, length= og digest= i filreferanse-noder.
-        col_renames: {col_idx: {orig_name: new_path}} for filnavn som
-        kolliderer på tvers av lob-mapper — brukes til kolonnebevissst patching.
+        col_renames:   {col_idx: {orig_name: new_path}} for filnavn som
+                       kolliderer på tvers av lob-mapper.
+        line_comments: {orig_name: comment_str} — legg XML-kommentar etter
+                       noden når en referanse oppdateres (inkl. same-name digest-update).
         """
         if not renames and not col_renames:
             return xml_bytes, 0
 
+        # Inkluder ALLE renames (også same-name) slik at length/digest
+        # oppdateres selv om filnavnet ikke endrer seg (standardize_bin-modus)
         ren_bytes = {k.encode("utf-8"): v.name.encode("utf-8")
-                     for k, v in renames.items()
-                     if k != v.name}
+                     for k, v in renames.items()}
         ren_paths = {k.encode("utf-8"): v
-                     for k, v in renames.items()
-                     if k != v.name}
+                     for k, v in renames.items()}
 
         # Pre-bygg per-kolonne bytes-dicts for kollisjons-oppslag
         col_ren_bytes: dict[int, dict[bytes, bytes]] = {}
@@ -4487,12 +4739,18 @@ class BlobConvertOperation(BaseOperation):
         if col_renames:
             for col_idx, cr in col_renames.items():
                 col_ren_bytes[col_idx] = {k.encode("utf-8"): v.name.encode("utf-8")
-                                          for k, v in cr.items() if k != v.name}
+                                          for k, v in cr.items()}
                 col_ren_paths[col_idx] = {k.encode("utf-8"): v
-                                          for k, v in cr.items() if k != v.name}
+                                          for k, v in cr.items()}
 
         if not ren_bytes and not col_ren_bytes:
             return xml_bytes, 0
+
+        # Pre-bygg bytes-versjon av line_comments for effektivt oppslag
+        _lc_bytes: dict[bytes, str] = {}
+        if line_comments:
+            for orig_name, cmt in line_comments.items():
+                _lc_bytes[orig_name.encode("utf-8")] = cmt
 
         _COL_RE = re.compile(rb'<c(\d+)\b')
         updates = 0
@@ -4511,10 +4769,19 @@ class BlobConvertOperation(BaseOperation):
                         if col_idx in col_ren_bytes:
                             eff_bytes = {**ren_bytes, **col_ren_bytes[col_idx]}
                             eff_paths = {**ren_paths, **col_ren_paths[col_idx]}
+                # Pre-sjekk kommentar på original linje (før rename)
+                pending_comment: "str | None" = None
+                if _lc_bytes:
+                    for orig_b, cmt in _lc_bytes.items():
+                        if orig_b in line:
+                            pending_comment = cmt
+                            break
                 new_line, n = _patch_line_with_digest(line, eff_bytes, eff_paths)
                 if n > 0:
                     line = new_line
                     updates += n
+                    if pending_comment:
+                        line = _append_xml_comment_to_line(line, pending_comment)
             out_buf.write(line)
 
         if updates == 0:
@@ -4531,6 +4798,7 @@ class BlobConvertOperation(BaseOperation):
             renames: dict[str, Path],
             w,
             col_renames: "dict[int, dict[str, Path]] | None" = None,
+            line_comments: "dict[str, str] | None" = None,
             **kwargs) -> int:
         """
         Patch stor tableX.xml direkte på disk.
@@ -4539,19 +4807,19 @@ class BlobConvertOperation(BaseOperation):
           - length="GAMMEL"   → length="NY" (fra ny PDF-fil)
           - digest="GAMMEL"   → digest="NY MD5" (beregnet fra ny PDF-fil)
         Linje-for-linje, ingen full fil i RAM. O(1) dict-oppslag per linje.
-        col_renames: {col_idx: {orig_name: new_path}} for kollisjons-filnavn.
+        col_renames:   {col_idx: {orig_name: new_path}} for kollisjons-filnavn.
+        line_comments: {orig_name: comment_str} — legg XML-kommentar etter noden.
         """
         import hashlib as _hashlib
 
+        # Inkluder ALLE renames (inkl. same-name) for digest-oppdatering
         ren_bytes: dict[bytes, bytes] = {
             k.encode("utf-8"): v.name.encode("utf-8")
             for k, v in renames.items()
-            if k != v.name
         }
         ren_paths: dict[bytes, Path] = {
             k.encode("utf-8"): v
             for k, v in renames.items()
-            if k != v.name
         }
 
         col_ren_bytes: dict[int, dict[bytes, bytes]] = {}
@@ -4559,12 +4827,17 @@ class BlobConvertOperation(BaseOperation):
         if col_renames:
             for _ci, _cr in col_renames.items():
                 col_ren_bytes[_ci] = {k.encode("utf-8"): v.name.encode("utf-8")
-                                      for k, v in _cr.items() if k != v.name}
+                                      for k, v in _cr.items()}
                 col_ren_paths[_ci] = {k.encode("utf-8"): v
-                                      for k, v in _cr.items() if k != v.name}
+                                      for k, v in _cr.items()}
 
         if not ren_bytes and not col_ren_bytes:
             return 0
+
+        _lc_bytes: dict[bytes, str] = {}
+        if line_comments:
+            for orig_name, cmt in line_comments.items():
+                _lc_bytes[orig_name.encode("utf-8")] = cmt
 
         tmp_path    = xml_path.with_suffix(".tmp_patch")
         updates     = 0
@@ -4594,15 +4867,25 @@ class BlobConvertOperation(BaseOperation):
                                 if _ci in col_ren_bytes:
                                     eff_bytes = {**ren_bytes, **col_ren_bytes[_ci]}
                                     eff_paths = {**ren_paths, **col_ren_paths[_ci]}
+                        # Pre-sjekk kommentar på original linje
+                        pending_comment: "str | None" = None
+                        if _lc_bytes:
+                            for orig_b, cmt in _lc_bytes.items():
+                                if orig_b in line:
+                                    pending_comment = cmt
+                                    break
                         new_line, n = _patch_line_with_digest(
                             line, eff_bytes, eff_paths)
                         if n > 0:
                             line = new_line
                             updates += n
+                            if pending_comment:
+                                line = _append_xml_comment_to_line(line,
+                                                                    pending_comment)
 
                     dst.write(line)
 
-                    if not comment_written and b'-->' in line:
+                    if not comment_written and b'?>' in line:
                         comment_written = True
                         dst.write(comment_bytes)
 
