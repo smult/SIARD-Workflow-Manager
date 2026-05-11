@@ -9,7 +9,7 @@ Ta kontakt hvis du har innspill, kritikk, ros, ønsker, kommentarer etc.
 
 Funksjonalitet omfatter blant annet:
 
-## Generell funksjonlitet ==
+## Generell funksjonlitet
 - Valg av SIARD-filer og arbeidsmapper
 - En del grunnleggende operasjoner for SIARD Workflow Manager, som for eksempel:
   - Ut og innpakking av SIARD
@@ -22,7 +22,7 @@ Funksjonalitet omfatter blant annet:
   - Virus-skanning av BLOB-er - forutsatt at ClamAV er installert, eller et antivirus-program som takler 
     commandline - fortsatt noe ustabil.. så bruk med varsomhet
   
-## Systemspesifikk funksjonlitet ==
+## Systemspesifikk funksjonlitet
   - CosDoc - Lagrer dokumenter som passordbeskyttede word-flette-filer. Modulen låser opp og fletter før eventuell konvertering
 
 ## Kjente utfordringer og begrensninger:
