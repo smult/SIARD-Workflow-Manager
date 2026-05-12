@@ -2832,6 +2832,12 @@ class BlobConvertOperation(BaseOperation):
                 ext  = "txt"
                 mime = "text/plain"
 
+            # Ikke omdøp .txt til .xml: XML-innhold i en .txt-fil er fremdeles
+            # en tekstfil — filendelsen skal beholdes og innholdet ikke konverteres.
+            if ext == "xml" and file_ext == "txt":
+                ext  = "txt"
+                mime = "text/plain"
+
             # Passordbeskyttede filer: ikke konverter — kopier med riktig endelse
             if is_encrypted:
                 to_rename_only.append((idx, zip_sti, ext, mime))
@@ -2990,7 +2996,12 @@ class BlobConvertOperation(BaseOperation):
             src_ext       = PurePosixPath(zip_sti).suffix.lstrip(".").lower()
             orig_basename = PurePosixPath(zip_sti).name
 
-            if _standardize_bin and src_ext != "bin":
+            # LOB-filer med .bin/.txt-endelse skal aldri omdøpes, uavhengig av
+            # hva innholdet ble detektert som — konvertering skjer via to_convert.
+            if src_ext in ("bin", "txt") and ext not in ("bin", "txt"):
+                ext = src_ext
+
+            if _standardize_bin and src_ext not in ("bin", "txt"):
                 # Standardiser til .bin — bruk rotstamme (alt før første punktum)
                 # for å håndtere multi-extension filnavn korrekt (f.eks. rec1.txt.rtf.pdf)
                 root_stem = orig_basename.split('.')[0]
@@ -3454,28 +3465,40 @@ class BlobConvertOperation(BaseOperation):
                             _creg_comment = (f"Filinnhold konvertert : .{ext} til .pdf"
                                              f" - Filendelse endret fra .{src_ext} til .bin")
                 else:
-                    # Standard: record001.bin (doc) → record001.doc.pdf
                     creg_basename  = orig_basename
-                    final_stem     = f"{stem_base}.{ext}"
-                    pdf_sti        = str(PurePosixPath(zip_sti).parent /
-                                         (final_stem + ".pdf"))
-                    _creg_comment  = None
+                    if src_ext in ("bin", "txt"):
+                        # LOB-fil: behold original filendelse, innholdet er nå PDF/A
+                        pdf_sti       = str(PurePosixPath(zip_sti).parent
+                                            / f"{stem_base}.{src_ext}")
+                        _creg_comment = (f"Filinnhold konvertert : .{ext} til .pdf"
+                                         f" - Filendelse (.{src_ext}) beholdt")
+                    else:
+                        # Standard: record001.doc → record001.doc.pdf
+                        final_stem    = f"{stem_base}.{ext}"
+                        pdf_sti       = str(PurePosixPath(zip_sti).parent /
+                                            (final_stem + ".pdf"))
+                        _creg_comment = None
 
                 pdf_target = extract_dir / pdf_sti
                 pdf_target.parent.mkdir(parents=True, exist_ok=True)
                 try:
                     shutil.move(str(pdf_path), str(pdf_target))
-                    # Slett kildefilen (RTF-temp for WPT, original for vanlig konvertering)
+                    # Slett kildefilen — men ikke hvis den er lik målfilen
+                    # (skjer når src_ext er .bin/.txt og konverteringsresultatet
+                    # skrives tilbake til samme sti som kilden)
                     orig = extract_dir / zip_sti
-                    if orig.exists():
+                    if orig.exists() and orig.resolve() != pdf_target.resolve():
                         orig.unlink()
                     # WPT: slett også .wpt-filen slik at kun .bin gjenstår
                     if _wpt_info:
                         _wpt_path = extract_dir / _wpt_info["wpt_sti"]
                         _wpt_path.unlink(missing_ok=True)
-                    result_ext = "bin" if _standardize_bin else "pdf"
+                    result_ext = ("bin" if _standardize_bin
+                                  else src_ext if src_ext in ("bin", "txt")
+                                  else "pdf")
                     file_ok    = True
-                    if _standardize_bin and conversion_registry is not None \
+                    if (_standardize_bin or src_ext in ("bin", "txt")) \
+                            and conversion_registry is not None \
                             and creg_lock is not None and _creg_comment:
                         with creg_lock:
                             conversion_registry[creg_basename] = (pdf_target,
@@ -4159,8 +4182,10 @@ class BlobConvertOperation(BaseOperation):
             # Én fil: erstatt blob direkte
             if len(result_files) == 1:
                 single = result_files[0]
-                single_ext, _, _ = _detect(single.read_bytes()[:65536])
-                new_name = f"{stem}.{single_ext}"
+                # Behold original filendelse — SIARD-referansen bruker den opprinnelige
+                # endelsen (f.eks. .bin), og innholdet er nå det utpakkede råformatet.
+                orig_file_ext = PurePosixPath(zip_sti).suffix.lstrip(".").lower()
+                new_name = f"{stem}.{orig_file_ext}"
                 new_path = blob_path.parent / new_name
                 try:
                     shutil.copy2(str(single), str(new_path))
