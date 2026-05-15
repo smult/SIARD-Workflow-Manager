@@ -402,6 +402,16 @@ class DiasParamDialog(ctk.CTkToplevel):
             import tkinter.messagebox as mb
             mb.showerror("Feil ved innlesing", str(exc), parent=self)
             return
+        # Nullstill alle felt til standardverdier før METS-verdier settes
+        for p in self._op_def.get("params", []):
+            if p["key"] in self._vars:
+                var, typ = self._vars[p["key"]]
+                default = p["default"]
+                if typ == "bool":
+                    var.set(bool(default))
+                else:
+                    var.set("" if default is None else str(default))
+
         for key, val in meta.items():
             if key in self._vars:
                 var, _ = self._vars[key]

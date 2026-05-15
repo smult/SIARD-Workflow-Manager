@@ -73,6 +73,17 @@ class OperationRow(ctk.CTkFrame):
         btns.grid(row=0, column=2, padx=(0, 4), pady=2)
         btns.grid_propagate(True)
 
+        # Advarselikon for rekkefølgebrudd — skjult som standard
+        self._warn_msg = ""
+        self._tooltip: tk.Toplevel | None = None
+        self._warn_lbl = ctk.CTkLabel(
+            btns, text="⚠", width=16,
+            font=ctk.CTkFont(family=FONTS["mono"], size=11, weight="bold"),
+            text_color="#FFA500", cursor="")
+        self._warn_lbl.pack_forget()
+        self._warn_lbl.bind("<Enter>", self._show_tooltip)
+        self._warn_lbl.bind("<Leave>", self._hide_tooltip)
+
         # Statusikon (prosjektfil-checkpoint): ✓ / ✗ / –
         self._status_lbl = ctk.CTkLabel(
             btns, text="", width=16,
@@ -144,6 +155,42 @@ class OperationRow(ctk.CTkFrame):
         """Vis checkpoint-status ved siden av knappene (✓ / ✗ / –)."""
         sym, color = _STATUS_CFG.get(status, ("", COLORS["muted"]))
         self._status_lbl.configure(text=sym, text_color=color)
+
+    def show_warning(self, msg: str) -> None:
+        self._warn_msg = msg
+        self._warn_lbl.pack(side="left", padx=(0, 2), before=self._status_lbl)
+
+    def clear_warning(self) -> None:
+        self._warn_msg = ""
+        self._warn_lbl.pack_forget()
+        self._hide_tooltip()
+
+    def _show_tooltip(self, event=None) -> None:
+        if not self._warn_msg:
+            return
+        self._hide_tooltip()
+        x = self._warn_lbl.winfo_rootx() + 20
+        y = self._warn_lbl.winfo_rooty() + 20
+        self._tooltip = tk.Toplevel(self)
+        self._tooltip.wm_overrideredirect(True)
+        self._tooltip.wm_geometry(f"+{x}+{y}")
+        self._tooltip.attributes("-topmost", True)
+        tk.Label(
+            self._tooltip,
+            text=self._warn_msg,
+            background="#2d2200", foreground="#FFA500",
+            relief="flat", padx=10, pady=6,
+            font=("Consolas", 10),
+            wraplength=320, justify="left",
+        ).pack()
+
+    def _hide_tooltip(self, event=None) -> None:
+        if self._tooltip:
+            try:
+                self._tooltip.destroy()
+            except Exception:
+                pass
+            self._tooltip = None
 
 
 class WorkflowPanel(ctk.CTkFrame):
@@ -251,7 +298,32 @@ class WorkflowPanel(ctk.CTkFrame):
     def set_file(self, path: Path):
         pass
 
-    def add_operation(self, op):
+    # ─── Rekkefølgevalidering ────────────────────────────────────────────────
+
+    def _validate_and_mark(self) -> bool:
+        """Oppdater ⚠-indikatorer på alle rader. Returnerer True ved brudd."""
+        from siard_workflow.core.workflow_validator import validate_workflow
+        ops = [r.op for r in self._rows]
+        bad = {id(op): msg for op, msg in validate_workflow(ops)}
+        for row in self._rows:
+            if id(row.op) in bad:
+                row.show_warning(bad[id(row.op)])
+            else:
+                row.clear_warning()
+        return bool(bad)
+
+    def has_order_violations(self) -> bool:
+        """Brukes av app.py for å blokkere kjøring."""
+        from siard_workflow.core.workflow_validator import validate_workflow
+        return bool(validate_workflow([r.op for r in self._rows]))
+
+    # ─── Legg til operasjoner ────────────────────────────────────────────────
+
+    def add_operation(self, op, *, silent: bool = False):
+        """
+        Legg til operasjon sist i listen.
+        silent=True: ingen validering (brukes ved lasting fra fil/profil).
+        """
         self.empty_lbl.grid_remove()
         idx = len(self._rows) + 1
         row = OperationRow(self.scroll, op, idx,
@@ -262,6 +334,8 @@ class WorkflowPanel(ctk.CTkFrame):
         row.grid(row=len(self._rows), column=0, sticky="ew", pady=3, padx=2)
         self._rows.append(row)
         self._bind_drag(row)
+        if not silent:
+            self._validate_and_mark()
 
     def _configure_row(self, row: OperationRow):
         """Åpne konfigurasjonsvindu for en eksisterende operasjon."""
@@ -304,7 +378,7 @@ class WorkflowPanel(ctk.CTkFrame):
         else:
             ParamDialog(self, live_def, on_confirm=_on_confirm, on_saved=_on_saved)
 
-    def insert_operation_after(self, op, after_id: str) -> None:
+    def insert_operation_after(self, op, after_id: str, *, silent: bool = False) -> None:
         """Sett inn operasjon rett etter den med gitt operation_id.
         Faller tilbake til add_operation() dersom after_id ikke finnes."""
         insert_idx = None
@@ -313,7 +387,7 @@ class WorkflowPanel(ctk.CTkFrame):
                 insert_idx = i + 1
                 break
         if insert_idx is None:
-            self.add_operation(op)
+            self.add_operation(op, silent=silent)
             return
 
         self.empty_lbl.grid_remove()
@@ -328,11 +402,14 @@ class WorkflowPanel(ctk.CTkFrame):
         for i, row in enumerate(self._rows):
             row.grid(row=i, column=0, sticky="ew", pady=3, padx=2)
         self._bind_drag(new_row)
+        if not silent:
+            self._validate_and_mark()
 
     def load_workflow(self, wf):
         self.clear()
         for op in wf:
-            self.add_operation(op)
+            self.add_operation(op, silent=True)
+        self._validate_and_mark()  # myk advarsel etter lasting
 
     def get_operations(self):
         return [r.op for r in self._rows]
@@ -377,6 +454,8 @@ class WorkflowPanel(ctk.CTkFrame):
         self._reindex()
         if not self._rows:
             self.empty_lbl.grid(row=0, column=0, pady=40)
+        else:
+            self._validate_and_mark()
 
     def _move_up(self, row: OperationRow):
         i = self._rows.index(row)
@@ -384,6 +463,7 @@ class WorkflowPanel(ctk.CTkFrame):
             return
         self._rows[i], self._rows[i - 1] = self._rows[i - 1], self._rows[i]
         self._reindex()
+        self._validate_and_mark()
 
     def _move_down(self, row: OperationRow):
         i = self._rows.index(row)
@@ -391,6 +471,7 @@ class WorkflowPanel(ctk.CTkFrame):
             return
         self._rows[i], self._rows[i + 1] = self._rows[i + 1], self._rows[i]
         self._reindex()
+        self._validate_and_mark()
 
     # ─── Drag-and-drop reordering ────────────────────────────────────────────
 
@@ -437,6 +518,7 @@ class WorkflowPanel(ctk.CTkFrame):
             self._rows.pop(i_src)
             self._rows.insert(i_tgt, row)
             self._reindex()
+            self._validate_and_mark()
         row.configure(border_color=COLORS["border"], border_width=1)
         if self._drag_target is not None and self._drag_target in self._rows:
             self._drag_target.configure(border_color=COLORS["border"], border_width=1)

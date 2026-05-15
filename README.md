@@ -43,6 +43,7 @@ Funksjonalitet omfatter blant annet:
 ## Installasjon
     pip install -r requirements.txt
     Eventuelt install.bat
+    Endre navn på config_example.json til config.json, hvis det er første gang programmet kjøres fra denne lokasjonen.
 
 ## Kjør direkte
     start.bat kjører opp programmet og sjekk av requirements. 

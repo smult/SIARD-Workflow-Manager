@@ -1414,6 +1414,14 @@ class App(ctk.CTk):
             self._log("Workflowen er tom", "warn")
             return
 
+        if self.workflow_panel.has_order_violations():
+            messagebox.showerror(
+                "Ugyldig arbeidsflyt",
+                "Arbeidsflyten har operasjoner i feil rekkefølge.\n"
+                "Rett opp rekkefølgen (se ⚠-markeringene) før du kjører.",
+                parent=self)
+            return
+
         if not self._pipeline_preflight(ops):
             return
 
