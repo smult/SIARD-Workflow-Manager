@@ -4011,6 +4011,8 @@ class BlobConvertOperation(BaseOperation):
         """
         import tarfile
 
+        _standardize_bin = _get_standardize_bin_ext()
+
         def _lo_convert_file(src: Path, tmp_work: Path) -> Path | None:
             """Konverter én fil med LO til PDF/A. Returnerer ferdig PDF eller None."""
             try:
@@ -4171,10 +4173,13 @@ class BlobConvertOperation(BaseOperation):
             # Én fil: erstatt blob direkte
             if len(result_files) == 1:
                 single = result_files[0]
-                # Behold original filendelse — SIARD-referansen bruker den opprinnelige
-                # endelsen (f.eks. .bin), og innholdet er nå det utpakkede råformatet.
-                orig_file_ext = PurePosixPath(zip_sti).suffix.lstrip(".").lower()
-                new_name = f"{stem}.{orig_file_ext}"
+                if _standardize_bin:
+                    # Behold original filendelse (.bin/.txt) — innholdet er nå utpakket.
+                    target_ext = PurePosixPath(zip_sti).suffix.lstrip(".").lower()
+                else:
+                    # Bruk faktisk detektert filendelse på utpakket innhold.
+                    target_ext, _, _ = _detect(single.read_bytes()[:65536])
+                new_name = f"{stem}.{target_ext}"
                 new_path = blob_path.parent / new_name
                 try:
                     shutil.copy2(str(single), str(new_path))
@@ -4191,8 +4196,13 @@ class BlobConvertOperation(BaseOperation):
                         n_fail[0] += 1
 
             else:
-                # Flere filer: pakk som ny .zip
-                new_name = f"{stem}.zip"
+                # Flere filer: pakk som ny zip-container
+                if _standardize_bin:
+                    # Behold original filendelse (.bin/.txt) — innholdet er en zip.
+                    multi_ext = PurePosixPath(zip_sti).suffix.lstrip(".").lower()
+                else:
+                    multi_ext = "zip"
+                new_name = f"{stem}.{multi_ext}"
                 new_path = blob_path.parent / new_name
                 try:
                     with zipfile.ZipFile(new_path, "w",
