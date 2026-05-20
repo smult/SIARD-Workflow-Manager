@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from gui.styles import COLORS, FONTS, cat_color
 from siard_workflow.operations import (
     SHA256Operation, BlobConvertOperation,
-    HexExtractOperation, XmlCleanerOperation,
+    HexExtractOperation, XmlCleanerOperation, SchemaSelectorOperation,
     XMLValidationOperation, MetadataExtractOperation,
     VirusScanOperation, ConditionalOperation,
     UnpackSiardOperation, RepackSiardOperation,
@@ -520,6 +520,19 @@ OP_DEFS = [
         "params": [
             {"key": "clean_padding_spaces", "label": "Rens \\u0020-padding",  "type": "bool", "default": True},
             {"key": "dry_run",              "label": "Tørkjøring (ikke skriv)", "type": "bool", "default": False},
+        ],
+    },
+    {
+        "cls": SchemaSelectorOperation,
+        "label": "Schema-velger",
+        "category": "Innhold",
+        "desc": ("Viser dialog der operatør velger hvilke schemas som skal være "
+                 "med i resultat-SIARD. Schemas som ikke velges fjernes fra "
+                 "metadata.xml og content/."),
+        "status": SchemaSelectorOperation.status,
+        "params": [
+            {"key": "auto_select_all", "label": "Behold alle uten å spørre", "type": "bool", "default": False},
+            {"key": "dry_run",         "label": "Tørkjøring (ikke skriv)",   "type": "bool", "default": False},
         ],
     },
     # ── Systemspesifikke operasjoner ─────────────────────────────────────────

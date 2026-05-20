@@ -1610,6 +1610,17 @@ class App(ctk.CTk):
                 for op in wf)
             if not _has_stdext:
                 ctx.metadata["ask_standardize_cb"] = self._ask_add_standardize_ext
+
+            # Schema-velger: callback for å spørre om auto-add når
+            # flere schemas oppdages, og dialog-callback for selve valget.
+            _has_schemasel = any(
+                getattr(op, "operation_id", "") == "schema_selector"
+                for op in wf)
+            if not _has_schemasel:
+                ctx.metadata["ask_schema_selector_cb"] = \
+                    self._ask_add_schema_selector
+            ctx.metadata["ask_schema_select_cb"] = self._schema_select_dialog_cb
+
             if self._global_temp_dir:
                 ctx.metadata["temp_dir"] = str(self._global_temp_dir)
             if self._output_dir_override:
@@ -1728,14 +1739,18 @@ class App(ctk.CTk):
                     if new_siard:
                         self._log_queue.put(("log",
                             f"  ↪ Neste steg bruker: {new_siard.name}", "info"))
-                    # Dynamisk innlegg av operasjon (f.eks. StandardizeExtOperation)
+                    # Dynamisk innlegg av operasjon (f.eks. StandardizeExtOperation
+                    # eller SchemaSelectorOperation). Støtter både enkelt-op og
+                    # liste — liste settes inn i samme rekkefølge etter gjeldende.
                     _to_insert = ctx.metadata.pop("_insert_after_current", None)
                     if _to_insert is not None:
-                        wf.insert(i + 1, _to_insert)
-                        self._log_queue.put(("log",
-                            f"  ✚ Lagt til i arbeidsflyt: {_to_insert.label}", "ok"))
-                        _label = _to_insert.label
-                        self.after(0, lambda lbl=_label:
+                        _ops_to_insert = (_to_insert if isinstance(_to_insert, list)
+                                          else [_to_insert])
+                        for k, _op in enumerate(_ops_to_insert):
+                            wf.insert(i + 1 + k, _op)
+                            self._log_queue.put(("log",
+                                f"  ✚ Lagt til i arbeidsflyt: {_op.label}", "ok"))
+                        self.after(0, lambda:
                                    self._workflow_panel.refresh_from_ops(
                                        list(wf._operations))
                                    if hasattr(self._workflow_panel, "refresh_from_ops")
@@ -2110,6 +2125,38 @@ class App(ctk.CTk):
         self.after(0, _show_dialog)
         result_event.wait()
         return result_holder[0]
+
+    def _ask_add_schema_selector(self, schema_count: int) -> bool:
+        """
+        Kalles fra UnpackSiardOperation når > 1 schema oppdages.
+        Spør om Schema-velger skal legges til arbeidsflyten.
+        """
+        result_event  = __import__("threading").Event()
+        result_holder = [False]
+
+        def _show_dialog():
+            from tkinter import messagebox
+            ans = messagebox.askyesno(
+                "Flere schemas funnet",
+                f"SIARD-arkivet inneholder {schema_count} schemas.\n\n"
+                "Vil du legge til «Schema-velger» i arbeidsflyten slik at du "
+                "kan velge hvilke schemas som skal være med i resultatet?",
+                parent=self)
+            result_holder[0] = bool(ans)
+            result_event.set()
+
+        self.after(0, _show_dialog)
+        result_event.wait()
+        return result_holder[0]
+
+    def _schema_select_dialog_cb(self, schemas: list) -> "list[str] | None":
+        """
+        Kalles fra SchemaSelectorOperation. Viser modal dialog der operatør
+        velger schemas. Returnerer liste av navn å beholde, eller None ved
+        avbryt.
+        """
+        from gui.schema_selector_dialog import ask_select_schemas_modal
+        return ask_select_schemas_modal(self.after, self, schemas)
 
     def _siardmapper_dialog_cb(self, matches, siard_path, extracted_path,
                                json_path=None, suggestion_map=None):

@@ -132,6 +132,42 @@ class UnpackSiardOperation(BaseOperation):
                 except Exception as exc:
                     w(f"  Advarsel: could not invoke ask_standardize_cb: {exc}", "warn")
 
+        # ── Sjekk for flere schemas ───────────────────────────────────────────
+        # Hvis utpakket SIARD har > 1 schema, tilby å legge til Schema-velger.
+        # Operatøren kan da velge bort schemas som ikke skal være med i
+        # resultatet.
+        schema_count = self._count_schemas(tmp)
+        if schema_count > 1:
+            w(f"  {schema_count} schemas funnet i SIARD.", "info")
+            ask_sch_cb = ctx.metadata.get("ask_schema_selector_cb")
+            # Ikke spør hvis Schema-velger allerede er satt inn av forrige
+            # callback (Standardiser-knappen)
+            already_inserting = isinstance(
+                ctx.metadata.get("_insert_after_current"), object) and \
+                getattr(ctx.metadata.get("_insert_after_current"),
+                        "operation_id", "") == "schema_selector"
+            if ask_sch_cb and not already_inserting:
+                try:
+                    if ask_sch_cb(schema_count):
+                        from siard_workflow.operations.schema_selector_operation \
+                            import SchemaSelectorOperation
+                        # Hvis vi allerede har lagt inn StandardizeExt for
+                        # neste plass, må vi håndtere kjeden. Enkleste:
+                        # legg Schema-velger først (rett etter Unpack), og
+                        # la StandardizeExt komme etter den.
+                        existing = ctx.metadata.get("_insert_after_current")
+                        if existing is not None:
+                            ctx.metadata["_insert_after_current"] = [
+                                SchemaSelectorOperation(), existing]
+                        else:
+                            ctx.metadata["_insert_after_current"] = \
+                                SchemaSelectorOperation()
+                        w("  Legger til 'Schema-velger' i arbeidsflyten.",
+                          "ok")
+                except Exception as exc:
+                    w(f"  Advarsel: could not invoke ask_schema_selector_cb: {exc}",
+                      "warn")
+
         return self._ok(data, f"{n_done:,} filer pakket ut til {tmp}")
 
     @staticmethod
@@ -152,6 +188,20 @@ class UnpackSiardOperation(BaseOperation):
                     if not (low.endswith(".bin") or low.endswith(".txt")):
                         count += 1
         return count
+
+    @staticmethod
+    def _count_schemas(extract_dir: Path) -> int:
+        """Teller antall <schema> i header/metadata.xml. Returnerer 0 ved feil."""
+        metadata_path = extract_dir / "header" / "metadata.xml"
+        if not metadata_path.exists():
+            return 0
+        try:
+            import xml.etree.ElementTree as _ET
+            ns = {"ns": "http://www.bar.admin.ch/xmlns/siard/2/metadata.xsd"}
+            root = _ET.parse(metadata_path).getroot()
+            return len(root.findall("ns:schemas/ns:schema", ns))
+        except Exception:
+            return 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
