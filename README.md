@@ -34,6 +34,8 @@ Funksjonalitet omfatter blant annet:
   Standard er 50, men kan hvis man har mye minne økers til 100 eller mer.
   Det er anbefalt å starte med 50 å øke etterhvert hvis det fungerer stabilt.
   Har man lite minne (<32GB) kan det være nødvendig å redusere batch-størrelsen til 25 eller mindre.
+- Bruken av Siegfried/PRONOM for filformatdeteksjon er bra, men litt treg. Bruk kan stilles inn i Innstillinger.
+  Huk av for å bruke Siegfried, og velg sti til sf-applikasjon, eller trykk på knappen Installer for å laste ned   siste versjon av Siegfried fra GitHub.
 
 ## Krav
 - Python 3.10+
@@ -43,7 +45,8 @@ Funksjonalitet omfatter blant annet:
 ## Installasjon
     pip install -r requirements.txt
     Eventuelt install.bat
-    Endre navn på config_example.json til config.json, hvis det er første gang programmet kjøres fra denne lokasjonen.
+    Endre navn på config_example.json til config.json, hvis det er første gang programmet kjøres fra denne
+    lokasjonen.
 
 ## Kjør direkte
     start.bat kjører opp programmet og sjekk av requirements. 
