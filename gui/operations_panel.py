@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from gui.styles import COLORS, FONTS, cat_color
 from siard_workflow.operations import (
     SHA256Operation, BlobConvertOperation,
-    HexExtractOperation,
+    HexExtractOperation, XmlCleanerOperation,
     XMLValidationOperation, MetadataExtractOperation,
     VirusScanOperation, ConditionalOperation,
     UnpackSiardOperation, RepackSiardOperation,
@@ -507,6 +507,19 @@ OP_DEFS = [
         "params": [
             {"key": "min_text_length", "label": "Min. tekstlengde (tegn)",    "type": "int",  "default": 30},
             {"key": "dry_run",         "label": "Tørkjøring (ikke skriv)",     "type": "bool", "default": False},
+        ],
+    },
+    {
+        "cls": XmlCleanerOperation,
+        "label": "XML-renser",
+        "category": "Innhold",
+        "desc": ("Renser tekstfelter i tableX.xml. Fjerner \\u0020-padding "
+                 "(SIARD-escaped mellomrom) på slutten av tekstfelter og "
+                 "kollapser inline-sekvenser til ett mellomrom."),
+        "status": XmlCleanerOperation.status,
+        "params": [
+            {"key": "clean_padding_spaces", "label": "Rens \\u0020-padding",  "type": "bool", "default": True},
+            {"key": "dry_run",              "label": "Tørkjøring (ikke skriv)", "type": "bool", "default": False},
         ],
     },
     # ── Systemspesifikke operasjoner ─────────────────────────────────────────

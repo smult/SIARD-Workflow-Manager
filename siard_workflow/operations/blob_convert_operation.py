@@ -48,7 +48,9 @@ from pathlib import Path, PurePosixPath
 
 from siard_workflow.core.base_operation import BaseOperation, OperationResult
 from siard_workflow.core.context import WorkflowContext
-from siard_workflow.core.blob_csv_logger import BlobCsvLogger, ConversionErrorLogger
+from siard_workflow.core.blob_csv_logger import (
+    BlobCsvLogger, ConversionErrorLogger, SiegfriedIdLogger,
+)
 from siard_workflow.core.siard_format import (
     detect_siard_version, siard_version_transform,
     get_target_siard_version, is_siard_xml,
@@ -56,65 +58,16 @@ from siard_workflow.core.siard_format import (
     restore_xml_header, find_root_tag_start,
 )
 
-# ── Magic-byte signaturer ─────────────────────────────────────────────────────
+# ── Fildeteksjon ──────────────────────────────────────────────────────────────
+# Deteksjonsmotor er pluggbar via siard_workflow.core.file_identifier.
+# Konstanter og hjelpefunksjoner re-eksporteres fra magic_bytes-modulen for
+# bakoverkompatibilitet (brukt andre steder i koden, f.eks. _ole2_tail_is_word).
 
-_MAGIC: list[tuple[bytes, str, str]] = [
-    (b"%PDF",             "pdf",  "application/pdf"),
-    (b"\xd0\xcf\x11\xe0","doc",  "application/msword"),
-    (b"\x89PNG",          "png",  "image/png"),
-    (b"\xff\xd8\xff",     "jpg",  "image/jpeg"),
-    (b"GIF8",             "gif",  "image/gif"),
-    (b"BM",               "bmp",  "image/bmp"),
-    (b"II*\x00",          "tiff", "image/tiff"),
-    (b"MM\x00*",          "tiff", "image/tiff"),
-    (b"\x1f\x8b",         "gz",   "application/gzip"),
-    (b"BZh",              "bz2",  "application/x-bzip2"),  # standard bzip2
-    (b"7z\xbc\xaf",       "7z",   "application/x-7z-compressed"),
-    (b"Rar!",             "rar",  "application/x-rar-compressed"),
-    (b"PK\x03\x04",       "zip",  "application/zip"),
-    (b"{\\rtf",           "rtf",  "application/rtf"),
-    (b"{\\RTF",           "rtf",  "application/rtf"),
-    (b"<html",            "html", "text/html"),
-    (b"<HTML",            "html", "text/html"),
-    (b"<?xml",            "xml",  "application/xml"),
-    (b"<?XML",            "xml",  "application/xml"),
-    (b"MZ",               "exe",  "application/x-msdownload"),
-    # Lyd — godkjent av §5-17
-    (b"ID3",              "mp3",  "audio/mpeg"),
-    (b"\xff\xfb",         "mp3",  "audio/mpeg"),
-    (b"\xff\xf3",         "mp3",  "audio/mpeg"),
-    (b"\xff\xf2",         "mp3",  "audio/mpeg"),
-    (b"RIFF",             "wav",  "audio/wav"),
-    (b"fLaC",             "flac", "audio/flac"),
-    (b"OggS",             "ogg",  "audio/ogg"),
-    # Video — godkjent av §5-17
-    (b"\x00\x00\x01\xba", "mpg",  "video/mpeg"),   # MPEG-2 PS
-    (b"\x00\x00\x01\xb3", "mpg",  "video/mpeg"),   # MPEG sequence
-    # WordPerfect
-    (b"\xff\x57\x50\x43", "wpd",  "application/vnd.wordperfect"),
-    (b"\x1a\x00\x00\x04", "wpd",  "application/vnd.wordperfect"),
-    # MS Write
-    (b"\x31\xbe\x00\x00", "wri",  "application/x-mswrite"),
-    (b"\x32\xbe\x00\x00", "wri",  "application/x-mswrite"),
-    # TIFF via ftyp-boks (JPEG2000, MP4/H.264)
-    (b"\x00\x00\x00\x0cftyp", "mp4", "video/mp4"),
-    (b"\x00\x00\x00\x18ftyp", "mp4", "video/mp4"),
-    (b"\x00\x00\x00\x20ftyp", "mp4", "video/mp4"),
-]
-
-_OLE2_SUBTYPES: list[tuple[bytes, str, str]] = [
-    (b"Microsoft Excel",      "xls", "application/vnd.ms-excel"),
-    (b"Microsoft PowerPoint", "ppt", "application/vnd.ms-powerpoint"),
-    (b"Calc",                 "xls", "application/vnd.ms-excel"),
-    (b"Impress",              "ppt", "application/vnd.ms-powerpoint"),
-]
-
-_OOXML_SIGS = {
-    "word/":       ("docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
-    "xl/":         ("xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
-    "ppt/":        ("pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
-    "content.xml": ("odt",  "application/vnd.oasis.opendocument.text"),
-}
+from siard_workflow.core.file_identifier import get_identifier
+from siard_workflow.core.identifiers.magic_bytes import (
+    _MAGIC, _OLE2_SUBTYPES, _OOXML_SIGS, _WORD_TAIL_SIGS,
+    _detect, _detect_ole2_type, _ole2_tail_is_word,
+)
 
 # ── Formatkategorier basert på riksarkivarens forskrift §5-17 ─────────────────
 
@@ -239,241 +192,8 @@ _CHECKSUM_TAGS = {
 
 
 # ── Hjelpefunksjoner ──────────────────────────────────────────────────────────
-
-def _detect_ole2_type(data: bytes) -> tuple[str, str, bool] | None:
-    """
-    Les OLE2 compound document directory og returner (ext, mime, is_encrypted).
-
-    is_encrypted=True hvis filen er passordbeskyttet ("EncryptionInfo"-strøm
-    finnes, noe som gjelder for både Office 2007+ OOXML kryptert og eldre
-    CryptoAPI-krypterte .doc/.xls/.ppt).
-
-    For OOXML-krypterte filer (EncryptedPackage + EncryptionInfo):
-    bestemmes filtypen fra root-entryens CLSID, med docx som fallback.
-
-    Kun directory entries med type=2 (stream) eller type=1 (storage) i det
-    øverste nivået teller. Innebygde OLE-objekter (Excel embedded i Word,
-    osv.) vil aldri vises på rot-nivå og forstyrrer ikke deteksjonen.
-    """
-    import struct as _struct
-
-    # Kjente root-entry CLSIDs (little-endian GUID) for krypterte OOXML-filer
-    _CLSID_WORD  = (b"\x06\x09\x02\x00\x00\x00\x00\x00"
-                    b"\xc0\x00\x00\x00\x00\x00\x00\x46")  # Word.Document.8
-    _CLSID_EXCEL = (b"\x20\x08\x02\x00\x00\x00\x00\x00"
-                    b"\xc0\x00\x00\x00\x00\x00\x00\x46")  # Excel.Sheet.8
-    _CLSID_PPT   = (b"\x10\x8d\x81\x64\x9b\x4f\xcf\x11"
-                    b"\x86\xea\x00\xaa\x00\xb9\x29\xe8")  # PowerPoint.Show
-
-    # OLE2-sektordimensjoner fra header
-    try:
-        sector_size = 1 << _struct.unpack_from('<H', data, 30)[0]  # SectorShift
-        dir_sector  = _struct.unpack_from('<I', data, 48)[0]       # FirstDirSectorLoc
-        if dir_sector == 0xFFFFFFFE or sector_size < 64:
-            return None
-        dir_offset  = 512 + dir_sector * sector_size
-    except Exception:
-        return None
-
-    # Les root-entry CLSID (bytes 80-95 av entry 0, type=5).
-    # Brukes til å identifisere krypterte OOXML-filer.
-    root_clsid = b""
-    if dir_offset + 96 <= len(data):
-        root_clsid = data[dir_offset + 80: dir_offset + 96]
-
-    # Les directory-entries lineært (type 1=storage, 2=stream).
-    # Entry-format: 128 bytes, navn i UTF-16LE, lengde i byte 64+65.
-    top_names: set[str] = set()
-    for i in range(64):
-        offset = dir_offset + i * 128
-        if offset + 128 > len(data):
-            break
-        try:
-            name_len   = _struct.unpack_from('<H', data, offset + 64)[0]
-            entry_type = data[offset + 66]
-            if entry_type not in (1, 2) or name_len < 2 or name_len > 64:
-                continue
-            name = data[offset:offset + name_len - 2].decode('utf-16-le',
-                                                              errors='replace')
-            name = name.strip('\x00')
-            if name:
-                top_names.add(name)
-        except Exception:
-            continue
-
-    # ── Krypteringsdeteksjon ──────────────────────────────────────────────────
-    # "EncryptionInfo"-strøm finnes i alle moderne krypterte Office-filer.
-    # "EncryptedPackage" + "EncryptionInfo" = OOXML-fil kryptert med passord.
-    is_encrypted = "EncryptionInfo" in top_names
-
-    if is_encrypted and "EncryptedPackage" in top_names:
-        # OOXML kryptert — original filtype leses fra root-entry CLSID
-        if root_clsid == _CLSID_EXCEL:
-            return ("xlsx",
-                    "application/vnd.openxmlformats-officedocument"
-                    ".spreadsheetml.sheet",
-                    True)
-        if root_clsid == _CLSID_PPT:
-            return ("pptx",
-                    "application/vnd.openxmlformats-officedocument"
-                    ".presentationml.presentation",
-                    True)
-        # Word CLSID eller ukjent → docx som fallback
-        return ("docx",
-                "application/vnd.openxmlformats-officedocument"
-                ".wordprocessingml.document",
-                True)
-
-    # ── Prioritert strøm-navnsjekk (kryptert eller ikke) ─────────────────────
-    if "WordDocument" in top_names:
-        return "doc", "application/msword", is_encrypted
-    if "Workbook" in top_names or "Book" in top_names:
-        return "xls", "application/vnd.ms-excel", is_encrypted
-    if "PowerPoint Document" in top_names:
-        return "ppt", "application/vnd.ms-powerpoint", is_encrypted
-
-    # Fallback 1: Søk de første 32 KB etter OLE2-katalognavn (UTF-16LE) og
-    # CompObj ProgID-strenger (ASCII) — fanger tilfeller der FAT-kjeden
-    # gjør at katalogentryene ikke er sammenhengende (se Word.Document.8).
-    # Begrensning til 32 KB unngår falske treff fra innebygde objekter eller
-    # referanser som kan forekomme langt inn i filen (f.eks. "Excel.Sheet"
-    # i et Word-dokument med innebygd regneark).
-    # Word-sjekk MÅ komme før PPT-sjekk; et Word-dokument med innebygd
-    # PPT-objekt kan ha "Microsoft PowerPoint" tidlig i datastrømmen.
-    _scan = data[:32768]
-    _WORD_U16 = b"W\x00o\x00r\x00d\x00D\x00o\x00c\x00u\x00m\x00e\x00n\x00t\x00"
-    if _WORD_U16 in _scan or b"Word.Document" in _scan:
-        return "doc", "application/msword", is_encrypted
-
-    _XLS_U16 = b"W\x00o\x00r\x00k\x00b\x00o\x00o\x00k\x00"
-    if _XLS_U16 in _scan or b"Excel.Sheet" in _scan:
-        return "xls", "application/vnd.ms-excel", is_encrypted
-
-    _PPT_U16 = b"P\x00o\x00w\x00e\x00r\x00P\x00o\x00i\x00n\x00t\x00 \x00D\x00o\x00c\x00u\x00m\x00e\x00n\x00t\x00"
-    if _PPT_U16 in _scan or b"PowerPoint.Show" in _scan:
-        return "ppt", "application/vnd.ms-powerpoint", is_encrypted
-
-    # Fallback 2: subtype-markører kun i de første 4 KB
-    # (ikke hele filen — unngår treffer på innebygde objekter)
-    early = data[:4096]
-    for marker, ext, mime in _OLE2_SUBTYPES:
-        if marker in early:
-            return ext, mime, is_encrypted
-
-    return None
-
-
-# Signaturer som kun finnes i ekte Word OLE2-filer, ikke i innebygde objekter
-_WORD_TAIL_SIGS = (
-    # UTF-16LE navn på rot-nivå strøm i Word .doc
-    b"W\x00o\x00r\x00d\x00D\x00o\x00c\x00u\x00m\x00e\x00n\x00t\x00",
-    # ASCII ProgID i \x01CompObj-strøm
-    b"Word.Document",
-    # Navn på Word-spesifikke tabell-strømmer (finnes ikke i XLS/PPT)
-    b"1\x00T\x00a\x00b\x00l\x00e\x00",   # UTF-16LE "1Table"
-    b"0\x00T\x00a\x00b\x00l\x00e\x00",   # UTF-16LE "0Table"
-)
-
-
-def _ole2_tail_is_word(data: bytes, tail_size: int = 16384) -> bool:
-    """
-    Sjekk om halen av en OLE2-fil inneholder Word-spesifikke signaturer.
-
-    Brukes som tiebreaker når vanlig deteksjon feilidentifiserer en Word-fil
-    med innebygde Excel/PPT-objekter som XLS eller PPT.  I slike tilfeller
-    ligger "Workbook"-directory-entryen tidlig i filen (fra det innebygde
-    objektet), mens Word-rottstrømmene (WordDocument, 1Table) kan ligge i
-    sektorer lenger ut — og dukker dermed opp i halen.
-    """
-    tail = data[-tail_size:] if len(data) > tail_size else data
-    return any(sig in tail for sig in _WORD_TAIL_SIGS)
-
-
-def _detect(data: bytes) -> tuple[str, str, bool]:
-    """
-    Returner (ext, mime, is_encrypted).
-    is_encrypted=True betyr at filen er passordbeskyttet og ikke skal
-    konverteres av LibreOffice — kun kopiere med riktig filendelse.
-    """
-    if not data:
-        return "bin", "application/octet-stream", False
-
-    # Strip kjente BOM-er og leading whitespace for å nå frem til faktisk header
-    # Mange eldre systemer skriver UTF-8/UTF-16 BOM foran RTF, HTML etc.
-    _BOMS = (
-        b"\xef\xbb\xbf",       # UTF-8 BOM
-        b"\xff\xfe",            # UTF-16 LE BOM
-        b"\xfe\xff",            # UTF-16 BE BOM
-        b"\xff\xfe\x00\x00",   # UTF-32 LE BOM
-        b"\x00\x00\xfe\xff",   # UTF-32 BE BOM
-    )
-    stripped = data
-    for bom in _BOMS:
-        if stripped.startswith(bom):
-            stripped = stripped[len(bom):]
-            break
-    # Strip leading whitespace/newlines (maks 64 bytes)
-    stripped = stripped.lstrip(b" \t\r\n")
-
-    # Søk også litt inn i filen (maks 512 bytes fra start) for headere
-    # som kan ha metadata/kommentarer foran seg
-    search_window = data[:512]
-
-    # OLE2 (DOC/XLS/PPT) — alltid i byte 0
-    if data[:4] == b"\xd0\xcf\x11\xe0" or stripped[:4] == b"\xd0\xcf\x11\xe0":
-        # Les OLE2 directory for å finne root stream-navn.
-        # Dette er den eneste pålitelige metoden — subtype-markører i innholdet
-        # kan stamme fra innebygde OLE-objekter (f.eks. Excel embedded i Word).
-        ole_type = _detect_ole2_type(data)
-        if ole_type:
-            return ole_type  # 3-tuple (ext, mime, is_encrypted)
-        return "doc", "application/msword", False
-
-    # BZ2 med 4-byte størrelses-header [uint32_LE][BZh9...]
-    # Brukes av norske fagsystemer (f.eks. PPT-tjenester, KITH-meldinger)
-    if len(data) > 10 and data[4:7] == b"BZh" and data[7:8] in b"123456789":
-        return "bz2", "application/x-bzip2", False
-
-    # OOXML/ODF (ZIP-basert) — alltid i byte 0
-    if data[:4] == b"PK\x03\x04" or stripped[:4] == b"PK\x03\x04":
-        try:
-            with zipfile.ZipFile(io.BytesIO(data)) as z:
-                names = "\n".join(z.namelist())
-                for k, v in _OOXML_SIGS.items():
-                    if k in names:
-                        return v[0], v[1], False
-        except Exception:
-            pass
-        return "zip", "application/zip", False
-
-    # MAGIC-tabell — sjekk både stripped og søkevindu
-    for sig, ext, mime in _MAGIC:
-        slen = len(sig)
-        if stripped[:slen] == sig:
-            return ext, mime, False
-        # Søk etter signaturen innen de første 512 bytes for tekst-baserte formater
-        if sig[0:1] in (b"{", b"<", b"%") and sig in search_window:
-            return ext, mime, False
-
-    # ── Tekst-basert fallback (ingen magic-byte treff) ───────────────────────
-    # WPTools native format — starter med <!WPTools_Format etter BOM/whitespace
-    if stripped[:16].startswith(b"<!WPTools_Format"):
-        return "wpt", "application/x-wptools", False
-
-    # Generisk XML/markup-innhold som ikke matchet kjent MAGIC-signatur
-    if stripped.startswith(b"<"):
-        return "xml", "application/xml", False
-
-    # Gyldig UTF-8 uten null-bytes → ren tekst
-    try:
-        if b"\x00" not in data[:512] and data[:512]:
-            data[:512].decode("utf-8")
-            return "txt", "text/plain", False
-    except (UnicodeDecodeError, ValueError):
-        pass
-
-    # Ukjent binærformat
-    return "bin", "application/octet-stream", False
+# Magic-byte-deteksjon (_detect, _detect_ole2_type, _ole2_tail_is_word) er
+# flyttet til siard_workflow.core.identifiers.magic_bytes og importeres øverst.
 
 
 def _wpt_to_rtf(wpt_bytes: bytes) -> bytes:
@@ -1517,7 +1237,7 @@ def suggest_lo_defaults() -> dict:
     - LibreOffice bruker ca 300-500 MB RAM per instans ved konvertering
     - Sett maks 60 % av tilgjengelig RAM til LO-instanser
     - Sett maks 75 % av CPU-kjerner (resten trenger OS og GUI)
-    - Ta minimum av de to, men aldri mer enn 8 (diminishing returns)
+    - Ta minimum av de to, capped til 16 (anbefalt maks for LO)
     - Minimum 1
 
     Batch-størrelse:
@@ -1566,7 +1286,9 @@ def suggest_lo_defaults() -> dict:
     ram_budget_mb      = ram_gb * 1024 * 0.60
     workers_by_ram     = max(1, int(ram_budget_mb / lo_ram_mb))
     workers_by_cpu     = max(1, int(cpus * 0.75))
-    workers            = min(workers_by_ram, workers_by_cpu, 8)
+    # Cap til 16 — over dette gir LO diminishing returns og økt
+    # subprocess-overhead. CPU/RAM-beregningen bestemmer innenfor det.
+    workers            = min(workers_by_ram, workers_by_cpu, 16)
 
     if ram_gb >= 32:
         batch = 100
@@ -1825,6 +1547,7 @@ class BlobConvertOperation(BaseOperation):
         log_dir  = ctx.metadata.get("log_dir")   # satt av app.py via ctx
         csv_log  = None
         err_log  = None
+        sf_log   = None
         if log_dir:
             siard_name = ctx.siard_path.stem if ctx.siard_path else "blob"
             csv_log = BlobCsvLogger(log_dir, siard_name)
@@ -1832,6 +1555,19 @@ class BlobConvertOperation(BaseOperation):
             w(f"  CSV-logg: {csv_log.log_path}", "info")
             err_log = ConversionErrorLogger(log_dir, siard_name)
             err_log.__enter__()
+            # Siegfried-identifikasjonslogg — opprettes alltid, men slettes
+            # automatisk hvis ingen rader skrives (når magic-bytes brukes).
+            sf_log = SiegfriedIdLogger(log_dir, siard_name)
+            sf_log.__enter__()
+            # Koble logger til aktiv backend hvis Siegfried er valgt
+            try:
+                from siard_workflow.core.file_identifier import get_identifier
+                ident = get_identifier()
+                if getattr(ident, "name", "") == "siegfried":
+                    ident.set_logger(sf_log)
+                    w(f"  Siegfried-ID-logg: {sf_log.log_path}", "info")
+            except Exception:
+                pass
 
         w("=" * 56)
         w("  BLOB-KONVERTERING", "step")
@@ -1943,6 +1679,8 @@ class BlobConvertOperation(BaseOperation):
                 csv_log.__exit__(None, None, None)
             if err_log:
                 err_log.__exit__(None, None, None)
+            if sf_log:
+                sf_log.__exit__(None, None, None)
             return self._fail(str(exc))
         finally:
             if csv_log:
@@ -1956,6 +1694,14 @@ class BlobConvertOperation(BaseOperation):
                     if err_log.log_path and err_log.count > 0:
                         w(f"  Feilogg ({err_log.count} feil): "
                           f"{err_log.log_path}", "warn")
+                except Exception:
+                    pass
+            if sf_log:
+                try:
+                    sf_log.__exit__(None, None, None)
+                    if sf_log.log_path and sf_log.count > 0:
+                        w(f"  Siegfried-ID-logg ({sf_log.count} filer): "
+                          f"{sf_log.log_path}", "info")
                 except Exception:
                     pass
 
@@ -2226,7 +1972,8 @@ class BlobConvertOperation(BaseOperation):
                 xml_type_hints=xml_type_hints,
                 err_log=err_log,
                 conversion_registry=_pipeline_creg,
-                creg_lock=_pipeline_creg_lock)
+                creg_lock=_pipeline_creg_lock,
+                emit_phase_events=False)  # 4-fase-flyt — kalleren styrer faser
             progress("phase_done")
 
         if stop_ev.is_set():
@@ -2592,10 +2339,14 @@ class BlobConvertOperation(BaseOperation):
                      xml_type_hints: dict | None = None,
                      err_log=None,
                      conversion_registry: "dict | None" = None,
-                     creg_lock: "threading.Lock | None" = None) -> None:
+                     creg_lock: "threading.Lock | None" = None,
+                     emit_phase_events: bool = True) -> None:
         """
         Deteksjon parallelt + LO batch-konvertering med unik brukerprofil per instans.
         xml_type_hints: {filnavn: ext} fra type-kolonner i tableX.xml.
+        emit_phase_events: True i 6-fase standalone-flyt (sender phase 3 og 4
+            som egne fase-events). False i 4-fase pipeline-flyt der kallerens
+            fase allerede dekker både deteksjon og konvertering.
         """
         lock  = threading.Lock()
         max_w = max(1, min(self.params["max_workers"], os.cpu_count() or 2))
@@ -2608,8 +2359,63 @@ class BlobConvertOperation(BaseOperation):
         # Steg A: Deteksjon parallelt
         _COMPRESSED = {"zip", "gz", "bz2", "tar", "rar", "7z"}
 
+        # Hent aktiv fildeteksjonsmotor (magic-bytes eller Siegfried/PRONOM).
+        # Forhåndsskann KUN faktiske blob-filer (all_blobs) — ikke hele
+        # extract_dir. Dette unngår at Siegfried bruker tid på tableX.xml,
+        # tableX.xsd og header/metadata.* som vi uansett aldri identifiserer.
+        _id = get_identifier()
+        _blob_paths = [extract_dir / z for z in all_blobs]
+        _backend = getattr(_id, "name", "magic")
+
+        if _backend == "siegfried" and _blob_paths:
+            # Siegfried er treg på store SIARD — logg progress og parallelliser
+            import time as _time
+            _SF_BATCH = 100
+            n_files   = len(_blob_paths)
+            n_batches = (n_files + _SF_BATCH - 1) // _SF_BATCH
+            w(f"  Forhåndsskanner {n_files:,} filer med Siegfried "
+              f"({n_batches:,} batcher, {max_w} parallelle) ...", "info")
+
+            _state = {"last_pct": 0.0,
+                      "last_log_t": _time.monotonic(),
+                      "t0": _time.monotonic()}
+
+            def _scan_progress(done: int, total: int) -> None:
+                # Logg hver 5 % ELLER minst hver 30 sek, pluss ved start/slutt
+                pct = (done / total) * 100.0 if total else 100.0
+                now = _time.monotonic()
+                if (done == total
+                        or pct - _state["last_pct"] >= 5.0
+                        or now - _state["last_log_t"] >= 30):
+                    elapsed = now - _state["t0"]
+                    w(f"    Forhåndsskann: {done:,}/{total:,} batcher "
+                      f"({pct:.0f}%, {elapsed:.0f}s)", "info")
+                    _state["last_pct"]   = pct
+                    _state["last_log_t"] = now
+
+            try:
+                _id.pre_scan(extract_dir, files=_blob_paths,
+                             max_workers=max_w, progress_cb=_scan_progress)
+                _total = _time.monotonic() - _state["t0"]
+                w(f"  Forhåndsskann ferdig på {_total:.0f}s", "ok")
+            except Exception as _exc:
+                w(f"  Forhåndsskann feilet: {_exc} — "
+                  f"fortsetter uten cache", "warn")
+        else:
+            # Magic-bytes: no-op, ingen logg trengs
+            try:
+                _id.pre_scan(extract_dir, files=_blob_paths)
+            except Exception:
+                pass
+
         _utf8_bin_count: list[int] = [0]   # trådsikker teller via GIL-beskyttet int
         _utf8_bin_lock  = threading.Lock()
+
+        # Cap for spekulative dekoder-forsøk på .txt-filer. Hex-validering
+        # (`bytes.fromhex`) og base64-skanning er O(N) i fil-størrelse, så for
+        # filer > 10 MB blir per-fil-kostnaden uforholdsmessig høy. Anta at
+        # store .txt-filer er ekte tekst (ikke base64/hex-encoded blob).
+        _DECODER_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
 
         def _detect_one(zip_sti: str) -> tuple[str, tuple[str, str, bool]]:
             p = extract_dir / zip_sti
@@ -2618,7 +2424,18 @@ class BlobConvertOperation(BaseOperation):
             except Exception:
                 return zip_sti, ("bin", "application/octet-stream", False)
 
-            ext, mime, is_encrypted = _detect(data)
+            ext, mime, is_encrypted = _id.identify(data=data, path=p)
+
+            # Lazy "hele filinnhold" — leses kun én gang selv om flere
+            # dekoder-branches trenger det. For txt-filer ble dette tidligere
+            # lest TO ganger (én gang i base64-blokken, én gang i UTF-8-blokken),
+            # noe som doblet disk-I/O for hver txt-fil.
+            full_data = None
+            def _get_full() -> bytes:
+                nonlocal full_data
+                if full_data is None:
+                    full_data = p.read_bytes() if len(data) == 65536 else data
+                return full_data
 
             # ── Base64-dekoding ───────────────────────────────────────────────
             # Hvis innholdet er "txt" (ukjent tekst), prøv å tolke det som base64.
@@ -2626,10 +2443,15 @@ class BlobConvertOperation(BaseOperation):
             # Vi gjør ingenting hvis dekodingen bare gir txt/bin — da er det
             # sannsynligvis base64 av ren tekst, og originalen er allerede korrekt.
             if ext == "txt":
-                full_data = p.read_bytes() if len(data) == 65536 else data
-                decoded = _try_decode_base64(full_data)
+                full_data = _get_full()
+                if len(full_data) > _DECODER_MAX_BYTES:
+                    # Stor .txt — sannsynligvis ekte tekst. Hopp over dyre
+                    # spekulative dekodere for å holde per-fil-tid forutsigbar.
+                    decoded = None
+                else:
+                    decoded = _try_decode_base64(full_data)
                 if decoded is not None:
-                    inner_ext, inner_mime, inner_enc = _detect(decoded[:65536])
+                    inner_ext, inner_mime, inner_enc = _id.identify(data=decoded[:65536])
                     # Kjør evt. utpakking på dekodede data hvis det er et arkiv
                     if inner_ext in _COMPRESSED:
                         tmp_arc = p.with_suffix(".b64tmp")
@@ -2638,7 +2460,7 @@ class BlobConvertOperation(BaseOperation):
                             unpacked = _unpack_single_file(tmp_arc)
                             if unpacked is not None:
                                 unpacked_data, unpacked_name = unpacked
-                                inner_ext, inner_mime, inner_enc = _detect(unpacked_data[:65536])
+                                inner_ext, inner_mime, inner_enc = _id.identify(data=unpacked_data[:65536])
                                 p.write_bytes(unpacked_data)
                                 w(f"    Base64+utpakket: {PurePosixPath(zip_sti).name} "
                                   f"({PurePosixPath(unpacked_name).name} → {inner_ext})", "info")
@@ -2669,13 +2491,14 @@ class BlobConvertOperation(BaseOperation):
             # Noen fagsystemer lagrer binærfiler som hex-strenger i LOB-felt
             # (f.eks. BZip2-komprimerte dokumenter kodet som ren hex-tekst).
             # Forsøk kun hvis ext fortsatt er txt etter base64-sjekken.
-            if ext == "txt":
+            # `bytes.fromhex` validerer hvert tegn (O(N)) — cap for store filer.
+            if ext == "txt" and len(full_data) <= _DECODER_MAX_BYTES:
                 raw = full_data.strip()
                 # Krav: jevnt antall tegn, minst 32 (= 16 byte dekoded), kun hex
                 if len(raw) >= 32 and len(raw) % 2 == 0:
                     try:
                         decoded_hex = bytes.fromhex(raw.decode("ascii"))
-                        hex_ext, hex_mime, hex_enc = _detect(decoded_hex[:65536])
+                        hex_ext, hex_mime, hex_enc = _id.identify(data=decoded_hex[:65536])
                         if hex_ext in _COMPRESSED:
                             _tmp_hex = p.with_suffix(".hextmp")
                             try:
@@ -2683,7 +2506,7 @@ class BlobConvertOperation(BaseOperation):
                                 unpacked = _unpack_single_file(_tmp_hex)
                                 if unpacked is not None:
                                     unpacked_data, unpacked_name = unpacked
-                                    u_ext, u_mime, u_enc = _detect(unpacked_data[:65536])
+                                    u_ext, u_mime, u_enc = _id.identify(data=unpacked_data[:65536])
                                     p.write_bytes(unpacked_data)
                                     w(f"    Hex+utpakket: {PurePosixPath(zip_sti).name} "
                                       f"({PurePosixPath(unpacked_name).name} → {u_ext})", "info")
@@ -2710,7 +2533,7 @@ class BlobConvertOperation(BaseOperation):
                 result = _unpack_single_file(p)
                 if result is not None:
                     inner_data, inner_name = result
-                    inner_ext, inner_mime, inner_enc = _detect(inner_data[:65536])
+                    inner_ext, inner_mime, inner_enc = _id.identify(data=inner_data[:65536])
                     if inner_ext not in ("bin", "txt") or len(inner_data) > 0:
                         try:
                             p.write_bytes(inner_data)
@@ -2733,7 +2556,7 @@ class BlobConvertOperation(BaseOperation):
                                 xml_count = 0
                                 for m in members:
                                     chunk = zf.read(m.filename)[:512]
-                                    member_ext, _, _ = _detect(chunk)
+                                    member_ext, _, _ = _id.identify(data=chunk)
                                     if member_ext in ("xml", "txt", "html"):
                                         xml_count += 1
                                 if xml_count == len(members):
@@ -2753,10 +2576,10 @@ class BlobConvertOperation(BaseOperation):
             # %âãÏÓ = \xe2\xe3... er ugyldig UTF-8), så risiko for falsk positiv er
             # minimal.  Kjøres for txt/bin (ingen ASCII-magic) og pdf (ASCII-magic).
             if ext in ("txt", "bin", "pdf"):
-                full_data = p.read_bytes() if len(data) == 65536 else data
+                full_data = _get_full()
                 recovered = _try_decode_utf8_binary(full_data)
                 if recovered is not None:
-                    rec_ext, rec_mime, rec_enc = _detect(recovered[:65536])
+                    rec_ext, rec_mime, rec_enc = _id.identify(data=recovered[:65536])
                     if rec_ext not in ("txt", "bin"):
                         try:
                             p.write_bytes(recovered)
@@ -2782,20 +2605,43 @@ class BlobConvertOperation(BaseOperation):
         w(f"  Detekterer {len(all_blobs):,} filer ...", "info")
         det_results: dict[str, tuple[str, str, bool]] = {}
         n_total       = len(all_blobs)
-        DETECT_REPORT = max(1, n_total // 10)   # logg ~10 ganger totalt
+        # Logg-strategi for deteksjonsfremgang:
+        #   - Cap antall logg-events til ~50 totalt: DETECT_REPORT = n // 50
+        #   - Rate-limit: minst 2 sek mellom logger (unngår spam-burst når
+        #     mange fast tasks ferdigstilles samtidig)
+        #   - Fallback: logg minst hvert 10. sek selv om fremgang er treig
+        DETECT_REPORT     = max(1, n_total // 50)
+        MIN_LOG_INTERVAL  = 2.0   # sekunder mellom logger
+        MAX_LOG_INTERVAL  = 10.0  # tving fram logg etter så lang stillhet
         n_detected    = 0
-        progress("phase", phase=3, total_phases=6,
-                 label=f"Detekterer {n_total:,} filer ...")
+        if emit_phase_events:
+            progress("phase", phase=3, total_phases=6,
+                     label=f"Detekterer {n_total:,} filer ...")
+        w(f"  Starter parallell deteksjon på {max_w} worker-tråder ...",
+          "info")
+        import time as _time
+        _last_log_t = _time.monotonic()
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_w) as pool:
             futs = {pool.submit(_detect_one, z): z for z in all_blobs}
             for fut in concurrent.futures.as_completed(futs):
                 zip_sti, result = fut.result()
                 det_results[zip_sti] = result
                 n_detected += 1
-                if n_detected % DETECT_REPORT == 0 or n_detected == n_total:
+                _now = _time.monotonic()
+                _gap = _now - _last_log_t
+                # Alltid logg siste; ellers krev både fremgangsterskel og
+                # minst MIN_LOG_INTERVAL siden forrige logg; fallback ved stillhet.
+                should_log = (
+                    n_detected == n_total
+                    or (_gap >= MIN_LOG_INTERVAL
+                        and (n_detected % DETECT_REPORT == 0
+                             or _gap >= MAX_LOG_INTERVAL))
+                )
+                if should_log:
                     w(f"  Detektert: {n_detected:,}/{n_total:,} filer ...", "info")
                     progress("phase_progress",
                              done=n_detected, total=n_total)
+                    _last_log_t = _now
 
         if _utf8_bin_count[0]:
             w(f"  UTF-8-kodet binærdata: {_utf8_bin_count[0]:,} filer gjenopprettet", "info")
@@ -2996,9 +2842,11 @@ class BlobConvertOperation(BaseOperation):
             src_ext       = PurePosixPath(zip_sti).suffix.lstrip(".").lower()
             orig_basename = PurePosixPath(zip_sti).name
 
-            # Med "Standardiser .bin"-valg PÅ: LOB-filer beholder original endelse
-            # uavhengig av detektert innhold — omdøping skjer IKKE via to_rename_only.
-            if _standardize_bin and src_ext in ("bin", "txt") and ext not in ("bin", "txt"):
+            # Med "Standardiser .bin"-valg PÅ: LOB-filer beholder ALLTID sin
+            # opprinnelige endelse — .bin forblir .bin selv om innholdet er
+            # detektert som .txt, og .txt forblir .txt selv om detektert som
+            # noe annet. Kun originale .txt-filer skal hete .txt i resultatet.
+            if _standardize_bin and src_ext in ("bin", "txt"):
                 ext = src_ext
 
             if _standardize_bin and src_ext not in ("bin", "txt"):
@@ -3156,11 +3004,21 @@ class BlobConvertOperation(BaseOperation):
             return
 
         # Steg D: LO batch-konvertering
-        progress("phase", phase=4, total_phases=6,
-                 label="Konverterer filer (batch LO)")
-        batch_size  = max(1, self.params["lo_batch_size"])
-        all_batches = [to_convert[i:i+batch_size]
-                       for i in range(0, len(to_convert), batch_size)]
+        if emit_phase_events:
+            progress("phase", phase=4, total_phases=6,
+                     label="Konverterer filer (batch LO)")
+        # Smart batch-fordeling: lo_batch_size er MAKS — bruk mindre batcher
+        # når filantallet er for lite til å fylle alle workers. F.eks. 149 filer
+        # med max=100/workers=8 ville gitt 2 batcher (100+49) = bare 2 workers
+        # aktive. Med ceil(149/8) = 19 får vi 8 batcher à ~19 filer = full
+        # parallellisme.
+        import math as _math
+        max_batch     = max(1, self.params["lo_batch_size"])
+        n_to_convert  = len(to_convert)
+        ideal_batch   = max(1, _math.ceil(n_to_convert / max_w))
+        batch_size    = min(max_batch, ideal_batch)
+        all_batches   = [to_convert[i:i+batch_size]
+                         for i in range(0, n_to_convert, batch_size)]
         profiles_root = extract_dir.parent / "lo_profiles"
         profiles_root.mkdir(exist_ok=True)
 
@@ -3168,8 +3026,8 @@ class BlobConvertOperation(BaseOperation):
                        for idx, zip_sti, _, _
                        in to_convert}
 
-        w(f"  LO: {len(all_batches)} batch(er) à ~{batch_size} filer, "
-          f"{max_w} parallelle instanser", "info")
+        w(f"  LO: {len(all_batches)} batch(er) à ~{batch_size} filer "
+          f"(maks {max_batch}), {max_w} parallelle instanser", "info")
 
         pdfa_version = self.params.get("pdfa_version", _PDFA_DEFAULT)
         pdfa_filter  = _build_pdfa_filter(pdfa_version)
@@ -4012,6 +3870,7 @@ class BlobConvertOperation(BaseOperation):
         import tarfile
 
         _standardize_bin = _get_standardize_bin_ext()
+        _id = get_identifier()
 
         def _lo_convert_file(src: Path, tmp_work: Path) -> Path | None:
             """Konverter én fil med LO til PDF/A. Returnerer ferdig PDF eller None."""
@@ -4147,7 +4006,7 @@ class BlobConvertOperation(BaseOperation):
                     result_files.append(src)
                     continue
 
-                inner_ext, _, inner_enc = _detect(data)
+                inner_ext, _, inner_enc = _id.identify(data=data, path=src)
 
                 if not inner_enc and inner_ext in _LO_CONVERTIBLE:
                     w(f"    Konverterer: {src.name} ({inner_ext.upper()} → PDF/A)", "info")
@@ -4178,7 +4037,8 @@ class BlobConvertOperation(BaseOperation):
                     target_ext = PurePosixPath(zip_sti).suffix.lstrip(".").lower()
                 else:
                     # Bruk faktisk detektert filendelse på utpakket innhold.
-                    target_ext, _, _ = _detect(single.read_bytes()[:65536])
+                    target_ext, _, _ = _id.identify(
+                        data=single.read_bytes()[:65536], path=single)
                 new_name = f"{stem}.{target_ext}"
                 new_path = blob_path.parent / new_name
                 try:
@@ -4414,7 +4274,7 @@ class BlobConvertOperation(BaseOperation):
                     file_bytes = text.encode("utf-8")
 
             # ── Detekter filtype ───────────────────────────────────────────
-            ext, mime, _ = _detect(file_bytes)
+            ext, mime, _ = get_identifier().identify(data=file_bytes)
 
             # ── Bestem lob-mappe og filnavn ────────────────────────────────
             lob_counter += 1

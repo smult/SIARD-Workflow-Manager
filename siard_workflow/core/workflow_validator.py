@@ -80,6 +80,17 @@ def validate_workflow(ops: list) -> list[tuple]:
             elif h and idx <= max(h):
                 msg = "Blob-konvertering skal ligge etter 'HEX-uttrekk'"
 
+        elif oid == "xml_cleaner":
+            # Jobber direkte på utpakkede tableX.xml-filer i pipeline-modus.
+            # Må derfor ligge mellom 'Pakk ut SIARD' og 'Pakk sammen SIARD'
+            # når begge er tilstede.
+            u = _idxs(ops, "unpack_siard")
+            r = _idxs(ops, "repack_siard")
+            if u and idx <= max(u):
+                msg = "XML-renser skal ligge etter 'Pakk ut SIARD'"
+            elif r and idx >= min(r):
+                msg = "XML-renser skal ligge før 'Pakk sammen SIARD'"
+
         elif oid == "metadata_extract":
             r = _idxs(ops, "repack_siard")
             if r and idx <= max(r):

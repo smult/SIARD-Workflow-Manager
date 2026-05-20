@@ -97,6 +97,32 @@ def _md5_upper(data: bytes) -> str:
     return hashlib.md5(data).hexdigest().upper()
 
 
+# XML 1.0 tillater ikke kontrolltegn 0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F
+# (unntak: 0x09 tab, 0x0A LF, 0x0D CR).
+import re as _re
+_XML_INVALID_CTRL = _re.compile(
+    r"[\x00-\x08\x0B\x0C\x0E-\x1F]"
+)
+
+
+def _hex_to_text(decoded: bytes) -> str | None:
+    """
+    Dekod bytes til tekst for inline-bruk i tableX.xml.
+    Prøver UTF-8 først, så cp1252 (Windows-1252) som dekker norsk/vesteuropeisk.
+    Filtrer XML-ulovlige kontrolltegn med replacement char.
+    Returnerer None hvis dekoding feiler helt.
+    """
+    try:
+        text = decoded.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            text = decoded.decode("cp1252", errors="replace")
+        except Exception:
+            return None
+    # Erstatt XML-ulovlige kontrolltegn (sjelden, men kan finnes i CLOB)
+    return _XML_INVALID_CTRL.sub("�", text)
+
+
 def _parse_clob_tables_from_xml(xml_bytes: bytes) -> list[dict]:
     """
     Felles hjelpefunksjon: parser metadata.xml-bytes og returnerer
@@ -238,8 +264,16 @@ def _process_table_fs(
                             continue
 
                         try:
+                            # Felt under minimum dekodet lengde — ikke eksporter
+                            # til ekstern fil, men dekod hex-strengen INLINE slik
+                            # at ferdig SIARD ikke inneholder rå hex.
                             if len(decoded) < min_text_length:
                                 stats["hex_skipped"] = stats.get("hex_skipped", 0) + 1
+                                _txt = _hex_to_text(decoded)
+                                if _txt is not None:
+                                    child.text = _txt
+                                    stats["hex_inline_decoded"] = (
+                                        stats.get("hex_inline_decoded", 0) + 1)
                                 continue
 
                             filename   = f"xrec{row_counter}.{ext}"
@@ -305,7 +339,9 @@ def _process_table(
     """
     Stream tableX.xml, dekod HEX CLOB-felt, skriv xrec{N}.txt,
     patch XML og skriv til zout.  Returnerer antall LOB-filer skrevet.
-    Felt kortere enn min_text_length tegn (etter dekoding) hoppes over.
+    Felt kortere enn min_text_length tegn (etter dekoding) eksporteres
+    ikke til ekstern fil, men hex-strengen dekodes INLINE slik at ferdig
+    SIARD ikke inneholder rå hex.
     """
     schema_folder = table_info["schema_folder"]
     folder        = table_info["folder"]
@@ -363,9 +399,16 @@ def _process_table(
                             continue
 
                         try:
-                            # Hopp over felt som er kortere enn minimumslengde
+                            # Felt under minimum dekodet lengde — ikke eksporter
+                            # til ekstern fil, men dekod hex-strengen INLINE slik
+                            # at ferdig SIARD ikke inneholder rå hex.
                             if len(decoded) < min_text_length:
                                 stats["hex_skipped"] = stats.get("hex_skipped", 0) + 1
+                                _txt = _hex_to_text(decoded)
+                                if _txt is not None:
+                                    child.text = _txt
+                                    stats["hex_inline_decoded"] = (
+                                        stats.get("hex_inline_decoded", 0) + 1)
                                 continue
                             filename   = f"xrec{row_counter}.{ext}"
                             zip_path   = lob_folder + filename
@@ -436,7 +479,7 @@ class HexExtractOperation(BaseOperation):
     default_params = {
         "dry_run":         False,
         "temp_dir":        "",
-        "min_text_length": 30,    # tekst kortere enn dette eksporteres ikke
+        "min_text_length": 30,    # tekst kortere enn dette dekodes inline (ikke fil)
     }
 
     @property
@@ -506,12 +549,13 @@ class HexExtractOperation(BaseOperation):
 
         w("  OPPSUMMERING:", "step")
         STAT_LABELS_HEX = {
-            "hex_exported":  "HEX-felt eksportert",
-            "hex_skipped":   "HEX-felt hoppet over",
-            "tables_patched":"Tabeller patchet",
-            "lob_before":    "LOB-filer (før)",
-            "lob_after":     "LOB-filer (etter)",
-            "lob_diff":      "LOB-filer (endring)",
+            "hex_exported":       "HEX-felt eksportert",
+            "hex_skipped":        "HEX-felt under terskel",
+            "hex_inline_decoded": "HEX-felt dekodet inline",
+            "tables_patched":     "Tabeller patchet",
+            "lob_before":         "LOB-filer (før)",
+            "lob_after":          "LOB-filer (etter)",
+            "lob_diff":           "LOB-filer (endring)",
         }
         for k, v in stats.items():
             label = STAT_LABELS_HEX.get(k, k)

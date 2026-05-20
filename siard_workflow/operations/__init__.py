@@ -4,6 +4,7 @@ from .siardmapper_operation import SiardMapperOperation
 from .sha256_operation import SHA256Operation
 from .blob_convert_operation import BlobConvertOperation
 from .hex_extract_operation import HexExtractOperation
+from .xml_cleaner_operation import XmlCleanerOperation
 from .virus_scan_operation import VirusScanOperation
 from .pipeline_operations import UnpackSiardOperation, RepackSiardOperation
 from .standardize_ext_operation import StandardizeExtOperation
@@ -21,6 +22,7 @@ __all__ = [
     "SHA256Operation",
     "BlobConvertOperation",
     "HexExtractOperation",
+    "XmlCleanerOperation",
     "VirusScanOperation",
     "UnpackSiardOperation",
     "RepackSiardOperation",

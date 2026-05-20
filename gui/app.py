@@ -36,6 +36,35 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
 
 
+def _sync_checkpoints_to_ops(old_checkpoints: list, ops: list) -> list:
+    """Bygg ny checkpoint-liste fra workflow-panelets operasjoner.
+
+    For hvert steg i `ops` brukes eksisterende checkpoint (samme operation_id)
+    om det finnes — slik at status/output/ctx_data bevares. Label og params
+    oppdateres fra panelet. Nye steg får en pending-checkpoint. Hver gammel
+    checkpoint kan kun konsumeres én gang, slik at duplikate operation_ids
+    håndteres posisjonelt.
+    """
+    from siard_workflow.core.project_file import OpCheckpoint
+    pool: dict = {}
+    for cp in old_checkpoints:
+        pool.setdefault(cp.operation_id, []).append(cp)
+    new_list: list = []
+    for op in ops:
+        bucket = pool.get(op.operation_id)
+        if bucket:
+            cp = bucket.pop(0)
+            cp.label  = op.label
+            cp.params = dict(op.params)
+            new_list.append(cp)
+        else:
+            new_list.append(OpCheckpoint(
+                operation_id=op.operation_id,
+                label=op.label,
+                params=dict(op.params)))
+    return new_list
+
+
 class _PipelineSuggestionDialog(ctk.CTkToplevel):
     """
     Dialog som foreslår å legge til 'Pakk ut SIARD' og 'Pakk sammen SIARD'
@@ -943,13 +972,16 @@ class App(ctk.CTk):
         if not src:
             messagebox.showinfo("Ingen fil", "Legg til en SIARD-fil i køen først.")
             return
-        # Bruk eksisterende prosjektfil som utgangspunkt hvis den finnes,
-        # ellers lag ny fra gjeldende operasjoner
+        # Bygg alltid operasjonslista fra gjeldende workflow-panel. Hvis det
+        # finnes en lastet prosjektfil, behold checkpoint-status for steg som
+        # matcher (samme operation_id) — nye steg legges til som pending, og
+        # fjernede steg forsvinner.
         if self._project_file is None:
             pf = ProjectFile.from_ops(src, ops)
         else:
             pf = self._project_file
             pf.source_siard = str(src)
+            pf.operations = _sync_checkpoints_to_ops(pf.operations, ops)
         idir = str(self._project_path.parent) if self._project_path else str(src.parent)
         ifile = (self._project_path.name
                  if self._project_path
@@ -1081,6 +1113,12 @@ class App(ctk.CTk):
         """Kalles når global innstillinger lagres."""
         from settings import save_config
         save_config(cfg)
+        # Reset cached fildeteksjons-backend slik at endret valg tar effekt
+        try:
+            from siard_workflow.core.file_identifier import reset_identifier
+            reset_identifier()
+        except Exception:
+            pass
         # Oppdater temp-mappe hvis endret
         td = cfg.get("global_temp_dir", "").strip()
         if td and Path(td).is_dir():
@@ -1494,6 +1532,9 @@ class App(ctk.CTk):
             if pf_arg and Path(pf_arg.source_siard) == path:
                 _pf      = pf_arg
                 _pf_path = pf_path_arg
+                # Sync operasjonslista mot det som faktisk skal kjøres — slik
+                # at nye steg får en checkpoint og fjernede ikke ligger igjen.
+                _pf.operations = _sync_checkpoints_to_ops(_pf.operations, list(wf))
             else:
                 _pf_path = path.with_suffix(".siardwf")
                 _pf      = ProjectFile.from_ops(path, list(wf))

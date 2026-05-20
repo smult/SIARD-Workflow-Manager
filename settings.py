@@ -60,6 +60,8 @@ _CONFIG_DEFAULTS: dict = {
         "ppt":  "pptx",   "pot":  "pptx",
     },
     "standardize_bin_ext":    True,  # behold .bin/.txt-endelse etter konvertering
+    "use_siegfried":          False, # bruk Siegfried/PRONOM i stedet for magic-bytes
+    "sf_executable":          "",    # sti til sf.exe (autoinstallert ved aktivering)
     "pdfa_version":           "PDF/A-2u (ISO 19005-2, level U)",  # standard PDF/A-versjon
     "disk_overhead_factor":   2.0,   # multiplikator for estimert temp-diskbehov
     "siard_output_version":   "2.1", # målversjon for eksportert SIARD ("2.1" eller "2.2")

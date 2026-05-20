@@ -333,6 +333,34 @@ class SettingsDialog(ctk.CTkToplevel):
                          row=r, column=0, columnspan=2,
                          padx=14, pady=(0, 4), sticky="w"); r += 1
 
+        # ── Filidentifisering ───────────────────────────────────────────────
+        _seksjon("Filidentifisering", r); r += 1
+        _rad("Bruk Siegfried/PRONOM",
+             "use_siegfried", "bool", r, default=False); r += 1
+        _rad("Sti til Siegfried (sf)", "sf_executable", "str", r,
+             default="", browse_file=True); r += 1
+
+        # Status-linje + installer-knapp
+        self._sf_status_lbl = ctk.CTkLabel(
+            frm, text=self._siegfried_status_text(),
+            font=ctk.CTkFont(family=FONTS["mono"], size=11),
+            text_color=COLORS["muted"], anchor="w")
+        self._sf_status_lbl.grid(row=r, column=0, columnspan=2,
+                                  padx=14, pady=(0, 4), sticky="w"); r += 1
+
+        ctk.CTkButton(
+            frm, text="Installer / Oppdater Siegfried",
+            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+            font=ctk.CTkFont(family=FONTS["mono"], size=11),
+            command=self._install_siegfried,
+        ).grid(row=r, column=1, padx=12, pady=(0, 4), sticky="e"); r += 1
+        ctk.CTkLabel(frm,
+                     text="PRONOM-basert filidentifisering. Krever sf-binær — installeres automatisk fra GitHub ved aktivering.",
+                     font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                     text_color=COLORS["muted"]).grid(
+                         row=r, column=0, columnspan=2,
+                         padx=14, pady=(0, 4), sticky="w"); r += 1
+
         _seksjon("Operasjoner — synlighet", r); r += 1
         ctk.CTkLabel(frm, text="Vis operasjoner med status",
                      font=ctk.CTkFont(family=FONTS["mono"], size=11),
@@ -403,6 +431,105 @@ class SettingsDialog(ctk.CTkToplevel):
                             result[k] = v
                 val = result
             cfg[key] = val
+
+        # Siegfried slått på men ikke installert → spør om installasjon
+        if cfg.get("use_siegfried"):
+            from siard_workflow.core.identifiers import installer as _sf_inst
+            sf_path = (cfg.get("sf_executable") or "").strip()
+            if not sf_path or not Path(sf_path).exists():
+                import tkinter.messagebox as _mb
+                yes = _mb.askyesno(
+                    "Installer Siegfried?",
+                    "Siegfried/PRONOM er aktivert, men sf-binæren mangler.\n\n"
+                    "Vil du laste den ned nå? (~30 MB)",
+                    parent=self,
+                )
+                if yes:
+                    try:
+                        sf = _sf_inst.install_siegfried(progress=None)
+                        cfg["sf_executable"] = str(sf)
+                    except Exception as exc:
+                        _mb.showerror(
+                            "Installasjon feilet",
+                            f"Kunne ikke installere Siegfried:\n{exc}\n\n"
+                            "Sjekk internett-tilkobling, eller skriv inn sti manuelt.",
+                            parent=self)
+                        return
+                else:
+                    # Avbryt — slå av igjen så vi ikke får dead-state
+                    cfg["use_siegfried"] = False
+
         if self._on_save:
             self._on_save(cfg)
+        # Reset cached identifier slik at neste deteksjon bruker valgt backend
+        try:
+            from siard_workflow.core.file_identifier import reset_identifier
+            reset_identifier()
+        except Exception:
+            pass
         self.destroy()
+
+    # ── Siegfried-status + installasjon ──────────────────────────────────────
+
+    def _siegfried_status_text(self) -> str:
+        from siard_workflow.core.identifiers import installer as _sf_inst
+        if not _sf_inst.is_installed():
+            return "Status: ikke installert"
+        ver = _sf_inst.get_version() or "ukjent versjon"
+        return f"Status: {ver}"
+
+    def _install_siegfried(self):
+        from siard_workflow.core.identifiers import installer as _sf_inst
+        import tkinter.messagebox as _mb
+        import threading
+
+        # Progress-vindu (modal)
+        prog = ctk.CTkToplevel(self)
+        prog.title("Installerer Siegfried")
+        prog.configure(fg_color=COLORS["surface"])
+        prog.transient(self)
+        prog.grab_set()
+        prog.geometry("420x140")
+        prog.resizable(False, False)
+        msg_var = ctk.StringVar(value="Forbereder...")
+        ctk.CTkLabel(prog, textvariable=msg_var,
+                     font=ctk.CTkFont(family=FONTS["mono"], size=12),
+                     wraplength=380, justify="left"
+                     ).pack(padx=20, pady=20, anchor="w", fill="x")
+
+        result: dict = {"ok": False, "err": None, "path": None}
+
+        def _worker():
+            try:
+                if _sf_inst.is_installed():
+                    # Bare oppdater signaturer
+                    _sf_inst.update_signatures(
+                        lambda m: prog.after(0, lambda: msg_var.set(m)))
+                    result["ok"] = True
+                else:
+                    sf = _sf_inst.install_siegfried(
+                        lambda m: prog.after(0, lambda: msg_var.set(m)))
+                    result["ok"] = True
+                    result["path"] = str(sf)
+            except Exception as exc:
+                result["err"] = str(exc)
+            prog.after(0, _done)
+
+        def _done():
+            prog.grab_release()
+            prog.destroy()
+            if result["err"]:
+                _mb.showerror("Installasjon feilet",
+                              result["err"], parent=self)
+                return
+            # Oppdater status-label og evt. sti-felt
+            self._sf_status_lbl.configure(text=self._siegfried_status_text())
+            if result["path"] and "sf_executable" in self._vars:
+                try:
+                    self._vars["sf_executable"].set(result["path"])
+                except Exception:
+                    pass
+            _mb.showinfo("Ferdig",
+                         "Siegfried er klar til bruk.", parent=self)
+
+        threading.Thread(target=_worker, daemon=True).start()

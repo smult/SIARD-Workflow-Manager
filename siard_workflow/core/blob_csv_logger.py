@@ -133,3 +133,74 @@ class ConversionErrorLogger:
             self._fh.write(line)
             self._fh.flush()
             self._count += 1
+
+
+class SiegfriedIdLogger:
+    """
+    Loggfører Siegfried/PRONOM-identifikasjon per fil.
+
+    Navnmønster: {siard_stem}_{ts}_siegfried_identifikasjon.log
+    CSV-format (semikolon-separert):
+        filnavn ; ext ; mime ; PUID ; format ; basis ; warning
+    """
+
+    HEADER = ["filnavn", "ext", "mime", "puid", "format", "basis", "warning"]
+
+    def __init__(self, log_dir: Path, siard_name: str = ""):
+        self.log_dir    = Path(log_dir)
+        self.siard_name = siard_name
+        self._path: Path | None = None
+        self._fh = None
+        self._writer = None
+        self._lock  = _threading.Lock()
+        self._count = 0
+
+    def __enter__(self) -> "SiegfriedIdLogger":
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        stem = self.siard_name or "siard"
+        self._path = self.log_dir / f"{stem}_{ts}_siegfried_identifikasjon.log"
+        self._fh   = open(self._path, "w", encoding="utf-8-sig", newline="")
+        self._writer = csv.writer(self._fh, delimiter=";",
+                                   quoting=csv.QUOTE_MINIMAL)
+        self._writer.writerow(self.HEADER)
+        self._fh.flush()
+        return self
+
+    def __exit__(self, *_):
+        if self._fh:
+            if self._count == 0:
+                try:
+                    self._fh.close()
+                    if self._path:
+                        self._path.unlink(missing_ok=True)
+                    self._path = None
+                    return
+                except Exception:
+                    pass
+            self._fh.close()
+
+    @property
+    def log_path(self) -> Path | None:
+        return self._path
+
+    @property
+    def count(self) -> int:
+        return self._count
+
+    def write(self, filename: str, ext: str, mime: str,
+              puid: str = "", format_name: str = "",
+              basis: str = "", warning: str = "") -> None:
+        if not self._writer:
+            return
+        # Normaliser linjeskift i lange feltverdier
+        def _clean(s: str) -> str:
+            return (s or "").replace("\n", " ").replace("\r", " ")
+        with self._lock:
+            self._writer.writerow([
+                _clean(filename), _clean(ext), _clean(mime),
+                _clean(puid), _clean(format_name),
+                _clean(basis), _clean(warning),
+            ])
+            self._fh.flush()
+            self._count += 1
