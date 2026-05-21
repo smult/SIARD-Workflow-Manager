@@ -289,6 +289,8 @@ class SiardMapperDialog(ctk.CTkToplevel):
 
         # Redigeringer: {iid: str}
         self._edits: Dict[str, str] = {}
+        # Tabeller markert for sletting fra resultat-SIARD (set av tbl.norm)
+        self._marked_for_deletion: set[str] = set()
         # Flat liste for navigasjon
         self._items: List[dict] = []
 
@@ -612,6 +614,9 @@ class SiardMapperDialog(ctk.CTkToplevel):
                                   font=("Courier New", 10, "bold"))
         self._tree.tag_configure("col_ok",  background="#0f2914", foreground="#7eeea0")
         self._tree.tag_configure("col_bad", background="#2e1010", foreground="#ee8080")
+        # Markert for sletting fra resultat-SIARD
+        self._tree.tag_configure("tbl_del", background="#5a1010", foreground="#ffb0b0",
+                                  font=("Courier New", 10, "bold", "overstrike"))
 
         # Sorter: uferdige tabeller øverst (A–Å), ferdige nederst (A–Å)
         sorted_tables = sorted(
@@ -642,11 +647,18 @@ class SiardMapperDialog(ctk.CTkToplevel):
             else:
                 open_state = preserve_open.get(tbl.norm, not is_complete)
 
+            # Bevar visuell markering hvis tabellen er merket for sletting
+            if tbl.norm in self._marked_for_deletion:
+                display_name = f"🗑  {tbl.name}  (slettes)"
+                row_tags = ("table", "tbl_del")
+            else:
+                display_name = tbl.name
+                row_tags = ("table", t_tag)
             self._tree.insert("", "end", iid=t_iid,
-                text=tbl.name,
+                text=display_name,
                 values=(ico, _shorten(tbl.json_desc), _shorten(ed_tbl) or "─"),
                 open=open_state,
-                tags=("table", t_tag))
+                tags=row_tags)
             self._items.append({"iid": t_iid, "type": "table",
                                  "tbl": tbl, "col": None,
                                  "tbl_norm": tbl.norm, "col_norm": None})
@@ -782,7 +794,10 @@ class SiardMapperDialog(ctk.CTkToplevel):
             json_desc = info["col"].json_desc
         elif info["type"] == "table":
             json_desc = info["tbl"].json_desc
-        if not json_desc:
+
+        # For col-rader: bare vise meny hvis det finnes en json_desc å kopiere
+        # For tabell-rader: ALLTID vise meny (sletting er alltid mulig)
+        if info["type"] == "col" and not json_desc:
             return
 
         menu = tk.Menu(
@@ -793,12 +808,52 @@ class SiardMapperDialog(ctk.CTkToplevel):
             font=("Courier New", 10),
             relief="flat", bd=1,
         )
-        menu.add_command(
-            label="📋  Kopier JSON-beskrivelse → Egendefinert",
-            command=lambda i=iid, d=json_desc: self._copy_json_to_custom(i, d),
-        )
+        if json_desc:
+            menu.add_command(
+                label="📋  Kopier JSON-beskrivelse → Egendefinert",
+                command=lambda i=iid, d=json_desc: self._copy_json_to_custom(i, d),
+            )
+        # Marker for sletting — kun for tabeller
+        if info["type"] == "table":
+            tbl_norm = info["tbl_norm"]
+            if json_desc:
+                menu.add_separator()
+            if tbl_norm in self._marked_for_deletion:
+                menu.add_command(
+                    label="↩  Fjern slette-markering",
+                    command=lambda n=tbl_norm: self._toggle_delete_mark(n, False),
+                )
+            else:
+                menu.add_command(
+                    label="🗑  Merk for sletting fra resultat-SIARD",
+                    foreground=COLORS["red"],
+                    activeforeground="#ffffff",
+                    activebackground="#7a2020",
+                    command=lambda n=tbl_norm: self._toggle_delete_mark(n, True),
+                )
         menu.post(event.x_root, event.y_root)
         menu.bind("<FocusOut>", lambda _: menu.destroy())
+
+    def _toggle_delete_mark(self, tbl_norm: str, mark: bool) -> None:
+        """Sett eller fjern slette-markering på en tabell. Oppdaterer UI."""
+        if mark:
+            self._marked_for_deletion.add(tbl_norm)
+        else:
+            self._marked_for_deletion.discard(tbl_norm)
+        # Oppdater visuell visning av tabell-raden
+        t_iid = f"T:{tbl_norm}"
+        tbl = next((info["tbl"] for info in self._items
+                    if info["iid"] == t_iid and info["type"] == "table"), None)
+        if tbl is None:
+            return
+        if mark:
+            # Vis prefix "🗑 " og tag "tbl_del"
+            display_name = f"🗑  {tbl.name}  (slettes)"
+            self._tree.item(t_iid, text=display_name, tags=("table", "tbl_del"))
+        else:
+            # Tilbake til normal — rebuild items vil sette riktig tag
+            self._refresh_status(t_iid)
+            self._tree.item(t_iid, text=tbl.name)
 
     def _copy_json_to_custom(self, iid: str, json_desc: str):
         self._edits[iid] = json_desc
@@ -1277,6 +1332,31 @@ class SiardMapperDialog(ctk.CTkToplevel):
         self._editor._commit_current()
         self._editor.hide()
         self._suggestions.hide()
+
+        # Vis advarsel hvis noen tabeller er merket for sletting
+        if self._marked_for_deletion:
+            from tkinter import messagebox
+            marked_names = sorted(
+                tbl.name for tbl in self._tables
+                if tbl.norm in self._marked_for_deletion
+            )
+            preview = "\n".join(f"  • {n}" for n in marked_names[:25])
+            if len(marked_names) > 25:
+                preview += f"\n  … og {len(marked_names) - 25} til"
+            ans = messagebox.askokcancel(
+                "Tabeller markert for sletting",
+                f"Følgende tabeller er markert for sletting i SIARD-filen:\n\n"
+                f"{preview}\n\n"
+                f"Totalt: {len(marked_names)} tabell(er).\n\n"
+                "Tabellene blir permanent fjernet fra metadata.xml og "
+                "content/-mappene. Denne handlingen kan ikke angres.\n\n"
+                "OK for å fortsette, Avbryt for å gå tilbake.",
+                parent=self,
+                icon="warning",
+            )
+            if not ans:
+                return  # gå tilbake til dialogen
+
         self._autosave()
         self._cancelled = False
         self.destroy()
@@ -1288,18 +1368,34 @@ class SiardMapperDialog(ctk.CTkToplevel):
     def get_result(self):
         if self._cancelled:
             return None
-        result: Dict[str, dict] = {}
+        # Beskrivelser per tabell/kolonne (bakoverkompatibelt med eksisterende API)
+        edits: Dict[str, dict] = {}
         for info in self._items:
             tn = info["tbl_norm"]
-            if tn not in result:
-                result[tn] = {"desc": "", "cols": {}}
+            if tn not in edits:
+                edits[tn] = {"desc": "", "cols": {}}
             iid = info["iid"]
             val = self._edits.get(iid, "").strip()
             if info["type"] == "table":
-                result[tn]["desc"] = val
+                edits[tn]["desc"] = val
             else:
-                result[tn]["cols"][info["col_norm"]] = val
-        return result
+                edits[tn]["cols"][info["col_norm"]] = val
+
+        # Tabeller markert for sletting (med navn + folder)
+        marked: List[dict] = []
+        for tbl in self._tables:
+            if tbl.norm in self._marked_for_deletion:
+                marked.append({
+                    "name":   tbl.name,
+                    "norm":   tbl.norm,
+                    "folder": tbl.folder,
+                })
+
+        # Ny struktur: dict med to nøkler. Operation må håndtere det.
+        return {
+            "edits": edits,
+            "marked_for_deletion": marked,
+        }
 
 
 

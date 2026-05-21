@@ -323,9 +323,13 @@ class App(ctk.CTk):
             ).pack(side="left", padx=2)
 
     def _build_statusbar(self):
-        """Statuslinje nederst i vinduet — temp-info + spinner."""
+        """Statuslinje nederst i vinduet — temp-info, ledig disk,
+        tråd/batch-innstillinger, fildeteksjons-backend, spinner."""
         sb = ctk.CTkFrame(self, fg_color=COLORS["surface"], corner_radius=0, height=26)
         sb.grid(row=2, column=0, columnspan=2, sticky="ew")
+        # Kolonner:
+        # 0: spinner | 1: temp (vokser) | 2: ledig disk | 3: tråder/batch
+        # 4: deteksjons-backend | 5: status-right
         sb.grid_columnconfigure(1, weight=1)
         sb.grid_propagate(False)
 
@@ -341,11 +345,47 @@ class App(ctk.CTk):
             text_color=COLORS["muted"], anchor="w")
         self.temp_label.grid(row=0, column=1, padx=6, pady=2, sticky="w")
 
+        # Separator
+        _sep_font = ctk.CTkFont(family=FONTS["mono"], size=11)
+        ctk.CTkLabel(sb, text="│", font=_sep_font,
+                     text_color=COLORS["border"]).grid(
+                         row=0, column=2, padx=2, pady=2)
+
+        self._status_disk = ctk.CTkLabel(
+            sb, text="Ledig: …",
+            font=_sep_font, text_color=COLORS["muted"], anchor="e")
+        self._status_disk.grid(row=0, column=3, padx=4, pady=2, sticky="e")
+
+        ctk.CTkLabel(sb, text="│", font=_sep_font,
+                     text_color=COLORS["border"]).grid(
+                         row=0, column=4, padx=2, pady=2)
+
+        self._status_workers = ctk.CTkLabel(
+            sb, text="Tråder: …",
+            font=_sep_font, text_color=COLORS["muted"], anchor="e")
+        self._status_workers.grid(row=0, column=5, padx=4, pady=2, sticky="e")
+
+        ctk.CTkLabel(sb, text="│", font=_sep_font,
+                     text_color=COLORS["border"]).grid(
+                         row=0, column=6, padx=2, pady=2)
+
+        self._status_backend = ctk.CTkLabel(
+            sb, text="Deteksjon: …",
+            font=_sep_font, text_color=COLORS["muted"], anchor="e")
+        self._status_backend.grid(row=0, column=7, padx=4, pady=2, sticky="e")
+
+        ctk.CTkLabel(sb, text="│", font=_sep_font,
+                     text_color=COLORS["border"]).grid(
+                         row=0, column=8, padx=2, pady=2)
+
         self._status_right = ctk.CTkLabel(
             sb, text="",
-            font=ctk.CTkFont(family=FONTS["mono"], size=11),
-            text_color=COLORS["muted"], anchor="e")
-        self._status_right.grid(row=0, column=2, padx=(0,12), pady=2, sticky="e")
+            font=_sep_font, text_color=COLORS["muted"], anchor="e")
+        self._status_right.grid(row=0, column=9, padx=(0,12), pady=2, sticky="e")
+
+        # Oppstart: les innstillinger én gang, start disk-oppdatering-loop
+        self.after(500, self._update_statusbar_settings)
+        self.after(500, self._update_statusbar_disk)
 
     def _build_queue_panel(self, parent):
         """Drag-drop + kø-liste over SIARD-filer øverst i venstre kolonne."""
@@ -571,6 +611,96 @@ class App(ctk.CTk):
 
     def _update_status_right(self, text: str):
         self._status_right.configure(text=text)
+
+    def _update_statusbar_disk(self) -> None:
+        """
+        Oppdater ledig diskplass på tempdisk. Kjøres jevnlig (hvert 30 sek)
+        via `after()`-loop.
+        """
+        try:
+            import shutil as _shutil
+            import tempfile as _tempfile
+            from pathlib import Path as _Path
+            temp_path = (self._global_temp_dir
+                         if self._global_temp_dir
+                         else _Path(_tempfile.gettempdir()))
+            try:
+                free = _shutil.disk_usage(str(temp_path)).free
+                # Formatér til lesbar enhet
+                for unit, factor in (("TB", 1024**4), ("GB", 1024**3),
+                                     ("MB", 1024**2), ("kB", 1024)):
+                    if free >= factor:
+                        free_str = f"{free / factor:.1f} {unit}"
+                        break
+                else:
+                    free_str = f"{free} B"
+                # Fargekoding: rødt under 10 GB, gult under 50 GB, ellers normal
+                if free < 10 * 1024**3:
+                    color = COLORS["red"]
+                elif free < 50 * 1024**3:
+                    color = "#e0a040"
+                else:
+                    color = COLORS["text"]
+                self._status_disk.configure(
+                    text=f"Ledig: {free_str}", text_color=color)
+            except Exception:
+                self._status_disk.configure(
+                    text="Ledig: (ukjent)", text_color=COLORS["muted"])
+        except Exception:
+            pass
+        # Planlegg neste disk-oppdatering om 30 sek
+        try:
+            self.after(30000, self._update_statusbar_disk)
+        except Exception:
+            pass
+
+    def _update_statusbar_settings(self) -> None:
+        """
+        Oppdater statusbar-felter som avhenger av globale innstillinger:
+        antall tråder + batch-størrelse, og deteksjons-backend.
+        Kalles ved oppstart og når global settings lagres
+        (fra `_on_global_settings_saved`).
+        """
+        try:
+            from settings import get_config as _get_cfg
+            try:
+                workers = int(_get_cfg("max_workers", 4) or 4)
+            except Exception:
+                workers = 4
+            try:
+                batch = int(_get_cfg("lo_batch_size", 50) or 50)
+            except Exception:
+                batch = 50
+            self._status_workers.configure(
+                text=f"Tråder: {workers} (batch {batch})",
+                text_color=COLORS["text"])
+
+            use_sf = False
+            try:
+                use_sf = bool(_get_cfg("use_siegfried", False))
+            except Exception:
+                pass
+            if use_sf:
+                try:
+                    from siard_workflow.core.identifiers import installer as _sf_inst
+                    if _sf_inst.is_installed():
+                        self._status_backend.configure(
+                            text="Deteksjon: Siegfried/PRONOM",
+                            text_color=COLORS["accent"])
+                    else:
+                        self._status_backend.configure(
+                            text="Deteksjon: Magic-bytes (SF ikke installert)",
+                            text_color="#e0a040")
+                except Exception:
+                    self._status_backend.configure(
+                        text="Deteksjon: Siegfried/PRONOM",
+                        text_color=COLORS["accent"])
+            else:
+                self._status_backend.configure(
+                    text="Deteksjon: Magic-bytes",
+                    text_color=COLORS["muted"])
+        except Exception:
+            pass
 
     def _tick_spinner(self):
         """Animert spinner i statusbar mens kjøring pågår."""
@@ -1119,6 +1249,14 @@ class App(ctk.CTk):
             reset_identifier()
         except Exception:
             pass
+        # Reflekter endringer i statusbar umiddelbart.
+        # _update_statusbar_disk() oppdaterer også loop-en — men en
+        # ekstra rask oppdatering her gjør at brukeren ser endring av
+        # temp-mappe med en gang.
+        try:
+            self._update_statusbar_settings()
+        except Exception:
+            pass
         # Oppdater temp-mappe hvis endret
         td = cfg.get("global_temp_dir", "").strip()
         if td and Path(td).is_dir():
@@ -1621,6 +1759,10 @@ class App(ctk.CTk):
                     self._ask_add_schema_selector
             ctx.metadata["ask_schema_select_cb"] = self._schema_select_dialog_cb
 
+            # Callback for å fylle inn tomme <schema><name>-noder
+            ctx.metadata["ask_fill_empty_schema_names_cb"] = \
+                self._ask_fill_empty_schema_names
+
             if self._global_temp_dir:
                 ctx.metadata["temp_dir"] = str(self._global_temp_dir)
             if self._output_dir_override:
@@ -1746,15 +1888,25 @@ class App(ctk.CTk):
                     if _to_insert is not None:
                         _ops_to_insert = (_to_insert if isinstance(_to_insert, list)
                                           else [_to_insert])
+                        # 1. Oppdater Workflow-objektet (bakgrunnstråd-trygt —
+                        #    rene Python-lister, ingen Tk-objekter).
                         for k, _op in enumerate(_ops_to_insert):
                             wf.insert(i + 1 + k, _op)
                             self._log_queue.put(("log",
                                 f"  ✚ Lagt til i arbeidsflyt: {_op.label}", "ok"))
-                        self.after(0, lambda:
-                                   self._workflow_panel.refresh_from_ops(
-                                       list(wf._operations))
-                                   if hasattr(self._workflow_panel, "refresh_from_ops")
-                                   else None)
+
+                        # 2. Oppdater workflow_panel (UI) — MÅ kjøres på
+                        #    hovedtråden. Sett inn etter forrige op-id slik at
+                        #    rekkefølgen blir bevart: unpack → ny1 → ny2 → ...
+                        _prev_id = op.operation_id
+                        _ops_copy = list(_ops_to_insert)
+                        def _do_gui_insert(prev_id=_prev_id, ops_list=_ops_copy):
+                            prev = prev_id
+                            for _op in ops_list:
+                                self.workflow_panel.insert_operation_after(
+                                    _op, prev, silent=True)
+                                prev = _op.operation_id
+                        self.after(0, _do_gui_insert)
                 except Exception as exc:
                     result = op._fail(str(exc))
                 elapsed = time.time() - t0
@@ -2157,6 +2309,22 @@ class App(ctk.CTk):
         """
         from gui.schema_selector_dialog import ask_select_schemas_modal
         return ask_select_schemas_modal(self.after, self, schemas)
+
+    def _ask_fill_empty_schema_names(self, empties: list,
+                                       existing_names: set | None = None
+                                       ) -> "dict | None":
+        """
+        Kalles fra UnpackSiardOperation når <schema><name> er tom i
+        metadata.xml. Viser dialog der operatør fyller inn navn.
+
+        existing_names: schema-navn som allerede er i bruk i samme SIARD —
+            dialogen validerer mot duplikater.
+
+        Returnerer {schema_index: new_name} eller None ved Avbryt.
+        """
+        from gui.empty_schema_name_dialog import ask_fill_empty_schema_names
+        return ask_fill_empty_schema_names(
+            self.after, self, empties, existing_names=existing_names)
 
     def _siardmapper_dialog_cb(self, matches, siard_path, extracted_path,
                                json_path=None, suggestion_map=None):

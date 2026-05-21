@@ -28,9 +28,12 @@ attributtverdi).
 """
 from __future__ import annotations
 
+import concurrent.futures
+import os
 import re
 import shutil
 import tempfile
+import threading
 import zipfile
 from pathlib import Path
 
@@ -201,34 +204,65 @@ class XmlCleanerOperation(BaseOperation):
 
     def _process_filesystem(self, extract_dir: Path, stats: dict,
                             w, progress, *, dry_run: bool) -> None:
-        """Rens alle tableX.xml in-place i extract_dir."""
+        """
+        Rens alle tableX.xml in-place i extract_dir, parallellisert.
+
+        Hver tableX.xml prosesseres uavhengig (les bytes → regex → skriv
+        bytes), så ThreadPoolExecutor er ideelt — disk-I/O og regex slipper
+        begge GIL.
+        """
         tables = list(_iter_table_xmls(extract_dir))
         if not tables:
             w("  Ingen tableX.xml-filer funnet under content/.", "info")
             return
 
-        progress("phase", phase=1, total_phases=1,
-                 label=f"Renser {len(tables)} tableX.xml-filer")
+        # Antall workers — hent fra global config, cap ved cpu_count og
+        # antall filer for å unngå degenerert pool.
+        try:
+            from settings import get_config
+            cfg_workers = int(get_config("max_workers", 4) or 4)
+        except Exception:
+            cfg_workers = 4
+        max_w = max(1, min(cfg_workers, os.cpu_count() or 4, len(tables)))
 
-        for i, (rel_sti, abs_path) in enumerate(tables, 1):
-            stats["tables_scanned"] += 1
+        progress("phase", phase=1, total_phases=1,
+                 label=f"Renser {len(tables)} tableX.xml-filer "
+                       f"({max_w} parallelle)")
+        w(f"  Starter parallell rensing av {len(tables)} tableX.xml-filer "
+          f"på {max_w} worker-tråder ...", "info")
+
+        # Workers leverer per-fil-resultater. Hovedtråden aggregerer stats
+        # og logger — slik unngår vi lock-kontensjon på hver write.
+        def _process_one(rel_sti: str, abs_path: Path):
+            """Returnerer (rel_sti, n_repl, saved, error). 'modified' avledes."""
             try:
                 src_bytes = abs_path.read_bytes()
                 cleaned, n_repl = _clean_padding_spaces(src_bytes)
                 if n_repl == 0:
-                    continue
+                    return (rel_sti, 0, 0, None)
                 saved = len(src_bytes) - len(cleaned)
-                stats["tables_modified"] += 1
-                stats["padding_removed"] += n_repl
-                stats["bytes_saved"]     += saved
                 if not dry_run:
                     abs_path.write_bytes(cleaned)
-                w(f"    {rel_sti}: {n_repl:,} sekvenser, "
-                  f"{saved:,} bytes spart", "info")
+                return (rel_sti, n_repl, saved, None)
             except Exception as exc:
-                w(f"    [FEIL] {rel_sti}: {exc}", "feil")
+                return (rel_sti, 0, 0, exc)
 
-            progress("phase_progress", done=i, total=len(tables))
+        n_done = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_w) as pool:
+            futs = [pool.submit(_process_one, rs, ap) for rs, ap in tables]
+            for fut in concurrent.futures.as_completed(futs):
+                rel_sti, n_repl, saved, err = fut.result()
+                n_done += 1
+                stats["tables_scanned"] += 1
+                if err is not None:
+                    w(f"    [FEIL] {rel_sti}: {err}", "feil")
+                elif n_repl > 0:
+                    stats["tables_modified"] += 1
+                    stats["padding_removed"] += n_repl
+                    stats["bytes_saved"]     += saved
+                    w(f"    {rel_sti}: {n_repl:,} sekvenser, "
+                      f"{saved:,} bytes spart", "info")
+                progress("phase_progress", done=n_done, total=len(tables))
 
         progress("phase_done")
 

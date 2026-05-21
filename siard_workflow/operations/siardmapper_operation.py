@@ -25,7 +25,9 @@ from __future__ import annotations
 import html as _html
 import io
 import json
+import shutil
 import threading
+import xml.etree.ElementTree as _ET
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -287,6 +289,50 @@ def _enrich(xml_bytes: bytes, matches: List[_Match], overwrite: bool) -> tuple[b
 
 # ── Oppdater matches med brukerens redigeringer fra dialogen ─────────────────
 
+_META_NS = "http://www.bar.admin.ch/xmlns/siard/2/metadata.xsd"
+
+
+def _remove_tables_from_metadata(xml_bytes: bytes,
+                                  marked_names: set
+                                  ) -> tuple[bytes, list[tuple[str, str]]]:
+    """
+    Fjern markerte tabeller fra metadata.xml.
+
+    Returnerer (modifisert_xml_bytes, slettede_paths) der `slettede_paths` er
+    en liste av (schema_folder, table_folder)-tupler som kalleren kan bruke
+    for å slette tilhørende content/{schema}/{table}/-mapper.
+    """
+    if not marked_names:
+        return xml_bytes, []
+
+    ns = {"ns": _META_NS}
+    _ET.register_namespace("", _META_NS)
+    tree = _ET.parse(io.BytesIO(xml_bytes))
+    root = tree.getroot()
+
+    deleted: list[tuple[str, str]] = []
+    for schema in root.findall("ns:schemas/ns:schema", ns):
+        sch_folder_el = schema.find("ns:folder", ns)
+        sch_folder    = (sch_folder_el.text or "").strip() \
+                        if sch_folder_el is not None else ""
+        tables_el = schema.find("ns:tables", ns)
+        if tables_el is None:
+            continue
+        for tbl in list(tables_el):
+            name_el = tbl.find("ns:name", ns)
+            fold_el = tbl.find("ns:folder", ns)
+            if name_el is None or fold_el is None:
+                continue
+            tname = (name_el.text or "").strip()
+            if tname in marked_names:
+                deleted.append((sch_folder, (fold_el.text or "").strip()))
+                tables_el.remove(tbl)
+
+    buf = io.BytesIO()
+    tree.write(buf, encoding="utf-8", xml_declaration=True)
+    return buf.getvalue(), deleted
+
+
 def _apply_dialog_edits(matches: List[_Match], edits: dict) -> List[_Match]:
     """
     Kombiner JSON-treff med manuelt redigerte beskrivelser fra dialogen.
@@ -432,12 +478,24 @@ class SiardMapperOperation(BaseOperation):
                 )
                 if updated is None:
                     return self._fail("Berikelse avbrutt av operatør")
+                # Ny dialog-struktur har "edits" + "marked_for_deletion".
+                # Eldre versjoner returnerte flat {tbl_norm: {...}} — håndter begge.
+                if isinstance(updated, dict) and "edits" in updated:
+                    edits_dict  = updated.get("edits") or {}
+                    marked_list = updated.get("marked_for_deletion") or []
+                else:
+                    edits_dict  = updated
+                    marked_list = []
                 # Oppdater matches med brukerens redigeringer
-                matches = _apply_dialog_edits(matches, updated)
+                matches = _apply_dialog_edits(matches, edits_dict)
+                # Lagre slette-markeringer til etter berikelse
+                marked_names = {m.get("name") for m in marked_list if m.get("name")}
             else:
                 w("  Ingen dialog tilgjengelig — fortsetter med tilgjengelige treff", "warn")
+                marked_names: set = set()
         else:
             w(f"  100 % treff: {n_tbl_tot} tabeller, {n_col_tot} kolonner", "ok")
+            marked_names: set = set()
 
         # ── Berik og skriv ────────────────────────────────────────────────────
         try:
@@ -445,33 +503,67 @@ class SiardMapperOperation(BaseOperation):
         except Exception as exc:
             return self._fail(f"Feil under berikelse: {exc}")
 
-        if n_tbl == 0 and n_col == 0:
+        # ── Sanering: fjern tabeller markert for sletting ─────────────────────
+        deleted_paths: list[tuple[str, str]] = []
+        if marked_names:
+            try:
+                enriched, deleted_paths = _remove_tables_from_metadata(
+                    enriched, marked_names)
+                w(f"  Fjernet {len(deleted_paths)} tabell(er) fra metadata.xml",
+                  "ok")
+                for sch_folder, tbl_folder in deleted_paths:
+                    w(f"    🗑  content/{sch_folder}/{tbl_folder}/", "info")
+            except Exception as exc:
+                return self._fail(f"Feil ved sanering av tabeller: {exc}")
+
+        if n_tbl == 0 and n_col == 0 and not deleted_paths:
             w("  Ingen beskrivelser ble lagt til", "warn")
             return self._ok(
-                {"tables_enriched": 0, "columns_enriched": 0},
+                {"tables_enriched": 0, "columns_enriched": 0,
+                 "tables_deleted": 0},
                 "Ingen endringer gjort")
 
         if pipeline:
             meta_path.write_bytes(enriched)
-            summary = f"{n_tbl} tabell(er), {n_col} kolonne(r) beriket"
+            # Slett content/{schema}/{table}/-mapper for markerte tabeller
+            for sch_folder, tbl_folder in deleted_paths:
+                target = ctx.extracted_path / "content" / sch_folder / tbl_folder
+                if target.exists():
+                    shutil.rmtree(target, ignore_errors=True)
+            summary = (f"{n_tbl} tabell(er) beriket, {n_col} kolonne(r) beriket"
+                       + (f", {len(deleted_paths)} tabell(er) slettet"
+                          if deleted_paths else ""))
             w(f"  {summary}", "ok")
-            return self._ok({"tables_enriched": n_tbl, "columns_enriched": n_col}, summary)
+            return self._ok(
+                {"tables_enriched": n_tbl, "columns_enriched": n_col,
+                 "tables_deleted": len(deleted_paths)},
+                summary)
         else:
             dst_path = siard_path.with_name(siard_path.stem + "_beriket" + siard_path.suffix)
             try:
+                # Hopp over content/{schema}/{table}/-entries som tilhører
+                # tabeller markert for sletting.
+                skip_prefixes = tuple(
+                    f"content/{s}/{t}/" for s, t in deleted_paths)
                 buf = io.BytesIO()
                 with zipfile.ZipFile(siard_path, "r") as zin, \
                      zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zout:
                     for item in all_info:
+                        # Skip filer som tilhører slettede tabeller
+                        if skip_prefixes and item.filename.startswith(skip_prefixes):
+                            continue
                         data = enriched if item.filename == meta_entry else zin.read(item.filename)
                         zout.writestr(item, data)
                 dst_path.write_bytes(buf.getvalue())
             except Exception as exc:
                 return self._fail(f"Feil ved skriving av SIARD: {exc}")
 
-            summary = f"{n_tbl} tabell(er), {n_col} kolonne(r) beriket"
+            summary = (f"{n_tbl} tabell(er) beriket, {n_col} kolonne(r) beriket"
+                       + (f", {len(deleted_paths)} tabell(er) slettet"
+                          if deleted_paths else ""))
             w(f"  Skrevet: {dst_path.name}  —  {summary}", "ok")
             return self._ok(
                 {"tables_enriched": n_tbl, "columns_enriched": n_col,
+                 "tables_deleted": len(deleted_paths),
                  "output_path": str(dst_path)},
                 summary)

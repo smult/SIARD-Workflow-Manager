@@ -96,6 +96,167 @@ def get_target_siard_version() -> str:
 _SAFE_SCHEMA_NAME_RE = re.compile(r'^[A-Za-z0-9_.\-]+$')
 
 
+# Regex for å hente ut <schema>...</schema>-blokker fra <schemas>-seksjonen
+_SCHEMA_BLOCK_RE = re.compile(
+    rb'(<(?:[A-Za-z0-9_-]+:)?schema(?:\s[^>]*)?>)(.*?)'
+    rb'(</(?:[A-Za-z0-9_-]+:)?schema\s*>)',
+    re.DOTALL,
+)
+# Regex for å hente ut <name>...</name>-tagger (åpnings + innhold + lukking)
+_NAME_TAG_RE = re.compile(
+    rb'(<(?:[A-Za-z0-9_-]+:)?name(?:\s[^>]*)?>)(.*?)'
+    rb'(</(?:[A-Za-z0-9_-]+:)?name\s*>)',
+    re.DOTALL,
+)
+# Tom-element-variant: <name/> (selvlukkende)
+_NAME_SELFCLOSE_RE = re.compile(
+    rb'<(?:[A-Za-z0-9_-]+:)?name(?:\s[^>]*)?/>',
+)
+# <folder>-tag
+_FOLDER_TAG_RE = re.compile(
+    rb'<(?:[A-Za-z0-9_-]+:)?folder(?:\s[^>]*)?>(.*?)'
+    rb'</(?:[A-Za-z0-9_-]+:)?folder\s*>',
+    re.DOTALL,
+)
+
+
+def _extract_schemas_body(data: bytes) -> "tuple[bytes, int, int] | None":
+    """Returnerer (schemas_body, start_offset, end_offset) eller None."""
+    sm = re.search(rb'<(?:[A-Za-z0-9_-]+:)?schemas(?:\s[^>]*)?>', data)
+    if not sm:
+        return None
+    em = re.search(rb'</(?:[A-Za-z0-9_-]+:)?schemas\s*>', data[sm.end():])
+    if not em:
+        return None
+    return (data[sm.end(): sm.end() + em.start()],
+            sm.end(),
+            sm.end() + em.start())
+
+
+def list_all_schema_names(data: bytes) -> list[dict]:
+    """
+    Returnerer liste av alle schemas i metadata.xml med {index, folder, name}.
+    `name` er tomstreng hvis `<name>` er tom eller manglende.
+    """
+    body_info = _extract_schemas_body(data)
+    if body_info is None:
+        return []
+    body, _, _ = body_info
+
+    result: list[dict] = []
+    for idx, m in enumerate(_SCHEMA_BLOCK_RE.finditer(body), start=1):
+        inner = m.group(2)
+        fm = _FOLDER_TAG_RE.search(inner)
+        folder = (fm.group(1).decode("utf-8", errors="replace").strip()
+                  if fm else f"schema{idx - 1}")
+        name = ""
+        nm = _NAME_TAG_RE.search(inner)
+        if nm:
+            name = nm.group(2).decode("utf-8", errors="replace").strip()
+        result.append({"index": idx, "folder": folder, "name": name})
+    return result
+
+
+def find_empty_schema_names(data: bytes) -> list[dict]:
+    """
+    Finn schemas i metadata.xml hvor `<name>` mangler eller er tom/whitespace.
+
+    Returnerer liste av {index, folder} (1-basert index), med folder-verdien
+    slik den står i metadata (typisk 'schema0', 'schema1', etc.).
+    """
+    body_info = _extract_schemas_body(data)
+    if body_info is None:
+        return []
+    body, _, _ = body_info
+
+    empty: list[dict] = []
+    for idx, m in enumerate(_SCHEMA_BLOCK_RE.finditer(body), start=1):
+        inner = m.group(2)
+        # Folder
+        fm = _FOLDER_TAG_RE.search(inner)
+        folder = (fm.group(1).decode("utf-8", errors="replace").strip()
+                  if fm else f"schema{idx - 1}")
+        # Sjekk <name>
+        is_empty = False
+        nm = _NAME_TAG_RE.search(inner)
+        if nm:
+            val = nm.group(2).decode("utf-8", errors="replace").strip()
+            if not val:
+                is_empty = True
+        else:
+            # <name/> eller mangler helt
+            if _NAME_SELFCLOSE_RE.search(inner):
+                is_empty = True
+            else:
+                # Ingen name-tag → også å regne som "tom"
+                is_empty = True
+        if is_empty:
+            empty.append({"index": idx, "folder": folder})
+    return empty
+
+
+def apply_schema_name_fixes(data: bytes,
+                             fixes: "dict[int, str]") -> bytes:
+    """
+    Sett inn schema-navn for schemas der `<name>` er tom/manglende.
+
+    `fixes` er en dict {schema_index_1basert: nytt_navn}. Schemas som
+    ikke er i fixes-dicten røres ikke.
+
+    Returnerer modifisert bytes. Bytes er identisk med input hvis ingen
+    endringer ble gjort (f.eks. ingen tomme schemas matchet fixes).
+    """
+    if not fixes:
+        return data
+    body_info = _extract_schemas_body(data)
+    if body_info is None:
+        return data
+    schemas_body, body_start, body_end = body_info
+    pre  = data[:body_start]
+    post = data[body_end:]
+
+    counter = [0]
+    changed = [False]
+
+    def _fix(m: re.Match) -> bytes:
+        counter[0] += 1
+        idx = counter[0]
+        if idx not in fixes:
+            return m.group(0)
+        new_name = (fixes[idx] or "").strip()
+        if not new_name:
+            return m.group(0)
+        new_name_b = new_name.encode("utf-8")
+        inner = m.group(2)
+        # Forsøk å erstatte eksisterende <name>...</name>
+        nm = _NAME_TAG_RE.search(inner)
+        if nm:
+            cur = nm.group(2).decode("utf-8", errors="replace").strip()
+            if not cur:
+                inner = inner[:nm.start(2)] + new_name_b + inner[nm.end(2):]
+                changed[0] = True
+                return m.group(1) + inner + m.group(3)
+            # Ikke-tom — la stå
+            return m.group(0)
+        # <name/> selvlukkende
+        sc = _NAME_SELFCLOSE_RE.search(inner)
+        if sc:
+            replacement = b"<name>" + new_name_b + b"</name>"
+            inner = inner[:sc.start()] + replacement + inner[sc.end():]
+            changed[0] = True
+            return m.group(1) + inner + m.group(3)
+        # Helt manglende — sett inn rett etter åpnings-taggen
+        new_tag = b"\n      <name>" + new_name_b + b"</name>"
+        inner = new_tag + inner
+        changed[0] = True
+        return m.group(1) + inner + m.group(3)
+
+    new_body = _SCHEMA_BLOCK_RE.sub(_fix, schemas_body)
+    if not changed[0]:
+        return data
+    return pre + new_body + post
+
+
 def sanitize_metadata_schema_names(data: bytes) -> bytes:
     """
     Saniterer <schemas><schema><name>-verdier i metadata.xml.

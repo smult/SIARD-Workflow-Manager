@@ -114,6 +114,14 @@ class UnpackSiardOperation(BaseOperation):
             "files_extracted":   n_done,
         }
 
+        # ── Sjekk for tomme <schema><name>-noder i metadata.xml ────────────────
+        # Schema-navn er obligatorisk i SIARD. Hvis en eller flere er tomme,
+        # spør operatør om å fylle inn (default = folder-navnet, typisk schemaN).
+        try:
+            self._check_empty_schema_names(tmp, ctx, w)
+        except Exception as exc:
+            w(f"  Advarsel: kunne ikke sjekke schema-navn: {exc}", "warn")
+
         # ── Sjekk for ikke-standard LOB-filendelser ────────────────────────────
         non_std = self._count_non_standard_lob_files(tmp)
         if non_std > 0:
@@ -188,6 +196,103 @@ class UnpackSiardOperation(BaseOperation):
                     if not (low.endswith(".bin") or low.endswith(".txt")):
                         count += 1
         return count
+
+    @staticmethod
+    def _check_empty_schema_names(extract_dir: Path, ctx, w) -> None:
+        """
+        Sjekk metadata.xml for tomme `<schema><name>`-noder. Hvis funnet,
+        spør operatør via callback om å fylle inn navn, og oppdater filen
+        på disk umiddelbart.
+
+        Schema-navn er obligatorisk i SIARD-spec. Konsumenter (KDRS Søk &
+        Vis m.fl.) feiler hvis navnet er tomt. Det er heller ikke lov å
+        bruke et navn som allerede er i bruk i samme SIARD — dialogen
+        validerer dette aktivt, og fallback genererer unike defaults.
+        """
+        from siard_workflow.core.siard_format import (
+            find_empty_schema_names, apply_schema_name_fixes,
+            list_all_schema_names,
+        )
+        metadata_path = extract_dir / "header" / "metadata.xml"
+        if not metadata_path.exists():
+            return
+        data = metadata_path.read_bytes()
+        empties = find_empty_schema_names(data)
+        if not empties:
+            return
+
+        # Hent navn på schemas som ALLEREDE har navn — dialog må unngå
+        # kollisjon mot disse.
+        all_names = list_all_schema_names(data)
+        existing_names = {s["name"] for s in all_names
+                          if s["name"] and s["name"].strip()}
+
+        def _unique_default(folder: str, used: set) -> str:
+            """Garanterer at default-navn ikke kolliderer med et eksisterende."""
+            base = (folder or "schema").strip() or "schema"
+            cand = base
+            n = 1
+            while cand in used:
+                n += 1
+                cand = f"{base}_{n}"
+            return cand
+
+        def _fallback_fixes() -> dict:
+            """Default-fixes som garantert er unike på tvers av eksisterende navn."""
+            used = set(existing_names)
+            out: dict = {}
+            for e in empties:
+                name = _unique_default(e["folder"], used)
+                used.add(name)
+                out[e["index"]] = name
+            return out
+
+        w(f"  ADVARSEL: {len(empties)} schema(er) mangler navn i metadata.xml:",
+          "warn")
+        for e in empties:
+            w(f"    • Schema #{e['index']} (folder: {e['folder']})", "warn")
+
+        ask_cb = ctx.metadata.get("ask_fill_empty_schema_names_cb")
+        if not ask_cb:
+            w("  Ingen dialog — bruker folder-navn (unike defaults) som schema-navn.",
+              "info")
+            fixes = _fallback_fixes()
+        else:
+            try:
+                fixes = ask_cb(empties, existing_names)
+            except TypeError:
+                # Bakoverkompatibilitet: eldre callback uten existing_names
+                try:
+                    fixes = ask_cb(empties)
+                except Exception as exc:
+                    w(f"  Dialog feilet: {exc} — bruker folder-navn.", "warn")
+                    fixes = _fallback_fixes()
+            except Exception as exc:
+                w(f"  Dialog feilet: {exc} — bruker folder-navn.", "warn")
+                fixes = _fallback_fixes()
+            if fixes is None:
+                w("  Operatør avbrøt — bruker folder-navn som default.", "warn")
+                fixes = _fallback_fixes()
+            else:
+                # Operatør ga input — verifiser at det IKKE kolliderer.
+                # Hvis dialog returnerer noe galt (programmer-feil), fall tilbake.
+                proposed = set(fixes.values())
+                if proposed & existing_names:
+                    w("  Dialog returnerte navn som kolliderer med "
+                      "eksisterende — bruker folder-navn.", "warn")
+                    fixes = _fallback_fixes()
+                elif len(proposed) != len(fixes):
+                    w("  Dialog returnerte duplikater — bruker folder-navn.",
+                      "warn")
+                    fixes = _fallback_fixes()
+
+        new_data = apply_schema_name_fixes(data, fixes)
+        if new_data != data:
+            metadata_path.write_bytes(new_data)
+            for idx, name in sorted(fixes.items()):
+                w(f"  ✓ Schema #{idx} → «{name}»", "ok")
+        else:
+            w("  Ingen schema-navn endret.", "info")
 
     @staticmethod
     def _count_schemas(extract_dir: Path) -> int:
