@@ -32,7 +32,13 @@ from gui.progress_panel import ProgressPanel
 from gui.format_chart_panel import FormatChartPanel
 from settings import get_config, set_config
 
-ctk.set_appearance_mode("dark")
+# Initialiser tema før noen widgets bygges. apply_theme leser ikke fra config
+# selv, så vi gjør det her én gang.
+try:
+    from gui.styles import apply_theme as _apply_theme_initial
+    _apply_theme_initial(get_config("theme_mode", "dark"))
+except Exception:
+    ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
 
 
@@ -311,7 +317,7 @@ class App(ctk.CTk):
                 row=0, column=col, padx=4, pady=8)
             col += 1
 
-        # Font-skalering A− / A+
+        # Font-skalering A− / A+ + tema-bryter (lyspære)
         font_frm = ctk.CTkFrame(bar, fg_color="transparent")
         font_frm.grid(row=0, column=col, padx=(8, 16), pady=8)
         for txt, delta in [("A−", -1), ("A+", +1)]:
@@ -321,6 +327,16 @@ class App(ctk.CTk):
                 font=ctk.CTkFont(family=FONTS["mono"], size=10),
                 command=lambda d=delta: self._font_scale(d),
             ).pack(side="left", padx=2)
+        # Lyspære: 💡 = light, 🌙 = dark (vises etter aktivt tema)
+        from gui.styles import current_theme as _cur_theme
+        _icon = "💡" if _cur_theme() == "dark" else "🌙"
+        self._theme_btn = ctk.CTkButton(
+            font_frm, text=_icon, width=32, height=26, corner_radius=5,
+            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+            font=ctk.CTkFont(size=14),
+            command=self._toggle_theme,
+        )
+        self._theme_btn.pack(side="left", padx=(8, 2))
 
     def _build_statusbar(self):
         """Statuslinje nederst i vinduet — temp-info, ledig disk,
@@ -2417,6 +2433,85 @@ class App(ctk.CTk):
         ))
         result_event.wait()
         return result_holder[0]
+
+    def _toggle_theme(self) -> None:
+        """
+        Bytt mellom lyst og mørkt tema. Lagrer valget i config og starter
+        programmet på nytt slik at alle custom-fargede widgets bygges med
+        riktige farger. Operatør bekrefter restart i dialog først.
+
+        Hvis en workflow kjører, varsles operatør om at den vil avbrytes.
+        """
+        from gui.styles import current_theme
+        from settings import set_config
+        from tkinter import messagebox
+
+        new_mode = "light" if current_theme() == "dark" else "dark"
+        mode_no  = "lys" if new_mode == "light" else "mørk"
+
+        # Bygg advarselsmelding (med ekstra advarsel hvis workflow kjører)
+        if self._running:
+            msg = (
+                f"Bytte til {mode_no} tema krever omstart av programmet.\n\n"
+                "⚠  En workflow kjører akkurat nå — den vil bli AVBRUTT.\n\n"
+                "Trykk OK for å lagre tema-valget og restarte nå.\n"
+                "Trykk Avbryt for å beholde gjeldende tema."
+            )
+            icon = "warning"
+        else:
+            msg = (
+                f"Bytte til {mode_no} tema krever omstart av programmet.\n\n"
+                "Trykk OK for å lagre tema-valget og restarte nå.\n"
+                "Trykk Avbryt for å beholde gjeldende tema."
+            )
+            icon = "question"
+
+        if not messagebox.askokcancel(
+                "Bytte tema krever omstart", msg,
+                icon=icon, parent=self):
+            return
+
+        # Lagre nytt tema-valg i config — leses ved oppstart
+        try:
+            set_config("theme_mode", new_mode)
+        except Exception:
+            pass
+
+        # Start på nytt
+        self._restart_app()
+
+    def _restart_app(self) -> None:
+        """
+        Start applikasjonen på nytt ved å spawne en ny prosess og avslutte
+        gjeldende. Fungerer både for source-kjøring og PyInstaller-bundle.
+        """
+        import subprocess as _sp
+        import sys as _sys
+        import os as _os
+
+        try:
+            # Bygg argumenter for ny prosess
+            if getattr(_sys, "frozen", False):
+                # PyInstaller-bundle: kjør .exe direkte
+                args = [_sys.executable]
+            else:
+                # Source-kjøring: python + script + evt. CLI-argumenter
+                args = [_sys.executable, *_sys.argv]
+
+            # Spawn ny prosess (frikoblet, så den overlever vår exit)
+            _sp.Popen(args, close_fds=False)
+        except Exception:
+            # Hvis restart-spawn feiler: la appen være som den er
+            return
+
+        # Avslutt gjeldende prosess. self.destroy() river ned tk-loopen,
+        # men subprocess-tråder kan henge — os._exit garanterer at vi går.
+        try:
+            self.destroy()
+        except Exception:
+            pass
+        # Gi tk-loopen et øyeblikk å rive ned før vi forcerer exit
+        _os._exit(0)
 
     def _font_scale(self, delta: int) -> None:
         """Juster font-størrelse for alle widgets dynamisk."""

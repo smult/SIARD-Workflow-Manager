@@ -1037,10 +1037,13 @@ class OperationCard(ctk.CTkFrame):
                            wraplength=300)
         lbl.grid(row=0, column=1, sticky="ew")
 
+        # "+"-knapp: bruk full kategorifarge som bg og hvit tekst — gir god
+        # kontrast i både lyst og mørkt tema (tidligere _dim-variant ble
+        # uleselig i light-mode).
         btn = ctk.CTkButton(top, text="+", width=24, height=24, corner_radius=5,
-                            fg_color=_dim(color, 0.35),
-                            hover_color=_dim(color, 0.65),
-                            text_color=color,
+                            fg_color=color,
+                            hover_color=_dim(color, 0.85),
+                            text_color="#ffffff",
                             font=ctk.CTkFont(size=14, weight="bold"),
                             command=lambda: self._clicked(op_def, on_add, on_saved))
         btn.grid(row=0, column=2, padx=(4, 0))
@@ -1097,10 +1100,10 @@ class OperationsPanel(ctk.CTkFrame):
         self._tabs = ctk.CTkTabview(
             self, height=90,
             fg_color=COLORS["panel"],
-            segmented_button_fg_color=COLORS["bg"],
-            segmented_button_selected_color=COLORS["accent"],
-            segmented_button_selected_hover_color=COLORS["accent_dim"],
-            text_color=COLORS["text"],
+            segmented_button_fg_color=COLORS["tab_unselected_bg"],
+            segmented_button_selected_color=COLORS["tab_selected_bg"],
+            segmented_button_selected_hover_color=COLORS["tab_selected_hover"],
+            text_color=COLORS["tab_text"],
             text_color_disabled=COLORS["muted"],
         )
         self._tabs.grid(row=1, column=0, sticky="ew", padx=10, pady=(0,10))

@@ -59,6 +59,7 @@ _CONFIG_DEFAULTS: dict = {
         "xls":  "xlsx",   "xlt":  "xlsx",
         "ppt":  "pptx",   "pot":  "pptx",
     },
+    "theme_mode":             "dark", # GUI-tema: "dark" eller "light"
     "standardize_bin_ext":    True,  # behold .bin/.txt-endelse etter konvertering
     "use_siegfried":          False, # bruk Siegfried/PRONOM i stedet for magic-bytes
     "sf_executable":          "",    # sti til sf.exe (autoinstallert ved aktivering)
