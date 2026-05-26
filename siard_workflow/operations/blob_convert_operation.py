@@ -1345,10 +1345,10 @@ def _collect_external_blobs(
         siard_dir: Path,
         all_blobs: list[str],
         table_blobs: dict,
-        w) -> tuple[list[str], dict[str, str]]:
+        w) -> tuple[list[str], dict[str, str], dict[str, list[dict]]]:
     """
     Skann alle tableX.xml-filer for file="..."-referanser som IKKE ble funnet
-    av filsystemskanningen.  Håndterer to tilfeller:
+    av filsystemskanningen.  Håndterer tre tilfeller:
 
     1. Intern full-sti ref (DBPT-format): filen ligger i extract_dir men ble
        ikke plukket opp av skannen (f.eks. uvanlig mappestruktur).  Legges
@@ -1358,14 +1358,25 @@ def _collect_external_blobs(
        til siard_dir, kopieres inn i extract_dir under tableX sin mappe og
        legges til listen og table_blobs.
 
-    Returnerer (extra_blobs, ext_ref_map) der ext_ref_map er
-    {orig_ref: new_dest_rel} for eksternt kopierte filer — brukes til
-    forhånds-patch av XML slik at standard _patch_all_xml håndterer resten.
+    3. Manglende: filen finnes hverken på intern eller ekstern sti, eller
+       lar seg ikke lese. Refen rapporteres som missing_refs slik at kallsiten
+       kan annotere XML, oppdatere err_log og oppsummere i kjørelogg.
+
+    Returnerer (extra_blobs, ext_ref_map, missing_refs) der:
+      - ext_ref_map er {orig_ref: new_dest_rel} for eksternt kopierte filer
+        (brukes til forhånds-patch av XML).
+      - missing_refs er {xml_sti: [{ref, reason}, ...]} for filer som ikke
+        ble funnet på disk.
     """
     _known_basenames = {PurePosixPath(p).name for p in all_blobs}
     _known_paths     = set(all_blobs)
-    extra:       list[str]      = []
-    ext_ref_map: dict[str, str] = {}
+    extra:        list[str]            = []
+    ext_ref_map:  dict[str, str]       = {}
+    missing_refs: dict[str, list[dict]] = {}
+
+    def _add_missing(xml_sti: str, ref: str, reason: str) -> None:
+        missing_refs.setdefault(xml_sti, []).append(
+            {"ref": ref, "reason": reason})
 
     for table_key, xml_sti in table_xml_map.items():
         xml_file = extract_dir / xml_sti
@@ -1385,6 +1396,28 @@ def _collect_external_blobs(
             if ref in _known_paths or basename in _known_basenames:
                 continue
 
+            # Verifiser at "basename-treffet" faktisk peker på en eksisterende
+            # fil. Hvis filen forventes som relativ ref i samme lob-mappe
+            # (vanlig SIARD-pattern), sjekk at filen er på disk.
+            #
+            # ref-format er typisk én av:
+            #   rec1.bin                    (relativ til xml-katalogen)
+            #   content/schemaN/tableM/lobK/rec1.bin
+            xml_dir = (extract_dir / xml_sti).parent
+
+            # Case 0: relativ ref i samme lob-undermappe (vanligst)
+            #   Søk i alle lob*-undermapper under tabellmappen
+            found_relative = False
+            if "/" not in ref:
+                for lob_dir in xml_dir.iterdir():
+                    if lob_dir.is_dir() and lob_dir.name.lower().startswith("lob"):
+                        cand = lob_dir / ref
+                        if cand.exists() and cand.is_file():
+                            found_relative = True
+                            break
+                if found_relative:
+                    continue
+
             # Case 1: intern full-sti — sjekk om filen faktisk finnes
             candidate_internal = extract_dir / ref
             if candidate_internal.exists() and candidate_internal.is_file():
@@ -1398,6 +1431,9 @@ def _collect_external_blobs(
 
             # Case 2: ekstern blob — prøv relativt til SIARD-mappa
             if not siard_dir or not siard_dir.is_dir():
+                if not found_relative and "/" not in ref:
+                    _add_missing(xml_sti, ref,
+                                  "ikke funnet i lob-mappe på disk")
                 continue
             candidate_external = (siard_dir / ref).resolve()
             # Sikkerhet: ikke la ../ navigere utenfor forventet område
@@ -1405,10 +1441,14 @@ def _collect_external_blobs(
                 candidate_external.relative_to(siard_dir.resolve().parent)
             except ValueError:
                 w(f"  Ekstern blob utenfor tillatt sti, ignorert: {ref}", "warn")
+                _add_missing(xml_sti, ref,
+                              "ekstern sti utenfor tillatt område")
                 continue
 
             if not candidate_external.exists() or not candidate_external.is_file():
                 w(f"  Ekstern blob ikke funnet: {ref}", "warn")
+                _add_missing(xml_sti, ref,
+                              "ikke funnet på intern eller ekstern sti")
                 continue
 
             # Kopier inn i extract_dir under tableX sin innholdsmappe
@@ -1420,6 +1460,7 @@ def _collect_external_blobs(
                 shutil.copy2(str(candidate_external), str(dest))
             except Exception as exc:
                 w(f"  Kunne ikke kopiere ekstern blob {ref}: {exc}", "warn")
+                _add_missing(xml_sti, ref, f"lesefeil: {exc}")
                 continue
 
             extra.append(dest_rel)
@@ -1429,7 +1470,74 @@ def _collect_external_blobs(
             ext_ref_map[ref] = dest_rel
             w(f"  Ekstern blob kopiert inn: {ref} → {dest_rel}", "info")
 
-    return extra, ext_ref_map
+    return extra, ext_ref_map, missing_refs
+
+
+def _annotate_missing_refs_in_xml(extract_dir: Path,
+                                    missing_refs: dict[str, list[dict]],
+                                    w) -> int:
+    """
+    Sett inn en XML-kommentar rett FØR linjer som refererer til
+    manglende blob-filer i tableX.xml.
+
+    Format på kommentaren:
+        <!-- ADVARSEL: Refererert fil ble ikke funnet på disk: rec12.bin
+             (årsak: ikke funnet i lob-mappe på disk) -->
+
+    Returnerer antall annotasjoner skrevet (kan være mindre enn antall
+    manglende refs hvis en linje har flere refs eller XML-strukturen er
+    uvanlig).
+    """
+    if not missing_refs:
+        return 0
+    n_annotated = 0
+    for xml_sti, items in missing_refs.items():
+        xml_file = extract_dir / xml_sti
+        if not xml_file.exists():
+            continue
+        try:
+            xml_bytes = xml_file.read_bytes()
+        except Exception:
+            continue
+
+        modified = False
+        # Bygg sett av refs som skal annoteres, og spor hvilke vi har annotert
+        refs_to_annotate = {(it["ref"], it["reason"]) for it in items}
+        already_done: set[tuple[str, str]] = set()
+
+        out_lines: list[bytes] = []
+        for line in xml_bytes.splitlines(keepends=True):
+            line_str = line.decode("utf-8", errors="replace")
+            for ref, reason in refs_to_annotate:
+                if (ref, reason) in already_done:
+                    continue
+                # Match attributtene file="ref" eller file='ref' nøyaktig
+                pattern = (f'file="{ref}"', f"file='{ref}'")
+                if any(p in line_str for p in pattern):
+                    # Bevar innrykk fra original-linjen
+                    indent = line[:len(line) - len(line.lstrip())]
+                    comment = (indent
+                               + b"<!-- ADVARSEL: Referert fil ble ikke "
+                                 b"funnet eller lot seg ikke lese: "
+                               + ref.encode("utf-8", errors="replace")
+                               + b" (aarsak: "
+                               + reason.encode("utf-8", errors="replace")
+                               + b") -->\n")
+                    out_lines.append(comment)
+                    modified = True
+                    already_done.add((ref, reason))
+                    n_annotated += 1
+                    break
+            out_lines.append(line)
+
+        if modified:
+            try:
+                xml_file.write_bytes(b"".join(out_lines))
+            except Exception as exc:
+                w(f"  Kunne ikke skrive annotert XML {xml_sti}: {exc}",
+                  "warn")
+
+    return n_annotated
 
 
 def _prepatch_external_refs(
@@ -1707,16 +1815,22 @@ class BlobConvertOperation(BaseOperation):
 
         w("  OPPSUMMERING:", "step")
         STAT_LABELS = {
-            "detected":         "Detektert",
-            "converted":        "Konvertert til PDF/A",
-            "kept":             "Beholdt originalformat",
-            "failed":           "Konvertering feilet",
-            "xml_updated":      "XML-noder oppdatert",
-            "inline_extracted": "Inline NBLOB/NCLOB",
+            "detected":           "Detektert",
+            "converted":          "Konvertert til PDF/A",
+            "kept":               "Beholdt originalformat",
+            "failed":             "Konvertering feilet",
+            "xml_updated":        "XML-noder oppdatert",
+            "inline_extracted":   "Inline NBLOB/NCLOB",
+            "missing_blob_refs":  "Manglende blob-refs i XML",
         }
         for k, v in stats.items():
             label = STAT_LABELS.get(k, k)
-            lvl = "ok" if v and k == "converted" else ("warn" if k == "failed" and v else "info")
+            if k == "converted" and v:
+                lvl = "ok"
+            elif k in ("failed", "missing_blob_refs") and v:
+                lvl = "warn"
+            else:
+                lvl = "info"
             w(f"    {label:<28} {v}", lvl)
         if not self.params["dry_run"]:
             w(f"    Ny SIARD: {dst_path}", "ok")
@@ -1812,13 +1926,16 @@ class BlobConvertOperation(BaseOperation):
 
         # Supplerer med blob-er referert i tableX.xml men ikke funnet av skannen
         # (intern full-sti / DBPT-format, eller eksternt lagrede blobs)
-        _xml_extra, _ext_ref_map = _collect_external_blobs(
+        _xml_extra, _ext_ref_map, _missing_refs = _collect_external_blobs(
             table_xml_map, extract_dir, ctx.siard_path.parent,
             all_blobs, table_blobs, w)
         if _xml_extra:
             all_blobs.extend(_xml_extra)
         if _ext_ref_map:
             _prepatch_external_refs(table_xml_map, extract_dir, _ext_ref_map, w)
+        # Rapporter og annoter manglende referanser
+        self._report_missing_refs(_missing_refs, extract_dir,
+                                    stats, w, err_log)
 
         ext_counts: dict = {}
         for p in all_blobs:
@@ -2258,13 +2375,16 @@ class BlobConvertOperation(BaseOperation):
 
                 # Supplerer med blob-er referert i tableX.xml men ikke i ZIP-en
                 # (intern full-sti / DBPT-format, eller eksternt lagrede blobs)
-                _xml_extra, _ext_ref_map = _collect_external_blobs(
+                _xml_extra, _ext_ref_map, _missing_refs = _collect_external_blobs(
                     table_xml_map, extract_dir, src_path.parent,
                     all_blobs, table_blobs, w)
                 if _xml_extra:
                     all_blobs.extend(_xml_extra)
                 if _ext_ref_map:
                     _prepatch_external_refs(table_xml_map, extract_dir, _ext_ref_map, w)
+                # Rapporter og annoter manglende referanser
+                self._report_missing_refs(_missing_refs, extract_dir,
+                                            stats, w, err_log)
 
                 # ── Resume-filtrering ─────────────────────────────────────────
                 _done = ctx.metadata.get("_blob_resume_done", set())
@@ -4147,6 +4267,64 @@ class BlobConvertOperation(BaseOperation):
             return result.get() or "behold"
         except Exception:
             return "behold"
+
+    def _report_missing_refs(self,
+                              missing_refs: "dict[str, list[dict]]",
+                              extract_dir: Path,
+                              stats: dict,
+                              w,
+                              err_log) -> None:
+        """
+        Sentral rapportering av blob-referanser som peker på filer som
+        ikke finnes på disk. Brukes av begge call-sites for
+        `_collect_external_blobs` (pipeline + standalone).
+
+        - Logger antall + per-fil-detalj til kjøreloggen
+        - Skriver én rad per manglende fil til err_log (CSV-rapport)
+        - Setter en XML-kommentar over hver tilhørende `<cN file="...">`-linje
+        - Oppdaterer stats med `missing_blob_refs`
+        """
+        if not missing_refs:
+            return
+        total = sum(len(v) for v in missing_refs.values())
+        stats["missing_blob_refs"] = stats.get("missing_blob_refs", 0) + total
+
+        w(f"  ADVARSEL: {total:,} blob-referanse(r) i tableX.xml peker på "
+          f"filer som ikke ble funnet på disk.", "warn")
+
+        # Detaljert kjørelogg: hvilke filer i hvilken tableX.xml
+        max_logged_per_file = 20
+        for xml_sti, items in missing_refs.items():
+            w(f"    {xml_sti}: {len(items):,} fil(er) ikke funnet", "warn")
+            for it in items[:max_logged_per_file]:
+                w(f"      • {it['ref']}  ({it['reason']})", "warn")
+            if len(items) > max_logged_per_file:
+                w(f"      … og {len(items) - max_logged_per_file} til "
+                  f"(se feillogg)", "warn")
+
+            # Skriv til err_log (CSV) for full sporbarhet
+            if err_log:
+                for it in items:
+                    try:
+                        err_log.write(
+                            f"{xml_sti}::{it['ref']}",
+                            "missing",
+                            f"Referert fil ble ikke funnet eller lot seg "
+                            f"ikke lese: {it['reason']}",
+                        )
+                    except Exception:
+                        pass
+
+        # Sett XML-kommentarer over linjer med manglende referanser
+        try:
+            n_annotated = _annotate_missing_refs_in_xml(
+                extract_dir, missing_refs, w)
+            if n_annotated > 0:
+                w(f"  ✓ Annotert {n_annotated:,} XML-linjer med "
+                  f"<!-- ADVARSEL ... --> kommentar", "ok")
+        except Exception as exc:
+            w(f"  Kunne ikke annotere XML med manglende-kommentarer: {exc}",
+              "warn")
 
     def _rename_file(self, extract_dir: Path, zip_sti: str,
                      ext: str) -> str:

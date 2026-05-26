@@ -108,7 +108,7 @@ class StandardizeExtOperation(BaseOperation):
     operation_id   = "standardize_ext"
     label          = "Standardiser filendelser"
     category       = "Kompatibilitet"
-    status         = 1   # beta
+    status         = 2
     produces_siard = False
 
     default_params: dict = {

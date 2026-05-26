@@ -505,7 +505,7 @@ OP_DEFS = [
         "desc": "Dekoder inline HEX CLOB-tekst i tableX.xml og eksporterer til eksterne .txt-filer. Kjøres før BLOB Konverter.",
         "status": HexExtractOperation.status,
         "params": [
-            {"key": "min_text_length", "label": "Min. tekstlengde (tegn)",    "type": "int",  "default": 30},
+            {"key": "min_text_length", "label": "Min. tekstlengde (tegn)",    "type": "int",  "default": 200},
             {"key": "dry_run",         "label": "Tørkjøring (ikke skriv)",     "type": "bool", "default": False},
         ],
     },

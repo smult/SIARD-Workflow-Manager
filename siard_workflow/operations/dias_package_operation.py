@@ -206,6 +206,67 @@ def _resolve_pending(token: str, siard_path: Path, ctx) -> "Path | None":
 
     return None
 
+# ── Diskplass-estimering og -sjekk ────────────────────────────────────────────
+
+def _estimate_package_size(siard_path: Path,
+                            content_extras: list[dict],
+                            metadata_extras: list[dict]) -> int:
+    """
+    Estimer størrelsen til ferdig DIAS-pakke i bytes.
+
+    Pakken er et ukomprimert tar-arkiv som inneholder:
+      - SIARD-filer (kilde eller eksplisitt valgte content_siard_extras)
+      - metadata-filer (logger, rapporter, SHA256, ...)
+      - genererte XML-filer (mets.xml, premis.xml, log.xml) — typisk < 1 MB
+
+    Returnerer estimert total med ~5 % buffer + 1 MB for tar-overhead.
+    """
+    total = 0
+    if content_extras:
+        for ef in content_extras:
+            try:
+                p = Path(ef.get("src", ""))
+                if p.exists():
+                    total += p.stat().st_size
+            except Exception:
+                pass
+    else:
+        try:
+            total += siard_path.stat().st_size
+        except Exception:
+            pass
+    for ef in metadata_extras:
+        try:
+            p = Path(ef.get("src", ""))
+            if p.exists():
+                total += p.stat().st_size
+        except Exception:
+            pass
+    return int(total * 1.05) + 1024 * 1024
+
+
+def _check_disk_space(out_root: Path,
+                       needed_bytes: int) -> "tuple[bool, int]":
+    """
+    Sjekk om `out_root`-disken har minst `needed_bytes` ledig.
+    Returnerer (har_plass, ledig_bytes). Ved feil: (True, 0) — la
+    pakkingen forsøkes og feile på faktisk skriving.
+    """
+    try:
+        free = shutil.disk_usage(str(out_root)).free
+        return free >= needed_bytes, free
+    except Exception:
+        return True, 0
+
+
+def _fmt_bytes(n: int) -> str:
+    for unit, factor in (("TB", 1024**4), ("GB", 1024**3),
+                         ("MB", 1024**2), ("kB", 1024)):
+        if n >= factor:
+            return f"{n / factor:.1f} {unit}"
+    return f"{n} B"
+
+
 class DiasPackageOperation(BaseOperation):
     """Pakker SIARD-fil inn i DIAS/SIP-format (METS + PREMIS) for ESSArch."""
 
@@ -218,7 +279,7 @@ class DiasPackageOperation(BaseOperation):
         "SIP, mets.xml, premis.xml, log.xml og komprimert tar-arkiv."
     )
     category        = "Pakking"
-    status          = 1
+    status          = 2
     produces_siard  = False
     requires_unpack = False
 
@@ -345,6 +406,44 @@ class DiasPackageOperation(BaseOperation):
         _auto_add(siard_path.parent / f"{base}.sha256", _adm, "SHA256")
         _wlog(f"  Totalt {len(metadata_extras)} ekstra filer klar for pakking")
         # ─────────────────────────────────────────────────────────────────────
+
+        # ── Diskplass-sjekk på mål-disk ─────────────────────────────────────
+        # Beregn estimert størrelse av tar-pakka og verifiser at det er nok
+        # plass på out_root. Ved utilstrekkelig plass: be operatør om å
+        # velge ny lokasjon (via callback til GUI), eller avbryt.
+        needed = _estimate_package_size(siard_path,
+                                          content_siard_extras,
+                                          metadata_extras)
+        _wlog(f"  Estimert DIAS-pakkestørrelse: {_fmt_bytes(needed)}")
+        has_space, free = _check_disk_space(out_root, needed)
+        if not has_space:
+            _wlog(f"  ADVARSEL: Ikke nok plass i {out_root} — "
+                  f"trenger {_fmt_bytes(needed)}, har {_fmt_bytes(free)}")
+            ask_cb = (ctx.metadata or {}).get("ask_dias_output_dir_cb")
+            new_dir = None
+            if ask_cb:
+                try:
+                    new_dir = ask_cb(out_root, needed, free)
+                except Exception as exc:
+                    _wlog(f"  Dialog-feil ved valg av lagringssted: {exc}")
+            if new_dir is None:
+                return self._fail(
+                    f"Ikke nok plass i {out_root} for DIAS-pakke "
+                    f"({_fmt_bytes(needed)} trengs, {_fmt_bytes(free)} ledig). "
+                    f"Avbrutt av operatør.")
+            out_root = Path(new_dir)
+            try:
+                out_root.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                return self._fail(f"Kan ikke opprette mappe {out_root}: {exc}")
+            # Sjekk på nytt
+            has_space, free = _check_disk_space(out_root, needed)
+            if not has_space:
+                return self._fail(
+                    f"Heller ikke nok plass i valgt mappe {out_root} "
+                    f"({_fmt_bytes(needed)} trengs, {_fmt_bytes(free)} ledig).")
+            _wlog(f"  Operatør valgte ny lokasjon: {out_root} "
+                  f"({_fmt_bytes(free)} ledig)")
 
         meta = {**self.params,
                 "extra_files": json.dumps(metadata_extras, ensure_ascii=False)}

@@ -1763,6 +1763,9 @@ class App(ctk.CTk):
             ctx.metadata["ask_fill_empty_schema_names_cb"] = \
                 self._ask_fill_empty_schema_names
 
+            # Callback for å velge ny mål-mappe ved disk-plassmangel i DIAS-pakking
+            ctx.metadata["ask_dias_output_dir_cb"] = self._ask_dias_output_dir
+
             if self._global_temp_dir:
                 ctx.metadata["temp_dir"] = str(self._global_temp_dir)
             if self._output_dir_override:
@@ -2309,6 +2312,77 @@ class App(ctk.CTk):
         """
         from gui.schema_selector_dialog import ask_select_schemas_modal
         return ask_select_schemas_modal(self.after, self, schemas)
+
+    def _ask_dias_output_dir(self, current_dir, needed_bytes: int,
+                              free_bytes: int) -> "str | None":
+        """
+        Kalles fra DiasPackageOperation når mål-disken ikke har nok plass.
+        Viser dialog som ber operatør velge ny lokasjon, eller avbryte.
+
+        Returnerer ny absolutt sti, eller None ved avbryt.
+        """
+        import threading as _threading
+        import shutil as _shutil
+        from tkinter import filedialog, messagebox
+
+        result_event  = _threading.Event()
+        result_holder: list = [None]
+
+        def _fmt(n: int) -> str:
+            for unit, factor in (("TB", 1024**4), ("GB", 1024**3),
+                                 ("MB", 1024**2), ("kB", 1024)):
+                if n >= factor:
+                    return f"{n / factor:.1f} {unit}"
+            return f"{n} B"
+
+        def _show_dialog():
+            # 1. Vis advarsel-modal med info om plass
+            msg = (
+                f"Ikke nok plass på mål-disk for DIAS-pakke.\n\n"
+                f"Mål-mappe:    {current_dir}\n"
+                f"Estimert størrelse: {_fmt(needed_bytes)}\n"
+                f"Ledig plass:        {_fmt(free_bytes)}\n\n"
+                "Vil du velge en annen lagringsmappe?\n"
+                "(Avbryt vil stoppe DIAS-pakking.)"
+            )
+            ok = messagebox.askyesno(
+                "Ikke nok diskplass for DIAS-pakke",
+                msg, icon="warning", parent=self)
+            if not ok:
+                result_event.set()
+                return
+
+            # 2. Filvelger — sjekk plass igjen før retur
+            while True:
+                chosen = filedialog.askdirectory(
+                    title="Velg lagringsmappe for DIAS-pakke",
+                    parent=self)
+                if not chosen:
+                    # Brukeren avbrøt filvelger
+                    result_event.set()
+                    return
+                try:
+                    chosen_free = _shutil.disk_usage(chosen).free
+                except Exception:
+                    chosen_free = 0
+                if chosen_free < needed_bytes:
+                    retry = messagebox.askyesno(
+                        "Fortsatt ikke nok plass",
+                        f"Valgt mappe har bare {_fmt(chosen_free)} ledig — "
+                        f"trenger {_fmt(needed_bytes)}.\n\n"
+                        "Vil du velge en annen mappe?",
+                        parent=self)
+                    if not retry:
+                        result_event.set()
+                        return
+                    continue
+                result_holder[0] = chosen
+                result_event.set()
+                return
+
+        self.after(0, _show_dialog)
+        result_event.wait()
+        return result_holder[0]
 
     def _ask_fill_empty_schema_names(self, empties: list,
                                        existing_names: set | None = None

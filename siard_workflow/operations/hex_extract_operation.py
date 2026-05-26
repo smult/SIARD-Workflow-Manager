@@ -201,7 +201,7 @@ def _process_table_fs(
     w,
     stats:           dict,
     dry_run:         bool = False,
-    min_text_length: int  = 30,
+    min_text_length: int  = 200,
 ) -> int:
     """
     Filesystem-variant av _process_table.
@@ -334,7 +334,7 @@ def _process_table(
     w,
     stats:         dict,
     dry_run:       bool = False,
-    min_text_length: int = 30,
+    min_text_length: int = 200,
 ) -> int:
     """
     Stream tableX.xml, dekod HEX CLOB-felt, skriv xrec{N}.txt,
@@ -479,7 +479,7 @@ class HexExtractOperation(BaseOperation):
     default_params = {
         "dry_run":         False,
         "temp_dir":        "",
-        "min_text_length": 30,    # tekst kortere enn dette dekodes inline (ikke fil)
+        "min_text_length": 200,    # tekst kortere enn dette dekodes inline (ikke fil)
     }
 
     @property
@@ -576,7 +576,7 @@ class HexExtractOperation(BaseOperation):
         Endrer tableX.xml og LOB-filer in-place i extract_dir.
         """
         dry_run         = bool(self.params.get("dry_run", False))
-        min_text_length = max(0, int(self.params.get("min_text_length", 30)))
+        min_text_length = max(0, int(self.params.get("min_text_length", 200)))
         PHASES = 3
 
         def phase(n, label):
@@ -629,7 +629,7 @@ class HexExtractOperation(BaseOperation):
                  stats: dict, w, progress) -> None:
 
         dry_run          = bool(self.params.get("dry_run", False))
-        min_text_length  = max(0, int(self.params.get("min_text_length", 30)))
+        min_text_length  = max(0, int(self.params.get("min_text_length", 200)))
         # Temp-mappe: global fra ctx, ellers self.params
         td = ""
         if hasattr(ctx, "metadata"):

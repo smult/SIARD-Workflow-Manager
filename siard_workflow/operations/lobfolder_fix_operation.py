@@ -131,7 +131,7 @@ class LobFolderFixOperation(BaseOperation):
         "kolonne-nivå lobFolder, og fjerner avsluttende '/'."
     )
     category       = "Kompatibilitet"
-    status         = 1
+    status         = 2
     produces_siard = True
     default_params: dict = {}
 

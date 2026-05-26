@@ -373,7 +373,7 @@ class SiardMapperOperation(BaseOperation):
         "en JSON-mal produsert av KDRS SIARDMapper. Krever lxml>=4.9.0."
     )
     category       = "Metadata"
-    status         = 1
+    status         = 2
     produces_siard = True
     default_params = {
         "json_template":       "",     # sti til JSON-malfilen
