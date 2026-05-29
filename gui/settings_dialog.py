@@ -333,11 +333,32 @@ class SettingsDialog(ctk.CTkToplevel):
                          row=r, column=0, columnspan=2,
                          padx=14, pady=(0, 4), sticky="w"); r += 1
 
+        # ── SIARD-pakking (ZIP-kompresjon) ──────────────────────────────────
+        _seksjon("SIARD-pakking", r); r += 1
+        _rad("ZIP-kompresjonsnivå (0-9)",
+             "siard_compress_level", "str", r, default="6"); r += 1
+        ctk.CTkLabel(frm,
+                     text=("0 = ingen (rask, størst SIARD)   "
+                           "6 = balansert (default)   "
+                           "9 = maks (treg, minst SIARD)"),
+                     font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                     text_color=COLORS["muted"]).grid(
+                         row=r, column=0, columnspan=2,
+                         padx=14, pady=(0, 4), sticky="w"); r += 1
+        _rad("Hopp over rekomprimering av allerede komprimerte filer",
+             "siard_compress_smart_skip", "bool", r, default=True); r += 1
+        ctk.CTkLabel(frm,
+                     text="jpg, png, zip-baserte OOXML/ODF, mp3/mp4 osv. — sparer CPU-tid ved å ikke pakke om allerede komprimerte filer",
+                     font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                     text_color=COLORS["muted"]).grid(
+                         row=r, column=0, columnspan=2,
+                         padx=14, pady=(0, 4), sticky="w"); r += 1
+
         # ── Filidentifisering ───────────────────────────────────────────────
         _seksjon("Filidentifisering", r); r += 1
-        _rad("Bruk Siegfried/PRONOM",
+        _rad("Bruk Siegfried/PRONOM (Avskrudd = python-magic-bytes)",
              "use_siegfried", "bool", r, default=False); r += 1
-        _rad("Sti til Siegfried (sf)", "sf_executable", "str", r,
+        _rad("Sti til Siegfried (sf.exe)", "sf_executable", "str", r,
              default="", browse_file=True); r += 1
 
         # Status-linje + installer-knapp
@@ -355,14 +376,14 @@ class SettingsDialog(ctk.CTkToplevel):
             command=self._install_siegfried,
         ).grid(row=r, column=1, padx=12, pady=(0, 4), sticky="e"); r += 1
         ctk.CTkLabel(frm,
-                     text="PRONOM-basert filidentifisering. Krever sf-binær — installeres automatisk fra GitHub ved aktivering.",
+                     text="PRONOM-filidentifisering. Installeres fra GitHub ved klikk på knappen ovenfor.",
                      font=ctk.CTkFont(family=FONTS["mono"], size=11),
                      text_color=COLORS["muted"]).grid(
                          row=r, column=0, columnspan=2,
                          padx=14, pady=(0, 4), sticky="w"); r += 1
 
-        _seksjon("Operasjoner — synlighet", r); r += 1
-        ctk.CTkLabel(frm, text="Vis operasjoner med status",
+        _seksjon("Operasjoner-synlighet (0-2)", r); r += 1
+        ctk.CTkLabel(frm, text="Vis operasjoner med status over ",
                      font=ctk.CTkFont(family=FONTS["mono"], size=11),
                      text_color=COLORS["text"],
                      anchor="w").grid(row=r, column=0,
@@ -382,7 +403,7 @@ class SettingsDialog(ctk.CTkToplevel):
             width=120,
         ).grid(row=r, column=1, padx=12, pady=6, sticky="e"); r += 1
         ctk.CTkLabel(frm,
-                     text="0 = alle (inkl. under utvikling)  |  1 = beta + ok  |  2 = kun ok/releaset",
+                     text="0 = alle (under utvikling og test)  |  1 = beta + ok  |  2 = kun ok/stabil",
                      font=ctk.CTkFont(family=FONTS["mono"], size=11),
                      text_color=COLORS["muted"]).grid(
                          row=r, column=0, columnspan=2,
@@ -406,7 +427,8 @@ class SettingsDialog(ctk.CTkToplevel):
     def _save(self):
         cfg: dict = {}
         int_keys  = {"max_workers", "lo_batch_size", "lo_timeout",
-                     "av_infected_rc", "av_timeout", "min_operation_status"}
+                     "av_infected_rc", "av_timeout", "min_operation_status",
+                     "siard_compress_level"}
         list_keys = {"lo_convertible", "rename_only"}
         args_keys = {"av_args"}
         dict_keys = {"lo_upgrade"}  # kommaseparert nøkkel=verdi → dict

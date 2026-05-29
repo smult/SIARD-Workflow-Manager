@@ -61,6 +61,8 @@ _CONFIG_DEFAULTS: dict = {
     },
     "theme_mode":             "dark", # GUI-tema: "dark" eller "light"
     "standardize_bin_ext":    True,  # behold .bin/.txt-endelse etter konvertering
+    "siard_compress_level":   6,     # ZIP-kompresjon: 0=STORED, 1-9=DEFLATE
+    "siard_compress_smart_skip": True,  # hopp over rekomprimering av jpg/png/zip/...
     "use_siegfried":          False, # bruk Siegfried/PRONOM i stedet for magic-bytes
     "sf_executable":          "",    # sti til sf.exe (autoinstallert ved aktivering)
     "pdfa_version":           "PDF/A-2u (ISO 19005-2, level U)",  # standard PDF/A-versjon

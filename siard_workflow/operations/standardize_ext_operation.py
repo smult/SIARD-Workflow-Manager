@@ -195,11 +195,35 @@ class StandardizeExtOperation(BaseOperation):
             stats = self._run_on_dir(extract_dir, w, progress, stop_ev)
 
             # Repakk
-            w(f"  Pakker ny SIARD: {dst_path.name} ...", "info")
+            from siard_workflow.core.siard_format import (
+                get_zip_compresslevel as _get_lvl,
+                get_smart_skip_enabled as _get_skip,
+                is_precompressed_bytes as _is_pre,
+            )
+            _level     = _get_lvl()
+            _smartskip = _get_skip()
+            _compress  = (zipfile.ZIP_STORED if _level == 0
+                          else zipfile.ZIP_DEFLATED)
+            _comp_lvl  = _level if _level > 0 else None
+
+            def _write_smart(zf, src_path, arc):
+                if _level > 0 and _smartskip:
+                    try:
+                        head = src_path.open("rb").read(16)
+                    except Exception:
+                        head = b""
+                    if head and _is_pre(head):
+                        zf.write(src_path, arc,
+                                 compress_type=zipfile.ZIP_STORED)
+                        return
+                zf.write(src_path, arc)
+
+            w(f"  Pakker ny SIARD: {dst_path.name} (kompresjon nivå "
+              f"{_level}) ...", "info")
             try:
-                with zipfile.ZipFile(dst_path, "w",
-                                     zipfile.ZIP_DEFLATED,
-                                     allowZip64=True) as zf_out:
+                with zipfile.ZipFile(dst_path, "w", _compress,
+                                     allowZip64=True,
+                                     compresslevel=_comp_lvl) as zf_out:
                     for orig_name in orig_namelist:
                         orig_p = extract_dir / orig_name
                         if orig_p.is_dir():
@@ -207,14 +231,14 @@ class StandardizeExtOperation(BaseOperation):
                                 zipfile.ZipInfo(orig_name + "/"), b"")
                             continue
                         if orig_p.exists():
-                            zf_out.write(orig_p, orig_name)
+                            _write_smart(zf_out, orig_p, orig_name)
                     # Legg til filer som kom til under prosessering (endret navn)
                     for f in extract_dir.rglob("*"):
                         if not f.is_file():
                             continue
                         arc = str(f.relative_to(extract_dir)).replace("\\", "/")
                         if arc not in orig_namelist:
-                            zf_out.write(f, arc)
+                            _write_smart(zf_out, f, arc)
             except Exception as exc:
                 dst_path.unlink(missing_ok=True)
                 return self._fail(f"Pakking feilet: {exc}")

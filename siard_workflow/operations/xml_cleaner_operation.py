@@ -353,14 +353,25 @@ class XmlCleanerOperation(BaseOperation):
                 return
 
             # Skriv ny SIARD med rensede tableX.xml
+            from siard_workflow.core.siard_format import (
+                get_zip_compresslevel as _get_lvl,
+                get_smart_skip_enabled as _get_skip,
+                is_precompressed_bytes as _is_pre,
+            )
+            _level     = _get_lvl()
+            _smartskip = _get_skip()
+            _compress  = zipfile.ZIP_STORED if _level == 0 else zipfile.ZIP_DEFLATED
+            _comp_lvl  = _level if _level > 0 else None
+
             tmp_fd, tmp_name = tempfile.mkstemp(suffix=".siard")
             import os as _os
             _os.close(tmp_fd)
             tmp_path = Path(tmp_name)
             try:
                 with zipfile.ZipFile(tmp_path, "w",
-                                     compression=zipfile.ZIP_DEFLATED,
-                                     allowZip64=True) as zout:
+                                     compression=_compress,
+                                     allowZip64=True,
+                                     compresslevel=_comp_lvl) as zout:
                     n_done = 0
                     for info in zin.infolist():
                         data = zin.read(info.filename)
@@ -378,7 +389,15 @@ class XmlCleanerOperation(BaseOperation):
                             n_done += 1
                             progress("phase_progress",
                                      done=n_done, total=len(table_xml_names))
-                        # Skriv (med original compress_type for å bevare format)
+                        # Bestem compress_type per fil:
+                        # - level=0 → STORED for alle
+                        # - level>0 + smart-skip + magic-match → STORED for denne
+                        # - ellers → bruk valgt level (arvet fra ZipFile)
+                        if (_level > 0 and _smartskip
+                                and _is_pre(data[:16])):
+                            info.compress_type = zipfile.ZIP_STORED
+                        else:
+                            info.compress_type = _compress
                         zout.writestr(info, data)
 
                 shutil.move(str(tmp_path), str(dst_path))

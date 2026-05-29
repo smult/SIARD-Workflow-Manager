@@ -401,13 +401,35 @@ class SchemaSelectorOperation(BaseOperation):
             progress("phase", phase=4, total_phases=4,
                      label="Pakker ny SIARD")
             if not dry_run:
-                w(f"  Pakker ny SIARD til {dst_path} ...", "info")
+                from siard_workflow.core.siard_format import (
+                    get_zip_compresslevel as _get_lvl,
+                    get_smart_skip_enabled as _get_skip,
+                    is_precompressed_bytes as _is_pre,
+                )
+                _level     = _get_lvl()
+                _smartskip = _get_skip()
+                _compress  = (zipfile.ZIP_STORED if _level == 0
+                              else zipfile.ZIP_DEFLATED)
+                _comp_lvl  = _level if _level > 0 else None
+                w(f"  Pakker ny SIARD til {dst_path} (kompresjon nivå "
+                  f"{_level}) ...", "info")
                 with zipfile.ZipFile(dst_path, "w",
-                                     compression=zipfile.ZIP_DEFLATED,
-                                     allowZip64=True) as zout:
+                                     compression=_compress,
+                                     allowZip64=True,
+                                     compresslevel=_comp_lvl) as zout:
                     for f in tmp.rglob("*"):
                         if f.is_file():
-                            zout.write(f, str(f.relative_to(tmp)))
+                            arc = str(f.relative_to(tmp))
+                            if _level > 0 and _smartskip:
+                                try:
+                                    head = f.open("rb").read(16)
+                                except Exception:
+                                    head = b""
+                                if head and _is_pre(head):
+                                    zout.write(f, arc,
+                                               compress_type=zipfile.ZIP_STORED)
+                                    continue
+                            zout.write(f, arc)
             progress("phase_done")
         return stats
 

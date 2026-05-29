@@ -5034,8 +5034,20 @@ class BlobConvertOperation(BaseOperation):
 
         written_names: set[str] = set()
 
-        with zipfile.ZipFile(dst_path, "w", zipfile.ZIP_DEFLATED,
-                             allowZip64=True) as zf:
+        # Hent global kompresjons-innstilling for SIARD-pakking
+        from siard_workflow.core.siard_format import (
+            get_zip_compresslevel as _get_lvl,
+            get_smart_skip_enabled as _get_skip,
+            is_precompressed_bytes as _is_pre,
+        )
+        _level     = _get_lvl()
+        _smartskip = _get_skip()
+        _compress  = zipfile.ZIP_STORED if _level == 0 else zipfile.ZIP_DEFLATED
+        _comp_lvl  = _level if _level > 0 else None
+
+        with zipfile.ZipFile(dst_path, "w", _compress,
+                             allowZip64=True,
+                             compresslevel=_comp_lvl) as zf:
             # 1. Skriv katalogoppføringer (tomme mapper) fra original ZIP,
             #    med versjonstreng transformert i header-stier.
             for dir_entry in orig_dir_entries:
@@ -5067,7 +5079,19 @@ class BlobConvertOperation(BaseOperation):
                         zf.writestr(arc_name, data)
                         n_transformed += 1
                     else:
-                        zf.write(file_path, arc_name)
+                        # Smart-skip basert på MAGIC-bytes (ikke filendelse)
+                        if _level > 0 and _smartskip:
+                            try:
+                                head = file_path.open("rb").read(16)
+                            except Exception:
+                                head = b""
+                            if head and _is_pre(head):
+                                zf.write(file_path, arc_name,
+                                         compress_type=zipfile.ZIP_STORED)
+                            else:
+                                zf.write(file_path, arc_name)
+                        else:
+                            zf.write(file_path, arc_name)
                     n_written += 1
                 except Exception as exc:
                     w(f"    FEIL skriv {arc_name}: {exc}", "feil")

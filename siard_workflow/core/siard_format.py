@@ -92,6 +92,78 @@ def get_target_siard_version() -> str:
     return "2.1"
 
 
+# ── ZIP-kompresjon for SIARD-pakking ──────────────────────────────────────────
+
+# Magic-bytes for formater som er ineffektive å rekomprimere — alle er
+# allerede komprimert internt (eller mediakomprimert). Brukes til å tvinge
+# ZIP_STORED på slike filer selv om brukerens valgte nivå er > 0.
+#
+# PDF er bevisst UTELATT: mange PDF-er har ukomprimerte streams og krymper
+# merkbart med DEFLATE. Vi lar brukerens nivå styre PDF.
+_PRECOMPRESSED_SIGS = (
+    b"\xff\xd8\xff",          # JPEG
+    b"\x89PNG\r\n\x1a\n",     # PNG
+    b"GIF87a", b"GIF89a",     # GIF
+    b"PK\x03\x04",            # ZIP / OOXML / ODF / JAR / EPUB
+    b"\x1f\x8b",              # GZIP
+    b"BZh",                   # BZIP2
+    b"7z\xbc\xaf\x27\x1c",    # 7-zip
+    b"Rar!\x1a\x07",          # RAR
+    b"ID3",                   # MP3 m/ID3-tag
+    b"\xff\xfb", b"\xff\xf3", b"\xff\xf2",  # MP3 frame syncs
+    b"OggS",                  # OGG
+    b"fLaC",                  # FLAC
+    b"\x00\x00\x00\x18ftyp",  # MP4 (med ftyp-offset)
+    b"\x00\x00\x00\x20ftyp",
+    b"\x00\x00\x00\x0cftyp",
+    b"\x00\x00\x00\x0cjP  \r\n\x87\n",  # JPEG2000
+)
+
+
+def get_zip_compresslevel(override: "int | None" = None) -> int:
+    """
+    Returnerer ZIP-kompresjonsnivå (0-9) for SIARD-pakking.
+
+    override: hvis satt og gyldig (0-9), brukes dette i stedet for global
+              config — operasjoner kan eksponere et per-instans-parameter.
+              None / "" / ugyldig → fall back til global config.
+    """
+    if override is not None and override != "":
+        try:
+            v = int(override)
+            if 0 <= v <= 9:
+                return v
+        except (TypeError, ValueError):
+            pass
+    try:
+        from settings import get_config
+        v = int(get_config("siard_compress_level", 6) or 6)
+        return max(0, min(9, v))
+    except Exception:
+        return 6
+
+
+def get_smart_skip_enabled() -> bool:
+    """True hvis allerede-komprimerte filer skal hoppe over rekomprimering."""
+    try:
+        from settings import get_config
+        return bool(get_config("siard_compress_smart_skip", True))
+    except Exception:
+        return True
+
+
+def is_precompressed_bytes(data: bytes) -> bool:
+    """
+    Returnerer True hvis data starter med magic-bytes for et format som
+    er meningsløst å rekomprimere. Sjekk innholdet, IKKE filendelsen — en
+    SIARD .bin-fil kan være alt fra ren tekst (komprimerbar) til JPG
+    (ikke komprimerbar).
+    """
+    if not data:
+        return False
+    return any(data.startswith(sig) for sig in _PRECOMPRESSED_SIGS)
+
+
 # Tegn som er tillatt i et schema-navn uten HTML- eller URL-koding
 _SAFE_SCHEMA_NAME_RE = re.compile(r'^[A-Za-z0-9_.\-]+$')
 

@@ -545,14 +545,32 @@ class SiardMapperOperation(BaseOperation):
                 # tabeller markert for sletting.
                 skip_prefixes = tuple(
                     f"content/{s}/{t}/" for s, t in deleted_paths)
+                from siard_workflow.core.siard_format import (
+                    get_zip_compresslevel as _get_lvl,
+                    get_smart_skip_enabled as _get_skip,
+                    is_precompressed_bytes as _is_pre,
+                )
+                _level     = _get_lvl()
+                _smartskip = _get_skip()
+                _compress  = (zipfile.ZIP_STORED if _level == 0
+                              else zipfile.ZIP_DEFLATED)
+                _comp_lvl  = _level if _level > 0 else None
                 buf = io.BytesIO()
                 with zipfile.ZipFile(siard_path, "r") as zin, \
-                     zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zout:
+                     zipfile.ZipFile(buf, "w", _compress,
+                                     allowZip64=True,
+                                     compresslevel=_comp_lvl) as zout:
                     for item in all_info:
                         # Skip filer som tilhører slettede tabeller
                         if skip_prefixes and item.filename.startswith(skip_prefixes):
                             continue
                         data = enriched if item.filename == meta_entry else zin.read(item.filename)
+                        # Smart-skip: STORED for allerede-komprimerte filer
+                        if (_level > 0 and _smartskip
+                                and _is_pre(data[:16])):
+                            item.compress_type = zipfile.ZIP_STORED
+                        else:
+                            item.compress_type = _compress
                         zout.writestr(item, data)
                 dst_path.write_bytes(buf.getvalue())
             except Exception as exc:

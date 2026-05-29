@@ -332,8 +332,9 @@ class RepackSiardOperation(BaseOperation):
     requires_unpack = False  # er selve sammenpackeren
 
     default_params = {
-        "output_suffix": "_konvertert",
-        "keep_temp":     False,
+        "output_suffix":  "_konvertert",
+        "keep_temp":      False,
+        "compress_level": "",   # tom = bruk global config (siard_compress_level)
     }
 
     def run(self, ctx: WorkflowContext) -> OperationResult:
@@ -394,9 +395,22 @@ class RepackSiardOperation(BaseOperation):
         t0        = datetime.datetime.now()
         REPORT    = max(1, n_total // 40)
 
+        # Bestem kompresjonsnivå (per-instans override vinner over global config)
+        from siard_workflow.core.siard_format import (
+            get_zip_compresslevel, get_smart_skip_enabled, is_precompressed_bytes,
+        )
+        level      = get_zip_compresslevel(self.params.get("compress_level"))
+        smart_skip = get_smart_skip_enabled()
+        compression = zipfile.ZIP_STORED if level == 0 else zipfile.ZIP_DEFLATED
+        compresslevel = level if level > 0 else None
+        w(f"  ZIP-kompresjon: nivå {level}"
+          + (" (smart-skip på)" if smart_skip and level > 0 else "")
+          + (" (STORED)" if level == 0 else ""), "info")
+
         try:
-            with zipfile.ZipFile(dst_path, "w", zipfile.ZIP_DEFLATED,
-                                 allowZip64=True) as zf:
+            with zipfile.ZipFile(dst_path, "w", compression,
+                                 allowZip64=True,
+                                 compresslevel=compresslevel) as zf:
 
                 # 1. Kataloginnganger fra original (f.eks. header/siardversion/2.1/)
                 for dir_entry in orig_dir_entries:
@@ -419,10 +433,16 @@ class RepackSiardOperation(BaseOperation):
                     else:
                         data = file_path.read_bytes()
 
-                    compress = (zipfile.ZIP_STORED
-                                if arc_name.lower().endswith(".bin")
-                                else zipfile.ZIP_DEFLATED)
-                    zf.writestr(arc_name, data, compress_type=compress)
+                    # Smart-skip: tving STORED for filer som ER allerede
+                    # komprimerte (basert på magic-bytes, ikke filendelsen).
+                    # Tekstlige `.bin`-filer (xml/rtf/txt) komprimeres normalt.
+                    if (level > 0 and smart_skip
+                            and is_precompressed_bytes(data[:16])):
+                        zf.writestr(arc_name, data,
+                                    compress_type=zipfile.ZIP_STORED)
+                    else:
+                        # Følg ZipFile-konstruktørens nivå
+                        zf.writestr(arc_name, data)
                     n_written += 1
 
                     if n_written % REPORT == 0 or n_written == n_total:

@@ -431,6 +431,9 @@ OP_DEFS = [
              "type": "str", "default": "_konvertert"},
             {"key": "keep_temp", "label": "Behold temp-mappe",
              "type": "bool", "default": False},
+            {"key": "compress_level",
+             "label": "ZIP-kompresjon 0-9 (tom = bruk global)",
+             "type": "str", "default": ""},
         ],
     },
     # ── Standard operasjoner ─────────────────────────────────────────────────
