@@ -629,11 +629,19 @@ def _patch_line_with_digest(
                 break
             key = line[start:end]
             if key in ren_bytes:
-                new_name = ren_bytes[key]
-                new_path = ren_paths[key]
+                # Direkte treff. ren_bytes[key] er alltid kun basename
+                # (v.name fra Path). Hvis key er en full sti, må vi bevare
+                # mappe-prefikset i den nye refen.
+                new_basename = ren_bytes[key]
+                new_path     = ren_paths[key]
+                if b"/" in key:
+                    dir_prefix = key.rsplit(b"/", 1)[0] + b"/"
+                    new_name   = dir_prefix + new_basename
+                else:
+                    new_name   = new_basename
             elif b"/" in key:
-                # Sti-ref (content/..., seg0/rec3.txt, lob4/rec1.bin, osv.):
-                # Slå opp på filnavn-delen alene, men bevar alltid mappe-prefikset.
+                # Fallback: full-sti-key ikke registrert direkte — slå opp på
+                # filnavn-delen alene, men bevar alltid mappe-prefikset.
                 # Slik forblir referansen konsistent: seg0/rec3.txt → seg0/rec3.bin,
                 # og content/schema0/.../rec3.txt → content/schema0/.../rec3.bin.
                 basename = key.rsplit(b"/", 1)[-1]
@@ -1345,7 +1353,8 @@ def _collect_external_blobs(
         siard_dir: Path,
         all_blobs: list[str],
         table_blobs: dict,
-        w) -> tuple[list[str], dict[str, str], dict[str, list[dict]]]:
+        w) -> tuple[list[str], dict[str, str],
+                    dict[str, list[dict]], dict[str, int]]:
     """
     Skann alle tableX.xml-filer for file="..."-referanser som IKKE ble funnet
     av filsystemskanningen.  Håndterer tre tilfeller:
@@ -1362,21 +1371,39 @@ def _collect_external_blobs(
        lar seg ikke lese. Refen rapporteres som missing_refs slik at kallsiten
        kan annotere XML, oppdatere err_log og oppsummere i kjørelogg.
 
-    Returnerer (extra_blobs, ext_ref_map, missing_refs) der:
+    Returnerer (extra_blobs, ext_ref_map, missing_refs, ref_format_counts) der:
       - ext_ref_map er {orig_ref: new_dest_rel} for eksternt kopierte filer
         (brukes til forhånds-patch av XML).
       - missing_refs er {xml_sti: [{ref, reason}, ...]} for filer som ikke
         ble funnet på disk.
+      - ref_format_counts er {"basename"|"lob_relative"|"full_relative"|"other": int}
+        for alle file=-refs analysert. Brukes til å advare om uvanlige
+        formater som kan gi problemer hos noen SIARD-konsumenter.
     """
     _known_basenames = {PurePosixPath(p).name for p in all_blobs}
     _known_paths     = set(all_blobs)
     extra:        list[str]            = []
     ext_ref_map:  dict[str, str]       = {}
     missing_refs: dict[str, list[dict]] = {}
+    ref_format_counts: dict[str, int]   = {
+        "basename": 0, "lob_relative": 0, "full_relative": 0, "other": 0,
+    }
 
     def _add_missing(xml_sti: str, ref: str, reason: str) -> None:
         missing_refs.setdefault(xml_sti, []).append(
             {"ref": ref, "reason": reason})
+
+    def _classify_ref(ref: str) -> str:
+        """Klassifiser file=-ref etter format-variant (kun for telling)."""
+        if "/" not in ref:
+            return "basename"
+        parts = ref.split("/")
+        if (len(parts) == 2
+                and parts[0].lower().startswith("lob")):
+            return "lob_relative"
+        if parts[0].lower() == "content":
+            return "full_relative"
+        return "other"
 
     for table_key, xml_sti in table_xml_map.items():
         xml_file = extract_dir / xml_sti
@@ -1391,6 +1418,10 @@ def _collect_external_blobs(
         for ref_b in refs:
             ref = ref_b.decode("utf-8", errors="replace").replace("\\", "/")
             basename = PurePosixPath(ref).name
+
+            # Klassifiser ALLE refs (også de som finsystem-scan allerede fant)
+            # for fullstendig format-fordelings-rapport
+            ref_format_counts[_classify_ref(ref)] += 1
 
             # Hopp over om allerede funnet (enten full sti eller bare filnavn)
             if ref in _known_paths or basename in _known_basenames:
@@ -1470,7 +1501,7 @@ def _collect_external_blobs(
             ext_ref_map[ref] = dest_rel
             w(f"  Ekstern blob kopiert inn: {ref} → {dest_rel}", "info")
 
-    return extra, ext_ref_map, missing_refs
+    return extra, ext_ref_map, missing_refs, ref_format_counts
 
 
 def _annotate_missing_refs_in_xml(extract_dir: Path,
@@ -1926,7 +1957,7 @@ class BlobConvertOperation(BaseOperation):
 
         # Supplerer med blob-er referert i tableX.xml men ikke funnet av skannen
         # (intern full-sti / DBPT-format, eller eksternt lagrede blobs)
-        _xml_extra, _ext_ref_map, _missing_refs = _collect_external_blobs(
+        _xml_extra, _ext_ref_map, _missing_refs, _ref_fmt = _collect_external_blobs(
             table_xml_map, extract_dir, ctx.siard_path.parent,
             all_blobs, table_blobs, w)
         if _xml_extra:
@@ -1936,6 +1967,7 @@ class BlobConvertOperation(BaseOperation):
         # Rapporter og annoter manglende referanser
         self._report_missing_refs(_missing_refs, extract_dir,
                                     stats, w, err_log)
+        self._report_ref_format_counts(_ref_fmt, w)
 
         ext_counts: dict = {}
         for p in all_blobs:
@@ -2375,7 +2407,7 @@ class BlobConvertOperation(BaseOperation):
 
                 # Supplerer med blob-er referert i tableX.xml men ikke i ZIP-en
                 # (intern full-sti / DBPT-format, eller eksternt lagrede blobs)
-                _xml_extra, _ext_ref_map, _missing_refs = _collect_external_blobs(
+                _xml_extra, _ext_ref_map, _missing_refs, _ref_fmt = _collect_external_blobs(
                     table_xml_map, extract_dir, src_path.parent,
                     all_blobs, table_blobs, w)
                 if _xml_extra:
@@ -2385,6 +2417,7 @@ class BlobConvertOperation(BaseOperation):
                 # Rapporter og annoter manglende referanser
                 self._report_missing_refs(_missing_refs, extract_dir,
                                             stats, w, err_log)
+                self._report_ref_format_counts(_ref_fmt, w)
 
                 # ── Resume-filtrering ─────────────────────────────────────────
                 _done = ctx.metadata.get("_blob_resume_done", set())
@@ -4326,6 +4359,56 @@ class BlobConvertOperation(BaseOperation):
             w(f"  Kunne ikke annotere XML med manglende-kommentarer: {exc}",
               "warn")
 
+    def _report_ref_format_counts(self,
+                                    counts: "dict[str, int]",
+                                    w) -> None:
+        """
+        Logg oversikt over file=-attributtenes format-fordeling i tableX.xml.
+
+        Alle tre format (basename / lob-relativ / full-relativ) er gyldige
+        iht SIARD 2.x-standarden (file= er xs:anyURI), men noen konsumenter
+        — særlig KDRS Søk & Vis — forventer basename-only. Hvis SIARDen
+        inneholder noe ANNET enn ren basename, logges en advarsel slik at
+        operatør kan vurdere om det er greit for målbruksområdet.
+        """
+        if not counts:
+            return
+        total = sum(counts.values())
+        if total == 0:
+            return
+
+        n_base = counts.get("basename", 0)
+        n_lob  = counts.get("lob_relative", 0)
+        n_full = counts.get("full_relative", 0)
+        n_oth  = counts.get("other", 0)
+
+        # Bygg menneskelig format-tekst med kun de tellingene > 0
+        parts = []
+        if n_base:  parts.append(f"{n_base:,} basename")
+        if n_lob:   parts.append(f"{n_lob:,} lob-relative")
+        if n_full:  parts.append(f"{n_full:,} full-relative (content/...)")
+        if n_oth:   parts.append(f"{n_oth:,} annet")
+        fmt_str = ", ".join(parts)
+
+        non_basename = n_lob + n_full + n_oth
+        if non_basename == 0:
+            # Alt er basename — vanlig og kompatibelt
+            w(f"  File-refs format: {fmt_str}", "info")
+            return
+
+        # Minst én ref er ikke basename — advarsel
+        w(f"  File-refs format: {fmt_str}", "warn")
+        if n_base > 0:
+            w("  ADVARSEL: SIARD har BLANDEDE file-attributt-format "
+              "(basename + andre). Noen SIARD-konsumenter (særlig KDRS Søk "
+              "& Vis) forventer ensartet basename (file=\"record5.bin\") "
+              "og kan ha problemer med uvanlige format.", "warn")
+        else:
+            w("  ADVARSEL: SIARD bruker ikke basename i file-attributtene. "
+              "Noen SIARD-konsumenter (særlig KDRS Søk & Vis) forventer "
+              "kun basename (file=\"record5.bin\") og kan ha problemer "
+              "med uvanlige format.", "warn")
+
     def _rename_file(self, extract_dir: Path, zip_sti: str,
                      ext: str) -> str:
         """Rename fil i extract_dir fra .bin/.txt til riktig ext. Returnerer ny zip_sti."""
@@ -4621,6 +4704,12 @@ class BlobConvertOperation(BaseOperation):
                                 renames[orig_name] = new_path   # fallback
                         else:
                             renames[orig_name] = new_path
+                        # Registrer ALLTID full sti som alternativ key —
+                        # full-sti-refs (file="content/.../record5.bin") får
+                        # da entydig oppslag i _patch_line_with_digest og
+                        # leser korrekt fil for length/digest. zip_sti er
+                        # garantert unik per fil, så ingen overskriving.
+                        renames[zip_sti] = new_path
 
             # Supplement / overstyr renames fra konverteringsregisteret
             # (håndterer bl.a. standardize_bin der alle sluttfiler er .bin)
@@ -4631,6 +4720,8 @@ class BlobConvertOperation(BaseOperation):
                     if orig_name in conversion_registry:
                         new_path, comment = conversion_registry[orig_name]
                         renames[orig_name] = new_path
+                        # Full-sti-key for entydig oppslag ved full-sti-refs
+                        renames[zip_sti_old] = new_path
                         line_comments[orig_name] = comment
 
             # Finn type-kolonne-kobling for denne tabellen
