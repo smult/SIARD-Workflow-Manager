@@ -968,17 +968,76 @@ class App(ctk.CTk):
             pass
 
     def _detect_libreoffice(self):
-        """Auto-detekter LibreOffice ved oppstart og lagre sti til config.json."""
+        """Auto-detekter LibreOffice ved oppstart og lagre sti til config.json.
+
+        Finnes ikke LibreOffice på noen av de vanlige stedene, blir brukeren
+        bedt om å peke ut installasjonsmappen — og valget verifiseres før det
+        lagres.
+        """
         try:
+            from siard_workflow.core.libreoffice import (
+                find_libreoffice, verify_libreoffice_path)
             saved = get_config("lo_executable", "")
-            if saved and Path(saved).is_file():
-                return  # allerede funnet og lagret
-            from siard_workflow.systemspecific_operations.cosdoc_operation import _find_libreoffice
-            found = _find_libreoffice("")
+            if saved:
+                # Verifiser at lagret sti faktisk peker på soffice på DENNE
+                # maskinen — config.json kan stamme fra en annen maskin.
+                verified = verify_libreoffice_path(saved)
+                if verified:
+                    if verified != saved:
+                        set_config("lo_executable", verified)  # normaliser
+                    return
+                # Stale/ugyldig sti — nullstill og prøv å finne på nytt
+                set_config("lo_executable", "")
+            found = find_libreoffice("")
             if found:
                 set_config("lo_executable", found)
+                return
+            # Ikke funnet automatisk — la bruker peke ut plasseringen
+            self._prompt_for_libreoffice()
         except Exception:
             pass
+
+    def _prompt_for_libreoffice(self):
+        """Be bruker velge LibreOffice program-mappe og verifiser valget.
+
+        Verifiseringen (siard_workflow.core.libreoffice.verify_libreoffice_path)
+        godtar både selve soffice-binæren, program-mappen, installasjonsroten
+        og en macOS .app-pakke. Lagrer verifisert soffice-sti til config.json.
+        """
+        from tkinter import filedialog, messagebox
+        from siard_workflow.core.libreoffice import verify_libreoffice_path
+
+        if not messagebox.askyesno(
+                "LibreOffice ikke funnet",
+                "LibreOffice ble ikke funnet automatisk.\n\n"
+                "LibreOffice kreves for å konvertere dokumenter til PDF/A.\n\n"
+                "Vil du peke ut LibreOffice-mappen manuelt nå?",
+                parent=self):
+            return
+
+        while True:
+            chosen = filedialog.askdirectory(
+                title="Velg LibreOffice-mappe (installasjonsrot eller program-mappe)",
+                parent=self,
+            )
+            if not chosen:
+                return  # avbrutt av bruker
+            verified = verify_libreoffice_path(chosen)
+            if verified:
+                set_config("lo_executable", verified)
+                messagebox.showinfo(
+                    "LibreOffice verifisert",
+                    f"LibreOffice ble funnet og lagret:\n{verified}",
+                    parent=self)
+                return
+            if not messagebox.askretrycancel(
+                    "Ugyldig mappe",
+                    "Fant ingen soffice-binær i den valgte mappen.\n\n"
+                    "Velg installasjonsmappen for LibreOffice — typisk\n"
+                    r"C:\Program Files\LibreOffice  (eller undermappen \program)."
+                    "\n\nPrøv igjen?",
+                    parent=self):
+                return
 
     def _init_worker_config(self):
         """Sett max_workers og lo_batch_size fra maskinvare ved første kjøring (verdi == 0)."""

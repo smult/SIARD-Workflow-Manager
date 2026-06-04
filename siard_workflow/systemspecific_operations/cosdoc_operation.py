@@ -258,38 +258,9 @@ def _get_blob(row: dict, idx: int) -> dict | None:
 
 # ── LibreOffice ───────────────────────────────────────────────────────────────
 
-def _find_libreoffice(hint: str = "soffice") -> str | None:
-    if hint and shutil.which(hint):
-        return hint
-    if hint and os.path.isfile(hint):
-        return hint
-    # Windows søkestier
-    if sys.platform == "win32":
-        candidates = []
-        base = os.environ.get("PROGRAMFILES", r"C:\Program Files")
-        if base:
-            for sub in ("LibreOffice", "LibreOffice 7", "LibreOffice 24", "OpenOffice"):
-                candidates.append(os.path.join(base, sub, "program", "soffice.exe"))
-        for base in (r"C:\Program Files", r"C:\Program Files (x86)"):
-            if os.path.isdir(base):
-                try:
-                    for entry in os.listdir(base):
-                        if "libre" in entry.lower() or "openoffice" in entry.lower():
-                            candidates.append(os.path.join(base, entry, "program", "soffice.exe"))
-                except OSError:
-                    pass
-        for c in candidates:
-            if os.path.isfile(c):
-                return c
-    if sys.platform == "darwin":
-        for p in ("/Applications/LibreOffice.app/Contents/MacOS/soffice",):
-            if os.path.isfile(p):
-                return p
-    for name in ("soffice", "libreoffice"):
-        found = shutil.which(name)
-        if found:
-            return found
-    return None
+# Felles, robust deteksjon ligger i siard_workflow.core.libreoffice.
+# Beholdt som lokalt navn for bakoverkompatibilitet med kallere.
+from siard_workflow.core.libreoffice import find_libreoffice as _find_libreoffice
 
 
 def _lo_profile_url(profile_dir: Path) -> str:

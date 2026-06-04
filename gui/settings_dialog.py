@@ -176,6 +176,73 @@ class SettingsDialog(ctk.CTkToplevel):
                          row=r, column=0, columnspan=2,
                          padx=14, pady=(0, 4), sticky="w"); r += 1
 
+        _seksjon("LibreOffice", r); r += 1
+        ctk.CTkLabel(frm, text="LibreOffice-sti (soffice)",
+                     font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                     text_color=COLORS["text"],
+                     anchor="w").grid(row=r, column=0,
+                                      padx=(12, 8), pady=6, sticky="w")
+        lo_var = ctk.StringVar(value=str(cfg.get("lo_executable", "")))
+        self._vars["lo_executable"] = lo_var
+        lo_cell = ctk.CTkFrame(frm, fg_color="transparent")
+        lo_cell.grid(row=r, column=1, padx=12, pady=6, sticky="ew")
+        lo_cell.grid_columnconfigure(0, weight=1)
+        ctk.CTkEntry(lo_cell, textvariable=lo_var, width=260,
+                     fg_color=COLORS["bg"],
+                     font=ctk.CTkFont(family=FONTS["mono"], size=12)
+                     ).grid(row=0, column=0, sticky="ew")
+
+        def _browse_lo(v=lo_var):
+            from siard_workflow.core.libreoffice import verify_libreoffice_path
+            import tkinter.messagebox as _mb
+            p = filedialog.askdirectory(
+                title="Velg LibreOffice-mappe (installasjonsrot eller program-mappe)",
+                initialdir=v.get() or ".")
+            if not p:
+                return
+            verified = verify_libreoffice_path(p)
+            if verified:
+                v.set(verified)
+            else:
+                _mb.showwarning(
+                    "Ugyldig mappe",
+                    "Fant ingen soffice-binær i den valgte mappen.\n\n"
+                    "Velg installasjonsmappen for LibreOffice — typisk\n"
+                    r"C:\Program Files\LibreOffice (eller undermappen \program).",
+                    parent=self)
+
+        def _detect_lo(v=lo_var):
+            from siard_workflow.core.libreoffice import find_libreoffice
+            import tkinter.messagebox as _mb
+            found = find_libreoffice("")
+            if found:
+                v.set(found)
+                _mb.showinfo("LibreOffice funnet",
+                             f"Fant LibreOffice:\n{found}", parent=self)
+            else:
+                _mb.showwarning(
+                    "Ikke funnet",
+                    "Fant ikke LibreOffice automatisk. Velg mappen manuelt med «Bla…».",
+                    parent=self)
+
+        ctk.CTkButton(lo_cell, text="Bla…", width=52,
+                      fg_color=COLORS["btn"],
+                      hover_color=COLORS["btn_hover"],
+                      font=ctk.CTkFont(family=FONTS["mono"], size=12),
+                      command=_browse_lo).grid(row=0, column=1, padx=(4, 0))
+        ctk.CTkButton(lo_cell, text="Detekter", width=72,
+                      fg_color=COLORS["btn"],
+                      hover_color=COLORS["btn_hover"],
+                      font=ctk.CTkFont(family=FONTS["mono"], size=12),
+                      command=_detect_lo).grid(row=0, column=2, padx=(4, 0))
+        r += 1
+        ctk.CTkLabel(frm,
+                     text="Tom = autodetekteres ved oppstart. Pek til installasjonsmappen eller soffice direkte.",
+                     font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                     text_color=COLORS["muted"]).grid(
+                         row=r, column=0, columnspan=2,
+                         padx=14, pady=(0, 4), sticky="w"); r += 1
+
         _seksjon("Parallellisering (LibreOffice — gjelder alle operasjoner)", r); r += 1
 
         # max_workers med Auto-knapp
@@ -453,6 +520,24 @@ class SettingsDialog(ctk.CTkToplevel):
                             result[k] = v
                 val = result
             cfg[key] = val
+
+        # LibreOffice-sti: verifiser at den faktisk peker på soffice.
+        # Normaliser (mappe → soffice-binær). Tom = autodetekteres ved oppstart.
+        lo_path = (cfg.get("lo_executable") or "").strip()
+        if lo_path:
+            from siard_workflow.core.libreoffice import verify_libreoffice_path
+            verified = verify_libreoffice_path(lo_path)
+            if verified:
+                cfg["lo_executable"] = verified
+            else:
+                import tkinter.messagebox as _mb
+                if not _mb.askyesno(
+                        "Ugyldig LibreOffice-sti",
+                        "Stien til LibreOffice peker ikke på en gyldig soffice-binær.\n\n"
+                        "Lagre likevel? (tom sti ville la programmet autodetektere "
+                        "ved neste oppstart)",
+                        parent=self):
+                    return
 
         # Siegfried slått på men ikke installert → spør om installasjon
         if cfg.get("use_siegfried"):

@@ -546,22 +546,44 @@ def _count_lines(path: Path) -> int:
     return max(count, 1)
 
 
+def _split_after_eol(data: bytes, pos: int) -> int:
+    """Returner indeks rett etter et eventuelt linjeskift på `pos`.
+
+    Slik at kommentaren havner på egen linje når det finnes et linjeskift,
+    men aldri «sluker» data dersom linjeskift mangler (enkeltlinje-XML).
+    """
+    if data[pos:pos+2] == b"\r\n":
+        return pos + 2
+    if data[pos:pos+1] in (b"\n", b"\r"):
+        return pos + 1
+    return pos
+
+
 def _inject_conversion_comment(data: bytes) -> bytes:
     """
-    Sett inn konverteringskommentar rett etter XML-deklarasjonen (?>) —
-    alltid på linje 2 i headeren, aldri midt i datastrukturen.
+    Sett inn konverteringskommentar rett ETTER XML-deklarasjonen (?>).
 
-    Bruker ?> som anker (ikke -->) for å unngå at per-fil inline-kommentarer
-    (<!-- Filinnhold konvertert ... -->) i datadelen styrer plasseringen.
+    Kommentaren skal ALDRI havne over <?xml ...?>-linjen. Bruker ?> som anker
+    (ikke -->) for å unngå at per-fil inline-kommentarer (<!-- Filinnhold
+    konvertert ... -->) i datadelen styrer plasseringen.
+
+    Robust mot:
+      • enkeltlinje-XML (ingen \\n etter ?>) — kommentaren legges rett etter ?>
+      • manglende XML-deklarasjon — kommentaren legges etter første tag-slutt,
+        slik at den fortsatt aldri havner over rot-elementet.
     """
     comment = _conversion_comment()
     pi_end = data.find(b"?>")
     if pi_end != -1:
-        nl = data.find(b"\n", pi_end)
-        if nl != -1:
-            return data[:nl+1] + comment + data[nl+1:]
-    # Ytterste fallback: ingen XML-deklarasjon funnet — legg til øverst
-    return comment + data
+        insert_at = _split_after_eol(data, pi_end + 2)  # rett etter "?>"
+        return data[:insert_at] + comment + data[insert_at:]
+    # Ingen XML-deklarasjon — legg etter første tag-slutt (under rot-elementet)
+    gt = data.find(b">")
+    if gt != -1:
+        insert_at = _split_after_eol(data, gt + 1)
+        return data[:insert_at] + comment + data[insert_at:]
+    # Tomt/uforståelig innhold — siste utvei: aldri øverst, legg bakerst
+    return data + comment
 
 
 # Alias for bakoverkompatibilitet — funksjonene er nå i siard_format.py
@@ -1202,39 +1224,9 @@ def _ns_prefix(tag: str) -> str:
     return "{" + m.group(1) + "}" if m else ""
 
 
-def _find_libreoffice(hint: str = "soffice") -> str | None:
-    import sys
-    if shutil.which(hint):
-        return hint
-    if sys.platform == "win32":
-        candidates = []
-        for base in (os.environ.get("PROGRAMFILES", r"C:\Program Files"),
-                     os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
-                     os.environ.get("LOCALAPPDATA", "")):
-            if base:
-                for sub in ("LibreOffice", "LibreOffice 7", "LibreOffice 24", "OpenOffice"):
-                    candidates.append(os.path.join(base, sub, "program", "soffice.exe"))
-        for base in (r"C:\Program Files", r"C:\Program Files (x86)"):
-            if os.path.isdir(base):
-                try:
-                    for entry in os.listdir(base):
-                        if "libre" in entry.lower() or "openoffice" in entry.lower():
-                            candidates.append(os.path.join(base, entry, "program", "soffice.exe"))
-                except OSError:
-                    pass
-        for c in candidates:
-            if os.path.isfile(c):
-                return c
-    if sys.platform == "darwin":
-        for p in ("/Applications/LibreOffice.app/Contents/MacOS/soffice",
-                  "/Applications/OpenOffice.app/Contents/MacOS/soffice"):
-            if os.path.isfile(p):
-                return p
-    for name in ("soffice", "libreoffice", "libreoffice7", "libreoffice24"):
-        found = shutil.which(name)
-        if found:
-            return found
-    return None
+# Felles, robust deteksjon ligger i siard_workflow.core.libreoffice.
+# Beholdt som lokalt navn for bakoverkompatibilitet med kallere.
+from siard_workflow.core.libreoffice import find_libreoffice as _find_libreoffice
 
 
 def suggest_lo_defaults() -> dict:
