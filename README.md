@@ -9,7 +9,7 @@ Ta kontakt hvis du har innspill, kritikk, ros, ønsker, kommentarer etc.
 
 Funksjonalitet omfatter blant annet:
 
-## Generell funksjonlitet
+## Generell funksjonalitet
 - Valg av SIARD-filer og arbeidsmapper
 - En del grunnleggende operasjoner for SIARD Workflow Manager, som for eksempel:
   - Ut og innpakking av SIARD
