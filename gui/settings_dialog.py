@@ -449,6 +449,33 @@ class SettingsDialog(ctk.CTkToplevel):
                          row=r, column=0, columnspan=2,
                          padx=14, pady=(0, 4), sticky="w"); r += 1
 
+        # ── Ollama (lokal PII-deteksjon for anonymisering) ──────────────────
+        _seksjon("Ollama (lokal PII-deteksjon)", r); r += 1
+        _rad("Bruk lokal Ollama", "ollama_enabled", "bool", r, default=True); r += 1
+        _rad("Vert (host)", "ollama_host", "str", r, default="127.0.0.1"); r += 1
+        _rad("Port", "ollama_port", "int", r, default=11434); r += 1
+        _rad("Modell (tom = auto)", "ollama_model", "str", r, default=""); r += 1
+        _rad("Tidsavbrudd (s)", "ollama_timeout", "int", r, default=30); r += 1
+
+        self._ollama_status_lbl = ctk.CTkLabel(
+            frm, text="Status: ikke testet",
+            font=ctk.CTkFont(family=FONTS["mono"], size=11),
+            text_color=COLORS["muted"], anchor="w")
+        self._ollama_status_lbl.grid(row=r, column=0, columnspan=2,
+                                     padx=14, pady=(0, 4), sticky="w"); r += 1
+        ctk.CTkButton(
+            frm, text="Test Ollama-tilkobling",
+            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+            font=ctk.CTkFont(family=FONTS["mono"], size=11),
+            command=self._test_ollama,
+        ).grid(row=r, column=1, padx=12, pady=(0, 4), sticky="e"); r += 1
+        ctk.CTkLabel(frm,
+                     text="Kjøres lokalt — data sendes ALDRI til sky. Tom modell = auto (foretrekker Gemma).",
+                     font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                     text_color=COLORS["muted"]).grid(
+                         row=r, column=0, columnspan=2,
+                         padx=14, pady=(0, 4), sticky="w"); r += 1
+
         _seksjon("Operasjoner-synlighet (0-2)", r); r += 1
         ctk.CTkLabel(frm, text="Vis operasjoner med status over ",
                      font=ctk.CTkFont(family=FONTS["mono"], size=11),
@@ -495,7 +522,7 @@ class SettingsDialog(ctk.CTkToplevel):
         cfg: dict = {}
         int_keys  = {"max_workers", "lo_batch_size", "lo_timeout",
                      "av_infected_rc", "av_timeout", "min_operation_status",
-                     "siard_compress_level"}
+                     "siard_compress_level", "ollama_port", "ollama_timeout"}
         list_keys = {"lo_convertible", "rename_only"}
         args_keys = {"av_args"}
         dict_keys = {"lo_upgrade"}  # kommaseparert nøkkel=verdi → dict
@@ -575,6 +602,40 @@ class SettingsDialog(ctk.CTkToplevel):
         except Exception:
             pass
         self.destroy()
+
+    # ── Ollama-test ──────────────────────────────────────────────────────────
+
+    def _test_ollama(self):
+        """Test tilkobling til lokal Ollama med gjeldende felt-verdier."""
+        host = (self._vars.get("ollama_host").get()
+                if "ollama_host" in self._vars else "127.0.0.1") or "127.0.0.1"
+        try:
+            port = int(self._vars.get("ollama_port").get())
+        except Exception:
+            port = 11434
+        model = (self._vars.get("ollama_model").get()
+                 if "ollama_model" in self._vars else "") or ""
+        try:
+            timeout = int(self._vars.get("ollama_timeout").get())
+        except Exception:
+            timeout = 30
+        try:
+            from siard_workflow.core.anonymize.ollama_client import OllamaClient
+            client = OllamaClient(host=host, port=port, model=model, timeout=timeout)
+            if not client.is_alive():
+                self._ollama_status_lbl.configure(
+                    text=f"Status: ingen kontakt med {host}:{port} "
+                         f"(anonymisering bruker da regex/heuristikk)",
+                    text_color=COLORS["muted"])
+                return
+            models = client.list_models()
+            chosen = client.pick_model() or "?"
+            self._ollama_status_lbl.configure(
+                text=f"Status: tilkoblet — {len(models)} modell(er), bruker «{chosen}»",
+                text_color=COLORS["accent"])
+        except Exception as exc:
+            self._ollama_status_lbl.configure(
+                text=f"Status: feil ved test ({exc})", text_color=COLORS["muted"])
 
     # ── Siegfried-status + installasjon ──────────────────────────────────────
 

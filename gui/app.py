@@ -1841,6 +1841,9 @@ class App(ctk.CTk):
             # Callback for å velge ny mål-mappe ved disk-plassmangel i DIAS-pakking
             ctx.metadata["ask_dias_output_dir_cb"] = self._ask_dias_output_dir
 
+            # Callback for forhåndsvisning/bekreftelse av SIARD-anonymisering
+            ctx.metadata["anonymize_preview_cb"] = self._anonymize_preview_cb
+
             if self._global_temp_dir:
                 ctx.metadata["temp_dir"] = str(self._global_temp_dir)
             if self._output_dir_override:
@@ -2387,6 +2390,15 @@ class App(ctk.CTk):
         """
         from gui.schema_selector_dialog import ask_select_schemas_modal
         return ask_select_schemas_modal(self.after, self, schemas)
+
+    def _anonymize_preview_cb(self, summary: dict) -> bool:
+        """
+        Kalles fra AnonymizeOperation. Viser modal forhåndsvisning av
+        identifiserte PII-felter og LOB-bytte. Returnerer True (anonymiser)
+        eller False (avbryt).
+        """
+        from gui.anonymize_preview_dialog import ask_anonymize_confirm_modal
+        return ask_anonymize_confirm_modal(self.after, self, summary)
 
     def _ask_dias_output_dir(self, current_dir, needed_bytes: int,
                               free_bytes: int) -> "str | None":

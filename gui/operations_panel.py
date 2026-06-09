@@ -16,6 +16,7 @@ from gui.styles import COLORS, FONTS, cat_color
 from siard_workflow.operations import (
     SHA256Operation, BlobConvertOperation,
     HexExtractOperation, XmlCleanerOperation, SchemaSelectorOperation,
+    AnonymizeOperation,
     XMLValidationOperation, MetadataExtractOperation,
     VirusScanOperation, ConditionalOperation,
     UnpackSiardOperation, RepackSiardOperation,
@@ -536,6 +537,27 @@ OP_DEFS = [
         "params": [
             {"key": "auto_select_all", "label": "Behold alle uten å spørre", "type": "bool", "default": False},
             {"key": "dry_run",         "label": "Tørkjøring (ikke skriv)",   "type": "bool", "default": False},
+        ],
+    },
+    {
+        "cls": AnonymizeOperation,
+        "label": "SIARD Anonymisering",
+        "category": "Innhold",
+        "desc": ("Finner personidentifiserende informasjon (fnr, navn, adresse, "
+                 "postnr, telefon, e-post) og erstatter med deterministiske "
+                 "fiktive verdier (samme verdi → samme fake, bevarer relasjoner). "
+                 "BLOB/CLOB/filer byttes til dummy-innhold (Lorem Ipsum-PDF/RTF/"
+                 "tekst eller media-stub). Bruker valgfritt LOKAL Ollama for økt "
+                 "treffsikkerhet på fritekst — aldri sky."),
+        "status": AnonymizeOperation.status,
+        "params": [
+            {"key": "output_suffix",        "label": "Suffix ny SIARD-fil",          "type": "str",  "default": "_anonymisert"},
+            {"key": "use_ollama",           "label": "Bruk lokal Ollama (hvis kjører)", "type": "bool", "default": True},
+            {"key": "replace_lobs",         "label": "Bytt BLOB/CLOB/filer til dummy", "type": "bool", "default": True},
+            {"key": "replace_binary_media", "label": "Bytt også bilde/lyd/video",     "type": "bool", "default": True},
+            {"key": "show_preview",         "label": "Vis forhåndsvisning før endring", "type": "bool", "default": True},
+            {"key": "preview_rows",         "label": "Antall eksempelrader i visning", "type": "int",  "default": 5},
+            {"key": "dry_run",              "label": "Tørkjøring (ikke skriv)",        "type": "bool", "default": False},
         ],
     },
     # ── Systemspesifikke operasjoner ─────────────────────────────────────────
@@ -1092,8 +1114,11 @@ class OperationsPanel(ctk.CTkFrame):
 
         # Filtrer operasjoner basert på min_operation_status fra config.json.
         # 0 = vis alle, 1 = vis beta + ok, 2 = vis kun ok/releaset (standard).
+        # NB: bruk eksplisitt None-sjekk — «get_config(...) or 2» ville tolket
+        # nivå 0 som falsy og falt tilbake til 2 (slik at «vis alle» ikke virket).
+        _mn = get_config("min_operation_status")
         try:
-            min_status = int(get_config("min_operation_status") or 2)
+            min_status = int(_mn) if _mn is not None else 2
         except (TypeError, ValueError):
             min_status = 2
         visible = [d for d in OP_DEFS if d.get("status", 2) >= min_status]

@@ -6,6 +6,7 @@ from .blob_convert_operation import BlobConvertOperation
 from .hex_extract_operation import HexExtractOperation
 from .xml_cleaner_operation import XmlCleanerOperation
 from .schema_selector_operation import SchemaSelectorOperation
+from .anonymize_operation import AnonymizeOperation
 from .virus_scan_operation import VirusScanOperation
 from .pipeline_operations import UnpackSiardOperation, RepackSiardOperation
 from .standardize_ext_operation import StandardizeExtOperation
@@ -25,6 +26,7 @@ __all__ = [
     "HexExtractOperation",
     "XmlCleanerOperation",
     "SchemaSelectorOperation",
+    "AnonymizeOperation",
     "VirusScanOperation",
     "UnpackSiardOperation",
     "RepackSiardOperation",
