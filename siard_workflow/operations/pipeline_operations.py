@@ -122,6 +122,16 @@ class UnpackSiardOperation(BaseOperation):
         except Exception as exc:
             w(f"  Advarsel: kunne ikke sjekke schema-navn: {exc}", "warn")
 
+        # ── Saniter schema-navn med spesialtegn ────────────────────────────────
+        # Schema-navn må være URL-/XML-sikre (kun A-Za-z0-9_.-). Navn med
+        # spesialtegn (<, >, &, ", ', æøå, mellomrom osv.) byttes til schemaN
+        # allerede ved utpakking, slik at ALLE arbeidsflyter får konsistente navn
+        # — ikke bare de som bruker BLOB-konvertering.
+        try:
+            self._sanitize_schema_names(tmp, w)
+        except Exception as exc:
+            w(f"  Advarsel: kunne ikke sanere schema-navn: {exc}", "warn")
+
         # ── Sjekk for ikke-standard LOB-filendelser ────────────────────────────
         non_std = self._count_non_standard_lob_files(tmp)
         if non_std > 0:
@@ -196,6 +206,41 @@ class UnpackSiardOperation(BaseOperation):
                     if not (low.endswith(".bin") or low.endswith(".txt")):
                         count += 1
         return count
+
+    @staticmethod
+    def _sanitize_schema_names(extract_dir: Path, w) -> None:
+        """
+        Saniter `<schema><name>`-verdier med spesialtegn i metadata.xml rett
+        etter utpakking. Navn som ikke er URL-/XML-sikre (kun A-Za-z0-9_.-)
+        byttes til 'schemaN' (1-basert indeks), og filen skrives på disk
+        umiddelbart slik at alle nedstrøms-operasjoner og repakking ser det
+        sanerte navnet.
+
+        Tomme navn håndteres separat av _check_empty_schema_names (med dialog);
+        denne tar kun ikke-tomme navn med ulovlige tegn.
+        """
+        from siard_workflow.core.siard_format import (
+            list_all_schema_names, sanitize_metadata_schema_names,
+            _SAFE_SCHEMA_NAME_RE,
+        )
+        metadata_path = extract_dir / "header" / "metadata.xml"
+        if not metadata_path.exists():
+            return
+        data = metadata_path.read_bytes()
+        unsafe = [s for s in list_all_schema_names(data)
+                  if s["name"].strip()
+                  and not _SAFE_SCHEMA_NAME_RE.match(s["name"].strip())]
+        if not unsafe:
+            return
+        w(f"  ADVARSEL: {len(unsafe)} schema-navn med spesialtegn funnet:", "warn")
+        for s in unsafe:
+            w(f"    • '{s['name']}' (folder: {s['folder']}) → schema{s['index']}",
+              "warn")
+        new_data = sanitize_metadata_schema_names(data)
+        if new_data != data:
+            metadata_path.write_bytes(new_data)
+            w(f"  Sanerte {len(unsafe)} schema-navn til 'schemaN' i metadata.xml.",
+              "ok")
 
     @staticmethod
     def _check_empty_schema_names(extract_dir: Path, ctx, w) -> None:
