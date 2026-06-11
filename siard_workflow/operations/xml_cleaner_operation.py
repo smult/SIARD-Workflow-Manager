@@ -123,6 +123,8 @@ class XmlCleanerOperation(BaseOperation):
     status          = 2
     produces_siard  = True
     requires_unpack = True
+    modifies_content = True
+    premis_event_type = "XML-rensing"
 
     default_params = {
         "clean_padding_spaces": True,   #  -padding (SIARD-escape) renses
@@ -136,6 +138,9 @@ class XmlCleanerOperation(BaseOperation):
                 "kollapser inline-sekvenser til ett mellomrom.")
 
     # ── run ──────────────────────────────────────────────────────────────────
+
+    def premis_should_record(self, result, ctx) -> bool:
+        return bool(result.success) and result.data.get("padding_removed", 0) > 0
 
     def run(self, ctx) -> object:
         log = ctx.metadata.get("file_logger")

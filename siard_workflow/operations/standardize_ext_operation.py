@@ -110,10 +110,15 @@ class StandardizeExtOperation(BaseOperation):
     category       = "Kompatibilitet"
     status         = 2
     produces_siard = False
+    modifies_content = True
+    premis_event_type = "filnavn-standardisering"
 
     default_params: dict = {
         "output_suffix": "_stdext",
     }
+
+    def premis_should_record(self, result, ctx) -> bool:
+        return bool(result.success) and result.data.get("renamed", 0) > 0
 
     def run(self, ctx: WorkflowContext) -> OperationResult:
         log = ctx.metadata.get("file_logger")

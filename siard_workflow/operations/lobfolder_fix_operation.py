@@ -133,7 +133,12 @@ class LobFolderFixOperation(BaseOperation):
     category       = "Kompatibilitet"
     status         = 2
     produces_siard = True
+    modifies_content = True
+    premis_event_type = "lobFolder-korreksjon"
     default_params: dict = {}
+
+    def premis_should_record(self, result, ctx) -> bool:
+        return bool(result.success) and result.data.get("fixes", 0) > 0
 
     def run(self, ctx: WorkflowContext) -> OperationResult:
         log = ctx.metadata.get("file_logger")

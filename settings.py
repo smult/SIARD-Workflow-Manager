@@ -69,6 +69,7 @@ _CONFIG_DEFAULTS: dict = {
     "disk_overhead_factor":   2.0,   # multiplikator for estimert temp-diskbehov
     "siard_output_version":   "2.1", # målversjon for eksportert SIARD ("2.1" eller "2.2")
     "min_operation_status":   2,     # 0=alle, 1=beta+ok, 2=kun ok/releaset
+    "enable_premis_provenance": True,  # skriv PREMIS-proveniens for endrende operasjoner
     # Ollama (LOKAL LLM for anonymisering — aldri sky)
     "ollama_enabled":         True,        # bruk lokal Ollama hvis tilgjengelig
     "ollama_host":            "127.0.0.1", # lokal vert

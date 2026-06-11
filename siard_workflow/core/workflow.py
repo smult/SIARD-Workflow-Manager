@@ -126,6 +126,26 @@ class Workflow:
         run = WorkflowRun(siard_path)
         run.start_time = time.time()
 
+        # PREMIS-proveniens: én event per innholdsendrende operasjon.
+        premis_logger = None
+        try:
+            from settings import get_config
+            _premis_on = get_config("enable_premis_provenance")
+        except Exception:
+            _premis_on = True
+        if _premis_on:
+            try:
+                from .premis_logger import PremisProvenanceLogger
+                try:
+                    from version import VERSION as _APP_VERSION
+                except Exception:
+                    _APP_VERSION = ""
+                premis_logger = PremisProvenanceLogger(
+                    siard_path.parent, siard_path, agent_version=str(_APP_VERSION))
+                ctx.metadata["premis_logger"] = premis_logger
+            except Exception:
+                premis_logger = None
+
         if verbose:
             print(f"\n▶ Starter workflow «{self.name}» på {siard_path.name}")
             print(f"  {len(self._operations)} operasjoner planlagt\n")
@@ -146,6 +166,10 @@ class Workflow:
                 result = op.run(ctx)
                 # Lagre resultat i kontekst så neste operasjon kan lese det
                 ctx.set_result(op.operation_id, result.data)
+                # PREMIS-proveniens for innholdsendrende operasjoner
+                if (premis_logger and getattr(op, "modifies_content", False)
+                        and op.premis_should_record(result, ctx)):
+                    premis_logger.record(op, result, ctx)
                 # Hvis operasjonen produserte en ny SIARD-fil, oppdater input-stien
                 new_siard = ctx.chain_siard(op.produces_siard, result.data)
                 if new_siard and verbose:
@@ -169,6 +193,14 @@ class Workflow:
                 break
 
         run.end_time = time.time()
+
+        if premis_logger and premis_logger.has_events():
+            try:
+                pp = premis_logger.finalize(ctx.siard_path, ctx)
+                if pp and verbose:
+                    print(f"  PREMIS-proveniens skrevet: {pp.name}")
+            except Exception:
+                logger.exception("Kunne ikke skrive PREMIS-proveniens")
 
         if verbose:
             print()

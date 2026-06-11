@@ -256,6 +256,8 @@ class AnonymizeOperation(BaseOperation):
     status          = 0          # verifisert ende-til-ende mot ekte SIARD
     produces_siard  = True
     requires_unpack = True
+    modifies_content = True
+    premis_event_type = "anonymisering"
 
     default_params = {
         "output_suffix":         "_anonymisert",

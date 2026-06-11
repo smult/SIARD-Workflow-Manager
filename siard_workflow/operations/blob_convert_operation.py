@@ -1622,6 +1622,8 @@ class BlobConvertOperation(BaseOperation):
     status          = 2
     produces_siard  = True
     requires_unpack = True
+    modifies_content = True
+    premis_event_type = "formatkonvertering"
     default_params = {
         "output_suffix":        "_konvertert",
         "libreoffice_bin":      "soffice",

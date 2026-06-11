@@ -475,6 +475,8 @@ class HexExtractOperation(BaseOperation):
     status          = 2
     produces_siard  = True
     requires_unpack = True
+    modifies_content = True
+    premis_event_type = "hex-ekstraksjon"
 
     default_params = {
         "dry_run":         False,

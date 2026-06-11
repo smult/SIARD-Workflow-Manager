@@ -213,6 +213,8 @@ class SchemaSelectorOperation(BaseOperation):
     status          = 2
     produces_siard  = True
     requires_unpack = True
+    modifies_content = True
+    premis_event_type = "skjemautvalg"
 
     default_params = {
         "auto_select_all": False,   # hvis True: hopp over dialog (alle med)

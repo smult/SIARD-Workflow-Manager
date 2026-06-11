@@ -204,6 +204,9 @@ def _resolve_pending(token: str, siard_path: Path, ctx) -> "Path | None":
     if token == "workflow_rapport":
         return _newest(parent, log_dir, pattern=f"{base}*_workflow_rapport*.pdf")
 
+    if token == "provenance_premis":
+        return _newest(parent, log_dir, pattern=f"{base}_premis.xml")
+
     return None
 
 # ── Diskplass-estimering og -sjekk ────────────────────────────────────────────
@@ -404,6 +407,13 @@ class DiasPackageOperation(BaseOperation):
 
         # SHA256 (finnes alltid i SIARD-mappen)
         _auto_add(siard_path.parent / f"{base}.sha256", _adm, "SHA256")
+
+        # PREMIS-proveniens (bearbeidingslogg). Legges i repository_operations/
+        # for å holde den adskilt fra pakkas egen administrative_metadata/premis.xml.
+        _auto_add(_auto_newest(siard_path.parent, _log_dir,
+                               pattern=f"{base}_premis.xml"),
+                  _repo, "premis-proveniens")
+
         _wlog(f"  Totalt {len(metadata_extras)} ekstra filer klar for pakking")
         # ─────────────────────────────────────────────────────────────────────
 

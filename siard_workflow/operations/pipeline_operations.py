@@ -49,8 +49,20 @@ class UnpackSiardOperation(BaseOperation):
     status         = 2
     produces_siard = False
     requires_unpack = False  # er selve utpakkeren
+    # Utpakkingen i seg selv endrer ikke innhold, men schema-navn-sanering gjør
+    # det. Føres derfor som PREMIS-event kun når sanering faktisk skjedde.
+    modifies_content = True
+    premis_event_type = "skjemanavn-sanering"
 
     default_params: dict = {}
+
+    def premis_should_record(self, result, ctx) -> bool:
+        return bool(result.success) and result.data.get("schemas_sanitized", 0) > 0
+
+    def premis_detail(self, result, ctx) -> str:
+        n = result.data.get("schemas_sanitized", 0)
+        return (f"{n} schema-navn med spesialtegn sanert til 'schemaN' i "
+                f"metadata.xml ved utpakking")
 
     def run(self, ctx: WorkflowContext) -> OperationResult:
         log = ctx.metadata.get("file_logger")
@@ -128,7 +140,7 @@ class UnpackSiardOperation(BaseOperation):
         # allerede ved utpakking, slik at ALLE arbeidsflyter får konsistente navn
         # — ikke bare de som bruker BLOB-konvertering.
         try:
-            self._sanitize_schema_names(tmp, w)
+            data["schemas_sanitized"] = self._sanitize_schema_names(tmp, w)
         except Exception as exc:
             w(f"  Advarsel: kunne ikke sanere schema-navn: {exc}", "warn")
 
@@ -208,7 +220,7 @@ class UnpackSiardOperation(BaseOperation):
         return count
 
     @staticmethod
-    def _sanitize_schema_names(extract_dir: Path, w) -> None:
+    def _sanitize_schema_names(extract_dir: Path, w) -> int:
         """
         Saniter `<schema><name>`-verdier med spesialtegn i metadata.xml rett
         etter utpakking. Navn som ikke er URL-/XML-sikre (kun A-Za-z0-9_.-)
@@ -218,6 +230,8 @@ class UnpackSiardOperation(BaseOperation):
 
         Tomme navn håndteres separat av _check_empty_schema_names (med dialog);
         denne tar kun ikke-tomme navn med ulovlige tegn.
+
+        Returnerer antall sanerte schema-navn (0 hvis ingen endring).
         """
         from siard_workflow.core.siard_format import (
             list_all_schema_names, sanitize_metadata_schema_names,
@@ -225,13 +239,13 @@ class UnpackSiardOperation(BaseOperation):
         )
         metadata_path = extract_dir / "header" / "metadata.xml"
         if not metadata_path.exists():
-            return
+            return 0
         data = metadata_path.read_bytes()
         unsafe = [s for s in list_all_schema_names(data)
                   if s["name"].strip()
                   and not _SAFE_SCHEMA_NAME_RE.match(s["name"].strip())]
         if not unsafe:
-            return
+            return 0
         w(f"  ADVARSEL: {len(unsafe)} schema-navn med spesialtegn funnet:", "warn")
         for s in unsafe:
             w(f"    • '{s['name']}' (folder: {s['folder']}) → schema{s['index']}",
@@ -241,6 +255,8 @@ class UnpackSiardOperation(BaseOperation):
             metadata_path.write_bytes(new_data)
             w(f"  Sanerte {len(unsafe)} schema-navn til 'schemaN' i metadata.xml.",
               "ok")
+            return len(unsafe)
+        return 0
 
     @staticmethod
     def _check_empty_schema_names(extract_dir: Path, ctx, w) -> None:

@@ -375,10 +375,18 @@ class SiardMapperOperation(BaseOperation):
     category       = "Metadata"
     status         = 2
     produces_siard = True
+    modifies_content = True
+    premis_event_type = "metadata-beriking"
     default_params = {
         "json_template":       "",     # sti til JSON-malfilen
         "overwrite_existing":  False,  # True = overstyr beskrivelser som allerede finnes
     }
+
+    def premis_should_record(self, result, ctx) -> bool:
+        d = result.data or {}
+        changed = (d.get("tables_enriched", 0) + d.get("columns_enriched", 0)
+                   + d.get("tables_deleted", 0))
+        return bool(result.success) and changed > 0
 
     def run(self, ctx: WorkflowContext) -> OperationResult:
         log = ctx.metadata.get("file_logger")

@@ -63,6 +63,14 @@ class BaseOperation(ABC):
     # True hvis en feil i denne operasjonen skal stoppe hele workflowen
     # umiddelbart (ingen etterfølgende steg kjøres).
     halt_on_failure: bool = False
+    # True hvis operasjonen endrer innholdet/metadataen i SIARD-uttrekket.
+    # Slike operasjoner føres som PREMIS-proveniens (én event per operasjon).
+    # NB: dette er ikke det samme som produces_siard — pipeline-modus endrer
+    # innhold uten produces_siard, og repack_siard produserer fil uten å endre
+    # innhold.
+    modifies_content: bool = False
+    # PREMIS eventType for proveniens-loggen. Tom => label brukes som fallback.
+    premis_event_type: str = ""
 
     def __init__(self, **params):
         # Prioritet: 1) eksplisitte params, 2) lagrede op_params, 3) config.json, 4) defaults
@@ -116,6 +124,24 @@ class BaseOperation(ABC):
     def run(self, ctx: WorkflowContext) -> OperationResult:
         """Utfør operasjonen. Må implementeres av underklasse."""
         ...
+
+    def premis_should_record(self, result: "OperationResult", ctx: WorkflowContext) -> bool:
+        """
+        Avgjør om kjøringen skal føres som PREMIS-event. Standard: før alle
+        vellykkede kjøringer av en innholdsendrende operasjon. Override i
+        rammeoperasjoner (f.eks. utpakking) som bare noen ganger endrer noe.
+        """
+        return bool(getattr(result, "success", True))
+
+    def premis_detail(self, result: "OperationResult", ctx: WorkflowContext) -> str:
+        """
+        Menneskelesbar oppsummering av hva operasjonen gjorde med uttrekket.
+        Brukes som <premis:eventDetail> i proveniens-loggen.
+
+        Standard returnerer result.message. Override i operasjoner der
+        result.data inneholder rikere tall (antall celler, filer, rader e.l.).
+        """
+        return result.message or ""
 
     def _ok(self, data: dict = None, message: str = "") -> OperationResult:
         return OperationResult(self.operation_id, True, data or {}, message)

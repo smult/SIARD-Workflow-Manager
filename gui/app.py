@@ -28,6 +28,7 @@ from siard_workflow.core.workflow import Workflow
 from siard_workflow.core.report import save_html, save_pdf
 from siard_workflow.core.workflow_io import workflow_to_json, workflow_from_json
 from siard_workflow.core.file_logger import WorkflowFileLogger
+from siard_workflow.core.premis_logger import PremisProvenanceLogger
 from gui.progress_panel import ProgressPanel
 from gui.format_chart_panel import FormatChartPanel
 from settings import get_config, set_config
@@ -1862,6 +1863,18 @@ class App(ctk.CTk):
             except Exception:
                 pass
 
+            # PREMIS-proveniens: én event per innholdsendrende operasjon,
+            # skrives til {base}_premis.xml i log-mappa og auto-inkluderes i
+            # DIAS-pakka. Kan slås av via config.
+            premis_logger = None
+            if get_config("enable_premis_provenance"):
+                try:
+                    premis_logger = PremisProvenanceLogger(
+                        log_dir, path, agent_version=str(self.VERSION))
+                    ctx.metadata["premis_logger"] = premis_logger
+                except Exception:
+                    premis_logger = None
+
             ctx.metadata["step_results"] = []
 
             for i, op in enumerate(wf):
@@ -1957,6 +1970,10 @@ class App(ctk.CTk):
                 try:
                     result = op.run(ctx)
                     ctx.set_result(op.operation_id, result.data)
+                    # PREMIS-proveniens for innholdsendrende operasjoner
+                    if (premis_logger and getattr(op, "modifies_content", False)
+                            and op.premis_should_record(result, ctx)):
+                        premis_logger.record(op, result, ctx)
                     # Hvis operasjonen produserte en ny SIARD-fil, oppdater input-stien
                     new_siard = ctx.chain_siard(op.produces_siard, result.data)
                     if new_siard:
@@ -2052,6 +2069,15 @@ class App(ctk.CTk):
                     break
 
             run.end_time = time.time()
+            # Skriv PREMIS-proveniensfil før loggen avsluttes (slik at en
+            # eventuell speiling rekker å nå kjøreloggen).
+            if premis_logger and premis_logger.has_events():
+                try:
+                    _pp = premis_logger.finalize(ctx.siard_path, ctx)
+                    if _pp and file_logger:
+                        file_logger.log(f"PREMIS-proveniens skrevet: {_pp.name}", "info")
+                except Exception:
+                    pass
             if file_logger:
                 file_logger.log(
                     f"Fullført: {'SUKSESS' if run.success else 'FEIL'}  ({run.elapsed:.2f}s)")
