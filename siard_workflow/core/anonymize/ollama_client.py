@@ -155,47 +155,58 @@ class OllamaClient:
     def analyze_table(self, columns: "list[tuple]", rows: "list[dict]",
                       table_name: str = "") -> "dict[str, str]":
         """Helhetlig tabellanalyse (foranalyse): gitt kolonner (idx, navn, type)
-        og noen EKSEMPELRADER, avgjør hvilke kolonner som skal anonymiseres.
+        og EKSEMPELRADER, avgjør hvilke kolonner som skal anonymiseres.
+
+        VIKTIG: feltnavnene SKJULES for modellen (kolonnene presenteres som
+        nøytrale etiketter K1, K2 …), slik at vurderingen baseres KUN på de
+        faktiske VERDIENE. Modellen anker ellers feilaktig på ord som «Navn» i
+        kolonnenavnet og feilklassifiserer fag-/typenavn som personnavn.
 
         Omfang — KUN disse kategoriene:
           FULL_NAME/FIRST_NAME/LAST_NAME = personnavn
           FNR                            = personnummer (11 sifre)
           EMAIL                          = e-postadresse
           ADDRESS/POSTNR/CITY            = stedsangivelse ned på stedsnivå
-        Alt annet (telefon, koder, beløp, datoer, titler, fag-/stedsnavn på
-        region-/landnivå, beskrivelser osv.) → utelates.
+        Alt annet → utelates.
 
         Returnerer {kolonnenavn: TYPE} der TYPE ∈ _CLASSIFY_VOCAB (OTHER utelates).
         """
         if not columns or not rows:
             return {}
-        col_line = ", ".join(f"{name}({typ})" for _idx, name, typ in columns)
+        # Nøytrale etiketter K1..Kn — skjul feltnavnet for modellen.
+        label_of: dict = {}
+        name_of: dict = {}
+        for i, (idx, name, _typ) in enumerate(columns, 1):
+            lab = f"K{i}"
+            label_of[idx] = lab
+            name_of[lab] = name
+        col_line = ", ".join(label_of[idx] for idx, _n, _t in columns)
         row_lines = []
         for ri, row in enumerate(rows, 1):
             cells = []
-            for idx, name, _typ in columns:
+            for idx, _name, _typ in columns:
                 v = (row.get(idx) or "").strip()
                 if v:
-                    cells.append(f"{name}={v[:40]}")
+                    cells.append(f"{label_of[idx]}={v[:60]}")
             if cells:
                 row_lines.append(f"Rad {ri}: " + "; ".join(cells))
         if not row_lines:
             return {}
-        ctx = f"Tabell «{table_name}».\n" if table_name else ""
         prompt = (
-            "Du gjør en foranalyse av en databasetabell for anonymisering. Bruk "
-            "BÅDE kolonnenavnene OG de faktiske eksempelradene.\n" + ctx +
-            "Finn KUN kolonner som inneholder:\n"
+            "Du gjør en foranalyse for anonymisering. Kolonnene er anonymisert "
+            "til etiketter (K1, K2 …) — vurder KUN ut fra de FAKTISKE VERDIENE, "
+            "ikke gjett ut fra noe annet.\n"
+            "Finn KUN kolonner der verdiene er:\n"
             "- personnavn (navn på enkeltpersoner)\n"
             "- personnummer/fødselsnummer (11 sifre)\n"
             "- e-postadresse\n"
             "- stedsangivelse ned på stedsnivå (gateadresse, postnummer, "
             "poststed/by/tettsted — IKKE fylke, region eller land)\n\n"
             f"Kolonner: {col_line}\n\n" + "\n".join(row_lines) + "\n\n"
-            "Svar KUN med JSON: {kolonnenavn: TYPE}. TYPE må være én av: "
-            f"{', '.join(t for t in _CLASSIFY_VOCAB if t != 'FREE_TEXT')}. "
-            "Ta KUN med kolonner som faktisk inneholder slike data (utelat alt "
-            "annet, inkludert telefon, titler, koder, beløp og datoer).")
+            "Svar KUN med JSON: {etikett: TYPE} (f.eks. {\"K3\": \"FULL_NAME\"}). "
+            f"TYPE må være én av: {', '.join(t for t in _CLASSIFY_VOCAB if t != 'FREE_TEXT')}. "
+            "Ta KUN med kolonner der VERDIENE faktisk er slike data (utelat alt "
+            "annet, inkludert fag-/kategorinavn, titler, koder, telefon og datoer).")
         ans = self._generate(prompt, fmt="json", num_predict=512)
         if not ans:
             return {}
@@ -206,10 +217,60 @@ class OllamaClient:
         out: dict[str, str] = {}
         if isinstance(parsed, dict):
             for k, v in parsed.items():
+                name = name_of.get(str(k).upper().strip())
                 t = str(v).upper().strip()
-                if t in _CLASSIFY_VOCAB and t != "OTHER":
-                    out[str(k)] = t
+                if name and t in _CLASSIFY_VOCAB and t != "OTHER":
+                    out[name] = t
         return out
+
+    def recommend_subset(self, schema_tables: "list[dict]") -> "list[str]":
+        """Foreslå hvilke tabeller som er SENTRALE/viktige for et redusert,
+        sammenhengende datautvalg (subset).
+
+        schema_tables: liste av {"name", "description", "rows", "refs_in",
+        "refs_out"} der refs_in = antall tabeller som peker TIL tabellen og
+        refs_out = antall fremmednøkler ut.
+
+        Returnerer en liste av tabellnavn (delsett av input). Tom ved feil →
+        kaller faller tilbake på heuristikk.
+        """
+        if not schema_tables:
+            return []
+        lines = []
+        for t in schema_tables[:120]:
+            desc = (t.get("description") or "").strip()
+            desc = f" — {desc[:60]}" if desc else ""
+            lines.append(
+                f"- {t.get('name','?')}: {int(t.get('rows',0))} rader, "
+                f"{int(t.get('refs_in',0))} innkommende ref, "
+                f"{int(t.get('refs_out',0))} utgående ref{desc}")
+        prompt = (
+            "Du hjelper med å lage et LITE, sammenhengende testutvalg fra et "
+            "fagsystem. Velg de SENTRALE «entitets»-tabellene som utvalget bør ta "
+            "utgangspunkt i.\n"
+            "PRIORITER tabeller som handler om PERSONER (person, klient, bruker, "
+            "ansatt, elev, pasient, innbygger, medlem, kunde, kontakt) OG om "
+            "saksinnhold (journal, sak, dokument, melding, notat, vedtak, brev, "
+            "henvendelse, søknad, oppgave).\n"
+            "UTELAT rene oppslags-/kode-/logg-/koblingstabeller, OG kopitabeller "
+            "(samme navn som en annen tabell, men med et tillegg som _tmp, _kopi, "
+            "_bak eller en dato).\n"
+            "Tabeller (navn: rader, referanser, beskrivelse):\n"
+            + "\n".join(lines) + "\n\n"
+            'Svar KUN med JSON: {"important": ["tabellnavn", ...]} med de 3–10 '
+            "viktigste sentrale tabellene.")
+        ans = self._generate(prompt, fmt="json", num_predict=256)
+        if not ans:
+            return []
+        try:
+            parsed = json.loads(ans)
+        except Exception:
+            return []
+        names = parsed.get("important") if isinstance(parsed, dict) else parsed
+        if not isinstance(names, list):
+            return []
+        valid = {str(t.get("name", "")).lower() for t in schema_tables}
+        return [str(n) for n in names if str(n).lower() in valid]
 
     def verify_person_names(self, samples: "list[str]") -> bool:
         """Avgjør om VERDIENE er navn på enkeltpersoner — basert KUN på verdiene.
@@ -220,7 +281,7 @@ class OllamaClient:
 
         Returnerer False ved tydelig «ANNET». PERSON eller uklart → True (behold
         som personnavn → anonymiser, sikreste standard for personvern)."""
-        sample_txt = "\n".join(f"- {s[:60]}" for s in (samples or [])[:12])
+        sample_txt = "\n".join(f"- {s[:60]}" for s in (samples or [])[:20])
         if not sample_txt.strip():
             return True
         prompt = (

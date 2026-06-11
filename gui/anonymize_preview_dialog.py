@@ -76,6 +76,35 @@ class AnonymizePreviewDialog(ctk.CTkToplevel):
         body.grid_columnconfigure(0, weight=1)
         r = 0
 
+        # Datareduksjon (subset) — vis først hvis aktiv
+        sub = self._summary.get("subset")
+        if sub:
+            r = self._section(body, r, "Datareduksjon (subset)")
+            orig = sub.get("total_original", 0)
+            kept = sub.get("total_kept", 0)
+            pct = (100.0 * kept / orig) if orig else 0.0
+            ctk.CTkLabel(
+                body,
+                text=(f"  Beholder inntil {sub.get('n_rows', 0)} rader per tabell "
+                      f"(+ relaterte rader for å bevare fremmednøkler).\n"
+                      f"  Reduserer {orig:,} → {kept:,} rader ({pct:.1f} %). "
+                      f"Tabellvalg: {sub.get('mode', '?')}."),
+                font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                text_color=COLORS["text"], anchor="w", justify="left"
+            ).grid(row=r, column=0, padx=14, pady=2, sticky="w")
+            r += 1
+            names = sub.get("important_names") or []
+            if names:
+                shown = ", ".join(names[:12]) + (f"  (+{len(names)-12})"
+                                                 if len(names) > 12 else "")
+                ctk.CTkLabel(
+                    body, text=f"  Viktige tabeller: {shown}",
+                    font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                    text_color=COLORS["muted"], anchor="w", wraplength=800,
+                    justify="left"
+                ).grid(row=r, column=0, padx=14, pady=(0, 4), sticky="w")
+                r += 1
+
         if cols:
             r = self._section(body, r, "PII-felter (før → etter)")
             for col in cols:

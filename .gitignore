@@ -7,3 +7,4 @@
 *.zip
 debug.log
 config.json
+extras/

@@ -35,9 +35,9 @@ from siard_workflow.core.anonymize.fake_generators import lorem_ipsum
 
 from siard_workflow.core.base_operation import BaseOperation
 from siard_workflow.core.anonymize.pii_detect import (
-    PiiType, ColumnClass, classify_column, find_all_pii, VALUE_TYPES,
-    should_anonymize, is_excluded_field, is_ambiguous_name, is_valid_fnr,
-    looks_like_person_name)
+    PiiType, ColumnClass, Span, classify_column, find_all_pii, find_name_spans,
+    VALUE_TYPES, should_anonymize, is_excluded_field, is_ambiguous_name,
+    is_valid_fnr, looks_like_person_name)
 
 # Navnetyper som verifiseres mot innhold ved tvetydige kolonnenavn
 _NAME_VALUE_TYPES = (PiiType.FULL_NAME, PiiType.FIRST_NAME, PiiType.LAST_NAME)
@@ -129,6 +129,7 @@ def read_tables(metadata_path: Path) -> "dict[str, dict]":
             tables[key] = {
                 "schema_name":     s_name,
                 "table_name":      t_name,
+                "table_desc":      _child_text(table, "description"),
                 "schema_folder":   s_folder,
                 "table_folder":    t_folder,
                 "columns":         cols,
@@ -149,6 +150,20 @@ def _table_xml_path(root: Path, info: dict) -> Path:
 def _decode_cell(raw: bytes) -> str:
     """Inner-tekst fra <cN>..</cN> → lesbar streng (XML-entiteter løst opp)."""
     return html.unescape(raw.decode("utf-8", errors="replace"))
+
+
+def _apply_spans(text: str, spans: "list", mapping) -> str:
+    """Erstatt PII-spenn i text med deterministiske fakes (via MappingStore),
+    behold resten av teksten. Spenn må være ikke-overlappende og sortert."""
+    out, pos = [], 0
+    for sp in spans:
+        if sp.start < pos:
+            continue
+        out.append(text[pos:sp.start])
+        out.append(mapping.map(sp.pii_type, sp.text))
+        pos = sp.end
+    out.append(text[pos:])
+    return "".join(out)
 
 
 def sample_columns(xml_path: Path, max_samples: int = 50) -> "dict[int, list[str]]":
@@ -249,8 +264,18 @@ class AnonymizeOperation(BaseOperation):
         "replace_binary_media":  True,
         "show_preview":          True,   # vis forhåndsvisning før endringer skrives
         "preview_rows":          5,
+        "analysis_rows":         20,    # antall eksempelrader Ollama vurderer per tabell
         "ollama_freetext_limit": 200,   # maks antall fritekstceller sendt til Ollama
         "dry_run":               False,
+        # ── Datareduksjon (subset) ──────────────────────────────────────────
+        # Når på: i stedet for å anonymisere HELE datasettet beholdes inntil
+        # `subset_rows` rader fra hver tabell, pluss relaterte rader (foreldre
+        # transitivt + utvalg av barn) slik at fremmednøkler henger sammen.
+        "subset_enabled":          False,
+        "subset_rows":             300,   # rader per tabell (frø)
+        "subset_include_children": True,  # ta med barnerader fra viktige frø-rader
+        "subset_table_mode":       "ollama",  # ollama | heuristic | manual
+        "subset_important_tables": "",    # manuelt: komma-separerte tabellnavn
     }
 
     @property
@@ -388,6 +413,13 @@ class AnonymizeOperation(BaseOperation):
         w(f"  Fant {len(tables)} tabell(er) i metadata.", "info")
         progress("phase_done")
 
+        # ── Datareduksjon (subset): planlegg radutvalg med referanseintegritet ──
+        subset_keep: "dict | None" = None
+        subset_info: "dict | None" = None
+        if bool(self.params.get("subset_enabled", False)):
+            subset_keep, subset_info = self._plan_subset(
+                root, metadata_path, tables, w, progress)
+
         # Fase 2: GRUNDIG FORANALYSE (Ollama vurderer ~10 rader per tabell)
         progress("phase", phase=2, total_phases=4,
                  label="Foranalyse: identifiserer persondata (Ollama)")
@@ -400,6 +432,8 @@ class AnonymizeOperation(BaseOperation):
 
         # Fase 3: forhåndsvisning + bekreftelse
         summary = self._build_summary(plans, lob_plans)
+        if subset_info is not None:
+            summary["subset"] = subset_info
         show_preview = bool(self.params.get("show_preview", True))
         if dry_run:
             w("  TØRKJØRING — viser plan, skriver ingen endringer.", "warn")
@@ -420,22 +454,35 @@ class AnonymizeOperation(BaseOperation):
         def _do_table(key, info):
             xml_path = _table_xml_path(root, info)
             table_plans = {idx: p for (tk, idx), p in plans.items() if tk == key}
+            keep_rows = subset_keep.get(key) if subset_keep is not None else None
             return self._rewrite_table(root, info, xml_path, table_plans,
-                                       replace_lobs, w)
+                                       replace_lobs, w, keep_rows=keep_rows)
 
         done = 0
+        kept_counts: dict = {}
         with ThreadPoolExecutor(max_workers=self._workers) as ex:
             futs = {ex.submit(_do_table, key, info): key
                     for key, info in tables.items()}
             for fut in as_completed(futs):
+                key = futs[fut]
                 cell_stats = fut.result()
                 stats["tables"]           += 1
                 stats["cells_anonymized"] += cell_stats["cells"]
                 stats["freetext_cells"]   += cell_stats["freetext"]
                 stats["lobs_replaced"]    += cell_stats["lobs"]
+                if "kept_rows" in cell_stats:
+                    kept_counts[key] = cell_stats["kept_rows"]
                 done += 1
                 progress("phase_progress", done=done, total=n_tables)
         progress("phase_done")
+
+        # Subset: oppdater <rows> i metadata.xml til faktisk beholdt antall
+        if subset_keep is not None and kept_counts:
+            patched = self._patch_metadata_rows(metadata_path, tables, kept_counts, w)
+            stats["subset_rows_kept"]   = sum(kept_counts.values())
+            stats["subset_tables"]      = patched
+            if subset_info:
+                stats["subset_original_rows"] = subset_info.get("total_original", 0)
 
         stats["mappings"] = len(self._mapping)
 
@@ -459,6 +506,160 @@ class AnonymizeOperation(BaseOperation):
         if n <= 0:
             n = min(16, (os.cpu_count() or 4) * 2)
         return max(1, n)
+
+    # ── Datareduksjon (subset) ─────────────────────────────────────────────────
+
+    def _plan_subset(self, root: Path, metadata_path: Path, tables: dict,
+                     w, progress) -> "tuple[dict, dict]":
+        """Planlegg referensielt radutvalg. Returnerer (keep, info)."""
+        from siard_workflow.core.anonymize import subset as S
+        w("  Datareduksjon (subset): planlegger referensielt utvalg ...", "step")
+        relations = S.read_relations(metadata_path, tables)
+        n_fk = sum(len(r.fks) for r in relations.values())
+        n_pk = sum(1 for r in relations.values() if r.pk_cols)
+        w(f"    {n_pk} tabell(er) med primærnøkkel, "
+          f"{n_fk} fremmednøkkel-relasjon(er).", "info")
+        if n_fk == 0:
+            w("    Ingen fremmednøkler i metadata — utvalget blir per-tabell "
+              "uten relasjonslukking.", "warn")
+
+        index = S.build_index(root, tables, relations, _table_xml_path)
+
+        # Kopitabeller (samme navn + _tmp/_kopi/dato) utelates helt.
+        copies = S.detect_copy_tables(tables)
+        if copies:
+            cnames = ", ".join(sorted(tables[tk]["table_name"] for tk in copies))
+            w(f"    Utelater {len(copies)} kopitabell(er): {cnames}", "info")
+
+        mode = str(self.params.get("subset_table_mode", "ollama")).lower()
+        important = self._select_important_tables(
+            mode, tables, relations, index, w, exclude=copies)
+        important -= copies
+        names = ", ".join(sorted(tables[tk]["table_name"] for tk in important)) \
+            or "(ingen)"
+        w(f"    Viktige tabeller ({len(important)}): {names}", "info")
+
+        n = int(self.params.get("subset_rows", 300) or 300)
+        plan = S.SubsetPlan(
+            important=important,
+            n_rows=n,
+            include_children=bool(self.params.get("subset_include_children", True)),
+            child_cap=n,
+            keep_full_threshold=n,   # tabeller ≤ n rader beholdes i sin helhet
+            exclude=frozenset(copies),
+        )
+        keep, info = S.select_rows(index, relations, tables, plan, w)
+        info["important_names"] = sorted(
+            tables[tk]["table_name"] for tk in info.get("important", []) if tk in tables)
+        info["mode"] = mode
+        w(f"    Reduserer {info['total_original']:,} → "
+          f"{info['total_kept']:,} rader.", "ok")
+        return keep, info
+
+    def _select_important_tables(self, mode: str, tables: dict, relations: dict,
+                                 index, w, exclude: "set | None" = None) -> set:
+        from siard_workflow.core.anonymize import subset as S
+        exclude = exclude or set()
+        name_to_key = {info["table_name"].lower(): tk
+                       for tk, info in tables.items()}
+
+        if mode == "manual":
+            raw = str(self.params.get("subset_important_tables", "") or "")
+            wanted = [s.strip() for s in raw.replace(";", ",").split(",") if s.strip()]
+            chosen = {name_to_key[n.lower()] for n in wanted
+                      if n.lower() in name_to_key}
+            if chosen:
+                return chosen
+            w("    Subset: ingen gyldige manuelle tabellnavn — "
+              "faller tilbake på heuristikk.", "warn")
+            mode = "heuristic"
+
+        if mode == "ollama" and self._ollama is not None:
+            try:
+                summary = [t for t in self._subset_schema_summary(
+                    tables, relations, index)
+                    if name_to_key.get(t["name"].lower()) not in exclude]
+                rec = self._ollama.recommend_subset(summary)
+                chosen = {name_to_key[n.lower()] for n in rec
+                          if n.lower() in name_to_key}
+                if chosen:
+                    w(f"    Subset: Ollama foreslo {len(chosen)} sentrale "
+                      f"tabell(er).", "ok")
+                    return chosen
+                w("    Subset: Ollama ga ingen brukbare forslag — "
+                  "bruker heuristikk.", "warn")
+            except Exception as exc:
+                w(f"    Subset: Ollama-forslag feilet ({exc}) — "
+                  f"bruker heuristikk.", "warn")
+
+        return set(S.recommend_important_heuristic(
+            tables, relations, index.row_count, exclude=exclude))
+
+    @staticmethod
+    def _subset_schema_summary(tables: dict, relations: dict, index) -> list:
+        """Bygg tabell-oppsummering til Ollama: navn, beskrivelse, rader, ref-tall."""
+        incoming = {tk: 0 for tk in tables}
+        for tk, rel in relations.items():
+            for fk in rel.fks:
+                if fk.parent_key in incoming:
+                    incoming[fk.parent_key] += 1
+        out = []
+        for tk, info in tables.items():
+            out.append({
+                "name":        info["table_name"],
+                "description": info.get("table_desc", ""),
+                "rows":        index.row_count.get(tk, 0),
+                "refs_in":     incoming.get(tk, 0),
+                "refs_out":    len(relations.get(tk).fks) if relations.get(tk) else 0,
+            })
+        return out
+
+    @staticmethod
+    def _patch_metadata_rows(metadata_path: Path, tables: dict,
+                             kept_counts: dict, w) -> int:
+        """Oppdater <rows>N</rows> i metadata.xml til beholdt antall per tabell.
+        Returnerer antall oppdaterte tabeller."""
+        try:
+            tree = ET.parse(metadata_path)
+        except Exception as exc:
+            w(f"    Subset: kunne ikke lese metadata.xml for <rows>-oppdatering: "
+              f"{exc}", "warn")
+            return 0
+        root_el = tree.getroot()
+        m = re.match(r"\{([^}]+)\}", root_el.tag)
+        if m:
+            ET.register_namespace("", m.group(1))   # bevar default-namespace
+
+        folder_keep = {}
+        for key, cnt in kept_counts.items():
+            info = tables.get(key)
+            if info:
+                folder_keep[(info["schema_folder"], info["table_folder"])] = cnt
+
+        patched = 0
+        for schema in root_el.iter():
+            if _local(schema.tag).lower() != "schema":
+                continue
+            s_folder = _child_text(schema, "folder")
+            for table in schema.iter():
+                if _local(table.tag).lower() != "table":
+                    continue
+                t_folder = _child_text(table, "folder")
+                cnt = folder_keep.get((s_folder, t_folder))
+                if cnt is None:
+                    continue
+                for child in table:
+                    if _local(child.tag).lower() == "rows":
+                        child.text = str(cnt)
+                        patched += 1
+                        break
+        if patched:
+            try:
+                tree.write(metadata_path, encoding="utf-8", xml_declaration=True)
+            except Exception as exc:
+                w(f"    Subset: skriving av metadata.xml feilet: {exc}", "warn")
+                return 0
+        return patched
 
     # ── Klassifisering (parallelt per tabell) ─────────────────────────────────
 
@@ -516,16 +717,19 @@ class AnonymizeOperation(BaseOperation):
             except Exception:
                 ollama_alive = False
 
-        # 2) GRUNDIG FORANALYSE: la Ollama vurdere ~10 reelle eksempelrader (fra
-        #    halen, ikke de første som ofte er dummy) + feltnavn for HVER tabell,
-        #    og avgjøre hvilke felter som skal anonymiseres (navn/fnr/e-post/sted).
+        # 2) GRUNDIG FORANALYSE: la Ollama vurdere flere reelle eksempelrader (fra
+        #    halen, ikke de første som ofte er dummy) for HVER tabell. Feltnavnene
+        #    SKJULES (nøytrale etiketter) — vurderingen baseres KUN på verdiene, og
+        #    KUN tekstkolonner sendes (numerisk fnr fanges av heuristikken).
         ollama_types: dict[str, str] = {}
         if ollama_alive:
             try:
+                n_rows = int(self.params.get("analysis_rows", 20) or 20)
                 cols_info = [(c["idx"], c["name"], c["type"])
-                             for c in info["columns"]]
+                             for c in info["columns"]
+                             if c["idx"] not in lob_cols and _is_text_type(c["type"])]
                 ollama_types = self._ollama.analyze_table(
-                    cols_info, spread_rows(rows, 10), info.get("table_name", ""))
+                    cols_info, spread_rows(rows, n_rows), info.get("table_name", ""))
             except Exception:
                 ollama_types = {}
         ollama_lc = {k.lower(): v for k, v in ollama_types.items()}
@@ -576,18 +780,17 @@ class AnonymizeOperation(BaseOperation):
                 # Navne-treff fra heuristikk. Tvetydige (NavnBM, FylkeNavn,
                 # bar «Navn» …) MÅ bekreftes mot INNHOLDET; sterke nøkkelord
                 # (Fornavn/Etternavn) stoles på.
-                if is_ambiguous_name(name) \
-                        and not self._confirm_name(samples.get(idx), ollama_alive):
+                if is_ambiguous_name(name) and not self._is_name_column(samples.get(idx)):
                     cc = ColumnClass(PiiType.OTHER, "ikke-personnavn")
                     log_lines.append((f"    {info['table_name']}.{name}: "
                                       f"OTHER (innhold: ikke personnavn)", "info"))
             elif cc.pii_type is PiiType.OTHER and sug_pt is not None:
                 # Ollama-foranalysen foreslår en type på en kolonne heuristikken
-                # bommet på. Navneforslag bekreftes mot innhold (analyze_table er
-                # upålitelig på navn — anker på kolonnenavnet); sted/fnr/e-post
-                # godtas (strenge per-verdi-vakter beskytter).
+                # bommet på. Navneforslag bekreftes mot innhold (form + navne-
+                # ordbok); sted/fnr/e-post godtas (strenge per-verdi-vakter
+                # beskytter).
                 if sug_pt in _NAME_VALUE_TYPES:
-                    if self._confirm_name(samples.get(idx), ollama_alive):
+                    if self._is_name_column(samples.get(idx)):
                         cc = ColumnClass(sug_pt, "ollama-table")
                 else:
                     cc = ColumnClass(sug_pt, "ollama-table")
@@ -599,20 +802,24 @@ class AnonymizeOperation(BaseOperation):
                                   f"{cc.pii_type.value} (kilde: {cc.source})", "info"))
         return plans, lob_plans, log_lines
 
-    def _confirm_name(self, samples, ollama_alive: bool) -> bool:
-        """Bekreft at en navne-kandidat faktisk er PERSONNAVN, basert på INNHOLD.
-        Ollama avgjør (verdi-basert, kolonnenavn utelatt) når den er tilgjengelig;
-        ellers en verdi-heuristikk. Tom kolonne → True (behold, sikrest)."""
+    @staticmethod
+    def _is_name_column(samples) -> bool:
+        """Deterministisk avgjørelse: er dette en PERSONNAVN-kolonne?
+
+        Krever at verdiene har navne-FORM (looks_like_person_name) OG at en andel
+        gjenkjennes som kjente norske fornavn/etternavn (navneordbok). Dette er
+        langt mer pålitelig enn LLM-en, som feilaktig bekrefter «J», «Høy»,
+        «Klasseliste», «Sokna skole» som personnavn. Tom kolonne → False
+        (ikke bekreftet → ikke anonymiser; unngår falske treff)."""
+        from siard_workflow.core.anonymize.pii_detect import is_recognized_name
         vals = [v for v in (samples or []) if v and v.strip()]
         if not vals:
-            return True
-        if ollama_alive and self._ollama is not None:
-            try:
-                return bool(self._ollama.verify_person_names(vals))
-            except Exception:
-                return True
-        # Uten Ollama: verdi-heuristikk (kapitaliserte ord, ingen sifre/akronym)
-        return sum(1 for v in vals if looks_like_person_name(v)) / len(vals) >= 0.5
+            return False
+        shape = sum(1 for v in vals if looks_like_person_name(v)) / len(vals)
+        if shape < 0.6:
+            return False
+        recog = sum(1 for v in vals if is_recognized_name(v)) / len(vals)
+        return recog >= 0.25
 
     def _classify_all(self, root: Path, tables: dict, w, progress=None):
         """Foranalyse: klassifiser alle tabeller parallelt (Ollama + heuristikk)
@@ -638,21 +845,42 @@ class AnonymizeOperation(BaseOperation):
     # ── Omskriving av én tabell (celler + LOB-filer + digest/length) ──────────
 
     def _rewrite_table(self, root: Path, info: dict, xml_path: Path,
-                       table_plans: dict, replace_lobs: bool, w) -> dict:
+                       table_plans: dict, replace_lobs: bool, w,
+                       keep_rows: "set | None" = None) -> dict:
         out = {"cells": 0, "freetext": 0, "lobs": 0}
         if not xml_path.exists():
             return out
+        subset = keep_rows is not None
 
-        # 1) Bytt LOB-filer på disk; bygg identitets-rename for digest/length-patch
+        # Subset: hvilke LOB-filer refereres av BEHOLDTE rader? (resten er
+        # foreldreløse og slettes — de hører til forkastede rader).
+        kept_lob_refs: "set | None" = None
+        if subset and info["lob_cols"]:
+            kept_lob_refs = self._collect_kept_lob_refs(xml_path, keep_rows)
+
+        # 1) Bytt LOB-filer på disk; bygg identitets-rename for digest/length-patch.
+        #    Ved subset: slett foreldreløse LOB-filer i stedet for å bytte dem.
         ren_bytes: dict[bytes, bytes] = {}
         ren_paths: dict[bytes, Path] = {}
-        if replace_lobs and info["lob_cols"]:
+        if info["lob_cols"] and (replace_lobs or subset):
             for idx, lob_folder in info["lob_cols"].items():
                 folder = root / "content" / lob_folder
                 if not folder.is_dir():
                     continue
                 for fp in folder.rglob("*"):   # rglob → fanger segmenterte LOB (seg0/…)
                     if not fp.is_file():
+                        continue
+                    # Subset: slett foreldreløse LOB-filer (kun direkte i lob-mappa
+                    # for å ikke røre segmenterte under-mapper for beholdte rader).
+                    if (subset and kept_lob_refs is not None
+                            and fp.parent == folder
+                            and fp.name not in kept_lob_refs):
+                        try:
+                            fp.unlink()
+                        except Exception:
+                            pass
+                        continue
+                    if not replace_lobs:
                         continue
                     try:
                         head = fp.open("rb").read(65536)
@@ -691,25 +919,50 @@ class AnonymizeOperation(BaseOperation):
 
         need_cell_rewrite = bool(value_cols or freetext_cols or inline_blob_cols)
         need_digest_patch = bool(ren_bytes)
-        if not need_cell_rewrite and not need_digest_patch:
+        # Ved subset må vi alltid strømme om for å filtrere rader, selv uten PII.
+        if not subset and not need_cell_rewrite and not need_digest_patch:
             return out
 
         from siard_workflow.operations.blob_convert_operation import (
             _patch_line_with_digest)
 
+        def _rewrite_line(line: bytes) -> bytes:
+            if need_cell_rewrite and b"<c" in line:
+                line, nc, nf = self._rewrite_line_cells(
+                    line, value_cols, freetext_cols, inline_blob_cols, col_maxlen)
+                out["cells"]    += nc
+                out["freetext"] += nf
+            if need_digest_patch and (b"file=" in line or b"href=" in line):
+                line, _ = _patch_line_with_digest(line, ren_bytes, ren_paths)
+            return line
+
         tmp_path = xml_path.with_suffix(xml_path.suffix + ".anon_tmp")
+        kept = 0
         try:
             with open(xml_path, "rb") as src, open(tmp_path, "wb") as dst:
-                for line in src:
-                    if need_cell_rewrite and b"<c" in line:
-                        line, nc, nf = self._rewrite_line_cells(
-                            line, value_cols, freetext_cols, inline_blob_cols,
-                            col_maxlen)
-                        out["cells"]    += nc
-                        out["freetext"] += nf
-                    if need_digest_patch and (b"file=" in line or b"href=" in line):
-                        line, _ = _patch_line_with_digest(line, ren_bytes, ren_paths)
-                    dst.write(line)
+                if not subset:
+                    for line in src:
+                        dst.write(_rewrite_line(line))
+                else:
+                    row_pos = -1
+                    in_row = False
+                    buf: list[bytes] = []
+                    for line in src:
+                        if b"<row" in line and not in_row:
+                            in_row = True
+                            row_pos += 1
+                            buf = []
+                        if in_row:
+                            buf.append(line)
+                            if b"</row>" in line:
+                                in_row = False
+                                if row_pos in keep_rows:
+                                    kept += 1
+                                    for bl in buf:
+                                        dst.write(_rewrite_line(bl))
+                                # forkastet rad → skrives ikke
+                            continue
+                        dst.write(line)   # header/footer-linjer
             tmp_path.replace(xml_path)
         except Exception as exc:
             w(f"    FEIL ved omskriving av {xml_path.name}: {exc}", "feil")
@@ -717,7 +970,39 @@ class AnonymizeOperation(BaseOperation):
                 tmp_path.unlink(missing_ok=True)
             except Exception:
                 pass
+        if subset:
+            out["kept_rows"] = kept
         return out
+
+    @staticmethod
+    def _collect_kept_lob_refs(xml_path: Path, keep_rows: set) -> set:
+        """Returner sett av LOB-filnavn (basenavn) referert av BEHOLDTE rader."""
+        refs: set = set()
+        file_re = re.compile(rb'(?:file|href)="([^"]+)"')
+        row_pos = -1
+        in_row = False
+        buf: list[bytes] = []
+        try:
+            with open(xml_path, "rb") as f:
+                for line in f:
+                    if b"<row" in line and not in_row:
+                        in_row = True
+                        row_pos += 1
+                        buf = []
+                    if in_row:
+                        buf.append(line)
+                        if b"</row>" in line:
+                            in_row = False
+                            if row_pos in keep_rows:
+                                blob = b"".join(buf)
+                                for m in file_re.finditer(blob):
+                                    ref = m.group(1).decode("utf-8", "replace")
+                                    base = ref.replace("\\", "/").rsplit("/", 1)[-1]
+                                    if base:
+                                        refs.add(base)
+        except Exception:
+            pass
+        return refs
 
     def _rewrite_line_cells(self, line: bytes, value_cols: dict,
                             freetext_cols: set,
@@ -761,44 +1046,48 @@ class AnonymizeOperation(BaseOperation):
                 return _emit(m.group(1), idx, fake)
             if idx in freetext_cols:
                 original = _decode_cell(inner)
-                # Lengre tekstfelt: hvis teksten gjør en person identifiserbar,
-                # erstatt HELE teksten med Lorem ipsum (deterministisk av
-                # originalen). Ellers la den stå.
-                if original.strip() and self._is_identifiable(original):
-                    words = max(5, min(120, len(original.split()) or 8))
-                    new_text = lorem_ipsum(words, seed=original)
+                if not original.strip():
+                    return m.group(0)
+                # 1) Erstatt konkrete PII-spenn (personnavn via ordbok + fnr/e-post)
+                #    deterministisk PÅ PLASS — behold resten av teksten.
+                spans = self._freetext_spans(original)
+                if spans:
+                    new_text = _apply_spans(original, spans, self._mapping)
                     n_cells += 1
                     n_free += 1
                     return _emit(m.group(1), idx, new_text)
+                # 2) Ingen eksplisitte spenn, men Ollama vurderer teksten som
+                #    kontekstuelt identifiserende → hele feltet blir Lorem ipsum.
+                if self._is_context_identifiable(original):
+                    words = max(5, min(120, len(original.split()) or 8))
+                    n_cells += 1
+                    n_free += 1
+                    return _emit(m.group(1), idx, lorem_ipsum(words, seed=original))
             return m.group(0)
 
         return _CELL_RE.sub(_repl, line), n_cells, n_free
 
     @staticmethod
-    def _has_direct_identifier(text: str) -> bool:
-        """True hvis teksten inneholder et DIREKTE personidentifikator-spenn:
-        fødselsnummer eller e-post (telefon er utenfor omfanget)."""
-        return any(s.pii_type in (PiiType.FNR, PiiType.EMAIL)
-                   for s in find_all_pii(text))
+    def _freetext_spans(text: str) -> "list[Span]":
+        """Finn PII-spenn i fritekst som skal byttes på plass: personnavn (via
+        navneordbok) + fødselsnummer + e-post. Telefon/postnr er utenfor omfang
+        for fritekst. Overlapp fjernes (fnr/e-post har prioritet over navn)."""
+        spans = [s for s in find_all_pii(text)
+                 if s.pii_type in (PiiType.FNR, PiiType.EMAIL)]
+        taken = [(s.start, s.end) for s in spans]
+        for sp in find_name_spans(text):
+            if not any(not (sp.end <= a or sp.start >= b) for a, b in taken):
+                spans.append(sp)
+                taken.append((sp.start, sp.end))
+        spans.sort(key=lambda s: s.start)
+        return spans
 
-    def _is_identifiable(self, text: str) -> bool:
-        """Avgjør om en fritekst er DIREKTE identifiserende for en privatperson.
-
-        Tekst erstattes med Lorem ipsum KUN når den faktisk identifiserer en
-        person — ikke for titler, roller eller ansatt-/saksbehandlerinfo som
-        gir verdi å beholde i et anonymisert SIARD.
-
-          1. Direkte identifikator (fnr/e-post/telefon) → alltid identifiserende.
-          2. Ellers: lokal Ollama vurderer om teksten direkte identifiserer en
-             registrert privatperson (klient). Titler/roller/ansatte → NEI.
-          3. Uten Ollama: kun direkte identifikatorer (punkt 1) — tekst som bare
-             inneholder navn/titler beholdes.
-        """
-        if self._has_direct_identifier(text):
-            return True
+    def _is_context_identifiable(self, text: str) -> bool:
+        """Sekundær sjekk: lokal Ollama vurderer om teksten KONTEKSTUELT
+        identifiserer en privatperson (navn som ikke er i ordboka, unike
+        detaljer). Cappet og trådsikkert. Uten Ollama → False."""
         if self._ollama is None or len(text) < 30:
             return False
-        # Cappet, trådsikker Ollama-vurdering
         with self._budget_lock:
             if self._ollama_budget <= 0:
                 return False
@@ -820,14 +1109,11 @@ class AnonymizeOperation(BaseOperation):
             examples = []
             for val in p["samples"][:preview_rows]:
                 if pt == PiiType.FREE_TEXT:
-                    # Direkte identifiserende fritekst → hele feltet blir Lorem
-                    # ipsum. (Forhåndsvisningen viser kun den sikre regel-veien;
-                    # Ollama-vurderingen av tvilstilfeller skjer ved kjøring.)
-                    if val.strip() and self._has_direct_identifier(val):
-                        after = lorem_ipsum(
-                            max(5, min(20, len(val.split()) or 8)), seed=val)
-                    else:
-                        after = val
+                    # Fritekst: personnavn/fnr/e-post byttes på plass (resten
+                    # beholdes). Forhåndsvisningen viser regel-veien; Ollamas
+                    # kontekstuelle vurdering skjer ved kjøring.
+                    spans = self._freetext_spans(val) if val.strip() else []
+                    after = _apply_spans(val, spans, self._mapping) if spans else val
                 elif should_anonymize(pt, val):
                     after = self._mapping.map(pt, val)
                 else:
@@ -866,6 +1152,16 @@ class AnonymizeOperation(BaseOperation):
             raise _AbortedByUser("Anonymisering avbrutt av bruker")
 
     def _log_summary(self, summary: dict, w):
+        sub = summary.get("subset")
+        if sub:
+            w(f"  DATAREDUKSJON (subset): {sub.get('total_original', 0):,} → "
+              f"{sub.get('total_kept', 0):,} rader "
+              f"({sub.get('n_rows', 0)} per tabell, modus: {sub.get('mode','?')}).",
+              "step")
+            names = sub.get("important_names") or []
+            if names:
+                w(f"    Viktige tabeller: {', '.join(names[:15])}"
+                  + (f" (+{len(names)-15})" if len(names) > 15 else ""), "info")
         w(f"  PII-kolonner: {len(summary['columns'])}, "
           f"LOB-kolonner: {len(summary['lob_columns'])}", "info")
         for col in summary["columns"][:20]:
@@ -957,9 +1253,14 @@ class AnonymizeOperation(BaseOperation):
         if stats.get("dry_run"):
             return (f"Tørkjøring: {stats.get('pii_columns', 0)} PII-kolonner, "
                     f"{stats.get('lob_columns', 0)} LOB-kolonner identifisert")
-        return (f"{stats.get('cells_anonymized', 0)} celler anonymisert, "
-                f"{stats.get('lobs_replaced', 0)} LOB-filer byttet, "
-                f"{stats.get('mappings', 0)} unike erstatninger")
+        msg = (f"{stats.get('cells_anonymized', 0)} celler anonymisert, "
+               f"{stats.get('lobs_replaced', 0)} LOB-filer byttet, "
+               f"{stats.get('mappings', 0)} unike erstatninger")
+        if "subset_rows_kept" in stats:
+            orig = stats.get("subset_original_rows", 0)
+            msg += (f"  |  datasett redusert til {stats['subset_rows_kept']:,}"
+                    + (f" av {orig:,}" if orig else "") + " rader")
+        return msg
 
 
 class _AbortedByUser(Exception):

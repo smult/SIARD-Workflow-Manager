@@ -118,6 +118,9 @@ class ProgressPanel(ctk.CTkFrame):
         self._anim_dir     = 1.0      # +1 / -1
         self._simple_done  = False
         self._simple_ok    = True
+        # None = ubestemt (animert glideblokk); float 0..1 = bestemt %-progresjon
+        self._simple_pct   = None
+        self._simple_phase_label = ""
 
         self._build()
         # Panelet starter skjult; _build_ui i app.py setter grid-info via .grid()
@@ -319,6 +322,8 @@ class ProgressPanel(ctk.CTkFrame):
         self._simple_ok   = True
         self._anim_pos    = 0.0
         self._anim_dir    = 1.0
+        self._simple_pct  = None          # start ubestemt til faser melder progresjon
+        self._simple_phase_label = ""
 
         op_label = label.upper()
         self._title_lbl.configure(text=op_label, text_color=COLORS["accent"])
@@ -356,6 +361,7 @@ class ProgressPanel(ctk.CTkFrame):
         """Full nullstilling — kalles ved ny SIARD-fil eller kø ferdig."""
         self._simple_mode = False
         self._simple_done = False
+        self._simple_pct  = None
         self._total       = 0
         self._converted   = 0
         self._kept        = 0
@@ -459,16 +465,31 @@ class ProgressPanel(ctk.CTkFrame):
                 text_color=COLORS["text"])
             self._phase_pcts[idx].configure(text="0%",
                                              text_color=COLORS["muted"])
+        # Simple-modus: vis fase som bestemt progressbar med %
+        if self._simple_mode and not self._simple_done:
+            self._simple_phase_label = f"[{phase}/{total_phases}] {label}".strip()
+            self._simple_pct = 0.0
+            self._simple_status.configure(text=f"{self._simple_phase_label}  0 %",
+                                          text_color=COLORS["text"])
+            self._draw_simple()
 
     def set_phase_progress(self, done: int, total: int, label: str = ""):
+        pct = done / total if total else 0
         idx = self._current_phase - 1
         if 0 <= idx < len(self._phase_canvases):
-            pct = done / total if total else 0
             self._phase_progress[idx] = pct
             self._phase_canvases[idx].set_active(pct)
             self._phase_pcts[idx].configure(
                 text=f"{done:,}/{total:,}" if total < 10000 else f"{pct*100:.0f}%",
                 text_color=COLORS["text"])
+        # Simple-modus: oppdater den bestemte progressbaren med % ferdig
+        if self._simple_mode and not self._simple_done:
+            self._simple_pct = pct
+            lbl = label or self._simple_phase_label
+            self._simple_status.configure(
+                text=f"{lbl}  {done:,}/{total:,} ({pct*100:.0f} %)".strip(),
+                text_color=COLORS["text"])
+            self._draw_simple()
 
     def phase_done(self):
         idx = self._current_phase - 1
@@ -597,6 +618,8 @@ class ProgressPanel(ctk.CTkFrame):
         """Animasjon for ubestemt progressbar i simple-modus."""
         if not self._simple_mode or self._simple_done:
             return
+        if self._simple_pct is not None:
+            return   # bestemt progresjon → ingen animasjon
         STEP  = 0.03   # fart per tick (~50 ms)
         BLOCK = 0.35   # relativ bredde på glideblokken
         self._anim_pos += self._anim_dir * STEP
@@ -624,10 +647,15 @@ class ProgressPanel(ctk.CTkFrame):
         if self._simple_done:
             color = COLORS["green"] if self._simple_ok else COLORS["red"]
             _rr(c, 0, 0, w, h, r, color)
-        else:
-            # Spor
+        elif self._simple_pct is not None:
+            # Bestemt progresjon: fyll baren til prosent ferdig
             _rr(c, 0, 0, w, h, r, COLORS["panel"])
-            # Glideblokk
+            if self._simple_pct > 0:
+                fw = max(int(w * self._simple_pct), r * 2)
+                _rr(c, 0, 0, fw, h, r, COLORS["accent"])
+        else:
+            # Ubestemt: animert glideblokk
+            _rr(c, 0, 0, w, h, r, COLORS["panel"])
             BLOCK = 0.35
             x1 = int(w * self._anim_pos)
             x2 = int(w * (self._anim_pos + BLOCK))

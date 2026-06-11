@@ -138,6 +138,15 @@ def test_email_value_guard():
     assert should_anonymize(PiiType.EMAIL, "12345") is False
 
 
+def test_city_address_require_letters():
+    from siard_workflow.core.anonymize.pii_detect import should_anonymize
+    # Sted/adresse med bokstaver → anonymiser; rene tallkoder → behold
+    assert should_anonymize(PiiType.CITY, "Oslo") is True
+    assert should_anonymize(PiiType.ADDRESS, "Storgata 1") is True
+    assert should_anonymize(PiiType.CITY, "0301") is False     # KommuneNr-kode
+    assert should_anonymize(PiiType.ADDRESS, "12345") is False
+
+
 def test_new_keywords_and_exact_match():
     assert classify_column("Adresse 2", []).pii_type == PiiType.ADDRESS
     assert classify_column("Veinavn", []).pii_type == PiiType.ADDRESS
@@ -147,6 +156,49 @@ def test_new_keywords_and_exact_match():
     # "ort"/"by" som delstreng skal IKKE gi falske treff
     assert classify_column("Sortering", ["1", "2"]).pii_type != PiiType.CITY
     assert classify_column("Bygg", ["A", "B"]).pii_type != PiiType.CITY
+
+
+def test_name_column_gate_rejects_nonnames():
+    """Determ. navn-gate (form + ordbok) skal avvise reelle falske treff fra data."""
+    from siard_workflow.operations.anonymize_operation import AnonymizeOperation as A
+    not_names = [
+        ["KG", "<Ny>", "KG", "<Ny>"],                        # Gruppe.Navn
+        ["Vennesla"],                                         # KommNavn (sted)
+        ["Sokna skole", "Nes skole", "Hov ungdomsskole"],    # SkoleVigo.Navn
+        ["Programmet er ikke registrert"],                   # LisensNavn
+        ["Traffic", "In-depth studies"],                     # NavnEngelsk
+        ["J", "G", "J"],                                     # Kjonn
+        ["Høy", "Lav", "hancha"],                            # Passord
+        ["Klasseliste", "Elevliste", "Fagliste"],            # Felt
+        ["Alle"],                                            # RapportGruppe.Navn
+    ]
+    for vals in not_names:
+        assert A._is_name_column(vals) is False, vals
+    real_names = [
+        ["Frøydis Solberg"],
+        ["Ola Nordmann", "Kari Hansen", "Per Berg"],
+        ["Stømne", "Larsen", "Olsen", "Solberg"],
+    ]
+    for vals in real_names:
+        assert A._is_name_column(vals) is True, vals
+    # tom kolonne → ikke bekreftet → ikke navn
+    assert A._is_name_column([]) is False
+
+
+def test_freetext_name_spans():
+    from siard_workflow.core.anonymize.pii_detect import find_name_spans
+    def names(t): return [s.text for s in find_name_spans(t)]
+    # Vanlig rekkefølge + ukjent etternavn absorbert
+    assert names("Eleven Ola Nordmann kom.") == ["Ola Nordmann"]
+    # Etternavn, Fornavn (kjent og ukjent etternavn)
+    assert names("Jensen, Petter") == ["Jensen, Petter"]
+    assert names("Kontakt Sætre, Pål ved behov") == ["Sætre, Pål"]
+    # Tvetydige fornavn alene gir IKKE treff (vanlige ord)
+    assert names("F1.Dag") == []
+    assert names("sortert per dag") == []
+    assert names("Han bor i Oslo, Per kom") == []
+    # men tvetydig fornavn i fullt navn fanges
+    assert names("Dag Hansen møtte") == ["Dag Hansen"]
 
 
 def test_looks_like_person_name():
@@ -161,20 +213,31 @@ def test_looks_like_person_name():
     assert not looks_like_person_name("Vo-institusjon")
 
 
-def test_freetext_direct_identifier_only():
-    """Fritekst Lorem-ipsum-erstattes kun ved DIREKTE identifikator (uten Ollama)."""
+def test_freetext_span_replacement():
+    """Fritekst: personnavn/fnr/e-post byttes på plass; titler/roller beholdes."""
     from siard_workflow.operations.anonymize_operation import AnonymizeOperation
+    from siard_workflow.core.anonymize.fake_generators import MappingStore
     op = AnonymizeOperation(use_ollama=False)
     op._ollama = None
-    # Tittel/rolle uten direkte identifikator → IKKE identifiserende
-    assert op._is_identifiable("Saksbehandler, tittel: Seniorrådgiver") is False
-    assert op._is_identifiable("Vedtak om støtte innvilget av leder") is False
-    # Telefon er UTENFOR omfanget → ikke en direkte identifikator
-    assert op._is_identifiable("Ring kontoret på 98765432 ved spørsmål") is False
-    # Direkte identifikator (epost/fnr) → identifiserende
-    assert op._is_identifiable("Kontakt per@example.no") is True
+    op._mapping = MappingStore()
+
+    def anon(text):
+        spans = op._freetext_spans(text)
+        from siard_workflow.operations.anonymize_operation import _apply_spans
+        return _apply_spans(text, spans, op._mapping)
+
+    # Tittel/rolle uten navn → uendret
+    assert op._freetext_spans("Saksbehandler, tittel: Seniorrådgiver") == []
+    assert op._freetext_spans("Vedtak om støtte innvilget av leder") == []
+    # Personnavn i fritekst → byttet ut, resten beholdt
+    out = anon("Eleven Ola Nordmann har slitt med matematikk.")
+    assert "Ola Nordmann" not in out and "matematikk" in out
+    # E-post og fnr i fritekst → byttet ut
+    assert "per@example.no" not in anon("Kontakt per@example.no")
     f = fake_fnr("01010099991")
-    assert op._is_identifiable(f"Klient med fnr {f} har sak") is True
+    assert f not in anon(f"Klient med fnr {f} i saken")
+    # Telefon er utenfor omfang → beholdes
+    assert "98765432" in anon("Ring kontoret på 98765432")
 
 
 def test_freetext_spans():
@@ -588,9 +651,12 @@ def _selftest():
     test_postnr_only_4_digits();           print("  ✓ postnr kun 4 sifre")
     test_excluded_poststed_fields();       print("  ✓ poststed-felter unntatt")
     test_email_value_guard();              print("  ✓ e-post-verdivakt")
+    test_city_address_require_letters();   print("  ✓ sted/adresse krever bokstaver")
     test_new_keywords_and_exact_match();   print("  ✓ nye nøkkelord + eksaktmatch")
+    test_name_column_gate_rejects_nonnames(); print("  ✓ navn-gate avviser falske treff")
+    test_freetext_name_spans();            print("  ✓ fritekst navn-spenn (også omvendt)")
     test_looks_like_person_name();         print("  ✓ verdi-heuristikk personnavn")
-    test_freetext_direct_identifier_only(); print("  ✓ fritekst kun ved direkte id")
+    test_freetext_span_replacement();      print("  ✓ fritekst span-erstatning")
     test_classify_by_name();               print("  ✓ klassifisering")
     test_freetext_spans();                 print("  ✓ fritekst-spenn")
     test_mapping_determinism();            print("  ✓ mapping-determinisme")

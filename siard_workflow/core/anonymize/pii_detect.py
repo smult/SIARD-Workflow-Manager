@@ -318,29 +318,139 @@ _NAME_PARTICLES = {"von", "van", "de", "der", "den", "af", "la", "le", "du",
 
 
 def looks_like_person_name(value: str) -> bool:
-    """Grov VERDI-heuristikk: ser verdien ut som et personnavn? Kapitaliserte ord,
-    ingen sifre, ikke akronym/ALL-CAPS, 1–4 ord. Brukes som fallback uten Ollama.
+    """Grov VERDI-heuristikk: ser verdien ut som et personnavn? 1–4 ord, ingen
+    sifre. Brukes som fallback uten Ollama OG som per-verdi-vakt på navnekolonner.
 
-    Skiller f.eks. «Ola Nordmann» (navn) fra «Ordinær grunnskole» (liten bokstav),
-    «Elevrådsarbeid 1. årstrinn» (siffer) og «SFO» (akronym). Enkeltstående
-    kapitaliserte fellesnavn («Matematikk») kan ikke skilles fra fornavn («Ola»)
-    og regnes derfor som mulig navn (Ollama avgjør slike når den er tilgjengelig).
+    CASE-UAVHENGIG: matcher mot navneordboka på små bokstaver, slik at verdier
+    skrevet med BARE STORE («OLA NORDMANN»), bare små («ola nordmann») eller blandet
+    («Ola Nordmann») alle gjenkjennes. Ordboka er primærsignalet.
+
+    For navn som IKKE finnes i ordboka faller vi tilbake på form-heuristikken, som
+    krever Title Case for å unngå falske treff på vanlige ord/akronymer
+    («Ordinær grunnskole» → liten forbokstav, «SFO» → akronym).
     """
+    from .name_dictionary import is_known_name_token
+
     v = (value or "").strip()
     if not v or any(ch.isdigit() for ch in v):
         return False
     words = [w for w in re.split(r"[ ,\-]+", v) if w]
     if not (1 <= len(words) <= 4):
         return False
+
+    # Primær: ordbok-treff (case-uavhengig) — minst ett kjent fornavn/etternavn.
+    if any(is_known_name_token(w) for w in words):
+        return True
+
+    # Fallback: form-heuristikk for ukjente navn (krever Title Case).
     for w in words:
         wl = w.strip(".'")
         if not wl or wl.lower() in _NAME_PARTICLES:
             continue
-        if not wl[0].isupper():            # ord med liten forbokstav → ikke navn
+        if len(wl) < 2:                    # enkeltbokstaver (J, G) → ikke navn
             return False
-        if len(wl) > 1 and wl.isupper():   # ALL-CAPS → akronym/kode
+        if not wl[0].isupper():            # liten forbokstav (skole, er) → ikke navn
+            return False
+        if wl.isupper():                   # ALL-CAPS akronym (KG, SFO) → ikke navn
+            return False
+        if not wl.replace("'", "").isalpha():  # spesialtegn (<Ny>) → ikke navn
             return False
     return True
+
+
+def is_recognized_name(value: str) -> bool:
+    """True hvis minst ett ord i verdien er et kjent norsk fornavn/etternavn."""
+    from .name_dictionary import is_known_name_token
+    v = (value or "").strip()
+    if not v:
+        return False
+    return any(is_known_name_token(w) for w in re.split(r"[ ,\-]+", v) if w)
+
+
+_NAME_WORD_RE = re.compile(r"[A-Za-zÆØÅÄÖÉÜæøåäöéü][A-Za-zÆØÅÄÖÉÜæøåäöéü'\-]*")
+
+
+def find_name_spans(text: str) -> "list[Span]":
+    """Finn personnavn-spenn i fritekst via navneordboka (uten LLM).
+
+    Fanger sammenhengende sekvenser av kapitaliserte ord som er kjente norske
+    fornavn/etternavn. For å holde presisjonen høy:
+      • ett enkelt FORNAVN godtas (lite tvetydig: «Ola», «Kari»)
+      • ett enkelt ETTERNAVN alene godtas IKKE (mange er også vanlige ord/steder:
+        «Berg», «Strand», «Lund») — men to+ navne-ord på rad («Ola Nordmann»,
+        «Hansen Berg») godtas som fullt navn.
+    """
+    from .name_dictionary import FIRST_NAMES, LAST_NAMES, AMBIGUOUS_FIRST
+    toks = [(m.group(0), m.start(), m.end()) for m in _NAME_WORD_RE.finditer(text)]
+    spans: list[Span] = []
+    i, n = 0, len(toks)
+    while i < n:
+        word, s, _e = toks[i]
+        wl = word.strip("'-").lower()
+        # CASE-UAVHENGIG anker: et ord starter et navn hvis det (i små bokstaver)
+        # finnes i ordboka — uansett om det er CAPS, lowercase eller Title Case.
+        if not (wl in FIRST_NAMES or wl in LAST_NAMES):
+            i += 1
+            continue
+        # Utvid sekvensen. Neste ord absorberes hvis det er et kjent navn (uansett
+        # bokstavstørrelse), ELLER (når vi allerede har et fornavn) et navne-formet
+        # ord med stor forbokstav eller helt i versaler — da er det nesten alltid
+        # etternavnet, selv om det ikke står i ordboka («Ola Nordmann»,
+        # «OLA NORDMANN», «Kari Bjørnstad»). Maks 4 ord i et navn.
+        j, end, has_first = i, _e, (wl in FIRST_NAMES)
+        unknown_absorbed = False
+        while j < n and (j - i) < 4:
+            w2, _s2, e2 = toks[j]
+            w2c = w2.strip("'-")
+            w2l = w2c.lower()
+            if w2l in FIRST_NAMES or w2l in LAST_NAMES:
+                has_first = has_first or (w2l in FIRST_NAMES)
+                end = e2
+                j += 1
+                continue
+            # Ukjent etternavn: krev fornavn foran, stor forbokstav (Title eller
+            # ALL-CAPS) og ≥3 bokstaver. Absorber HØYST ETT ukjent ord — ellers
+            # ville hele setninger i ALL-CAPS-tekst slukes («OLA NORDMANN KOM»).
+            if (has_first and not unknown_absorbed and w2[:1].isupper()
+                    and len(w2c) >= 3 and w2c.isalpha()):
+                unknown_absorbed = True
+                end = e2
+                j += 1
+                continue
+            break
+        run_len = j - i
+        start, back = s, False
+        # «Etternavn, Fornavn»-rekkefølge: når et (ikke-tvetydig) FORNAVN starter
+        # runen og forrige ord er et kapitalisert navne-formet ord skilt med
+        # KOMMA, ta det med som etternavn — også når etternavnet ikke er i
+        # ordboka («Sætre, Pål», «Jensen, Petter»).
+        if wl in FIRST_NAMES and wl not in AMBIGUOUS_FIRST and i > 0:
+            pw, ps, pe = toks[i - 1]
+            pwc = pw.strip("'-")
+            sep = text[pe:s]
+            if "," in sep and not sep.strip(", ") and pw[:1].isupper() \
+                    and len(pwc) >= 2 and pwc.isalpha() and not pwc.isupper():
+                start, back = ps, True
+        # Sterkt signal: et fler-ords navn-run godtas KUN hvis det har stor
+        # forbokstav et sted (Title/CAPS) ELLER minst ett utvetydig navne-ord.
+        # Ren-lowercase runer av bare tvetydige fellesord («per dag», «sortert
+        # per dag») avvises som vanlig tekst. Komma-formen er allerede sterk.
+        run_toks = toks[i:j]
+        has_caps = any(t[0][:1].isupper() for t in run_toks)
+        has_strong = any(
+            (t[0].strip("'-").lower() in FIRST_NAMES
+             or t[0].strip("'-").lower() in LAST_NAMES)
+            and t[0].strip("'-").lower() not in AMBIGUOUS_FIRST
+            for t in run_toks)
+        strong = back or has_caps or has_strong
+        if (back or run_len >= 2) and strong:
+            spans.append(Span(start, end, PiiType.FULL_NAME, text[start:end]))
+        elif run_len == 1 and has_first and wl not in AMBIGUOUS_FIRST:
+            # Ett enkelt fornavn alene — hopp over de som også er vanlige ord
+            # (utløses likevel i fulle navn der et etternavn følger).
+            spans.append(Span(start, end, PiiType.FIRST_NAME, text[start:end]))
+        i = max(j, i + 1)
+    return spans
 
 
 def _norm_col(name: str) -> str:
@@ -467,4 +577,11 @@ def should_anonymize(pii_type: PiiType, value: str) -> bool:
     if pii_type is PiiType.EMAIL:
         # E-post endres kun for faktiske e-postadresser
         return _looks_email(v)
+    if pii_type in (PiiType.CITY, PiiType.ADDRESS):
+        # Sted/adresse må inneholde bokstaver — beskytter rene tallkoder
+        # (f.eks. KommuneNr/VigoNr som Ollama av og til feilflagger som sted).
+        return any(ch.isalpha() for ch in v)
+    if pii_type in (PiiType.FIRST_NAME, PiiType.LAST_NAME, PiiType.FULL_NAME):
+        # Endre kun verdier som faktisk har personnavn-form (ikke koder/etiketter)
+        return looks_like_person_name(v)
     return True

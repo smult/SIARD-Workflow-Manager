@@ -206,6 +206,29 @@ def fake_value(pii_type: PiiType, original: str) -> str:
     return gen(original or "")
 
 
+# ── Case-bevaring for navn ────────────────────────────────────────────────────
+
+# Navnetyper der matching er case-uavhengig: «OLA», «ola» og «Ola» skal mappes til
+# SAMME fiktive verdi (samme person), og resultatet skal følge originalens form.
+_CASE_TYPES = frozenset({PiiType.FIRST_NAME, PiiType.LAST_NAME, PiiType.FULL_NAME})
+
+
+def apply_case(original: str, fake: str) -> str:
+    """Gi `fake` samme bokstav-form som `original`:
+      «OLA NORDMANN» → «PER HANSEN»  (ALL-CAPS)
+      «ola nordmann» → «per hansen»  (lowercase)
+      «Ola Nordmann» / blandet       → uendret (generatorene gir Title Case)
+    """
+    letters = [c for c in (original or "") if c.isalpha()]
+    if not letters:
+        return fake
+    if all(c.isupper() for c in letters):
+        return fake.upper()
+    if all(c.islower() for c in letters):
+        return fake.lower()
+    return fake
+
+
 # ── Mapping-lager (deler én instans for hele kjøringen) ───────────────────────
 
 class MappingStore:
@@ -225,23 +248,28 @@ class MappingStore:
     def map(self, pii_type: PiiType, original: str) -> str:
         if original is None:
             return original
-        key = (pii_type.value, original)
+        # Navn matches case-uavhengig: nøkkelen normaliseres til små bokstaver slik
+        # at «OLA»/«ola»/«Ola» gir SAMME fake (bevarer relasjoner). Resultatet får
+        # originalens bokstav-form via apply_case().
+        is_name = pii_type in _CASE_TYPES
+        seed = original.lower() if is_name else original
+        key = (pii_type.value, seed)
         with self._lock:
             cached = self._map.get(key)
-            if cached is not None:
-                return cached
-            fake = fake_value(pii_type, original)
-            # Garanter at den fiktive verdien aldri er lik originalen (unngå at
-            # et navn tilfeldig mappes til seg selv). Re-roll deterministisk ved
-            # å forstyrre hash-seedet med nullbytes — som er både ikke-siffer og
-            # ikke-bokstav, slik at generatorenes format-/lengde-logikk (fnr,
-            # postnr) ikke påvirkes. Samme original → samme re-roll.
-            attempt = 0
-            while fake == original and attempt < 8:
-                attempt += 1
-                fake = fake_value(pii_type, original + "\x00" * attempt)
-            self._map[key] = fake
-            return fake
+            if cached is None:
+                fake = fake_value(pii_type, seed)
+                # Garanter at den fiktive verdien aldri er lik originalen (unngå at
+                # et navn tilfeldig mappes til seg selv). Re-roll deterministisk ved
+                # å forstyrre hash-seedet med nullbytes — som er både ikke-siffer og
+                # ikke-bokstav, slik at generatorenes format-/lengde-logikk (fnr,
+                # postnr) ikke påvirkes. Samme original → samme re-roll.
+                attempt = 0
+                while fake == seed and attempt < 8:
+                    attempt += 1
+                    fake = fake_value(pii_type, seed + "\x00" * attempt)
+                self._map[key] = fake
+                cached = fake
+        return apply_case(original, cached) if is_name else cached
 
     def items(self) -> "list[tuple[str, str, str]]":
         """(pii_type, original, fake) for rapportering."""

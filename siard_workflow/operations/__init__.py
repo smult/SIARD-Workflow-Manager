@@ -11,6 +11,7 @@ from .virus_scan_operation import VirusScanOperation
 from .pipeline_operations import UnpackSiardOperation, RepackSiardOperation
 from .standardize_ext_operation import StandardizeExtOperation
 from .workflow_report_operation import WorkflowReportOperation
+from .depot_reports_operation import DepotReportsOperation
 from .standard_operations import (
     XMLValidationOperation,
     MetadataExtractOperation,
@@ -32,6 +33,7 @@ __all__ = [
     "RepackSiardOperation",
     "StandardizeExtOperation",
     "WorkflowReportOperation",
+    "DepotReportsOperation",
     "XMLValidationOperation",
     "MetadataExtractOperation",
     "ConditionalOperation",

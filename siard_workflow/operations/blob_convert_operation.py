@@ -2556,6 +2556,18 @@ class BlobConvertOperation(BaseOperation):
         _utf8_bin_count: list[int] = [0]   # trådsikker teller via GIL-beskyttet int
         _utf8_bin_lock  = threading.Lock()
 
+        # Blob-stier som ble pakket ut fra en komprimert container under deteksjon
+        # (zip/gz/bz2/7z/rar/base64/hex). For disse skal det FAKTISKE detekterte
+        # formatet eksponeres (f.eks. .xml), også når «Standardiser .bin» er på —
+        # hele poenget med utpakkingen er at det opprinnelige binær-formatet
+        # forsvinner og det reelle innholds-formatet kommer fram.
+        _unpacked_blobs: set[str] = set()
+        _unpacked_lock  = threading.Lock()
+
+        def _mark_unpacked(zip_sti: str) -> None:
+            with _unpacked_lock:
+                _unpacked_blobs.add(zip_sti)
+
         # Cap for spekulative dekoder-forsøk på .txt-filer. Hex-validering
         # (`bytes.fromhex`) og base64-skanning er O(N) i fil-størrelse, så for
         # filer > 10 MB blir per-fil-kostnaden uforholdsmessig høy. Anta at
@@ -2570,6 +2582,20 @@ class BlobConvertOperation(BaseOperation):
                 return zip_sti, ("bin", "application/octet-stream", False)
 
             ext, mime, is_encrypted = _id.identify(data=data, path=p)
+
+            # ── Backend-uavhengig container-sjekk ────────────────────────────
+            # Hvis den aktive identifieren ikke kjente igjen innholdet (bin/txt),
+            # men magic-bytes ser et pakke-/komprimeringsformat, bruk magic-
+            # resultatet slik at filen pakkes ut uansett backend. Dette fanger
+            # bl.a. Siegfried (som mangler bz2-signatur og ikke matcher .bz2 med
+            # 4-byte lengdeprefiks) og .bin-filer som egentlig er zip/gz/bz2.
+            if ext in ("bin", "txt"):
+                try:
+                    m_ext, m_mime, m_enc = _detect(data)
+                    if m_ext in _COMPRESSED:
+                        ext, mime, is_encrypted = m_ext, m_mime, m_enc
+                except Exception:
+                    pass
 
             # Lazy "hele filinnhold" — leses kun én gang selv om flere
             # dekoder-branches trenger det. For txt-filer ble dette tidligere
@@ -2607,6 +2633,7 @@ class BlobConvertOperation(BaseOperation):
                                 unpacked_data, unpacked_name = unpacked
                                 inner_ext, inner_mime, inner_enc = _id.identify(data=unpacked_data[:65536])
                                 p.write_bytes(unpacked_data)
+                                _mark_unpacked(zip_sti)
                                 w(f"    Base64+utpakket: {PurePosixPath(zip_sti).name} "
                                   f"({PurePosixPath(unpacked_name).name} → {inner_ext})", "info")
                                 return zip_sti, (inner_ext, inner_mime, inner_enc)
@@ -2653,6 +2680,7 @@ class BlobConvertOperation(BaseOperation):
                                     unpacked_data, unpacked_name = unpacked
                                     u_ext, u_mime, u_enc = _id.identify(data=unpacked_data[:65536])
                                     p.write_bytes(unpacked_data)
+                                    _mark_unpacked(zip_sti)
                                     w(f"    Hex+utpakket: {PurePosixPath(zip_sti).name} "
                                       f"({PurePosixPath(unpacked_name).name} → {u_ext})", "info")
                                     return zip_sti, (u_ext, u_mime, u_enc)
@@ -2685,6 +2713,7 @@ class BlobConvertOperation(BaseOperation):
                             ext          = inner_ext
                             mime         = inner_mime
                             is_encrypted = inner_enc
+                            _mark_unpacked(zip_sti)
                             w(f"    Pakket ut: {PurePosixPath(zip_sti).name} "
                               f"({PurePosixPath(inner_name).name} → {inner_ext})", "info")
                         except Exception:
@@ -2991,10 +3020,16 @@ class BlobConvertOperation(BaseOperation):
             # opprinnelige endelse — .bin forblir .bin selv om innholdet er
             # detektert som .txt, og .txt forblir .txt selv om detektert som
             # noe annet. Kun originale .txt-filer skal hete .txt i resultatet.
-            if _standardize_bin and src_ext in ("bin", "txt"):
+            #
+            # UNNTAK: filer som ble pakket ut fra en komprimert container under
+            # deteksjon (zip/gz/bz2/base64/hex). Da er det opprinnelige binær-
+            # formatet borte, og det reelle innholdet (f.eks. XML) skal eksponeres
+            # med riktig filendelse slik at formatet kan detekteres som det det er.
+            _was_unpacked = zip_sti in _unpacked_blobs
+            if _standardize_bin and src_ext in ("bin", "txt") and not _was_unpacked:
                 ext = src_ext
 
-            if _standardize_bin and src_ext not in ("bin", "txt"):
+            if _standardize_bin and src_ext not in ("bin", "txt") and not _was_unpacked:
                 # Standardiser til .bin — bruk rotstamme (alt før første punktum)
                 # for å håndtere multi-extension filnavn korrekt (f.eks. rec1.txt.rtf.pdf)
                 root_stem = orig_basename.split('.')[0]
@@ -3715,91 +3750,137 @@ class BlobConvertOperation(BaseOperation):
         if not pause_ev.is_set():
             stop_ev.clear()
 
-        # ── Retry-runde: parallell batch-konvertering av feilede filer ───────
+        # ── Retry: halverende batcher (bisection) ────────────────────────────
+        # Ved feil tas filene IKKE rett til enkeltvis behandling. De ukonverterte
+        # filene kjøres på nytt i batcher à batch_size/2, og for hver runde
+        # halveres størrelsen (… → 1). Slik isoleres den/de problematiske filene
+        # gradvis, mens de øvrige filene fortsatt konverteres i effektive batcher.
+        # Kun i siste runde (størrelse 1) markeres gjenværende filer som feilet.
         if retry_list and not stop_ev.is_set():
             retry_timeout = min(60, self.params["lo_timeout"])
-            # Retry en og en fil — isolerer hengende filer og unngår at én fil
-            # blokkerer hele batchen igjen
-            retry_batches = [[item] for item in retry_list]
-            w(f"  Nytt forsøk: {len(retry_list)} filer enkeltvis, {max_w} worker(e) "
-              f"(timeout {retry_timeout}s) ...", "info")
-
             converted_before = stats.get("converted", 0)
+            total_retry = len(retry_list)
 
-            def _run_retry_batch(rb_args):
-                rb_idx, rb_items = rb_args
-                if stop_ev.is_set():
-                    return
-                while pause_ev.is_set():
+            def _run_retry_round(items: list, size: int, final: bool) -> list:
+                """Kjør `items` i batcher à `size` parallelt. Returner filer som
+                FORTSATT feilet. final=True → marker gjenværende som endelig
+                feilet (stats['failed'] + err_log); ellers samles de til ny runde."""
+                rbatches = [items[i:i + size]
+                            for i in range(0, len(items), size)]
+                still_lock = threading.Lock()
+                still: list = []
+
+                def _run_rb(rb_args):
+                    rb_idx, rb_items = rb_args
+                    local_failed: list = []
                     if stop_ev.is_set():
+                        with still_lock:
+                            still.extend(rb_items)
                         return
-                    import time as _t; _t.sleep(0.1)
-
-                rb_profile = None
-                while rb_profile is None:
-                    if stop_ev.is_set():
-                        return
-                    try:
-                        import queue as _qr
-                        rb_profile = profile_pool.get(timeout=5)
-                    except _qr.Empty:
-                        continue
-
-                try:
-                    retry_root = extract_dir.parent / f"retry_b{rb_idx}"
-                    lo_ok, lo_err, input_map = _run_lo_chunk(
-                        rb_items, f"retry_b{rb_idx}", rb_profile,
-                        retry_timeout, retry_root)
-
-                    expected: dict[str, tuple] = {
-                        zip_sti: (ext, mime)
-                        for _, zip_sti, ext, mime in rb_items
-                    }
-                    processed_stis: set[str] = set()
-
-                    for batch_file, zip_sti, ext, mime in input_map:
+                    while pause_ev.is_set():
                         if stop_ev.is_set():
-                            break
-                        processed_stis.add(zip_sti)
-                        fname  = PurePosixPath(zip_sti).name
-                        pdf_ok = (retry_root / "out" /
-                                  (batch_file.stem + ".pdf")).exists()
-                        if pdf_ok:
-                            _process_file_result(
-                                batch_file, zip_sti, ext,
-                                retry_root / "out", True, "")
-                            w(f"    Nytt forsøk OK: {fname}", "ok")
+                            with still_lock:
+                                still.extend(rb_items)
+                            return
+                        import time as _t; _t.sleep(0.1)
+                    rb_profile = None
+                    while rb_profile is None:
+                        if stop_ev.is_set():
+                            with still_lock:
+                                still.extend(rb_items)
+                            return
+                        try:
+                            import queue as _qr
+                            rb_profile = profile_pool.get(timeout=5)
+                        except _qr.Empty:
+                            continue
+                    try:
+                        retry_root = extract_dir.parent / f"retry_s{size}_b{rb_idx}"
+                        lo_ok, lo_err, input_map = _run_lo_chunk(
+                            rb_items, f"retry_s{size}_b{rb_idx}", rb_profile,
+                            retry_timeout, retry_root)
+                        expected = {zip_sti: (ext, mime)
+                                    for _, zip_sti, ext, mime in rb_items}
+                        processed: set = set()
+                        for batch_file, zip_sti, ext, mime in input_map:
+                            if stop_ev.is_set():
+                                break
+                            processed.add(zip_sti)
+                            pdf_ok = (retry_root / "out" /
+                                      (batch_file.stem + ".pdf")).exists()
+                            if pdf_ok:
+                                _process_file_result(
+                                    batch_file, zip_sti, ext,
+                                    retry_root / "out", True, "")
+                            elif final:
+                                _process_file_result(
+                                    batch_file, zip_sti, ext, retry_root / "out",
+                                    False, lo_err or "Ingen PDF produsert")
+                                w(f"    Endelig feilet: "
+                                  f"{PurePosixPath(zip_sti).name} — beholdes "
+                                  f"som .{ext}", "warn")
+                            else:
+                                orig = next((it for it in rb_items
+                                             if it[1] == zip_sti), None)
+                                if orig:
+                                    local_failed.append(orig)
+                        # Filer som ikke kom med i input_map (staging/kopi feilet)
+                        for zip_sti, (ext, mime) in expected.items():
+                            if zip_sti in processed:
+                                continue
+                            orig = next((it for it in rb_items
+                                         if it[1] == zip_sti), None)
+                            if final:
+                                self._rename_file(extract_dir, zip_sti, ext)
+                                with lock:
+                                    stats["failed"] += 1
+                                if err_log:
+                                    err_log.write(zip_sti, ext, "Retry kopi-feil")
+                            elif orig:
+                                local_failed.append(orig)
+                        shutil.rmtree(retry_root, ignore_errors=True)
+                    except Exception as exc:
+                        # Bare DENNE retry-batchen feiler — send filene videre til
+                        # neste (mindre) runde i stedet for å felle dem.
+                        w(f"    Retry-batch (à {size}) krasjet: {exc}", "warn")
+                        if final:
+                            for _, zip_sti, ext, mime in rb_items:
+                                self._rename_file(extract_dir, zip_sti, ext)
+                                with lock:
+                                    stats["failed"] += 1
+                                if err_log:
+                                    err_log.write(zip_sti, ext,
+                                                  f"Retry-krasj: {exc}")
                         else:
-                            err = lo_err or "Ingen PDF produsert"
-                            _process_file_result(
-                                batch_file, zip_sti, ext,
-                                retry_root / "out", False, err)
-                            w(f"    Nytt forsøk feilet: {fname} "
-                              f"— beholdes som .{ext}", "warn")
+                            local_failed.extend(rb_items)
+                    finally:
+                        profile_pool.put(rb_profile)
+                    if local_failed:
+                        with still_lock:
+                            still.extend(local_failed)
 
-                    # Filer som ikke kom med i input_map (kopi feilet)
-                    for zip_sti, (ext, mime) in expected.items():
-                        if zip_sti not in processed_stis:
-                            fname = PurePosixPath(zip_sti).name
-                            self._rename_file(extract_dir, zip_sti, ext)
-                            with lock:
-                                stats["failed"] += 1
-                            w(f"    Nytt forsøk kopi-feil: {fname}", "warn")
-                            if err_log:
-                                err_log.write(zip_sti, ext, "Retry kopi-feil")
+                with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=max_w) as rpool:
+                    list(rpool.map(_run_rb, enumerate(rbatches)))
+                return still
 
-                    shutil.rmtree(retry_root, ignore_errors=True)
-                finally:
-                    profile_pool.put(rb_profile)
-
-            with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=max_w) as retry_pool:
-                list(retry_pool.map(_run_retry_batch,
-                                    enumerate(retry_batches)))
+            pending = retry_list
+            size = max(1, batch_size // 2)
+            round_no = 0
+            while pending and not stop_ev.is_set():
+                final = (size <= 1)
+                round_no += 1
+                w(f"  Nytt forsøk (runde {round_no}): {len(pending)} filer i "
+                  f"batcher à {size}, {max_w} worker(e) "
+                  f"(timeout {retry_timeout}s) ...", "info")
+                pending = _run_retry_round(pending, size, final)
+                if final:
+                    break
+                size = max(1, size // 2)
 
             retry_ok = stats.get("converted", 0) - converted_before
-            w(f"  Nytt forsøk ferdig: {retry_ok}/{len(retry_list)} konvertert",
-              "info")
+            w(f"  Nytt forsøk ferdig: {retry_ok}/{total_retry} konvertert "
+              f"i {round_no} runde(r)", "info")
 
         # Rydd profiler ved slutten
         shutil.rmtree(profiles_root, ignore_errors=True)

@@ -22,7 +22,7 @@ from siard_workflow.operations import (
     UnpackSiardOperation, RepackSiardOperation,
     WorkflowReportOperation, DiasPackageOperation,
     LobFolderFixOperation, SiardMapperOperation,
-    StandardizeExtOperation,
+    StandardizeExtOperation, DepotReportsOperation,
 )
 from siard_workflow.systemspecific_operations import CosDocMailMergeOperation
 from settings import save_op_params, save_config, get_config, _SETTINGS_FILE
@@ -557,6 +557,13 @@ OP_DEFS = [
             {"key": "replace_binary_media", "label": "Bytt også bilde/lyd/video",     "type": "bool", "default": True},
             {"key": "show_preview",         "label": "Vis forhåndsvisning før endring", "type": "bool", "default": True},
             {"key": "preview_rows",         "label": "Antall eksempelrader i visning", "type": "int",  "default": 5},
+            {"key": "analysis_rows",        "label": "Rader Ollama analyserer per tabell", "type": "int", "default": 20},
+            {"key": "subset_enabled",       "label": "Reduser datamengde (subset, inntil N rader)", "type": "bool", "default": False},
+            {"key": "subset_rows",          "label": "  Rader per tabell (subset)",    "type": "int",  "default": 300},
+            {"key": "subset_table_mode",    "label": "  Velg viktige tabeller",        "type": "choice",
+             "choices": ["ollama", "heuristic", "manual"], "default": "ollama"},
+            {"key": "subset_important_tables", "label": "  Viktige tabeller (manuelt, komma)", "type": "str", "default": ""},
+            {"key": "subset_include_children", "label": "  Ta med relaterte barnerader", "type": "bool", "default": True},
             {"key": "dry_run",              "label": "Tørkjøring (ikke skriv)",        "type": "bool", "default": False},
         ],
     },
@@ -707,6 +714,26 @@ OP_DEFS = [
             {"key": "report_suffix",   "label": "Filsuffiks rapport",     "type": "str",  "default": "_workflow_rapport"},
             {"key": "include_charts",  "label": "Inkluder kakediagrammer", "type": "bool", "default": True},
             {"key": "include_details", "label": "Inkluder detaljseksjoner","type": "bool", "default": True},
+        ],
+    },
+    {
+        "cls": DepotReportsOperation,
+        "label": "Depotrapporter (PDF)",
+        "category": "Rapport",
+        "desc": (
+            "Genererer et sett depot-PDF-rapporter (Arkivinformasjon, "
+            "Konverteringsrapport, Filorganisering og Behandlingssammendrag). "
+            "Hvilke rapporter som lages velges automatisk ut fra hvilke "
+            "operasjoner som ble kjørt. Legg operasjonen sist i workflowen."
+        ),
+        "status": DepotReportsOperation.status,
+        "params": [
+            {"key": "report_subdir",             "label": "Undermappe (tom = SIARD-mappe)", "type": "str",  "default": "depotrapporter"},
+            {"key": "include_archive_info",      "label": "Arkivinformasjon",        "type": "bool", "default": True},
+            {"key": "include_conversion",        "label": "Konverteringsrapport",    "type": "bool", "default": True},
+            {"key": "include_file_organization", "label": "Filorganisering",         "type": "bool", "default": True},
+            {"key": "include_summary",           "label": "Behandlingssammendrag",   "type": "bool", "default": True},
+            {"key": "open_folder",               "label": "Åpne mappen etterpå",     "type": "bool", "default": True},
         ],
     },
     #{
