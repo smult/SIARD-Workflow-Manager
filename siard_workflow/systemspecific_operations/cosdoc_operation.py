@@ -892,7 +892,6 @@ class CosDocMailMergeOperation(BaseOperation):
         "dry_run":        False,
         "output_suffix":  "_cosdoc",
         "table_name":     "",      # tom = auto-detect (suffix _elfiler); eksplisitt navn overstyrer
-        "lo_executable":  "",      # soffice-sti — auto-detekteres hvis tom
         "lo_timeout":     120,     # sekunder per LO-konvertering
         "temp_dir":       "",      # temp-rotmappe
     }
@@ -933,7 +932,9 @@ class CosDocMailMergeOperation(BaseOperation):
         suffix     = str(self.params["output_suffix"] or "_cosdoc")
         table_name = str(self.params.get("table_name") or "").strip()
         from settings import get_config as _get_cfg
-        lo_hint       = str(self.params["lo_executable"] or _get_cfg("lo_executable", "") or "soffice")
+        # LibreOffice-sti hentes fra globale innstillinger (lo_executable).
+        # Ingen lokal overstyring per operasjon — global sti gjelder for alle.
+        lo_hint       = str(_get_cfg("lo_executable", "") or "soffice")
         lo_timeout    = int(self.params["lo_timeout"] or 120)
         max_workers   = max(1, min(int(_get_cfg("max_workers",  4)  or 4), os.cpu_count() or 4))
         lo_batch_size = max(1, int(_get_cfg("lo_batch_size", 20) or 20))

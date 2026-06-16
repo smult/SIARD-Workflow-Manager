@@ -1501,6 +1501,78 @@ class App(ctk.CTk):
 
         return False  # avbrutt
 
+    def _segfolder_preflight(self, ops: list) -> bool:
+        """
+        Skanner SIARD-filen(e) for SIARD 2.2 LOB-segmentering (seg_N-mapper)
+        og tilbyr å sette inn SegFolderFixOperation rett etter
+        UnpackSiardOperation — men kun når mål-versjonen er 2.1, ettersom
+        SIARD 2.2 tillater segmentering.
+
+        Returnerer True = fortsett kjøring, False = avbryt.
+        """
+        from siard_workflow.operations import UnpackSiardOperation
+        from siard_workflow.operations.segfolder_fix_operation import (
+            SegFolderFixOperation, scan_segfolder_issues)
+
+        # Kun relevant i pipeline-modus
+        if not any(isinstance(op, UnpackSiardOperation) for op in ops):
+            return True
+
+        # Allerede lagt til — ikke spør igjen
+        if any(isinstance(op, SegFolderFixOperation) for op in ops):
+            return True
+
+        # SIARD 2.2 tillater segmentering — kun relevant ved nedgradering til 2.1
+        try:
+            from siard_workflow.core.siard_format import get_target_siard_version
+            if get_target_siard_version() != "2.1":
+                return True
+        except Exception:
+            pass
+
+        # Rask skanning av SIARD-filene i køen
+        all_issues: dict = {}
+        for path in self.siard_queue:
+            found = scan_segfolder_issues(path)
+            if found:
+                all_issues[path] = found
+
+        if not all_issues:
+            return True
+
+        lines = [
+            "SIARD 2.2 LOB-segmentering (seg_N-mapper) ble oppdaget.\n",
+            "Segmentering ble innført i SIARD 2.2 og støttes IKKE av SIARD 2.1.",
+            "Mål-versjonen er satt til 2.1, så LOB-filene må flyttes ut av "
+            "seg-mappene og file=-referansene i tableX.xml må oppdateres.\n",
+        ]
+        for path, issues in all_issues.items():
+            lines.append(f"  {path.name}:")
+            for issue in issues:
+                lines.append(f"    • {issue}")
+        lines += [
+            "",
+            "Vil du legge til «Fjern LOB-segmentering» automatisk etter "
+            "«Pakk ut SIARD»?",
+        ]
+
+        dialog = _PipelineSuggestionDialog(self, "\n".join(lines))
+        dialog.title("LOB-segmentering oppdaget (SIARD 2.2)")
+        self.wait_window(dialog)
+
+        if dialog.result == "ja":
+            self.workflow_panel.insert_operation_after(
+                SegFolderFixOperation(), "unpack_siard")
+            self._log(
+                "«Fjern LOB-segmentering (SIARD 2.2→2.1)» lagt til etter "
+                "«Pakk ut SIARD»", "ok")
+            return True  # ops re-hentes av kalleren
+
+        if dialog.result == "nei":
+            return True  # operatøren avslo — fortsett uten
+
+        return False  # avbrutt
+
     def _report_preflight(self, ops: list) -> bool:
         """
         Spør om brukeren vil legge til 'Kjørerapport (PDF)' dersom den ikke
@@ -1685,6 +1757,12 @@ class App(ctk.CTk):
             return
 
         # Re-hent ops i tilfelle lobfolder_fix ble lagt til
+        ops = list(self.workflow_panel.get_operations())
+
+        if not self._segfolder_preflight(ops):
+            return
+
+        # Re-hent ops i tilfelle segfolder_fix ble lagt til
         ops = list(self.workflow_panel.get_operations())
 
         if not self._report_preflight(ops):

@@ -21,7 +21,7 @@ from siard_workflow.operations import (
     VirusScanOperation, ConditionalOperation,
     UnpackSiardOperation, RepackSiardOperation,
     WorkflowReportOperation, DiasPackageOperation,
-    LobFolderFixOperation, SiardMapperOperation,
+    LobFolderFixOperation, SegFolderFixOperation, SiardMapperOperation,
     StandardizeExtOperation, DepotReportsOperation,
 )
 from siard_workflow.systemspecific_operations import CosDocMailMergeOperation
@@ -584,7 +584,6 @@ OP_DEFS = [
         "params": [
             {"key": "output_suffix", "label": "Suffix ny SIARD-fil",      "type": "str",  "default": "_cosdoc"},
             {"key": "table_name",    "label": "Tabellnavn (tom = auto)",   "type": "str",  "default": ""},
-            {"key": "lo_executable",  "label": "LibreOffice (soffice-sti)", "type": "str",  "default": ""},
             {"key": "lo_timeout",     "label": "LO timeout per fil (s)",    "type": "int",  "default": 120},
             {"key": "dry_run",        "label": "Tørkjøring (ikke skriv)",   "type": "bool", "default": False},
         ],
@@ -604,6 +603,24 @@ OP_DEFS = [
         ),
         "status": LobFolderFixOperation.status,
         "params": [],
+    },
+    {
+        "cls": SegFolderFixOperation,
+        "label": "Fjern LOB-segmentering (SIARD 2.2→2.1)",
+        "category": "Kompatibilitet",
+        "desc": (
+            "Fjerner SIARD 2.2 LOB-segmentering (seg_N-mapper) som ikke støttes "
+            "av SIARD 2.1: flytter LOB-filene opp ut av seg-mappene og patcher "
+            "file=-referansene i tableX.xml tilsvarende. "
+            "Kjører kun når mål-versjon (siard_output_version) er 2.1 — ellers "
+            "trygt no-op. Legges automatisk til etter 'Pakk ut SIARD' dersom "
+            "segmentering oppdages. Støtter pipeline-modus og standalone-modus."
+        ),
+        "status": SegFolderFixOperation.status,
+        "params": [
+            {"key": "output_suffix", "label": "Suffix ny SIARD-fil",
+             "type": "str", "default": "_segfix"},
+        ],
     },
     {
         "cls": StandardizeExtOperation,

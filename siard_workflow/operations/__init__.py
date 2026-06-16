@@ -1,5 +1,6 @@
 from .dias_package_operation import DiasPackageOperation
 from .lobfolder_fix_operation import LobFolderFixOperation
+from .segfolder_fix_operation import SegFolderFixOperation
 from .siardmapper_operation import SiardMapperOperation
 from .sha256_operation import SHA256Operation
 from .blob_convert_operation import BlobConvertOperation
@@ -21,6 +22,7 @@ from .standard_operations import (
 __all__ = [
     "DiasPackageOperation",
     "LobFolderFixOperation",
+    "SegFolderFixOperation",
     "SiardMapperOperation",
     "SHA256Operation",
     "BlobConvertOperation",
