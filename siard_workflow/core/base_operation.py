@@ -69,8 +69,15 @@ class BaseOperation(ABC):
     # innhold uten produces_siard, og repack_siard produserer fil uten å endre
     # innhold.
     modifies_content: bool = False
-    # PREMIS eventType for proveniens-loggen. Tom => label brukes som fallback.
-    premis_event_type: str = ""
+    # PREMIS eventType for proveniens-loggen. MÅ være en gyldig DIAS_PREMIS-
+    # enumverdi: "Creation", "Ingestion", "Migration", "Adjustment",
+    # "Deletion" eller "Disposal" (se premis_logger.VALID_EVENT_TYPES).
+    # Standard for innholdsendrende operasjoner er "Adjustment".
+    premis_event_type: str = "Adjustment"
+    # Menneskelesbar kategori (f.eks. "formatkonvertering") som føres i
+    # <premis:eventDetail>. eventType er begrenset til enumerasjonen over, så
+    # denne bevarer den beskrivende betegnelsen for operasjonen.
+    premis_event_label: str = ""
 
     def __init__(self, **params):
         # Prioritet: 1) eksplisitte params, 2) lagrede op_params, 3) config.json, 4) defaults

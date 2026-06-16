@@ -376,7 +376,8 @@ class SiardMapperOperation(BaseOperation):
     status         = 2
     produces_siard = True
     modifies_content = True
-    premis_event_type = "metadata-beriking"
+    premis_event_type  = "Adjustment"
+    premis_event_label = "metadata-beriking"
     default_params = {
         "json_template":       "",     # sti til JSON-malfilen
         "overwrite_existing":  False,  # True = overstyr beskrivelser som allerede finnes

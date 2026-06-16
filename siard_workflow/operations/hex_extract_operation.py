@@ -476,7 +476,8 @@ class HexExtractOperation(BaseOperation):
     produces_siard  = True
     requires_unpack = True
     modifies_content = True
-    premis_event_type = "hex-ekstraksjon"
+    premis_event_type  = "Migration"
+    premis_event_label = "hex-ekstraksjon"
 
     default_params = {
         "dry_run":         False,

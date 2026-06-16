@@ -111,7 +111,8 @@ class StandardizeExtOperation(BaseOperation):
     status         = 2
     produces_siard = False
     modifies_content = True
-    premis_event_type = "filnavn-standardisering"
+    premis_event_type  = "Adjustment"
+    premis_event_label = "filnavn-standardisering"
 
     default_params: dict = {
         "output_suffix": "_stdext",

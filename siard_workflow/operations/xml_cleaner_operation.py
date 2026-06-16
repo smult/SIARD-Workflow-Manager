@@ -124,7 +124,8 @@ class XmlCleanerOperation(BaseOperation):
     produces_siard  = True
     requires_unpack = True
     modifies_content = True
-    premis_event_type = "XML-rensing"
+    premis_event_type  = "Adjustment"
+    premis_event_label = "XML-rensing"
 
     default_params = {
         "clean_padding_spaces": True,   #  -padding (SIARD-escape) renses

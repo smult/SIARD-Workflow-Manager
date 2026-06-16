@@ -134,7 +134,8 @@ class LobFolderFixOperation(BaseOperation):
     status         = 2
     produces_siard = True
     modifies_content = True
-    premis_event_type = "lobFolder-korreksjon"
+    premis_event_type  = "Adjustment"
+    premis_event_label = "lobFolder-korreksjon"
     default_params: dict = {}
 
     def premis_should_record(self, result, ctx) -> bool:

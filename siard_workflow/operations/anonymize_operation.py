@@ -257,7 +257,8 @@ class AnonymizeOperation(BaseOperation):
     produces_siard  = True
     requires_unpack = True
     modifies_content = True
-    premis_event_type = "anonymisering"
+    premis_event_type  = "Adjustment"
+    premis_event_label = "anonymisering"
 
     default_params = {
         "output_suffix":         "_anonymisert",

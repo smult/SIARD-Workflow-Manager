@@ -52,7 +52,8 @@ class UnpackSiardOperation(BaseOperation):
     # Utpakkingen i seg selv endrer ikke innhold, men schema-navn-sanering gjør
     # det. Føres derfor som PREMIS-event kun når sanering faktisk skjedde.
     modifies_content = True
-    premis_event_type = "skjemanavn-sanering"
+    premis_event_type  = "Adjustment"
+    premis_event_label = "skjemanavn-sanering"
 
     default_params: dict = {}
 

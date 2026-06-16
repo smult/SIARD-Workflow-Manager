@@ -214,7 +214,8 @@ class SchemaSelectorOperation(BaseOperation):
     produces_siard  = True
     requires_unpack = True
     modifies_content = True
-    premis_event_type = "skjemautvalg"
+    premis_event_type  = "Deletion"
+    premis_event_label = "skjemautvalg"
 
     default_params = {
         "auto_select_all": False,   # hvis True: hopp over dialog (alle med)

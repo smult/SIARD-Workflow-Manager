@@ -139,7 +139,8 @@ class SegFolderFixOperation(BaseOperation):
     status         = 2
     produces_siard = False
     modifies_content = True
-    premis_event_type = "LOB-segmentering fjernet"
+    premis_event_type  = "Adjustment"
+    premis_event_label = "LOB-segmentering fjernet"
     default_params: dict = {
         "output_suffix": "_segfix",
     }

@@ -22,6 +22,16 @@ PREMIS_NS = "http://arkivverket.no/standarder/PREMIS"
 XSI_NS    = "http://www.w3.org/2001/XMLSchema-instance"
 XLINK_NS  = "http://www.w3.org/1999/xlink"
 
+# Gyldige verdier for <premis:eventType> i DIAS_PREMIS v2.0 (se enumerasjonen
+# i DIAS_PREMIS.xsd, elementet `eventType`). eventType MÅ være én av disse —
+# en fri kategoritekst gir ugyldig PREMIS. Den beskrivende kategorien føres i
+# stedet i <premis:eventDetail>.
+VALID_EVENT_TYPES = frozenset({
+    "Creation", "Ingestion", "Migration", "Adjustment", "Deletion", "Disposal",
+})
+# Trygg fallback for innholdsendrende operasjoner som ikke oppgir gyldig type.
+DEFAULT_EVENT_TYPE = "Adjustment"
+
 # Suffikser som strippes for å finne uttrekkets «base»-navn — samme liste som
 # DiasPackageOperation bruker, slik at premis-fila matcher de andre sidefilene.
 _SUFFIXES = ("_konvertert", "_hex_extracted", "_cosdoc", "_blob", "_dias")
@@ -87,14 +97,34 @@ class PremisProvenanceLogger:
         Speiler også én info-linje i kjøreloggen hvis en file_logger finnes.
         """
         try:
-            event_type = getattr(op, "premis_event_type", "") or getattr(op, "label", "") \
-                or getattr(op, "operation_id", "operasjon")
+            # eventType MÅ være en gyldig DIAS_PREMIS-enum. En operasjon som
+            # oppgir noe annet (f.eks. en fri kategoritekst) faller tilbake til
+            # DEFAULT_EVENT_TYPE, og teksten bevares som label i eventDetail.
+            raw_type = (getattr(op, "premis_event_type", "") or "").strip()
+            if raw_type in VALID_EVENT_TYPES:
+                event_type = raw_type
+            else:
+                if raw_type:
+                    logger.warning(
+                        "Ugyldig PREMIS eventType %r fra %s — bruker %r",
+                        raw_type, getattr(op, "operation_id", "?"),
+                        DEFAULT_EVENT_TYPE)
+                event_type = DEFAULT_EVENT_TYPE
+
+            # Beskrivende kategori (menneskelesbar) for eventDetail.
+            label = (getattr(op, "premis_event_label", "") or "").strip()
+            # Bakoverkompat: hvis ingen egen label, men premis_event_type var en
+            # fri tekst, bruk den teksten som label.
+            if not label and raw_type and raw_type not in VALID_EVENT_TYPES:
+                label = raw_type
+
             try:
                 detail = op.premis_detail(result, ctx)
             except Exception:
                 detail = getattr(result, "message", "") or ""
             self._events.append({
                 "type":    event_type,
+                "label":   label,
                 "op_id":   getattr(op, "operation_id", ""),
                 "datetime": self._ts(),
                 "detail":  detail or "",
@@ -103,7 +133,8 @@ class PremisProvenanceLogger:
             fl = (ctx.metadata or {}).get("file_logger") if ctx else None
             if fl:
                 status = "OK" if getattr(result, "success", True) else "FEIL"
-                fl.log(f"  PREMIS: {event_type} ({status}) — {detail or '–'}", "info")
+                shown = f"{event_type} ({label})" if label else event_type
+                fl.log(f"  PREMIS: {shown} ({status}) — {detail or '–'}", "info")
         except Exception:
             logger.exception("Kunne ikke registrere PREMIS-event for %r", op)
 
@@ -169,8 +200,15 @@ class PremisProvenanceLogger:
             ET.SubElement(eid, _p("eventIdentifierValue")).text = str(i)
             ET.SubElement(e, _p("eventType")).text = ev["type"]
             ET.SubElement(e, _p("eventDateTime")).text = ev["datetime"]
-            if ev["detail"]:
-                ET.SubElement(e, _p("eventDetail")).text = ev["detail"]
+            # eventDetail bærer den beskrivende kategorien (label) + detaljer,
+            # ettersom eventType nå er begrenset til DIAS-enumerasjonen.
+            label, detail = ev.get("label", ""), ev.get("detail", "")
+            if label and detail:
+                detail_text = f"{label}: {detail}"
+            else:
+                detail_text = label or detail
+            if detail_text:
+                ET.SubElement(e, _p("eventDetail")).text = detail_text
             outcome_inf = ET.SubElement(e, _p("eventOutcomeInformation"))
             # DIAS-konvensjon: 0 = suksess, 1 = feil
             ET.SubElement(outcome_inf, _p("eventOutcome")).text = "0" if ev["success"] else "1"
