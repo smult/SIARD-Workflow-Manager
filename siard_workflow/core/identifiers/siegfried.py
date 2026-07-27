@@ -304,7 +304,8 @@ class SiegfriedIdentifier:
         if path is not None:
             cached = self._cache.get(self._cache_key(path))
             if cached is not None:
-                return self._hybrid_encrypt(cached, data, path)
+                return self._magic_fallback(
+                    self._hybrid_encrypt(cached, data, path), data, path)
 
         # 2. Ad-hoc per-fil-kall — krever sf
         if not self.is_available():
@@ -356,7 +357,8 @@ class SiegfriedIdentifier:
         matches = files[0].get("matches", [])
         base = self._parse_match(matches)
         self._log_match(str(path), base[0], base[1], matches)
-        return self._hybrid_encrypt(base, data, path)
+        return self._magic_fallback(
+            self._hybrid_encrypt(base, data, path), data, path)
 
     # ── Logging-hjelpefunksjon ───────────────────────────────────────────────
 
@@ -396,6 +398,41 @@ class SiegfriedIdentifier:
         # Siegfried setter "encrypted" eller "password" i warning for noen formater
         enc = "encrypt" in warn or "password" in warn
         return (ext, mime, enc)
+
+    # ── Magic-bytes fallback ────────────────────────────────────────────────
+
+    @staticmethod
+    def _magic_fallback(base: tuple[str, str, bool],
+                        data: Optional[bytes],
+                        path: Optional[Path]) -> tuple[str, str, bool]:
+        """
+        Hvis Siegfried ikke kjente igjen filen (ext == "bin"), prøv magic-bytes
+        på header-en og bruk dét resultatet hvis det er et kjent format.
+
+        Bakgrunn: PRONOM/DROID-signaturer krever ofte at formatets sluttmarkør
+        ligger nær slutten av fila (f.eks. «%%EOF» for PDF). Database-eksporterte
+        LOB-er har gjerne etterfølgende padding (faste kolonnebredder) eller et
+        innledende lengde-prefiks, slik at DROID ikke matcher og Siegfried
+        returnerer «bin». Magic-bytes kjenner igjen formatet på header-en alene
+        og fanger derfor disse filene. Fallbacken brukes KUN når Siegfried ikke
+        fant noe — Siegfrieds presisjon beholdes når den faktisk matcher.
+        """
+        ext, mime, enc = base
+        if ext != "bin":
+            return base
+        head = data
+        if head is None and path is not None:
+            try:
+                head = Path(path).read_bytes()[:65536]
+            except Exception:
+                return base
+        if not head:
+            return base
+        from siard_workflow.core.identifiers.magic_bytes import _detect
+        m_ext, m_mime, m_enc = _detect(head)
+        if m_ext != "bin":
+            return (m_ext, m_mime, m_enc)
+        return base
 
     # ── Hybrid kryptering-deteksjon ─────────────────────────────────────────
 
