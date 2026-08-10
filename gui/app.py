@@ -87,19 +87,14 @@ class _PipelineSuggestionDialog(ctk.CTkToplevel):
         self.grab_set()
         self.lift()
 
-        # Sentrer over foreldrevinduet
-        self.update_idletasks()
-        pw, ph = parent.winfo_width(), parent.winfo_height()
-        px, py = parent.winfo_x(), parent.winfo_y()
-        w, h = 520, 300
-        x = px + (pw - w) // 2
-        y = py + (ph - h) // 2
-        self.geometry(f"{w}x{h}+{x}+{y}")
         self.configure(fg_color=COLORS["bg"])
+
+        w    = 560
+        wrap = w - 64
 
         # Ikon + tittel
         header = ctk.CTkFrame(self, fg_color=COLORS["panel"], corner_radius=0)
-        header.pack(fill="x", padx=0, pady=0)
+        header.pack(side="top", fill="x", padx=0, pady=0)
         ctk.CTkLabel(
             header,
             text="  Pipeline-modus anbefalt",
@@ -108,25 +103,15 @@ class _PipelineSuggestionDialog(ctk.CTkToplevel):
             anchor="w",
         ).pack(side="left", padx=12, pady=10)
 
-        # Meldingstekst
-        ctk.CTkLabel(
-            self,
-            text=message,
-            font=ctk.CTkFont(family=FONTS["mono"], size=11),
-            text_color=COLORS["text"],
-            wraplength=480,
-            justify="left",
-            anchor="nw",
-        ).pack(padx=16, pady=(14, 8), fill="x")
-
-        # Knapper
+        # Knapper — pakkes FØR meldingen (side=bottom) slik at de alltid er
+        # synlige og aldri skyves ut, uansett hvor langt innholdet er.
         btn_row = ctk.CTkFrame(self, fg_color="transparent")
         btn_row.pack(side="bottom", fill="x", padx=16, pady=14)
         btn_row.grid_columnconfigure((0, 1, 2), weight=1)
 
         ctk.CTkButton(
             btn_row, text="Ja, legg til automatisk",
-            fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"],
+            fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"], text_color=COLORS["on_accent"],
             font=ctk.CTkFont(family=FONTS["mono"], size=11, weight="bold"),
             height=34,
             command=self._on_ja,
@@ -134,7 +119,7 @@ class _PipelineSuggestionDialog(ctk.CTkToplevel):
 
         ctk.CTkButton(
             btn_row, text="Nei, kjør uten",
-            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
             font=ctk.CTkFont(family=FONTS["mono"], size=11),
             height=34,
             command=self._on_nei,
@@ -142,14 +127,42 @@ class _PipelineSuggestionDialog(ctk.CTkToplevel):
 
         ctk.CTkButton(
             btn_row, text="Avbryt",
-            fg_color="#2a1515", hover_color="#3d2020",
-            text_color=COLORS["red"],
+            fg_color=COLORS["danger_bg"], hover_color=COLORS["danger_hover"], text_color=COLORS["danger_text"], border_color=COLORS["danger_border"], border_width=1,
             font=ctk.CTkFont(family=FONTS["mono"], size=11),
             height=34,
             command=self._on_avbryt,
         ).grid(row=0, column=2, padx=(6, 0), sticky="ew")
 
+        # Meldingstekst i rullbar ramme — fyller plassen mellom header og
+        # knapper. Rammen scroller dersom innholdet er høyere enn maks-høyden.
+        msg_frame = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        msg_frame.pack(side="top", fill="both", expand=True, padx=0, pady=0)
+        msg_label = ctk.CTkLabel(
+            msg_frame,
+            text=message,
+            font=ctk.CTkFont(family=FONTS["mono"], size=11),
+            text_color=COLORS["text"],
+            wraplength=wrap,
+            justify="left",
+            anchor="nw",
+        )
+        msg_label.pack(padx=16, pady=(14, 8), fill="x", anchor="nw")
+
         self.protocol("WM_DELETE_WINDOW", self._on_avbryt)
+
+        # Dynamisk høyde ut fra faktisk innhold (klemt til 85 % av skjermen),
+        # sentrert over foreldrevinduet.
+        self.update_idletasks()
+        needed = (header.winfo_reqheight()
+                  + msg_label.winfo_reqheight()
+                  + btn_row.winfo_reqheight()
+                  + 64)                       # marginer/paddings + scroll-ramme
+        h = max(240, min(needed, int(self.winfo_screenheight() * 0.85)))
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        px, py = parent.winfo_x(), parent.winfo_y()
+        x = px + (pw - w) // 2
+        y = py + (ph - h) // 2
+        self.geometry(f"{w}x{h}+{x}+{y}")
 
     def _on_ja(self):
         self.result = "ja"
@@ -300,12 +313,13 @@ class App(ctk.CTk):
             bar, values=["-- profil --"] + self.manager.list_profiles(),
             variable=self.profile_var, width=160,
             fg_color=COLORS["btn"], button_color=COLORS["accent"],
+            text_color=COLORS["btn_text"],
+            dropdown_fg_color=COLORS["panel"], dropdown_text_color=COLORS["text"],
             font=ctk.CTkFont(family=FONTS["mono"], size=11),
             command=self._load_profile)
         self.profile_menu.grid(row=0, column=1, padx=4, pady=8, sticky="w")
 
-        menu_cfg = dict(height=30, width=100, fg_color=COLORS["btn"],
-                        hover_color=COLORS["btn_hover"],
+        menu_cfg = dict(height=30, width=100, fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
                         font=ctk.CTkFont(family=FONTS["mono"], size=10))
 
         col = 2
@@ -324,7 +338,7 @@ class App(ctk.CTk):
         for txt, delta in [("A−", -1), ("A+", +1)]:
             ctk.CTkButton(
                 font_frm, text=txt, width=32, height=26, corner_radius=5,
-                fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+                fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
                 font=ctk.CTkFont(family=FONTS["mono"], size=10),
                 command=lambda d=delta: self._font_scale(d),
             ).pack(side="left", padx=2)
@@ -333,7 +347,7 @@ class App(ctk.CTk):
         _icon = "💡" if _cur_theme() == "dark" else "🌙"
         self._theme_btn = ctk.CTkButton(
             font_frm, text=_icon, width=32, height=26, corner_radius=5,
-            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
             font=ctk.CTkFont(size=14),
             command=self._toggle_theme,
         )
@@ -819,8 +833,7 @@ class App(ctk.CTk):
             def _rm(p=path):
                 self._queue_remove(p)
             ctk.CTkButton(row, text="✕", width=20, height=20, corner_radius=3,
-                          fg_color="#2a1515", hover_color="#3d2020",
-                          text_color=COLORS["red"],
+                          fg_color=COLORS["danger_bg"], hover_color=COLORS["danger_hover"], text_color=COLORS["danger_text"], border_color=COLORS["danger_border"], border_width=1,
                           font=ctk.CTkFont(size=11),
                           command=_rm).grid(row=0, column=1, padx=(0,4), pady=3)
 

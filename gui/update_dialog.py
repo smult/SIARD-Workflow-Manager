@@ -133,14 +133,14 @@ class UpdateDialog(ctk.CTkToplevel):
 
         self._skip_btn = ctk.CTkButton(
             btn_row, text="Hopp over",
-            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
             command=self.destroy, width=110, **btn_cfg,
         )
         self._skip_btn.pack(side="left", padx=(0, 8))
 
         self._update_btn = ctk.CTkButton(
             btn_row, text="⬇  Oppdater nå",
-            fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"],
+            fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"], text_color=COLORS["on_accent"],
             command=self._start_download, width=150, **btn_cfg,
         )
         self._update_btn.pack(side="left")

@@ -101,11 +101,53 @@ def test_real_match_is_preserved() -> None:
         "ekte Siegfried-treff (tiff) bevares selv om header ser annerledes ut")
 
 
+class _TxtSiegfried(SiegfriedIdentifier):
+    """Siegfried-stub som later som sf alltid svarer «txt» (fmt/111)."""
+
+    def __init__(self):
+        super().__init__()
+        self.sf_exe = "sf"
+
+    def is_available(self) -> bool:
+        return True
+
+    def _sf_single(self, path, data):  # type: ignore[override]
+        base = ("txt", "text/plain", False)
+        return self._magic_fallback(
+            self._hybrid_encrypt(base, data, path), data, path)
+
+
+_XML = b'<?xml version="1.0" encoding="UTF-8"?>\n<root><a>x</a></root>'
+
+
+def test_txt_xml_upgrade() -> None:
+    print("test_txt_xml_upgrade")
+    idf = _TxtSiegfried()
+    _ok(idf.identify(data=_XML)[0] == "xml",
+        "txt-match med XML-innhold → xml")
+    _ok(idf.identify(data=b"\x00\x00\x0aHDR " + _XML)[0] == "xml",
+        "padded/prefikset XML lagret som .txt → xml")
+    _ok(idf.identify(data=b"\xef\xbb\xbf" + _XML)[0] == "xml",
+        "XML med UTF-8 BOM → xml")
+    _ok(idf.identify(data=b"<!DOCTYPE html><html></html>")[0] == "html",
+        "HTML-innhold → html")
+    _ok(idf.identify(data=b"Helt vanlig tekst uten markup.")[0] == "txt",
+        "ekte tekst forblir txt")
+    _ok(idf.identify(data=b"< dette er bare et tegn, ikke xml")[0] == "txt",
+        "tekst som starter med '<' (uten deklarasjon) forblir txt")
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "record1.txt"
+        p.write_bytes(_XML)
+        _ok(idf.identify(path=p)[0] == "xml",
+            "XML-innhold i .txt via path → xml")
+
+
 def main() -> int:
     test_fallback_via_data()
     test_fallback_via_path()
     test_cache_hit_gets_fallback()
     test_real_match_is_preserved()
+    test_txt_xml_upgrade()
     print("\nALLE SIEGFRIED-FALLBACK-TESTER OK")
     return 0
 

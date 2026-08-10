@@ -26,6 +26,7 @@ from siard_workflow.core.siard_format import (
     detect_siard_version, siard_version_transform,
     get_target_siard_version, is_siard_xml,
 )
+from siard_workflow.core import external_lob
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -58,12 +59,22 @@ class UnpackSiardOperation(BaseOperation):
     default_params: dict = {}
 
     def premis_should_record(self, result, ctx) -> bool:
-        return bool(result.success) and result.data.get("schemas_sanitized", 0) > 0
+        return bool(result.success) and (
+            result.data.get("schemas_sanitized", 0) > 0
+            or result.data.get("external_lobs_imported", 0) > 0)
 
     def premis_detail(self, result, ctx) -> str:
-        n = result.data.get("schemas_sanitized", 0)
-        return (f"{n} schema-navn med spesialtegn sanert til 'schemaN' i "
-                f"metadata.xml ved utpakking")
+        parts = []
+        n_san = result.data.get("schemas_sanitized", 0)
+        if n_san:
+            parts.append(f"{n_san} schema-navn med spesialtegn sanert til "
+                         f"'schemaN' i metadata.xml ved utpakking")
+        n_ext = result.data.get("external_lobs_imported", 0)
+        if n_ext:
+            parts.append(f"{n_ext} LOB-fil(er) importert fra eksternt fillager "
+                         f"({result.data.get('external_base', '')}) og "
+                         f"<lobFolder> satt til 'content'")
+        return "; ".join(parts) or "ingen endringer ved utpakking"
 
     def run(self, ctx: WorkflowContext) -> OperationResult:
         log = ctx.metadata.get("file_logger")
@@ -126,6 +137,19 @@ class UnpackSiardOperation(BaseOperation):
             "original_namelist": original_namelist,
             "files_extracted":   n_done,
         }
+
+        # ── Internaliser eksternt fillager (ekstern lobFolder) ─────────────────
+        # SIARD kan lagre LOB-ene i en søstermappe (ekstern db-nivå <lobFolder>).
+        # Kopier dem inn i den utpakkede mappen slik at ALLE nedstrøms-
+        # operasjoner behandler dem på lik linje med interne LOB-er. Bruker kan
+        # velge eksternt fillager igjen ved «Pakk sammen SIARD».
+        try:
+            ext_stats = external_lob.internalize(tmp, siard_path, w)
+            data["external_lobs_imported"] = ext_stats["external_lobs_imported"]
+            if ext_stats.get("external_base"):
+                data["external_base"] = ext_stats["external_base"]
+        except Exception as exc:
+            w(f"  Advarsel: kunne ikke importere eksternt fillager: {exc}", "warn")
 
         # ── Sjekk for tomme <schema><name>-noder i metadata.xml ────────────────
         # Schema-navn er obligatorisk i SIARD. Hvis en eller flere er tomme,
@@ -397,6 +421,7 @@ class RepackSiardOperation(BaseOperation):
         "output_suffix":  "_konvertert",
         "keep_temp":      False,
         "compress_level": "",   # tom = bruk global config (siard_compress_level)
+        "lob_storage":    "intern",   # "intern" = LOB-er i ZIP; "ekstern" = søstermappe
     }
 
     def run(self, ctx: WorkflowContext) -> OperationResult:
@@ -440,9 +465,27 @@ class RepackSiardOperation(BaseOperation):
                 pass
         w(f"  SIARD-versjon: {src_version} → {target_version}", "info")
 
+        # ── Eksternt fillager (valgfritt) ──────────────────────────────────────
+        # Hvis bruker valgte «ekstern»: flytt LOB-filene ut til en søstermappe
+        # og skriv om <lobFolder>/file=-referanser før ZIP-en skrives. Filene er
+        # da ute av extract_dir og havner derfor ikke i ZIP-en.
+        lob_storage = (self.params.get("lob_storage") or "intern").strip().lower()
+        ext_result: dict = {}
+        if lob_storage == "ekstern":
+            try:
+                ext_result = external_lob.externalize(extract_dir, dst_path, w)
+            except Exception as exc:
+                return self._fail(f"Kunne ikke eksternalisere fillager: {exc}")
+
         # Kataloginnganger fra original ZIP
         orig_dir_entries = sorted(
             n for n in orig_namelist if n.endswith("/"))
+        if lob_storage == "ekstern":
+            # LOB-mappene ligger nå eksternt — ikke skriv tomme lob*/-innganger.
+            import re as _re
+            _lobdir = _re.compile(r"(^|/)lob\d+/", _re.IGNORECASE)
+            orig_dir_entries = [n for n in orig_dir_entries
+                                if not _lobdir.search(n)]
 
         def _ver_path(name: str) -> str:
             if (src_version and src_version != target_version
@@ -541,5 +584,11 @@ class RepackSiardOperation(BaseOperation):
             "output_path":   str(dst_path),
             "files_written": n_written,
             "size_mb":       round(size_mb, 2),
+            "lob_storage":   lob_storage,
         }
+        if ext_result:
+            data["external_documents_dir"] = ext_result.get("external_documents_dir")
+            data["lob_files_externalized"] = ext_result.get("lob_files_externalized", 0)
+            w(f"  Eksternt fillager: {ext_result.get('lob_files_externalized', 0)} "
+              f"fil(er) → {ext_result.get('external_documents_dir')}", "ok")
         return self._ok(data, f"{n_written:,} filer → {dst_path.name}")

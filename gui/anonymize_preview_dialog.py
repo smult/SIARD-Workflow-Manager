@@ -128,11 +128,11 @@ class AnonymizePreviewDialog(ctk.CTkToplevel):
         btns = ctk.CTkFrame(self, fg_color="transparent")
         btns.grid(row=2, column=0, padx=16, pady=(0, 14), sticky="e")
         ctk.CTkButton(btns, text="Avbryt", width=110,
-                      fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+                      fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
                       font=ctk.CTkFont(family=FONTS["mono"], size=12),
                       command=self._cancel).pack(side="left", padx=(0, 8))
         ctk.CTkButton(btns, text="Anonymiser", width=150,
-                      fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"],
+                      fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"], text_color=COLORS["on_accent"],
                       font=ctk.CTkFont(family=FONTS["mono"], size=12, weight="bold"),
                       command=self._confirm).pack(side="left")
 

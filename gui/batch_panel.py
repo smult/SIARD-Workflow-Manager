@@ -49,8 +49,7 @@ class BatchFileRow(ctk.CTkFrame):
         self._msg_lbl.grid(row=0, column=3, padx=4)
 
         ctk.CTkButton(self, text="✕", width=24, height=24, corner_radius=4,
-                      fg_color="#2a1515", hover_color="#3d2020",
-                      text_color=COLORS["red"],
+                      fg_color=COLORS["danger_bg"], hover_color=COLORS["danger_hover"], text_color=COLORS["danger_text"], border_color=COLORS["danger_border"], border_width=1,
                       font=ctk.CTkFont(size=11),
                       command=lambda: on_remove(self)).grid(row=0, column=4, padx=(4, 8))
 
@@ -105,12 +104,12 @@ class BatchWindow(ctk.CTkToplevel):
         btns.grid(row=0, column=2, padx=12, pady=8)
 
         ctk.CTkButton(btns, text="+ Legg til filer", width=130, height=30,
-                      fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+                      fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
                       font=ctk.CTkFont(family=FONTS["mono"], size=11),
                       command=self._add_files).pack(side="left", padx=(0, 6))
 
         self._run_btn = ctk.CTkButton(btns, text="▶ Kjor alle", width=120, height=30,
-                                       fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"],
+                                       fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"], text_color=COLORS["on_accent"],
                                        font=ctk.CTkFont(family=FONTS["mono"], size=11, weight="bold"),
                                        command=self._run_all)
         self._run_btn.pack(side="left")

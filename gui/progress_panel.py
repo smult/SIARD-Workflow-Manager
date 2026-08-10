@@ -152,14 +152,13 @@ class ProgressPanel(ctk.CTkFrame):
                        font=ctk.CTkFont(family=FONTS["mono"], size=10))
         self._pause_btn = ctk.CTkButton(
             hdr, text="⏸ Pause",
-            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
             command=self._on_pause, **btn_cfg)
         self._pause_btn.grid(row=0, column=2, padx=(8, 4))
 
         self._stop_btn = ctk.CTkButton(
             hdr, text="⏹ Stopp",
-            fg_color="#3d1a1a", hover_color="#5a2020",
-            text_color=COLORS["red"],
+            fg_color=COLORS["danger_bg"], hover_color=COLORS["danger_hover"], text_color=COLORS["danger_text"], border_color=COLORS["danger_border"], border_width=1,
             command=self._on_stop, **btn_cfg)
         self._stop_btn.grid(row=0, column=3)
 
@@ -391,8 +390,8 @@ class ProgressPanel(ctk.CTkFrame):
                                    fg_color=COLORS["btn"])
         self._pause_btn.grid()
         self._stop_btn.configure(state="disabled", text="⏹ Stopp",
-                                  fg_color="#3d1a1a", hover_color="#5a2020",
-                                  text_color=COLORS["red"])
+                                  fg_color=COLORS["danger_bg"], hover_color=COLORS["danger_hover"],
+                                  text_color=COLORS["danger_text"])
         self._stop_btn.grid()   # gjenopprett synlighet
 
         self._simple_frame.grid_remove()
@@ -595,16 +594,14 @@ class ProgressPanel(ctk.CTkFrame):
         if stopped:
             self._stop_btn.configure(
                 text="▶ Fortsett",
-                fg_color=COLORS["accent"],
-                hover_color=COLORS["accent_dim"],
-                text_color=COLORS["text"],
+                fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"], text_color=COLORS["on_accent"],
                 state="normal")
         else:
             self._stop_btn.configure(
                 text="⏹ Stopp",
-                fg_color="#3d1a1a",
-                hover_color="#5a2020",
-                text_color=COLORS["red"],
+                fg_color=COLORS["danger_bg"],
+                hover_color=COLORS["danger_hover"],
+                text_color=COLORS["danger_text"],
                 state="normal")
             self._stop_btn.grid()
 

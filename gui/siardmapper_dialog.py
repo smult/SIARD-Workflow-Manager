@@ -370,14 +370,14 @@ class SiardMapperDialog(ctk.CTkToplevel):
 
         ctk.CTkButton(
             hdr, text="✎ Endre metadata for mal", height=26, width=190,
-            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
             font=ctk.CTkFont(family=FONTS["mono"], size=10),
             command=self._edit_meta,
         ).grid(row=0, column=2, padx=(8, 6), pady=7)
 
         ctk.CTkButton(
             hdr, text="↺ Re-match mot JSON", height=26, width=160,
-            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
             font=ctk.CTkFont(family=FONTS["mono"], size=10),
             command=self._rematch,
         ).grid(row=0, column=3, padx=(0, 14), pady=7)
@@ -519,15 +519,14 @@ class SiardMapperDialog(ctk.CTkToplevel):
 
         ctk.CTkButton(
             foot, text="Lagre og fortsett",
-            fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"],
+            fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"], text_color=COLORS["on_accent"],
             font=ctk.CTkFont(family=FONTS["mono"], size=11, weight="bold"),
             height=34, command=self._save,
         ).grid(row=0, column=0, padx=(16, 6), pady=10)
 
         ctk.CTkButton(
             foot, text="Avbryt kjøring",
-            fg_color="#2a1515", hover_color="#3d2020",
-            text_color=COLORS["red"],
+            fg_color=COLORS["danger_bg"], hover_color=COLORS["danger_hover"], text_color=COLORS["danger_text"], border_color=COLORS["danger_border"], border_width=1,
             font=ctk.CTkFont(family=FONTS["mono"], size=11),
             height=34, command=self._cancel,
         ).grid(row=0, column=2, padx=(6, 16), pady=10)
@@ -1264,14 +1263,14 @@ class SiardMapperDialog(ctk.CTkToplevel):
 
         ctk.CTkButton(
             btn_frm, text="OK",
-            fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"],
+            fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"], text_color=COLORS["on_accent"],
             font=ctk.CTkFont(family=FONTS["mono"], size=11, weight="bold"),
             height=34, command=_ok,
         ).grid(row=0, column=0, padx=(0, 6), sticky="ew")
 
         ctk.CTkButton(
             btn_frm, text="Avbryt",
-            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
             font=ctk.CTkFont(family=FONTS["mono"], size=11),
             height=34, command=win.destroy,
         ).grid(row=0, column=1, sticky="ew")

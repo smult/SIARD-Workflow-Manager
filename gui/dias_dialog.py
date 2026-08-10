@@ -248,11 +248,11 @@ class DiasParamDialog(ctk.CTkToplevel):
         btns.grid(row=2, column=0, columnspan=2,
                   padx=16, pady=(0, 14), sticky="e")
         ctk.CTkButton(btns, text="Avbryt", width=100,
-                      fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+                      fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
                       font=ctk.CTkFont(family=FONTS["mono"], size=13),
                       command=self.destroy).pack(side="left", padx=(0, 8))
         ctk.CTkButton(btns, text="Legg til i workflow", width=170,
-                      fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"],
+                      fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"], text_color=COLORS["on_accent"],
                       font=ctk.CTkFont(family=FONTS["mono"], size=13, weight="bold"),
                       command=self._confirm).pack(side="left")
 
@@ -279,7 +279,7 @@ class DiasParamDialog(ctk.CTkToplevel):
         mets_row = ctk.CTkFrame(frm, fg_color="transparent")
         mets_row.grid(row=0, column=0, columnspan=2, padx=6, pady=(4, 6), sticky="w")
         ctk.CTkButton(mets_row, text="Les inn fra METS-fil …",
-                      fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+                      fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
                       font=ctk.CTkFont(family=FONTS["mono"], size=12),
                       command=self._load_from_mets).pack(side="left")
 
@@ -307,7 +307,9 @@ class DiasParamDialog(ctk.CTkToplevel):
                     fg_color=COLORS["bg"],
                     button_color=COLORS["accent"],
                     button_hover_color=COLORS["accent_dim"],
+                    text_color=COLORS["text"],
                     dropdown_fg_color=COLORS["panel"],
+                    dropdown_text_color=COLORS["text"],
                     font=ctk.CTkFont(family=FONTS["mono"], size=12),
                     width=1,
                     dynamic_resizing=False,
@@ -349,8 +351,7 @@ class DiasParamDialog(ctk.CTkToplevel):
                         if d:
                             v.set(d)
                     ctk.CTkButton(hf, text="…", width=32,
-                                  fg_color=COLORS["btn"],
-                                  hover_color=COLORS["btn_hover"],
+                                  fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
                                   font=ctk.CTkFont(family=FONTS["mono"], size=12),
                                   command=_pick_dir).grid(row=0, column=1, padx=(4, 0))
                     self._vars[p["key"]] = (var, p["type"])
@@ -447,8 +448,7 @@ class DiasParamDialog(ctk.CTkToplevel):
         # Knapper
         btn_bar = ctk.CTkFrame(parent, fg_color="transparent")
         btn_bar.grid(row=2, column=0, padx=10, pady=(0, 4), sticky="ew")
-        btn_cfg = dict(height=30, fg_color=COLORS["btn"],
-                       hover_color=COLORS["btn_hover"],
+        btn_cfg = dict(height=30, fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
                        font=ctk.CTkFont(family=FONTS["mono"], size=12))
         ctk.CTkButton(btn_bar, text="➕  Legg til fil", **btn_cfg,
                       command=self._add_file).pack(side="left", padx=(0, 6))

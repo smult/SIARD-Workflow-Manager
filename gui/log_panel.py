@@ -38,13 +38,13 @@ class LogPanel(ctk.CTkFrame):
 
         self._show_all_btn = ctk.CTkButton(
             hdr, text="Vis alle", width=64, height=22,
-            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
             font=ctk.CTkFont(family=FONTS["mono"], size=10),
             command=self._toggle_show_all)
         self._show_all_btn.grid(row=0, column=2, padx=(0, 4))
 
         ctk.CTkButton(hdr, text="Tøm", width=50, height=22,
-                      fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+                      fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
                       font=ctk.CTkFont(family=FONTS["mono"], size=10),
                       command=self.clear).grid(row=0, column=3)
 

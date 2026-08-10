@@ -263,7 +263,7 @@ class SiardMapperParamDialog(ctk.CTkToplevel):
         #self._siard_entry.grid(row=0, column=0, sticky="ew", padx=(0, 4))
         #ctk.CTkButton(
         #    siard_row, text="Bla…", width=54, height=28,
-        #    fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+        #    fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
         #    font=ctk.CTkFont(family=FONTS["mono"], size=10),
         #    command=self._browse_siard,
         #).grid(row=0, column=1)
@@ -307,7 +307,7 @@ class SiardMapperParamDialog(ctk.CTkToplevel):
         btn_row.grid(row=r, column=0, sticky="w", padx=16, pady=(0, 4))
         self._refresh_btn = ctk.CTkButton(
             btn_row, text="↻ Oppdater liste", height=26, width=130,
-            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
             font=ctk.CTkFont(family=FONTS["mono"], size=10),
             command=self._refresh_async,
         )
@@ -342,7 +342,7 @@ class SiardMapperParamDialog(ctk.CTkToplevel):
         self._json_entry.grid(row=0, column=0, sticky="ew", padx=(0, 4))
         ctk.CTkButton(
             json_row, text="Bla…", width=54, height=28,
-            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
             font=ctk.CTkFont(family=FONTS["mono"], size=10),
             command=self._browse_json,
         ).grid(row=0, column=1)
@@ -351,7 +351,7 @@ class SiardMapperParamDialog(ctk.CTkToplevel):
         ctk.CTkButton(
             body, text="Generer tom JSON-mal fra valgt SIARD",
             height=28, anchor="w",
-            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
             font=ctk.CTkFont(family=FONTS["mono"], size=10),
             command=self._generate_template,
         ).grid(row=r, column=0, sticky="w", padx=16, pady=(0, 6))
@@ -376,13 +376,13 @@ class SiardMapperParamDialog(ctk.CTkToplevel):
         btns.grid_columnconfigure((0, 1), weight=1)
 
         ctk.CTkButton(btns, text="OK",
-                      fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"],
+                      fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"], text_color=COLORS["on_accent"],
                       font=ctk.CTkFont(family=FONTS["mono"], size=11, weight="bold"),
                       height=34, command=self._ok,
         ).grid(row=0, column=0, padx=(0, 6), sticky="ew")
 
         ctk.CTkButton(btns, text="Avbryt",
-                      fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+                      fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
                       font=ctk.CTkFont(family=FONTS["mono"], size=11),
                       height=34, command=self.destroy,
         ).grid(row=0, column=1, sticky="ew")

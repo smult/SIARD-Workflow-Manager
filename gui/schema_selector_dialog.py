@@ -97,8 +97,7 @@ class SchemaSelectorDialog(ctk.CTkToplevel):
             self._vars[s["name"]] = var
             ctk.CTkCheckBox(
                 row, text="", variable=var, width=24,
-                fg_color=COLORS["accent"],
-                hover_color=COLORS["accent_dim"],
+                fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"], text_color=COLORS["on_accent"],
             ).grid(row=0, column=0, padx=(10, 8), pady=8, sticky="w")
 
             info = ctk.CTkFrame(row, fg_color="transparent")
@@ -161,26 +160,22 @@ class SchemaSelectorDialog(ctk.CTkToplevel):
         btns.grid(row=1, column=0, padx=14, pady=(0, 10), sticky="e")
 
         ctk.CTkButton(btns, text="Velg alle", width=90,
-                      fg_color=COLORS["btn"],
-                      hover_color=COLORS["btn_hover"],
+                      fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
                       font=ctk.CTkFont(family=FONTS["mono"], size=11),
                       command=self._select_all
                       ).pack(side="left", padx=(0, 6))
         ctk.CTkButton(btns, text="Velg ingen", width=90,
-                      fg_color=COLORS["btn"],
-                      hover_color=COLORS["btn_hover"],
+                      fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
                       font=ctk.CTkFont(family=FONTS["mono"], size=11),
                       command=self._select_none
                       ).pack(side="left", padx=(0, 12))
         ctk.CTkButton(btns, text="Avbryt", width=100,
-                      fg_color=COLORS["btn"],
-                      hover_color=COLORS["btn_hover"],
+                      fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
                       font=ctk.CTkFont(family=FONTS["mono"], size=12),
                       command=self._on_cancel
                       ).pack(side="left", padx=(0, 6))
         ctk.CTkButton(btns, text="OK", width=120,
-                      fg_color=COLORS["accent"],
-                      hover_color=COLORS["accent_dim"],
+                      fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"], text_color=COLORS["on_accent"],
                       font=ctk.CTkFont(family=FONTS["mono"],
                                        size=12, weight="bold"),
                       command=self._on_ok

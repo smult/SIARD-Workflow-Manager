@@ -106,8 +106,7 @@ class SettingsDialog(ctk.CTkToplevel):
                             v.set(p)
 
                     ctk.CTkButton(cell, text="Bla…", width=52,
-                                  fg_color=COLORS["btn"],
-                                  hover_color=COLORS["btn_hover"],
+                                  fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
                                   font=ctk.CTkFont(family=FONTS["mono"], size=12),
                                   command=_browse).grid(
                                       row=0, column=1, padx=(4, 0))
@@ -226,13 +225,11 @@ class SettingsDialog(ctk.CTkToplevel):
                     parent=self)
 
         ctk.CTkButton(lo_cell, text="Bla…", width=52,
-                      fg_color=COLORS["btn"],
-                      hover_color=COLORS["btn_hover"],
+                      fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
                       font=ctk.CTkFont(family=FONTS["mono"], size=12),
                       command=_browse_lo).grid(row=0, column=1, padx=(4, 0))
         ctk.CTkButton(lo_cell, text="Detekter", width=72,
-                      fg_color=COLORS["btn"],
-                      hover_color=COLORS["btn_hover"],
+                      fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
                       font=ctk.CTkFont(family=FONTS["mono"], size=12),
                       command=_detect_lo).grid(row=0, column=2, padx=(4, 0))
         r += 1
@@ -280,8 +277,7 @@ class SettingsDialog(ctk.CTkToplevel):
                 messagebox.showerror("Feil", str(exc), parent=self)
 
         ctk.CTkButton(mw_cell, text="Auto", width=52,
-                      fg_color=COLORS["accent"],
-                      hover_color=COLORS["accent_dim"],
+                      fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"], text_color=COLORS["on_accent"],
                       font=ctk.CTkFont(family=FONTS["mono"], size=10),
                       command=_auto_hw).pack(side="left")
         r += 1
@@ -379,7 +375,9 @@ class SettingsDialog(ctk.CTkToplevel):
             fg_color=COLORS["bg"],
             button_color=COLORS["accent"],
             button_hover_color=COLORS["accent_dim"],
+            text_color=COLORS["text"],
             dropdown_fg_color=COLORS["panel"],
+            dropdown_text_color=COLORS["text"],
             font=ctk.CTkFont(family=FONTS["mono"], size=11),
             width=120,
         ).grid(row=r, column=1, padx=12, pady=6, sticky="e"); r += 1
@@ -438,7 +436,7 @@ class SettingsDialog(ctk.CTkToplevel):
 
         ctk.CTkButton(
             frm, text="Installer / Oppdater Siegfried",
-            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
             font=ctk.CTkFont(family=FONTS["mono"], size=11),
             command=self._install_siegfried,
         ).grid(row=r, column=1, padx=12, pady=(0, 4), sticky="e"); r += 1
@@ -465,7 +463,7 @@ class SettingsDialog(ctk.CTkToplevel):
                                      padx=14, pady=(0, 4), sticky="w"); r += 1
         ctk.CTkButton(
             frm, text="Test Ollama-tilkobling",
-            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
             font=ctk.CTkFont(family=FONTS["mono"], size=11),
             command=self._test_ollama,
         ).grid(row=r, column=1, padx=12, pady=(0, 4), sticky="e"); r += 1
@@ -492,7 +490,9 @@ class SettingsDialog(ctk.CTkToplevel):
             fg_color=COLORS["bg"],
             button_color=COLORS["accent"],
             button_hover_color=COLORS["accent_dim"],
+            text_color=COLORS["text"],
             dropdown_fg_color=COLORS["panel"],
+            dropdown_text_color=COLORS["text"],
             font=ctk.CTkFont(family=FONTS["mono"], size=11),
             width=120,
         ).grid(row=r, column=1, padx=12, pady=6, sticky="e"); r += 1
@@ -507,13 +507,11 @@ class SettingsDialog(ctk.CTkToplevel):
         btns = ctk.CTkFrame(self, fg_color="transparent")
         btns.grid(row=2, column=0, padx=16, pady=(0, 14), sticky="e")
         ctk.CTkButton(btns, text="Avbryt", width=90,
-                      fg_color=COLORS["btn"],
-                      hover_color=COLORS["btn_hover"],
+                      fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
                       font=ctk.CTkFont(family=FONTS["mono"], size=11),
                       command=self.destroy).pack(side="left", padx=(0, 8))
         ctk.CTkButton(btns, text="Lagre", width=110,
-                      fg_color=COLORS["accent"],
-                      hover_color=COLORS["accent_dim"],
+                      fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"], text_color=COLORS["on_accent"],
                       font=ctk.CTkFont(family=FONTS["mono"], size=11,
                                        weight="bold"),
                       command=self._save).pack(side="left")

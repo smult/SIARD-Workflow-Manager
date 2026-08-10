@@ -48,6 +48,7 @@ from pathlib import Path, PurePosixPath
 
 from siard_workflow.core.base_operation import BaseOperation, OperationResult
 from siard_workflow.core.context import WorkflowContext
+from siard_workflow.core import external_lob
 from siard_workflow.core.blob_csv_logger import (
     BlobCsvLogger, ConversionErrorLogger, SiegfriedIdLogger,
 )
@@ -1345,7 +1346,8 @@ def _collect_external_blobs(
         siard_dir: Path,
         all_blobs: list[str],
         table_blobs: dict,
-        w) -> tuple[list[str], dict[str, str],
+        w,
+        siard_path: "Path | None" = None) -> tuple[list[str], dict[str, str],
                     dict[str, list[dict]], dict[str, int]]:
     """
     Skann alle tableX.xml-filer for file="..."-referanser som IKKE ble funnet
@@ -1380,6 +1382,23 @@ def _collect_external_blobs(
     ref_format_counts: dict[str, int]   = {
         "basename": 0, "lob_relative": 0, "full_relative": 0, "other": 0,
     }
+
+    # Eksternt fillager (ekstern db-nivå <lobFolder>): LOB-ene ligger i en
+    # søstermappe, og celle-file= er relative til kolonnens lobFolder under den
+    # (f.eks. "seg5/rec1.txt"). Løs opp basen én gang. Brukes når filene IKKE
+    # allerede er internalisert i extract_dir (typisk standalone-modus).
+    ext_lob_base: "Path | None" = None
+    try:
+        _meta_p = extract_dir / "header" / "metadata.xml"
+        if _meta_p.exists() and siard_path is not None:
+            _db = external_lob.read_db_lobfolder(_meta_p.read_bytes())
+            if external_lob.is_external_lobfolder(_db):
+                _cand = external_lob.resolve_external_base(siard_path, _db)
+                if _cand.is_dir():
+                    ext_lob_base = _cand
+                    w(f"  Eksternt fillager (db-lobFolder): {ext_lob_base}", "info")
+    except Exception:
+        ext_lob_base = None
 
     def _add_missing(xml_sti: str, ref: str, reason: str) -> None:
         missing_refs.setdefault(xml_sti, []).append(
@@ -1452,23 +1471,36 @@ def _collect_external_blobs(
                 w(f"  Intern full-sti blob lagt til: {ref}", "info")
                 continue
 
-            # Case 2: ekstern blob — prøv relativt til SIARD-mappa
-            if not siard_dir or not siard_dir.is_dir():
-                if not found_relative and "/" not in ref:
-                    _add_missing(xml_sti, ref,
-                                  "ikke funnet i lob-mappe på disk")
-                continue
-            candidate_external = (siard_dir / ref).resolve()
-            # Sikkerhet: ikke la ../ navigere utenfor forventet område
-            try:
-                candidate_external.relative_to(siard_dir.resolve().parent)
-            except ValueError:
-                w(f"  Ekstern blob utenfor tillatt sti, ignorert: {ref}", "warn")
-                _add_missing(xml_sti, ref,
-                              "ekstern sti utenfor tillatt område")
-                continue
+            # Case 2: ekstern blob — finn kilde via én av to strategier:
+            #   (a) relativt til SIARD-mappa (per-celle ../-referanser), eller
+            #   (b) eksternt db-nivå lobFolder-lager (søstermappe): filen ligger
+            #       under <base>/<schema>/<table>/lob*/<ref> (ref kan ha seg-ledd).
+            candidate_external = None
 
-            if not candidate_external.exists() or not candidate_external.is_file():
+            # (a) legacy: relativt til siard_dir, med sti-sikkerhet
+            if siard_dir and siard_dir.is_dir():
+                cand_a = (siard_dir / ref).resolve()
+                try:
+                    cand_a.relative_to(siard_dir.resolve().parent)
+                    within = True
+                except ValueError:
+                    within = False
+                if within and cand_a.is_file():
+                    candidate_external = cand_a
+
+            # (b) eksternt db-lobFolder-lager
+            if candidate_external is None and ext_lob_base is not None:
+                _schema, _table = table_key.split("/", 1)
+                _tdir = ext_lob_base / _schema / _table
+                if _tdir.is_dir():
+                    for _lob in sorted(_tdir.iterdir()):
+                        if _lob.is_dir() and _lob.name.lower().startswith("lob"):
+                            _c = _lob / ref
+                            if _c.is_file():
+                                candidate_external = _c
+                                break
+
+            if candidate_external is None:
                 w(f"  Ekstern blob ikke funnet: {ref}", "warn")
                 _add_missing(xml_sti, ref,
                               "ikke funnet på intern eller ekstern sti")
@@ -1954,7 +1986,7 @@ class BlobConvertOperation(BaseOperation):
         # (intern full-sti / DBPT-format, eller eksternt lagrede blobs)
         _xml_extra, _ext_ref_map, _missing_refs, _ref_fmt = _collect_external_blobs(
             table_xml_map, extract_dir, ctx.siard_path.parent,
-            all_blobs, table_blobs, w)
+            all_blobs, table_blobs, w, siard_path=ctx.siard_path)
         if _xml_extra:
             all_blobs.extend(_xml_extra)
         if _ext_ref_map:
@@ -2404,7 +2436,7 @@ class BlobConvertOperation(BaseOperation):
                 # (intern full-sti / DBPT-format, eller eksternt lagrede blobs)
                 _xml_extra, _ext_ref_map, _missing_refs, _ref_fmt = _collect_external_blobs(
                     table_xml_map, extract_dir, src_path.parent,
-                    all_blobs, table_blobs, w)
+                    all_blobs, table_blobs, w, siard_path=src_path)
                 if _xml_extra:
                     all_blobs.extend(_xml_extra)
                 if _ext_ref_map:
@@ -2855,11 +2887,10 @@ class BlobConvertOperation(BaseOperation):
                 ext  = "txt"
                 mime = "text/plain"
 
-            # Ikke omdøp .txt til .xml: XML-innhold i en .txt-fil er fremdeles
-            # en tekstfil — filendelsen skal beholdes og innholdet ikke konverteres.
-            if ext == "xml" and file_ext == "txt":
-                ext  = "txt"
-                mime = "text/plain"
+            # XML-/HTML-innhold i en .txt-fil: behold innholdstypen (xml/html)
+            # for identifikasjon og sammendrag, men filendelsen skal IKKE endres
+            # til .xml og innholdet ikke konverteres. Filnavnbevaring håndteres i
+            # rename-only-løkken (content_ext vs. result_ext).
 
             # Passordbeskyttede filer: ikke konverter — kopier med riktig endelse
             if is_encrypted:
@@ -3019,6 +3050,21 @@ class BlobConvertOperation(BaseOperation):
             src_ext       = PurePosixPath(zip_sti).suffix.lstrip(".").lower()
             orig_basename = PurePosixPath(zip_sti).name
 
+            # Sann innholdstype fra identifiseringen — brukes til telling og
+            # rapport uavhengig av hvilken filendelse resultatfila får. Slik
+            # telles f.eks. XML-innhold i en .txt-fil som «xml» i sammendraget,
+            # mens selve fila beholder .txt-endelsen.
+            content_ext = ext
+
+            _was_unpacked = zip_sti in _unpacked_blobs
+
+            # Markup-innhold (xml/html) i en .txt-fil skal IKKE omdøpes til
+            # .xml/.html — behold .txt-endelsen. (Dekker tilfellet der
+            # "Standardiser .bin" er AV; med den PÅ håndteres det også nedenfor.)
+            if content_ext in ("xml", "html", "htm") and src_ext == "txt" \
+                    and not _was_unpacked:
+                ext = "txt"
+
             # Med "Standardiser .bin"-valg PÅ: LOB-filer beholder ALLTID sin
             # opprinnelige endelse — .bin forblir .bin selv om innholdet er
             # detektert som .txt, og .txt forblir .txt selv om detektert som
@@ -3028,7 +3074,6 @@ class BlobConvertOperation(BaseOperation):
             # deteksjon (zip/gz/bz2/base64/hex). Da er det opprinnelige binær-
             # formatet borte, og det reelle innholdet (f.eks. XML) skal eksponeres
             # med riktig filendelse slik at formatet kan detekteres som det det er.
-            _was_unpacked = zip_sti in _unpacked_blobs
             if _standardize_bin and src_ext in ("bin", "txt") and not _was_unpacked:
                 ext = src_ext
 
@@ -3046,7 +3091,7 @@ class BlobConvertOperation(BaseOperation):
                         pass
                 result_ext = "bin"
                 if conversion_registry is not None and creg_lock is not None:
-                    comment = (f"Filinnhold : {ext} - "
+                    comment = (f"Filinnhold : {content_ext} - "
                                f"Filendelse endret fra .{src_ext} til .bin")
                     with creg_lock:
                         conversion_registry[orig_basename] = (new_path, comment)
@@ -3058,7 +3103,9 @@ class BlobConvertOperation(BaseOperation):
 
             with lock:
                 stats["kept"] += 1
-            rename_ext_counts[ext] = rename_ext_counts.get(ext, 0) + 1
+            # Tell etter INNHOLDSTYPE (xml/html/pdf …), ikke filendelsen, slik at
+            # sammendraget gjenspeiler hva filene faktisk er.
+            rename_ext_counts[content_ext] = rename_ext_counts.get(content_ext, 0) + 1
 
             # Etter rename: finn ny filsti
             new_file = extract_dir / new_sti
@@ -3066,15 +3113,20 @@ class BlobConvertOperation(BaseOperation):
 
             if csv_log:
                 if result_ext == "bin" and src_ext != "bin":
-                    kommentar = f"Detektert som {ext} - standardisert til .bin"
+                    kommentar = f"Detektert som {content_ext} - standardisert til .bin"
+                elif content_ext != result_ext:
+                    # Innhold identifisert som noe annet enn filendelsen (f.eks.
+                    # XML i .txt): behold endelsen, men rapporter innholdstypen.
+                    kommentar = (f"Filinnhold: {content_ext} - "
+                                 f".{result_ext}-endelse beholdt")
                 elif ext == src_ext:
                     kommentar = "Beholdt originalformat"
-                elif ext == "pdf":
+                elif content_ext == "pdf":
                     kommentar = "Allerede PDF - ingen konvertering"
                 elif src_ext in ("bin", ""):
-                    kommentar = f"Detektert som {ext} - endret filendelse"
+                    kommentar = f"Detektert som {content_ext} - endret filendelse"
                 else:
-                    kommentar = f"Detektert som {ext}"
+                    kommentar = f"Detektert som {content_ext}"
                 csv_log.write(
                     zip_sti, fra_sz, src_ext,
                     new_sti, til_sz, result_ext,

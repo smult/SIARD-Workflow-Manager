@@ -136,6 +136,34 @@ _PUID_TO_EXT: dict[str, str] = {
 }
 
 
+def _markup_from_header(head: bytes) -> "tuple[str, str] | None":
+    """
+    Returner ("xml", mime) / ("html", mime) hvis header-en har en reell
+    markup-deklarasjon (``<?xml …?>`` / ``<html`` / ``<!DOCTYPE``), ellers None.
+
+    Tåler BOM og innledende whitespace, og finner ``<?xml`` også når det ligger
+    litt inn i fila (lengdeprefiks/padding i DB-eksporterte LOB-er) — men KUN på
+    en eksplisitt deklarasjon, slik at ren tekst som tilfeldigvis starter med
+    «<» ikke feilklassifiseres.
+    """
+    if not head:
+        return None
+    stripped = head
+    for _bom in (b"\xef\xbb\xbf", b"\xff\xfe", b"\xfe\xff"):
+        if stripped.startswith(_bom):
+            stripped = stripped[len(_bom):]
+            break
+    stripped = stripped.lstrip(b" \t\r\n")
+    window = head[:512].lower()
+    if stripped[:5].lower() == b"<?xml" or b"<?xml" in window:
+        return ("xml", "application/xml")
+    if (stripped[:5].lower() == b"<html"
+            or stripped[:9].lower() == b"<!doctype"
+            or b"<html" in window):
+        return ("html", "text/html")
+    return None
+
+
 class SiegfriedIdentifier:
     """Siegfried/PRONOM-backend."""
 
@@ -292,6 +320,17 @@ class SiegfriedIdentifier:
                 continue
             matches = f.get("matches", [])
             ext, mime, enc = self._parse_match(matches)
+            # txt → markup: hvis Siegfried ga «txt» men innholdet er XML/HTML,
+            # oppgrader slik at cache, identifikasjonslogg og sammendrag blir
+            # konsistente. Leser kun header for txt-klassifiserte filer.
+            if ext == "txt":
+                try:
+                    head = Path(path).read_bytes()[:512]
+                    markup = _markup_from_header(head)
+                    if markup is not None:
+                        ext, mime = markup[0], markup[1]
+                except Exception:
+                    pass
             key = self._cache_key(path)
             self._cache[key] = (ext, mime, enc)
             self._log_match(path, ext, mime, matches)
@@ -418,7 +457,7 @@ class SiegfriedIdentifier:
         fant noe — Siegfrieds presisjon beholdes når den faktisk matcher.
         """
         ext, mime, enc = base
-        if ext != "bin":
+        if ext not in ("bin", "txt"):
             return base
         head = data
         if head is None and path is not None:
@@ -428,6 +467,18 @@ class SiegfriedIdentifier:
                 return base
         if not head:
             return base
+
+        # txt → markup-oppgradering: Siegfried gir «txt» (fmt/111) for
+        # XML-innhold når PRONOM-signaturen ikke matcher (BOF-signatur bommer
+        # ved lengdeprefiks/padding i DB-eksporterte LOB-er). Oppgrader til
+        # xml/html KUN ved en reell markup-deklarasjon. Filendelsen røres ikke her.
+        if ext == "txt":
+            markup = _markup_from_header(head)
+            if markup is not None:
+                return (markup[0], markup[1], enc)
+            return base
+
+        # ext == "bin": generell magic-bytes-fallback
         from siard_workflow.core.identifiers.magic_bytes import _detect
         m_ext, m_mime, m_enc = _detect(head)
         if m_ext != "bin":

@@ -26,11 +26,23 @@ COLORS_DARK = {
     "text_sub":   "#b7bcc8",
     "btn":        "#1e2333",
     "btn_hover":  "#252b3a",
-    # Tabview-bakgrunner (operasjons-faner og lignende)
-    "tab_unselected_bg":  "#0d0f14",
-    "tab_selected_bg":    "#4f8ef7",
-    "tab_selected_hover": "#3a70d4",
-    "tab_text":           "#d4daf0",
+    # Sekundær-knapp (tekst/kant) + tekst på primær (accent) knapp
+    "btn_text":   "#d4daf0",
+    "btn_border": "#252b3a",
+    "on_accent":  "#ffffff",
+    # Destruktiv knapp (slett/fjern/stopp)
+    "danger_bg":     "#2a1515",
+    "danger_hover":  "#3d2020",
+    "danger_text":   "#e05252",
+    "danger_border": "#3a1c1c",
+    # Tabview / segmentknapp (operasjons-faner). Delt tekstfarge for valgt+uvalgt,
+    # så valgt-bakgrunnen er dempet nok til at lys tekst består AA.
+    "tab_bar_bg":            "#191d28",   # stripe/gap mellom faner
+    "tab_unselected_bg":     "#232838",   # synlig, mørk fane-pille
+    "tab_unselected_hover":  "#2c3346",
+    "tab_selected_bg":       "#295291",   # dempet blå → #d4daf0 = 5.6:1 (AA)
+    "tab_selected_hover":    "#2f5aa0",
+    "tab_text":              "#d4daf0",
     "cat_Integritet":  "#4f8ef7",
     "cat_Innhold":     "#f0c040",
     "cat_Validering":  "#2ecc71",
@@ -42,9 +54,10 @@ COLORS_DARK = {
 }
 
 # ── Lyst tema ────────────────────────────────────────────────────────────────
-# NB: `btn` er bevisst mørk (slate) i lyst tema slik at default hvit knappetekst
-# som CTk plukker fra "dark-blue" core-themet forblir leselig på alle 45+
-# knappebruk uten å eksplisitt sette text_color overalt.
+# NB: Sekundærknapper bruker et "tonalt" uttrykk i lyst tema — lyst tonet fyll
+# (`btn`) + mørk blå tekst (`btn_text`) + tynn kant (`btn_border`). Dette gir
+# WCAG-AAA-kontrast og et lettere, mer moderne uttrykk enn en mørk slate-flate.
+# Primærknapper (accent) bruker ren hvit tekst (`on_accent`) for å bestå AA.
 COLORS_LIGHT = {
     "bg":         "#eef1f6",
     "surface":    "#f6f8fb",
@@ -59,13 +72,23 @@ COLORS_LIGHT = {
     "muted":      "#6b7280",
     "text":       "#1a1f2e",
     "text_sub":   "#3b4252",
-    "btn":        "#475569",   # mørk slate → hvit default-tekst blir leselig
-    "btn_hover":  "#334155",
-    # Tabview: lys valgt-bakgrunn + mørk tekst for å unngå white-on-white
-    "tab_unselected_bg":  "#dde3ee",
-    "tab_selected_bg":    "#bfd4f5",
-    "tab_selected_hover": "#a8c3f0",
-    "tab_text":           "#1a1f2e",
+    "btn":        "#e8eefc",   # tonalt lyst fyll (sekundærknapp)
+    "btn_hover":  "#dbe6fb",
+    "btn_text":   "#1e40af",   # mørk blå knappetekst (AAA mot btn)
+    "btn_border": "#c3d4fb",   # tynn kant som avgrenser mot lys bakgrunn
+    "on_accent":  "#ffffff",   # ren hvit tekst på primær accent-knapp
+    # Destruktiv knapp — tonalt rødt fyll i stedet for mørk maroon-blokk
+    "danger_bg":     "#fdeaea",
+    "danger_hover":  "#fbdada",
+    "danger_text":   "#991b1b",
+    "danger_border": "#f4c7c7",
+    # Tabview: lyse fane-piller + mørk tekst (AAA), tydeligere valgt-farge
+    "tab_bar_bg":            "#ffffff",
+    "tab_unselected_bg":     "#dde3ee",
+    "tab_unselected_hover":  "#cfd8ea",
+    "tab_selected_bg":       "#a9c8f5",
+    "tab_selected_hover":    "#93b8f0",
+    "tab_text":              "#1a1f2e",
     "cat_Integritet":  "#2563eb",
     "cat_Innhold":     "#b45309",
     "cat_Validering":  "#15803d",

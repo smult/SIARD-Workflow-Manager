@@ -96,6 +96,25 @@ def scan_segfolder_issues(siard_path: Path) -> list[str]:
         if base and _PART_SUFFIX_RE.search(base):
             part_files += 1
 
+    # Eksternt fillager: segmenteringen ligger da IKKE i ZIP-en, men i
+    # søstermappen (ekstern db-nivå lobFolder). UnpackSiardOperation
+    # internaliserer disse, så seg-fjerning må fortsatt tilbys. Skann derfor
+    # også det eksterne lageret (grunt glob, tidlig ut).
+    if not seg_dirs:
+        try:
+            from siard_workflow.core import external_lob
+            with zipfile.ZipFile(siard_path, "r") as zf:
+                meta = zf.read("header/metadata.xml")
+            db = external_lob.read_db_lobfolder(meta)
+            if external_lob.is_external_lobfolder(db):
+                ext_base = external_lob.resolve_external_base(siard_path, db)
+                if ext_base.is_dir():
+                    for d in ext_base.glob("*/*/lob*/seg*"):
+                        if d.is_dir() and _SEG_NAME_RE.match(d.name):
+                            seg_dirs.add(str(d.relative_to(ext_base)))
+        except Exception:
+            pass
+
     if not seg_dirs:
         return []
 

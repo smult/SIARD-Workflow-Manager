@@ -18,12 +18,14 @@ import os
 import shutil
 import tarfile
 import tempfile
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid1
 
 from siard_workflow.core.base_operation import BaseOperation, OperationResult
 from siard_workflow.core.context import WorkflowContext
+from siard_workflow.core import external_lob
 
 logger = logging.getLogger(__name__)
 
@@ -463,12 +465,14 @@ class DiasPackageOperation(BaseOperation):
             content_dir = Path(tmp_content) / siard_path.stem
             content_dir.mkdir()
 
+            copied_siards: list[Path] = []
             if content_siard_extras:
                 # Dialogbrukeren har eksplisitt valgt hvilke SIARD-filer som skal med
                 for ef in content_siard_extras:
                     src = Path(ef["src"])
                     if src.exists():
                         shutil.copy2(src, content_dir / src.name)
+                        copied_siards.append(src)
                         logger.info("Content SIARD inkludert: %s", src.name)
                     else:
                         logger.warning("Content SIARD ikke funnet: %s", src)
@@ -476,6 +480,7 @@ class DiasPackageOperation(BaseOperation):
             else:
                 # Ingen eksplisitte content-valg: bruk kilde-SIARD (eksisterende atferd)
                 shutil.copy2(siard_path, content_dir / siard_path.name)
+                copied_siards.append(siard_path)
 
             _file_log = (ctx.metadata or {}).get("file_logger")
 
@@ -483,6 +488,17 @@ class DiasPackageOperation(BaseOperation):
                 logger.info(msg)
                 if _file_log:
                     _file_log.log(msg, "info")
+
+            # ── Eksternt fillager (ekstern lobFolder) ──────────────────────────
+            # Hvis en inkludert SIARD refererer et eksternt fillager (søster-
+            # mappe), MÅ mappen følge med i content/ ved siden av .siard-fila, så
+            # den relative <lobFolder>-referansen fortsatt løser opp i pakken.
+            for _src in copied_siards:
+                try:
+                    _copy_external_sidecar(_src, content_dir, _log_fn)
+                except Exception as exc:
+                    _log_fn(f"  Advarsel: kunne ikke inkludere eksternt "
+                            f"fillager for {_src.name}: {exc}")
 
             # Hent temp-base fra ctx.metadata (satt av app.py) eller bruk systemtemp
             _temp_base_s = (_ctx_meta.get("temp_dir") or "").strip()
@@ -503,6 +519,44 @@ class DiasPackageOperation(BaseOperation):
         return self._ok(
             data={"aic_path": str(aic_path)},
             message=f"DIAS-pakke opprettet: {aic_path.name}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Eksternt fillager i DIAS-pakke
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _copy_external_sidecar(src_siard: Path, content_dir: Path, log_fn) -> None:
+    """
+    Hvis ``src_siard`` bruker et eksternt fillager (ekstern db-nivå
+    ``<lobFolder>``), kopier søstermappen inn i ``content_dir`` ved siden av
+    .siard-fila, med uendret navn. Da bevares den relative referansen
+    (``..\\<navn>.siard_documents\\content``) inne i DIAS-pakkens content/.
+
+    No-op for interne arkiver eller når søstermappen ikke finnes.
+    """
+    try:
+        with zipfile.ZipFile(src_siard, "r") as zf:
+            meta = zf.read("header/metadata.xml")
+    except Exception:
+        return
+    db = external_lob.read_db_lobfolder(meta)
+    if not external_lob.is_external_lobfolder(db):
+        return
+
+    ext_base = external_lob.resolve_external_base(src_siard, db)   # <søster>/content
+    sidecar = ext_base.parent
+    if not sidecar.is_dir():
+        log_fn(f"  [ADVARSEL] Eksternt fillager referert av {src_siard.name} "
+               f"men mappen ble ikke funnet: {sidecar} — utelates fra pakken")
+        return
+
+    dst = content_dir / sidecar.name
+    if dst.exists():
+        return
+    n_files = sum(1 for p in sidecar.rglob("*") if p.is_file())
+    shutil.copytree(sidecar, dst)
+    log_fn(f"  Eksternt fillager inkludert i DIAS-pakke: {sidecar.name}/ "
+           f"({n_files} fil(er))")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

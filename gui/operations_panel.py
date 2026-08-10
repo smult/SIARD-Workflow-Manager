@@ -430,6 +430,9 @@ OP_DEFS = [
         "params": [
             {"key": "output_suffix", "label": "Suffix ny SIARD-fil",
              "type": "str", "default": "_konvertert"},
+            {"key": "lob_storage", "label": "LOB-fillager i resultat",
+             "type": "choice", "choices": ["intern", "ekstern"],
+             "default": "intern"},
             {"key": "keep_temp", "label": "Behold temp-mappe",
              "type": "bool", "default": False},
             {"key": "compress_level",
@@ -831,7 +834,9 @@ class ParamDialog(ctk.CTkToplevel):
                         fg_color=COLORS["bg"],
                         button_color=COLORS["accent"],
                         button_hover_color=COLORS["accent_dim"],
+                        text_color=COLORS["text"],
                         dropdown_fg_color=COLORS["panel"],
+                        dropdown_text_color=COLORS["text"],
                         font=ctk.CTkFont(family=FONTS["mono"], size=10),
                         width=280,
                     ).grid(row=i, column=1, padx=12, sticky="e")
@@ -875,8 +880,7 @@ class ParamDialog(ctk.CTkToplevel):
                             messagebox.showerror("Feil", str(exc), parent=self)
 
                     ctk.CTkButton(cell, text="Auto", width=52,
-                                  fg_color=COLORS["accent"],
-                                  hover_color=COLORS["accent_dim"],
+                                  fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"], text_color=COLORS["on_accent"],
                                   font=ctk.CTkFont(family=FONTS["mono"], size=10),
                                   command=_auto_hw).pack(side="left")
                     self._vars[p["key"]] = (var, "int")
@@ -922,13 +926,11 @@ class ParamDialog(ctk.CTkToplevel):
                             messagebox.showerror("Feil", str(exc), parent=self)
 
                     ctk.CTkButton(cell, text="Bla…", width=46,
-                                  fg_color=COLORS["btn"],
-                                  hover_color=COLORS["btn_hover"],
+                                  fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
                                   font=ctk.CTkFont(family=FONTS["mono"], size=10),
                                   command=_browse_temp).pack(side="left", padx=(0, 4))
                     ctk.CTkButton(cell, text="Auto", width=46,
-                                  fg_color=COLORS["accent"],
-                                  hover_color=COLORS["accent_dim"],
+                                  fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"], text_color=COLORS["on_accent"],
                                   font=ctk.CTkFont(family=FONTS["mono"], size=10),
                                   command=_auto_temp).pack(side="left")
                 elif p["type"] == "autocomplete":
@@ -976,11 +978,11 @@ class ParamDialog(ctk.CTkToplevel):
         btns = ctk.CTkFrame(self, fg_color="transparent")
         btns.grid(row=10, column=0, padx=16, pady=(0,16), sticky="e")
         ctk.CTkButton(btns, text="Avbryt", width=90,
-                      fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+                      fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
                       font=ctk.CTkFont(family=FONTS["mono"], size=11),
                       command=self.destroy).pack(side="left", padx=(0,8))
         ctk.CTkButton(btns, text="Legg til", width=110,
-                      fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"],
+                      fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"], text_color=COLORS["on_accent"],
                       font=ctk.CTkFont(family=FONTS["mono"], size=11, weight="bold"),
                       command=self._confirm).pack(side="left")
 
@@ -1064,11 +1066,11 @@ class _ConditionalDialog(ctk.CTkToplevel):
         btns = ctk.CTkFrame(self, fg_color="transparent")
         btns.pack(padx=16, pady=12, anchor="e")
         ctk.CTkButton(btns, text="Avbryt", width=90,
-                      fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+                      fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
                       font=ctk.CTkFont(family=FONTS["mono"], size=11),
                       command=self.destroy).pack(side="left", padx=(0,8))
         ctk.CTkButton(btns, text="Legg til", width=110,
-                      fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"],
+                      fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"], text_color=COLORS["on_accent"],
                       font=ctk.CTkFont(family=FONTS["mono"], size=11, weight="bold"),
                       command=self._confirm).pack(side="left")
 
@@ -1172,7 +1174,9 @@ class OperationsPanel(ctk.CTkFrame):
         self._tabs = ctk.CTkTabview(
             self, height=90,
             fg_color=COLORS["panel"],
-            segmented_button_fg_color=COLORS["tab_unselected_bg"],
+            segmented_button_fg_color=COLORS["tab_bar_bg"],
+            segmented_button_unselected_color=COLORS["tab_unselected_bg"],
+            segmented_button_unselected_hover_color=COLORS["tab_unselected_hover"],
             segmented_button_selected_color=COLORS["tab_selected_bg"],
             segmented_button_selected_hover_color=COLORS["tab_selected_hover"],
             text_color=COLORS["tab_text"],
