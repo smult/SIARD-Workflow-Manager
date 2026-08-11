@@ -173,8 +173,39 @@ FONT_MIN_SIZE = 10   # tidl. 9; bumpes til 10 som minimum for alle tekster
 
 class FontRegistry:
     """Holder styr på alle CTkFont-instanser for dynamisk størrelsesjustering."""
-    _fonts: list = []   # [(weakref(font), base_size)]
+    _fonts: list = []       # [(weakref(font), base_size)]
+    _observers: list = []   # [weakref.WeakMethod(callback)] — kalles ved endring
     _offset: int = 0
+
+    @classmethod
+    def add_observer(cls, callback) -> None:
+        """
+        Registrer en callback (typisk en bundet metode) som kalles hver gang
+        font-størrelsen endres. Brukes av widgets som IKKE bygger på CTkFont —
+        f.eks. canvas-tegnet tekst — og som selv må tegne om ved endring.
+        Holdes via WeakMethod slik at widgeten kan samles av GC.
+        """
+        import weakref
+        try:
+            ref = weakref.WeakMethod(callback)
+        except TypeError:
+            ref = weakref.ref(callback)   # frittstående funksjon
+        cls._observers.append(ref)
+
+    @classmethod
+    def _notify(cls) -> None:
+        dead = []
+        for i, wr in enumerate(cls._observers):
+            cb = wr()
+            if cb is None:
+                dead.append(i)
+            else:
+                try:
+                    cb()
+                except Exception:
+                    pass
+        for i in reversed(dead):
+            del cls._observers[i]
 
     @classmethod
     def _apply(cls) -> None:
@@ -190,6 +221,13 @@ class FontRegistry:
                     pass
         for i in reversed(dead):
             del cls._fonts[i]
+        cls._notify()
+
+    @classmethod
+    def effective_size(cls, base_size: int) -> int:
+        """Effektiv fontstørrelse for en gitt base-størrelse ved gjeldende offset.
+        Samme formel som CTkFont-wrapperen bruker, slik at canvas-tekst matcher."""
+        return max(FONT_MIN_SIZE, base_size + cls._offset)
 
     @classmethod
     def scale(cls, delta: int) -> None:

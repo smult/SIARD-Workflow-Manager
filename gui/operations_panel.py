@@ -1182,6 +1182,15 @@ class OperationsPanel(ctk.CTkFrame):
             text_color=COLORS["tab_text"],
             text_color_disabled=COLORS["muted"],
         )
+        # Fanetekst ("Pipeline", "Integritet" …) skal skalere med +/-.
+        # CTkTabview tar ikke `font`, så vi setter en registrert CTkFont direkte
+        # på den interne segmentknappen (auto-registreres i FontRegistry og
+        # følger dermed fontjusteringen som resten av GUI-et).
+        try:
+            self._tabs._segmented_button.configure(
+                font=ctk.CTkFont(family=FONTS["mono"], size=12))
+        except Exception:
+            pass
         self._tabs.grid(row=1, column=0, sticky="ew", padx=10, pady=(0,10))
 
         for cat in categories:

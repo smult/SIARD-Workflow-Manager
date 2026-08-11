@@ -7,8 +7,9 @@ under BLOB-konvertering. Plasseres under workflow-listen i venstre panel.
 from __future__ import annotations
 
 import tkinter as tk
+import tkinter.font as tkfont
 import customtkinter as ctk
-from gui.styles import COLORS, FONTS
+from gui.styles import COLORS, FONTS, FontRegistry
 
 # Fargekart per filformat
 _FMT_COLORS: dict[str, str] = {
@@ -80,11 +81,12 @@ class FormatChartPanel(ctk.CTkFrame):
     Oppdateres løpende via update(ext, count).
     """
 
-    BAR_H      = 16   # søylehøyde px
-    ROW_H      = 26   # totalhøyde per rad (søyle + label + margin)
+    BAR_H      = 16   # min. søylehøyde px (skaleres med font)
+    ROW_H      = 26   # min. totalhøyde per rad (skaleres med font)
     MAX_ROWS   = 20   # maks antall format-rader å vise
     MIN_HEIGHT = 60
     MAX_HEIGHT = MAX_ROWS * ROW_H + 40   # header + rader
+    LABEL_BASE = 10   # base-fontstørrelse — SAMME som overskriften «Filformater»
 
     def __init__(self, parent, **kwargs):
         super().__init__(parent,
@@ -102,7 +104,8 @@ class FormatChartPanel(ctk.CTkFrame):
         ctk.CTkLabel(
             self,
             text="Filformater",
-            font=ctk.CTkFont(family=FONTS["mono"], size=10, weight="bold"),
+            font=ctk.CTkFont(family=FONTS["mono"], size=self.LABEL_BASE,
+                             weight="bold"),
             text_color=COLORS["muted"],
             anchor="w",
         ).grid(row=0, column=0, padx=10, pady=(6, 2), sticky="w")
@@ -116,6 +119,10 @@ class FormatChartPanel(ctk.CTkFrame):
         self._canvas.grid(row=1, column=0, padx=6, pady=(0, 6), sticky="ew")
         self._canvas.bind("<Configure>", self._on_resize)
         self._built = True
+
+        # Canvas-tegnet tekst bygger ikke på CTkFont, så den må tegnes om
+        # eksplisitt når +/- endrer fontstørrelsen.
+        FontRegistry.add_observer(self._redraw)
 
     def reset(self):
         """Nullstill ved ny kjøring."""
@@ -149,56 +156,80 @@ class FormatChartPanel(ctk.CTkFrame):
         sorted_items = sorted(self._counts.items(), key=lambda x: -x[1])[:self.MAX_ROWS]
         total   = sum(self._counts.values())
         max_val = sorted_items[0][1] if sorted_items else 1
-
         n_rows  = len(sorted_items)
-        height  = max(self.MIN_HEIGHT, n_rows * self.ROW_H + 4)
+
+        # Fontstørrelse følger +/- (samme base som overskriften «Filformater»).
+        fs = FontRegistry.effective_size(self.LABEL_BASE)
+        # CTkFont (overskriften) tegnes i PIKSLER (negativ tk-størrelse) og
+        # skaleres med widget-scaling. Canvas-tekst med POSITIV størrelse tolkes
+        # som PUNKTER og blir ~30 % større ved 96 DPI. Speil derfor CTkFont:
+        # bruk negativ (piksel) størrelse × samme scaling, slik at ledeteksten
+        # blir NØYAKTIG like stor som overskriften.
+        try:
+            ws = self._get_widget_scaling()
+        except Exception:
+            ws = 1.0
+        px         = max(1, round(fs * ws))
+        cell_font  = (FONTS["mono"], -px)
+        measure    = tkfont.Font(root=c, family=FONTS["mono"], size=-px)
+
+        # Kolonnebredder måles ut fra faktisk tekst ved gjeldende font, slik at
+        # verken formatnavnet eller tallet bak streken kuttes.
+        label_texts = [f".{ext}" for ext, _ in sorted_items]
+        count_texts = [f"{count:,}" for _, count in sorted_items]
+        label_w = max((measure.measure(t) for t in label_texts), default=30) + 10
+        count_w = max((measure.measure(t) for t in count_texts), default=20) + 10
+
+        # Rad-/søylehøyde skalerer med (piksel-)fonten så teksten får plass.
+        bar_h = max(self.BAR_H, px + 4)
+        row_h = max(self.ROW_H, bar_h + px)
+
+        height = max(self.MIN_HEIGHT, n_rows * row_h + 6)
         c.configure(height=height)
 
         width = c.winfo_width()
         if width < 10:
-            width = 340   # fallback før widget er tegnet
+            width = 320   # fallback før widget er tegnet
 
-        label_w = 46   # px for format-teksten til venstre
-        count_w = 40   # px for tall til høyre
-        bar_area = max(10, width - label_w - count_w - 12)
+        # Streken (søylene) gjøres smalere for å gi plass til tekst + tall.
+        bar_area = max(10, width - label_w - count_w - 16)
 
-        y = 4
+        y = 3
         for ext, count in sorted_items:
-            bar_w   = max(2, int(bar_area * count / max_val))
-            color   = _FMT_COLORS.get(ext, _DEFAULT_COLOR)
-            bar_y   = y + (self.ROW_H - self.BAR_H) // 2
+            bar_w = max(2, int(bar_area * count / max_val))
+            color = _FMT_COLORS.get(ext, _DEFAULT_COLOR)
+            bar_y = y + (row_h - bar_h) // 2
+            mid_y = bar_y + bar_h // 2
 
-            # Label
+            # Ledetekst (format) — høyrejustert mot søylestarten
             c.create_text(
-                label_w - 4, bar_y + self.BAR_H // 2,
+                label_w - 5, mid_y,
                 text=f".{ext}",
                 anchor="e",
                 fill=COLORS["text"],
-                font=(FONTS["mono"], 9),
+                font=cell_font,
             )
-            # Søyle bakgrunn
+            # Søyle-bakgrunn
             c.create_rectangle(
                 label_w, bar_y,
-                label_w + bar_area, bar_y + self.BAR_H,
+                label_w + bar_area, bar_y + bar_h,
                 fill=COLORS["panel"], outline="",
             )
             # Søyle
             c.create_rectangle(
                 label_w, bar_y,
-                label_w + bar_w, bar_y + self.BAR_H,
+                label_w + bar_w, bar_y + bar_h,
                 fill=color, outline="",
             )
-            # Tall
-            pct = count / total * 100 if total else 0
+            # Tall (antall filer) — venstrejustert etter søylen
             c.create_text(
-                label_w + bar_area + 4,
-                bar_y + self.BAR_H // 2,
+                label_w + bar_area + 6, mid_y,
                 text=f"{count:,}",
                 anchor="w",
                 fill=COLORS["muted"],
-                font=(FONTS["mono"], 9),
+                font=cell_font,
             )
-            y += self.ROW_H
+            y += row_h
 
     def _on_resize(self, event):
         self._redraw()
