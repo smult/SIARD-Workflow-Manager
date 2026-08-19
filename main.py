@@ -1,3 +1,4 @@
+import os
 import sys
 import subprocess
 from pathlib import Path
@@ -8,10 +9,34 @@ def resource_path(relative):
     return Path(base) / relative
 
 
+# ── Konsoll-løs kjøring (pythonw.exe) ─────────────────────────────────────────
+# start.bat starter GUI-et med pythonw.exe (uten konsollvindu) slik at
+# konsollen/PowerShell ikke henger mens programmet kjører, og programmet ikke
+# dør når konsollen lukkes. Under pythonw er sys.stdout/stderr = None, og enhver
+# print() ville da krasje. Rut strømmene trygt til en loggfil, slik at
+# eventuelle oppstartsfeil kan feilsøkes i ettertid.
+def _redirect_std_streams() -> None:
+    if sys.stdout is not None and sys.stderr is not None:
+        return
+    try:
+        fh = open(Path(__file__).parent / "siard_manager.log",
+                  "a", encoding="utf-8", buffering=1)
+    except Exception:
+        fh = open(os.devnull, "w")
+    if sys.stdout is None:
+        sys.stdout = fh
+    if sys.stderr is None:
+        sys.stderr = fh
+
+
+_redirect_std_streams()
+
+
 # ── Avhengighetssjekk ved oppstart ───────────────────────────────────────────
 
 _REQUIRED_PACKAGES = [
     # (import-navn, pip-pakkenavn)
+    ("customtkinter", "customtkinter"),
     ("reportlab", "reportlab>=4.0"),
 ]
 
@@ -54,8 +79,24 @@ from gui.app import App
 
 
 def main():
-    app = App()
-    app.mainloop()
+    try:
+        app = App()
+        app.mainloop()
+    except Exception:
+        # Uten konsoll (pythonw) er en uhåndtert feil usynlig — logg traceback
+        # til fil og vis en enkel feilmelding slik at brukeren ikke står igjen
+        # med et program som «bare forsvinner».
+        import traceback
+        traceback.print_exc()   # → siard_manager.log under pythonw
+        try:
+            import tkinter.messagebox as _mb
+            _mb.showerror(
+                "SIARD Workflow Manager",
+                "Programmet kunne ikke starte.\n\n"
+                "Detaljer er skrevet til siard_manager.log i programmappen.")
+        except Exception:
+            pass
+        raise
 
 
 if __name__ == "__main__":
