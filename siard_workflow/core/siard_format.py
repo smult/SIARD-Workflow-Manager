@@ -329,6 +329,181 @@ def apply_schema_name_fixes(data: bytes,
     return pre + new_body + post
 
 
+# ── Schema-navn-referanser (referencedSchema / typeSchema) ────────────────────
+#
+# Et schema-navn refereres også lenger nede i metadata.xml:
+#   - <foreignKey><referencedSchema>  (peker på schemaet som FK-en refererer)
+#   - <column><typeSchema>            (peker på schemaet der en UDT er definert)
+# Når det opprinnelige schema-navnet er tomt, er disse også tomme; når navnet
+# fylles inn eller saneres må referansene oppdateres tilsvarende, ellers henger
+# ikke uttrekket logisk sammen.
+
+# Tagger som holder en schema-navn-REFERANSE (ikke schemaets eget <name>).
+_SCHEMA_REF_TAGS = ("referencedSchema", "typeSchema")
+
+
+def _ref_tag_res(tag: str) -> "tuple[re.Pattern, re.Pattern]":
+    """Bygg (innhold-regex, selvlukk-regex) for en referanse-tag, namespace-tolerant."""
+    t = tag.encode("ascii")
+    content = re.compile(
+        rb'(<(?:[A-Za-z0-9_-]+:)?' + t + rb'(?:\s[^>]*)?>)(.*?)'
+        rb'(</(?:[A-Za-z0-9_-]+:)?' + t + rb'\s*>)',
+        re.DOTALL,
+    )
+    selfclose = re.compile(
+        rb'<(?:[A-Za-z0-9_-]+:)?' + t + rb'(?:\s[^>]*)?/>',
+    )
+    return content, selfclose
+
+
+_REF_TAG_RES = {tag: _ref_tag_res(tag) for tag in _SCHEMA_REF_TAGS}
+
+
+def _fill_empty_refs(segment: bytes, new_name_b: bytes) -> "tuple[bytes, int]":
+    """
+    Erstatt TOMME referanse-tagger (referencedSchema/typeSchema) i `segment` med
+    `new_name_b`. Rører ikke referanser som allerede har en ikke-tom verdi.
+    Returnerer (ny_segment, antall_erstattet).
+    """
+    count = [0]
+    for content_re, self_re in _REF_TAG_RES.values():
+        def _content_sub(m: re.Match) -> bytes:
+            if m.group(2).strip():          # allerede utfylt — la stå
+                return m.group(0)
+            count[0] += 1
+            return m.group(1) + new_name_b + m.group(3)
+        segment = content_re.sub(_content_sub, segment)
+
+        def _self_sub(m: re.Match) -> bytes:
+            count[0] += 1
+            # Bygg <tag>navn</tag> med samme (evt. prefiksede) tag-navn
+            open_tag = m.group(0)[:-2] + b">"    # bytt "/>" mot ">"
+            # Utled tag-navn for lukketagg
+            inner = open_tag[1:-1].split(b" ", 1)[0]
+            return open_tag + new_name_b + b"</" + inner + b">"
+        segment = self_re.sub(_self_sub, segment)
+    return segment, count[0]
+
+
+def _count_empty_refs(segment: bytes) -> int:
+    """Antall TOMME referanse-tagger i `segment`."""
+    n = 0
+    for content_re, self_re in _REF_TAG_RES.values():
+        n += sum(1 for m in content_re.finditer(segment) if not m.group(2).strip())
+        n += sum(1 for _ in self_re.finditer(segment))
+    return n
+
+
+def apply_empty_schema_reference_fixes(
+        data: bytes, fixes: "dict[int, str]") -> "tuple[bytes, dict]":
+    """
+    Fyll inn TOMME schema-navn-referanser (referencedSchema/typeSchema) etter at
+    tomme `<schema><name>` er fylt inn via `apply_schema_name_fixes`.
+
+    `fixes` er samme dict {1-basert schema-indeks -> nytt navn}. En tom referanse
+    kan kun peke på et navnløst schema som nettopp fikk navn.
+
+    Strategi:
+      1. Per schema-blokk `i` i `fixes`: erstatt tomme referanser INNE i blokken
+         med `fixes[i]` (dekker intra-schema-referanser — det vanlige).
+      2. Hvis nøyaktig ETT schema fylles inn: global-erstatt gjenværende tomme
+         referanser med det ene navnet (dekker også kryss-schema-referanser til
+         det ene navnløse schemaet).
+      3. Resten (flere navnløse schemas + kryss-schema) lar seg ikke løse entydig
+         fra en tom verdi — de står igjen og rapporteres som `unresolved`.
+
+    Returnerer (bytes, {"updated": n, "unresolved": r}).
+    """
+    stats = {"updated": 0, "unresolved": 0}
+    if not fixes:
+        return data, stats
+    body_info = _extract_schemas_body(data)
+    if body_info is None:
+        return data, stats
+    schemas_body, body_start, body_end = body_info
+    pre  = data[:body_start]
+    post = data[body_end:]
+
+    counter = [0]
+
+    def _per_block(m: re.Match) -> bytes:
+        counter[0] += 1
+        idx = counter[0]
+        if idx not in fixes:
+            return m.group(0)
+        new_name = (fixes[idx] or "").strip()
+        if not new_name:
+            return m.group(0)
+        inner, n = _fill_empty_refs(m.group(2), new_name.encode("utf-8"))
+        stats["updated"] += n
+        return m.group(1) + inner + m.group(3)
+
+    new_body = _SCHEMA_BLOCK_RE.sub(_per_block, schemas_body)
+
+    # Enkelt-schema: løs opp evt. gjenværende tomme referanser (kryss-schema mot
+    # det ene navnløse schemaet) globalt.
+    if len(fixes) == 1:
+        only_name = (next(iter(fixes.values())) or "").strip()
+        if only_name:
+            new_body, n = _fill_empty_refs(new_body, only_name.encode("utf-8"))
+            stats["updated"] += n
+
+    stats["unresolved"] = _count_empty_refs(new_body)
+
+    if stats["updated"] == 0:
+        return data, stats
+    return pre + new_body + post, stats
+
+
+def apply_schema_reference_renames(
+        data: bytes, renames: "dict[str, str]") -> "tuple[bytes, int]":
+    """
+    Bytt VERDIEN i schema-navn-referanser (referencedSchema/typeSchema) fra et
+    gammelt (ikke-tomt) navn til et nytt. Brukes ved sanering: når et
+    `<schema><name>` med ulovlige tegn døpes om til `schemaN`, må referansene som
+    pekte på det gamle navnet oppdateres tilsvarende.
+
+    `renames` = {gammelt_navn -> nytt_navn}. Matching er case-uavhengig (speiler
+    eksisterende `.lower()`-matching i FK-lesende kode). Referanser som ikke
+    matcher noen nøkkel røres ikke.
+
+    Returnerer (bytes, antall_oppdatert).
+    """
+    renames = {(k or "").strip(): (v or "").strip()
+               for k, v in (renames or {}).items()
+               if (k or "").strip() and (v or "").strip()
+               and (k or "").strip() != (v or "").strip()}
+    if not renames:
+        return data, 0
+    body_info = _extract_schemas_body(data)
+    if body_info is None:
+        return data, 0
+    schemas_body, body_start, body_end = body_info
+    pre  = data[:body_start]
+    post = data[body_end:]
+
+    # Oppslag på lowercase gammelt navn → nytt navn (bytes)
+    lut = {k.lower(): v.encode("utf-8") for k, v in renames.items()}
+    count = [0]
+
+    def _rename_in(segment: bytes) -> bytes:
+        for content_re, _self_re in _REF_TAG_RES.values():
+            def _sub(m: re.Match) -> bytes:
+                cur = m.group(2).decode("utf-8", errors="replace").strip()
+                repl = lut.get(cur.lower())
+                if repl is None:
+                    return m.group(0)
+                count[0] += 1
+                return m.group(1) + repl + m.group(3)
+            segment = content_re.sub(_sub, segment)
+        return segment
+
+    new_body = _rename_in(schemas_body)
+    if count[0] == 0:
+        return data, 0
+    return pre + new_body + post, count[0]
+
+
 def sanitize_metadata_schema_names(data: bytes) -> bytes:
     """
     Saniterer <schemas><schema><name>-verdier i metadata.xml.
