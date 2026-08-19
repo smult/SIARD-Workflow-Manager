@@ -260,13 +260,14 @@ class UnpackSiardOperation(BaseOperation):
         """
         from siard_workflow.core.siard_format import (
             list_all_schema_names, sanitize_metadata_schema_names,
-            _SAFE_SCHEMA_NAME_RE,
+            apply_schema_reference_renames, _SAFE_SCHEMA_NAME_RE,
         )
         metadata_path = extract_dir / "header" / "metadata.xml"
         if not metadata_path.exists():
             return 0
         data = metadata_path.read_bytes()
-        unsafe = [s for s in list_all_schema_names(data)
+        before = list_all_schema_names(data)
+        unsafe = [s for s in before
                   if s["name"].strip()
                   and not _SAFE_SCHEMA_NAME_RE.match(s["name"].strip())]
         if not unsafe:
@@ -276,12 +277,29 @@ class UnpackSiardOperation(BaseOperation):
             w(f"    • '{s['name']}' (folder: {s['folder']}) → schema{s['index']}",
               "warn")
         new_data = sanitize_metadata_schema_names(data)
-        if new_data != data:
-            metadata_path.write_bytes(new_data)
-            w(f"  Sanerte {len(unsafe)} schema-navn til 'schemaN' i metadata.xml.",
-              "ok")
-            return len(unsafe)
-        return 0
+        if new_data == data:
+            return 0
+        metadata_path.write_bytes(new_data)
+        w(f"  Sanerte {len(unsafe)} schema-navn til 'schemaN' i metadata.xml.",
+          "ok")
+
+        # Hold schema-navn-referanser i synk: bygg gammelt→nytt navn ved å diffe
+        # navnene før/etter sanering (per indeks), og oppdater
+        # referencedSchema/typeSchema som pekte på det gamle navnet.
+        after = {s["index"]: s["name"].strip()
+                 for s in list_all_schema_names(new_data)}
+        renames = {}
+        for s in before:
+            old = s["name"].strip()
+            new = after.get(s["index"], "")
+            if old and new and old != new:
+                renames[old] = new
+        ref_data, n_ref = apply_schema_reference_renames(new_data, renames)
+        if n_ref:
+            metadata_path.write_bytes(ref_data)
+            w(f"  ✓ {n_ref} schema-referanse(r) "
+              f"(referencedSchema/typeSchema) oppdatert til sanert navn", "ok")
+        return len(unsafe)
 
     @staticmethod
     def _check_empty_schema_names(extract_dir: Path, ctx, w) -> None:
@@ -297,7 +315,7 @@ class UnpackSiardOperation(BaseOperation):
         """
         from siard_workflow.core.siard_format import (
             find_empty_schema_names, apply_schema_name_fixes,
-            list_all_schema_names,
+            list_all_schema_names, apply_empty_schema_reference_fixes,
         )
         metadata_path = extract_dir / "header" / "metadata.xml"
         if not metadata_path.exists():
@@ -379,6 +397,19 @@ class UnpackSiardOperation(BaseOperation):
                 w(f"  ✓ Schema #{idx} → «{name}»", "ok")
         else:
             w("  Ingen schema-navn endret.", "info")
+
+        # Hold referanser til de (tidligere tomme) schema-navnene i synk:
+        # <foreignKey><referencedSchema> og <column><typeSchema> var tomme fordi
+        # schema-navnet var tomt — de settes nå til det innfylte navnet.
+        ref_data, ref_stats = apply_empty_schema_reference_fixes(new_data, fixes)
+        if ref_data != new_data:
+            metadata_path.write_bytes(ref_data)
+            w(f"  ✓ {ref_stats['updated']} schema-referanse(r) "
+              f"(referencedSchema/typeSchema) satt til nytt schema-navn", "ok")
+        if ref_stats.get("unresolved"):
+            w(f"  ADVARSEL: {ref_stats['unresolved']} tom schema-referanse "
+              f"kunne ikke kobles entydig (flere navnløse schemas) — beholdt tom",
+              "warn")
 
     @staticmethod
     def _count_schemas(extract_dir: Path) -> int:
