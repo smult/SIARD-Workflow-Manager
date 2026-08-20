@@ -1216,6 +1216,56 @@ def _checksum(data: bytes, algo: str) -> str:
     return h.hexdigest()
 
 
+def _available_memory_bytes() -> "int | None":
+    """Ledig fysisk minne (bytes) — se siard_workflow.core.sysmem."""
+    from siard_workflow.core import sysmem
+    return sysmem.available_memory_bytes()
+
+
+def _get_stream_inline_threshold_bytes() -> int:
+    """
+    DOM→streaming-terskel i bytes. Leser `siard_stream_inline_threshold_mb` fra
+    config.json; hvis usatt/ugyldig brukes en RAM-basert auto-verdi
+    (sysmem.auto_stream_inline_threshold_mb).
+    """
+    from siard_workflow.core import sysmem
+    try:
+        from settings import get_config
+        val = get_config("siard_stream_inline_threshold_mb")
+        mb = int(val)
+        if mb > 0:
+            return mb * 1024 * 1024
+    except (TypeError, ValueError, Exception):
+        pass
+    return sysmem.auto_stream_inline_threshold_mb() * 1024 * 1024
+
+
+def _fmt_gb(n: int) -> str:
+    return f"{n / (1024 ** 3):.2f} GB"
+
+
+def _decode_inline_lob_text(text: str) -> "tuple[bytes, str]":
+    """
+    Dekod inline LOB-tekst til rå bytes. Returnerer (file_bytes, detected_as).
+
+    Støtter samme encodings som før: SIARD \\uXXXX-escaping, hex, base64, og
+    direkte UTF-8. Delt av både DOM- og streaming-ekstraksjon slik at logikken
+    ikke driver fra hverandre.
+    """
+    if r"\u" in text and not text.startswith("\\x"):
+        return _unescape_siard(text), "unicode-escaped"
+    if _is_hex(text):
+        try:
+            return _hex_decode(text), "hex"
+        except Exception:
+            return text.encode("utf-8"), "tekst"
+    try:
+        import base64 as _b64
+        return _b64.b64decode(text, validate=True), "base64"
+    except Exception:
+        return text.encode("utf-8"), "tekst"
+
+
 def _local(tag: str) -> str:
     return _NS_RE.sub("", tag)
 
@@ -1676,6 +1726,9 @@ class BlobConvertOperation(BaseOperation):
         self.params["max_workers"]  = max(1, int(_get_cfg("max_workers",  4)  or 4))
         self.params["lo_batch_size"] = max(1, int(_get_cfg("lo_batch_size", 50) or 50))
 
+        # DOM→streaming-terskel for inline-ekstraksjon (config, ellers RAM-auto)
+        self._STREAM_INLINE_THRESHOLD = _get_stream_inline_threshold_bytes()
+
         # Normaliser øvrige int-parametere
         for _key in ("lo_timeout",):
             try:
@@ -2017,24 +2070,42 @@ class BlobConvertOperation(BaseOperation):
             col_meta = _read_col_metadata(metadata_xml) if metadata_xml.exists() else {}
             lob_cols = {k: v["lob_cols"] for k, v in col_meta.items()}
 
+            # Proaktiv minne-advarsel for store tableX.xml
+            self._warn_oversized_xml(table_xml_map, extract_dir, w)
+
             for table_key, xml_sti in table_xml_map.items():
                 xml_file = extract_dir / xml_sti
                 if not xml_file.exists():
                     continue
                 try:
                     xml_bytes = xml_file.read_bytes()
+                except MemoryError:
+                    w(f"  [MINNE] {xml_sti} ({_fmt_gb(xml_file.stat().st_size)}) "
+                      f"er for stor for tilgjengelig minne — hopper over "
+                      f"inline-ekstraksjon for denne tabellen. Eksterne LOB-er og "
+                      f"XML-patching behandles fortsatt (streaming). Anbefaling: "
+                      f"frigjør minne eller bruk maskin med mer RAM.", "feil")
+                    continue
                 except Exception as exc:
                     w(f"  FEIL les {xml_sti}: {exc}", "feil")
                     continue
                 patched, new_files, n = self._extract_inline(
-                    xml_bytes, xml_sti, table_key, stats, w, lob_cols=lob_cols)
+                    xml_bytes, xml_sti, table_key, stats, w, lob_cols=lob_cols,
+                    xml_path=xml_file, extract_dir=extract_dir)
                 if n > 0:
-                    xml_pre[xml_sti]  = patched
-                    inline_new.update(new_files)
-                    for lob_sti, lob_data in new_files.items():
-                        lob_path = extract_dir / lob_sti
-                        lob_path.parent.mkdir(parents=True, exist_ok=True)
-                        lob_path.write_bytes(lob_data)
+                    if patched is not None:
+                        # DOM-vei: patchet XML i minne + LOB-bytes å skrive
+                        xml_pre[xml_sti] = patched
+                        inline_new.update(new_files)
+                        for lob_sti, lob_data in new_files.items():
+                            lob_path = extract_dir / lob_sti
+                            lob_path.parent.mkdir(parents=True, exist_ok=True)
+                            lob_path.write_bytes(lob_data)
+                    else:
+                        # Streaming-vei: XML + LOB-er allerede skrevet til disk;
+                        # new_files er en liste med lob-stier (kun for all_blobs).
+                        for lob_sti in new_files:
+                            inline_new[lob_sti] = None
                     w(f"  {table_key}: {n} inline ekstrahert", "ok")
 
             # Oppdater all_blobs etter inline-ekstraksjon
@@ -2086,6 +2157,13 @@ class BlobConvertOperation(BaseOperation):
                 continue
             try:
                 xml_bytes_wpt = xml_file_wpt.read_bytes()
+            except MemoryError:
+                w(f"  [MINNE] {xml_sti_wpt} "
+                  f"({_fmt_gb(xml_file_wpt.stat().st_size)}) er for stor for "
+                  f"tilgjengelig minne — hopper over inline WPT/RTF for denne "
+                  f"tabellen. Anbefaling: frigjør minne eller bruk mer RAM.",
+                  "feil")
+                continue
             except Exception:
                 continue
             # Rask pre-sjekk: finnes inline RTF i fila? (bytes-søk, ingen parsing)
@@ -2094,14 +2172,23 @@ class BlobConvertOperation(BaseOperation):
             w(f"  Fant inline WPT/RTF i {xml_sti_wpt} — ekstraherer ...", "info")
             patched_wpt, new_files_wpt, n_wpt = self._extract_inline(
                 xml_bytes_wpt, xml_sti_wpt, table_key_wpt, stats, w,
-                lob_cols=_wpt_lob_cols)  # faktiske lob_cols — korrekt lobFolder
+                lob_cols=_wpt_lob_cols,  # faktiske lob_cols — korrekt lobFolder
+                xml_path=xml_file_wpt, extract_dir=extract_dir)
             if n_wpt > 0:
-                xml_pre[xml_sti_wpt] = patched_wpt
-                inline_new.update(new_files_wpt)
-                for lob_sti_wpt, lob_data_wpt in new_files_wpt.items():
-                    lob_path_wpt = extract_dir / lob_sti_wpt
-                    lob_path_wpt.parent.mkdir(parents=True, exist_ok=True)
-                    lob_path_wpt.write_bytes(lob_data_wpt)
+                if patched_wpt is not None:
+                    xml_pre[xml_sti_wpt] = patched_wpt
+                    inline_new.update(new_files_wpt)
+                    for lob_sti_wpt, lob_data_wpt in new_files_wpt.items():
+                        lob_path_wpt = extract_dir / lob_sti_wpt
+                        lob_path_wpt.parent.mkdir(parents=True, exist_ok=True)
+                        lob_path_wpt.write_bytes(lob_data_wpt)
+                    _wpt_stis = list(new_files_wpt.keys())
+                else:
+                    # Streaming: XML + LOB-er allerede på disk; liste av stier
+                    _wpt_stis = new_files_wpt
+                    for _s in _wpt_stis:
+                        inline_new[_s] = None
+                for lob_sti_wpt in _wpt_stis:
                     # Registrer i table_blobs/all_blobs for konvertering
                     rel_parts_wpt = PurePosixPath(lob_sti_wpt).parts
                     if (len(rel_parts_wpt) >= 4
@@ -2391,25 +2478,42 @@ class BlobConvertOperation(BaseOperation):
 
                     inline_new: dict[str, bytes] = {}
                     xml_pre:    dict[str, bytes]  = {}
+                    # Proaktiv minne-advarsel for store tableX.xml
+                    self._warn_oversized_xml(table_xml_map, extract_dir, w)
                     for table_key, xml_sti in table_xml_map.items():
                         xml_file = extract_dir / xml_sti
                         if not xml_file.exists():
                             continue
                         try:
                             xml_bytes = xml_file.read_bytes()
+                        except MemoryError:
+                            w(f"  [MINNE] {xml_sti} "
+                              f"({_fmt_gb(xml_file.stat().st_size)}) er for stor "
+                              f"for tilgjengelig minne — hopper over inline for "
+                              f"denne tabellen. Eksterne LOB-er og XML-patching "
+                              f"behandles fortsatt (streaming). Anbefaling: "
+                              f"frigjør minne eller bruk maskin med mer RAM.",
+                              "feil")
+                            continue
                         except Exception as exc:
                             w(f"  FEIL les {xml_sti}: {exc}", "feil")
                             continue
                         patched, new_files, n = self._extract_inline(
                             xml_bytes, xml_sti, table_key, stats, w,
-                            lob_cols=lob_cols)
+                            lob_cols=lob_cols, xml_path=xml_file,
+                            extract_dir=extract_dir)
                         if n > 0:
-                            xml_pre[xml_sti]  = patched
-                            inline_new.update(new_files)
-                            for lob_sti, lob_data in new_files.items():
-                                lob_path = extract_dir / lob_sti
-                                lob_path.parent.mkdir(parents=True, exist_ok=True)
-                                lob_path.write_bytes(lob_data)
+                            if patched is not None:
+                                xml_pre[xml_sti]  = patched
+                                inline_new.update(new_files)
+                                for lob_sti, lob_data in new_files.items():
+                                    lob_path = extract_dir / lob_sti
+                                    lob_path.parent.mkdir(parents=True, exist_ok=True)
+                                    lob_path.write_bytes(lob_data)
+                            else:
+                                # Streaming: XML + LOB-er allerede på disk
+                                for lob_sti in new_files:
+                                    inline_new[lob_sti] = None
                             w(f"  {table_key}: {n} inline ekstrahert", "ok")
                 else:
                     inline_new = {}
@@ -4553,12 +4657,116 @@ class BlobConvertOperation(BaseOperation):
 
     # ── Inline NBLOB/NCLOB ───────────────────────────────────────────────────
 
+    @staticmethod
+    def _has_inline_candidates(xml_bytes: bytes, lob_col_map: dict) -> bool:
+        """
+        Rask, minne-trygg strøm-skann (iterparse) som avgjør om tableX.xml
+        inneholder inline LOB-innhold som må ekstraheres. Rader frigjøres
+        fortløpende (root.clear()) slik at minnebruken er bundet til én rad —
+        i motsetning til full DOM-parsing som skalerer med hele filstørrelsen.
+
+        Returnerer True hvis det finnes minst én inline-kandidat (LOB-celle med
+        tekstinnhold og uten file=-referanse), ellers False. Ved tvil/feil under
+        skanningen returneres True slik at den ordinære DOM-veien får avgjøre.
+        """
+        try:
+            context = ET.iterparse(io.BytesIO(xml_bytes), events=("start", "end"))
+            _event, root = next(context)   # <table>-start
+        except (ET.ParseError, StopIteration, MemoryError, Exception):
+            return True   # kan ikke strøm-skanne — la DOM-veien håndtere det
+
+        found = False
+        try:
+            for event, elem in context:
+                if event != "end":
+                    continue
+                tag = elem.tag
+                if isinstance(tag, str):
+                    tl = _local(tag).lower()
+                    # Allerede ekstern referanse → aldri inline
+                    if not (elem.get("file") or elem.get("fileName")
+                            or elem.get("href")):
+                        text = (elem.text or "").strip()
+                        if text:
+                            if tl in _INLINE_TAGS:
+                                found = True
+                            elif (tl.startswith("c") and tl[1:].isdigit()
+                                  and int(tl[1:]) in lob_col_map):
+                                found = True
+                            elif (tl.startswith("c") and tl[1:].isdigit()
+                                  and len(text) > 20 and _is_wpt_inline_text(text)):
+                                found = True
+                    if found:
+                        break
+                    if tl == "row":
+                        root.clear()   # frigi ferdigbehandlede rader
+        except MemoryError:
+            return True   # la DOM-veien rapportere/håndtere
+        finally:
+            try:
+                root.clear()
+            except Exception:
+                pass
+        return found
+
+    def _warn_oversized_xml(self, table_xml_map: dict, extract_dir: Path, w) -> None:
+        """
+        Advar operatøren PROAKTIVT hvis en tableX.xml er stor i forhold til
+        tilgjengelig minne. Inline-fasen leser hele fila i minnet (1×), så filer
+        nær/over ledig RAM kan feile — dette gir en tydelig, handlingsrettet
+        melding i stedet for en brå MemoryError midt i kjøringen.
+        """
+        avail = _available_memory_bytes()
+        if not avail:
+            return   # kunne ikke fastslå ledig minne — ingen advarsel
+        limit = int(avail * 0.7)   # flagg filer som bruker > 70 % av ledig RAM
+        big: list[tuple[str, int]] = []
+        for _tk, xml_sti in table_xml_map.items():
+            try:
+                sz = (extract_dir / xml_sti).stat().st_size
+            except OSError:
+                continue
+            if sz > limit:
+                big.append((xml_sti, sz))
+        if not big:
+            return
+        big.sort(key=lambda x: -x[1])
+        w("", "warn")
+        w("  ╔════ ADVARSEL: STOR XML-FIL vs TILGJENGELIG MINNE ════", "warn")
+        w(f"  ║  Tilgjengelig minne: {_fmt_gb(avail)}", "warn")
+        for xml_sti, sz in big[:10]:
+            w(f"  ║    • {xml_sti}: {_fmt_gb(sz)}", "warn")
+        if len(big) > 10:
+            w(f"  ║    … og {len(big) - 10} fil(er) til", "warn")
+        w("  ║  Inline-ekstraksjon leser hele fila i minnet og kan feile.", "warn")
+        w("  ║  Anbefaling: lukk andre program / frigjør minne, eller kjør på", "warn")
+        w("  ║  en maskin med mer RAM. Filer som ikke får plass hoppes over med", "warn")
+        w("  ║  tydelig melding — eksterne LOB-er og XML-patching behandles", "warn")
+        w("  ║  fortsatt (streaming, konstant minne).", "warn")
+        w("  ╚══════════════════════════════════════════════════════", "warn")
+
+    # Store tableX.xml streames rad-for-rad i stedet for å DOM-parses (som
+    # bruker ~5-10× filstørrelsen i minnet). Settes fra config
+    # (siard_stream_inline_threshold_mb) / RAM-auto ved run(); denne
+    # klasse-verdien er kun fallback (og brukes av tester som overstyrer den).
+    _STREAM_INLINE_THRESHOLD = 50 * 1024 * 1024   # 50 MB (fallback)
+
     def _extract_inline(self, xml_bytes: bytes, xml_sti: str,
                         table_key: str, stats: dict, w,
                         lob_cols: dict | None = None,
-                        ) -> tuple[bytes, dict[str, bytes], int]:
+                        xml_path: "Path | None" = None,
+                        extract_dir: "Path | None" = None,
+                        ) -> tuple["bytes | None", "dict[str, bytes] | list[str]", int]:
         """
         Ekstraher inline LOB-innhold fra tableX.xml til eksterne filer.
+
+        Returkontrakt (to varianter):
+          • DOM-vei (små filer): (patched_bytes, {lob_sti: bytes}, n) — som før.
+            Kalleren skriver LOB-ene og legger patched_bytes i xml_pre.
+          • Streaming-vei (store filer, xml_path+extract_dir gitt): (None,
+            [lob_sti, ...], n) — patchet XML OG LOB-er er allerede skrevet til
+            disk. patched=None signaliserer «alt er på disk». Kalleren bruker
+            listen kun til å oppdatere all_blobs/table_blobs.
 
         To strategier kombineres:
         A) _INLINE_TAGS (SIARD 1.0): <nclob>, <blob> etc. med tekstinnhold
@@ -4571,15 +4779,6 @@ class BlobConvertOperation(BaseOperation):
           - Base64
           - Direkte bytes (UTF-8 eller latin-1)
         """
-        try:
-            # insert_comments=True (Python 3.8+) bevarer <!--...--> i treet
-            _parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
-            tree = ET.parse(io.BytesIO(xml_bytes), _parser)
-            root = tree.getroot()
-        except ET.ParseError as e:
-            w(f"    XML-parsefeil {xml_sti}: {e}", "feil")
-            return xml_bytes, {}, 0
-
         # Bygg set av LOB-kolonneindekser for denne tabellen (1-basert)
         # table_key kan være "schema0/table58" eller bare "table58"
         lob_col_map: dict[int, str] = {}
@@ -4593,124 +4792,55 @@ class BlobConvertOperation(BaseOperation):
                         lob_col_map = v
                         break
 
+        # ── Minne-trygg forhåndssjekk ─────────────────────────────────────────
+        # DOM-parsing (ET.parse) bygger hele treet i minnet — ~5-10× filstørrelsen
+        # — og sprenger minnet på store tabeller (hundretusener av rader). Når alle
+        # LOB-er allerede er EKSTERNE fil-referanser (file="...") er det ingenting
+        # å ekstrahere inline. Strøm-skann derfor først (bundet minne) og hopp helt
+        # over DOM-parsing hvis det ikke finnes inline-innhold.
+        if not self._has_inline_candidates(xml_bytes, lob_col_map):
+            return xml_bytes, {}, 0
+
+        # ── Store filer: strøm rad-for-rad til disk (konstant minne) ──────────
+        # Krever xml_path (kilde på disk) og extract_dir (der LOB-er/patchet XML
+        # skrives). patched=None returneres → alt ligger allerede på disk.
+        if (xml_path is not None and extract_dir is not None
+                and len(xml_bytes) >= self._STREAM_INLINE_THRESHOLD):
+            new_stis, n = self._extract_inline_streaming(
+                Path(xml_path), xml_sti, table_key, stats, w,
+                lob_col_map, Path(extract_dir), base_path=str(PurePosixPath(xml_sti).parent))
+            return None, new_stis, n
+
+        try:
+            # insert_comments=True (Python 3.8+) bevarer <!--...--> i treet
+            _parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
+            tree = ET.parse(io.BytesIO(xml_bytes), _parser)
+            root = tree.getroot()
+        except ET.ParseError as e:
+            w(f"    XML-parsefeil {xml_sti}: {e}", "feil")
+            return xml_bytes, {}, 0
+        except MemoryError:
+            w(f"    [MINNE] {xml_sti} er for stor for inline-ekstraksjon i minnet "
+              f"— hopper over inline for denne tabellen (eksterne LOB-er behandles "
+              f"normalt). Kjør ev. 'HEX Inline Extract' først, eller øk RAM.", "feil")
+            return xml_bytes, {}, 0
+
         new_files:  dict[str, bytes] = {}
-        lob_counter = 0
-        n_extracted = 0
+        counter     = [0]
         base_path   = str(PurePosixPath(xml_sti).parent)
 
+        def _write_dom(sti: str, data: bytes) -> None:
+            new_files[sti] = data
+
+        # Per-element-behandling er delt med streaming-veien
+        # (_extract_lob_from_element) slik at dekod-/navn-/attributt-logikken
+        # ikke driver fra hverandre. DOM-veien slår opp parent via _find_parent.
         for elem in root.iter():
-            if not isinstance(elem.tag, str):
-                continue   # hopp over ET.Comment / ET.ProcessingInstruction
-            tag_local = _local(elem.tag).lower()
+            self._extract_lob_from_element(
+                elem, (lambda e=elem: self._find_parent(root, e)),
+                lob_col_map, base_path, counter, stats, w, xml_sti, _write_dom)
 
-            # Bestem om dette elementet er et LOB-felt
-            is_inline_tag  = tag_local in _INLINE_TAGS
-            is_lob_col     = False
-            is_wpt_inline  = False
-            wpt_col_idx    = 0
-            lob_folder     = ""
-            if not is_inline_tag and lob_col_map:
-                # B) Sjekk om tagnavn er cN der N er i lob_col_map
-                if tag_local.startswith("c") and tag_local[1:].isdigit():
-                    col_idx = int(tag_local[1:])
-                    if col_idx in lob_col_map:
-                        is_lob_col = True
-                        lob_folder = lob_col_map[col_idx]
-
-            if not is_inline_tag and not is_lob_col:
-                # C) Detekter inline WPT/RTF i vilkårlig <cN> (ikke metadata-definert LOB)
-                if tag_local.startswith("c") and tag_local[1:].isdigit():
-                    _preview = (elem.text or "").strip()
-                    if len(_preview) > 20 and _is_wpt_inline_text(_preview):
-                        is_wpt_inline = True
-                        wpt_col_idx   = int(tag_local[1:])
-                        w(f"    [{xml_sti}] Detektert inline RTF i <{tag_local}> "
-                          f"({len(_preview)} tegn)", "info")
-
-            if not is_inline_tag and not is_lob_col and not is_wpt_inline:
-                continue
-
-            # Hopp over hvis allerede ekstern referanse
-            if elem.get("file") or elem.get("fileName") or elem.get("href"):
-                continue
-
-            text = (elem.text or "").strip()
-            if not text:
-                continue
-
-            # ── Dekod innhold ──────────────────────────────────────────────
-            file_bytes: bytes
-            detected_as = "tekst"
-
-            # 1. SIARD \uXXXX-escaped (vanligst for RTF/tekst i NCLOB)
-            if r"\u" in text and not text.startswith("\\x"):
-                file_bytes  = _unescape_siard(text)
-                detected_as = "unicode-escaped"
-            # 2. Hex-kodet binærdata
-            elif _is_hex(text):
-                try:
-                    file_bytes  = _hex_decode(text)
-                    detected_as = "hex"
-                except Exception:
-                    file_bytes = text.encode("utf-8")
-            # 3. Base64
-            else:
-                try:
-                    import base64 as _b64
-                    file_bytes  = _b64.b64decode(text, validate=True)
-                    detected_as = "base64"
-                except Exception:
-                    file_bytes = text.encode("utf-8")
-
-            # ── Detekter filtype ───────────────────────────────────────────
-            ext, mime, _ = get_identifier().identify(data=file_bytes)
-
-            # ── Bestem lob-mappe og filnavn ────────────────────────────────
-            lob_counter += 1
-            if lob_folder:
-                # Bruk lobFolder fra metadata som rotmappe (sti B)
-                lob_dir  = lob_folder
-                filename = f"rec{lob_counter}.{ext}"
-            elif is_wpt_inline:
-                # Sti C: kolonne-spesifikk lob-mappe basert på kolonneindeks
-                lob_dir  = f"{base_path}/lob{wpt_col_idx}"
-                filename = f"rec{lob_counter}.{ext}"
-            else:
-                lob_dir  = f"{base_path}/lob{lob_counter}"
-                filename = f"LOB{lob_counter:04d}.{ext}"
-
-            zip_sti_lob = f"{lob_dir}/{filename}"
-
-            new_files[zip_sti_lob] = file_bytes
-            elem.text = None
-
-            if is_wpt_inline:
-                # Sett fil-attributter direkte på elementet.
-                # Bare filnavn — IKKE lob{N}/-prefiks — siden KDRS Søk & Vis
-                # resolver file-ref som lobFolder + filnavn (fra metadata.xml).
-                # lob{N}/-prefiks ville gi dobbel-path: lob3/lob3/rec1.bin.
-                import hashlib as _hashlib
-                elem.set("file",       filename)
-                elem.set("length",     str(len(file_bytes)))
-                elem.set("digestType", "MD5")
-                elem.set("digest",     _hashlib.md5(file_bytes).hexdigest().upper())
-            else:
-                elem.set("file", filename)
-                # Oppdater søsken-elementer (mimeType, length, checksum)
-                parent = self._find_parent(root, elem)
-                if parent is not None:
-                    self._update_sibling(parent, "mimeType",    mime,                 w)
-                    self._update_sibling(parent, "length",      str(len(file_bytes)), w)
-                    for cs_tag in _CHECKSUM_TAGS:
-                        node = self._find_sibling_tag(parent, cs_tag)
-                        if node is not None:
-                            node.text = _checksum(file_bytes, cs_tag)
-
-            n_extracted += 1
-            stats["inline_extracted"] += 1
-            w(f"    {xml_sti} <{tag_local}>: {detected_as} → {ext} "
-              f"({len(file_bytes):,} bytes) → {zip_sti_lob}", "info")
-
+        n_extracted = counter[0]
         if n_extracted == 0:
             return xml_bytes, {}, 0
 
@@ -4727,6 +4857,195 @@ class BlobConvertOperation(BaseOperation):
         tree.write(out, xml_declaration=True, encoding="utf-8")
         result = _restore_xml_header(xml_bytes, out.getvalue())
         return result, new_files, n_extracted
+
+    # ── Delt per-element inline-behandling (DOM + streaming) ──────────────────
+
+    def _extract_lob_from_element(self, elem, get_parent, lob_col_map: dict,
+                                  base_path: str, counter: list, stats: dict, w,
+                                  xml_sti: str, write_lob) -> "str | None":
+        """
+        Behandle ETT element: hvis det er et inline LOB-felt (inline-tag,
+        metadata-definert LOB-kolonne, eller inline WPT/RTF) uten eksisterende
+        file=-referanse, dekod innholdet, skriv LOB-en via `write_lob(sti, data)`,
+        sett file=-attributt + oppdater søsken (mimeType/length/digest), og
+        returner LOB-stien. Ellers None.
+
+        `get_parent()` gir parent-elementet (for søsken-oppdatering) — DOM slår
+        opp via _find_parent, streaming via en parent-map for raden. `counter`
+        er en delt muterbar teller ([int]).
+        """
+        if not isinstance(elem.tag, str):
+            return None   # ET.Comment / ProcessingInstruction
+        tag_local = _local(elem.tag).lower()
+
+        is_inline_tag = tag_local in _INLINE_TAGS
+        is_lob_col    = False
+        is_wpt_inline = False
+        wpt_col_idx   = 0
+        lob_folder    = ""
+        if not is_inline_tag and lob_col_map:
+            if tag_local.startswith("c") and tag_local[1:].isdigit():
+                col_idx = int(tag_local[1:])
+                if col_idx in lob_col_map:
+                    is_lob_col = True
+                    lob_folder = lob_col_map[col_idx]
+
+        if not is_inline_tag and not is_lob_col:
+            if tag_local.startswith("c") and tag_local[1:].isdigit():
+                _preview = (elem.text or "").strip()
+                if len(_preview) > 20 and _is_wpt_inline_text(_preview):
+                    is_wpt_inline = True
+                    wpt_col_idx   = int(tag_local[1:])
+                    w(f"    [{xml_sti}] Detektert inline RTF i <{tag_local}> "
+                      f"({len(_preview)} tegn)", "info")
+
+        if not is_inline_tag and not is_lob_col and not is_wpt_inline:
+            return None
+        if elem.get("file") or elem.get("fileName") or elem.get("href"):
+            return None
+        text = (elem.text or "").strip()
+        if not text:
+            return None
+
+        file_bytes, detected_as = _decode_inline_lob_text(text)
+        ext, mime, _ = get_identifier().identify(data=file_bytes)
+
+        counter[0] += 1
+        lob_counter = counter[0]
+        if lob_folder:
+            lob_dir  = lob_folder
+            filename = f"rec{lob_counter}.{ext}"
+        elif is_wpt_inline:
+            lob_dir  = f"{base_path}/lob{wpt_col_idx}"
+            filename = f"rec{lob_counter}.{ext}"
+        else:
+            lob_dir  = f"{base_path}/lob{lob_counter}"
+            filename = f"LOB{lob_counter:04d}.{ext}"
+        zip_sti_lob = f"{lob_dir}/{filename}"
+
+        write_lob(zip_sti_lob, file_bytes)
+        elem.text = None
+
+        if is_wpt_inline:
+            import hashlib as _hashlib
+            elem.set("file",       filename)
+            elem.set("length",     str(len(file_bytes)))
+            elem.set("digestType", "MD5")
+            elem.set("digest",     _hashlib.md5(file_bytes).hexdigest().upper())
+        else:
+            elem.set("file", filename)
+            parent = get_parent()
+            if parent is not None:
+                self._update_sibling(parent, "mimeType",    mime,                 w)
+                self._update_sibling(parent, "length",      str(len(file_bytes)), w)
+                for cs_tag in _CHECKSUM_TAGS:
+                    node = self._find_sibling_tag(parent, cs_tag)
+                    if node is not None:
+                        node.text = _checksum(file_bytes, cs_tag)
+
+        stats["inline_extracted"] += 1
+        w(f"    {xml_sti} <{tag_local}>: {detected_as} → {ext} "
+          f"({len(file_bytes):,} bytes) → {zip_sti_lob}", "info")
+        return zip_sti_lob
+
+    # ── Streaming inline-ekstraksjon for enormt store tableX.xml ──────────────
+
+    @staticmethod
+    def _read_xml_header_prefix(xml_path: Path) -> bytes:
+        """Les bytes fra start av fila fram til første <row (prolog + <table …>)."""
+        buf = bytearray()
+        with open(xml_path, "rb") as f:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                buf += chunk
+                i = buf.find(b"<row")
+                if i != -1:
+                    return bytes(buf[:i])
+        return bytes(buf)
+
+    def _extract_inline_streaming(self, xml_path: Path, xml_sti: str,
+                                  table_key: str, stats: dict, w,
+                                  lob_col_map: dict, extract_dir: Path,
+                                  base_path: str) -> "tuple[list[str], int]":
+        """
+        Minne-trygg inline-ekstraksjon: strømmer tableX.xml rad-for-rad
+        (ET.iterparse), skriver ekstraherte LOB-er OG den patchede XML-en rett
+        til disk, og erstatter originalen atomisk. Minnebruken er bundet til én
+        rad uansett filstørrelse. Alle XML-endringer er rad-lokale (file=,
+        mimeType/length/digest), så per-rad-behandling er ekvivalent med DOM-veien.
+
+        Returnerer (liste_over_lob_stier, antall_ekstrahert).
+        """
+        header = self._read_xml_header_prefix(xml_path)
+        tmp_path = xml_path.with_suffix(xml_path.suffix + ".tmp_inline")
+
+        new_stis: list[str] = []
+        counter  = [0]
+
+        def _write_lob(sti: str, data: bytes) -> None:
+            p = extract_dir / sti
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(data)
+            new_stis.append(sti)
+
+        # Åpne kilde-fila eksplisitt slik at vi kan lukke handtaket FØR os.replace
+        # (ET.iterparse lukker ikke fila når vi bryter ut av loopen tidlig, og
+        # Windows nekter å erstatte/rydde en åpen fil).
+        src = None
+        try:
+            src = open(xml_path, "rb")
+            with open(tmp_path, "wb") as out:
+                out.write(header)
+                context = ET.iterparse(src, events=("start", "end"))
+                _ev, root = next(context)          # ("start", <table>)
+                rootname  = _local(root.tag)
+                depth = 1
+                for ev, elem in context:
+                    if ev == "start":
+                        depth += 1
+                        continue
+                    depth -= 1
+                    if depth == 1:
+                        # En direkte barn av <table> (typisk <row>) er ferdig.
+                        parent_map = {c: p for p in elem.iter() for c in p}
+                        for cell in list(elem.iter()):
+                            self._extract_lob_from_element(
+                                cell, (lambda c=cell: parent_map.get(c)),
+                                lob_col_map, base_path, counter, stats, w,
+                                xml_sti, _write_lob)
+                        # Strip namespace-prefiks før serialisering (som DOM-veien)
+                        for e in elem.iter():
+                            if isinstance(e.tag, str) and "}" in e.tag:
+                                e.tag = e.tag.split("}", 1)[1]
+                        elem.tail = None
+                        out.write(ET.tostring(elem, encoding="unicode").encode("utf-8"))
+                        out.write(b"\n")
+                        elem.clear()
+                        root.clear()      # frigi ferdigbehandlede rader
+                    elif depth == 0:
+                        break
+                out.write(b"</" + rootname.encode("utf-8") + b">\n")
+        except Exception as exc:
+            if src is not None:
+                src.close()
+                src = None
+            tmp_path.unlink(missing_ok=True)
+            w(f"    FEIL streaming inline {xml_sti}: {exc}", "feil")
+            return [], 0
+        finally:
+            if src is not None:
+                src.close()
+
+        n = counter[0]
+        if n == 0:
+            tmp_path.unlink(missing_ok=True)
+            return [], 0
+
+        os.replace(tmp_path, xml_path)
+        w(f"  {xml_sti}: {n} inline ekstrahert (streaming, konstant minne)", "ok")
+        return new_stis, n
 
     # ── Patch tableX.xml ─────────────────────────────────────────────────────
 

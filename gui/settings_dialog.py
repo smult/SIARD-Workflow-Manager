@@ -294,6 +294,67 @@ class SettingsDialog(ctk.CTkToplevel):
 
         _rad("Tidsavbrudd per batch (s)", "lo_timeout", "int", r, default=300); r += 1
 
+        # ── Inline-ekstraksjon: DOM→streaming-terskel (minne) ──────────────────
+        ctk.CTkLabel(frm, text="Inline DOM→streaming-terskel (MB)",
+                     font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                     text_color=COLORS["text"],
+                     anchor="w").grid(row=r, column=0, padx=(12, 8), pady=6, sticky="w")
+        _thr_cfg = cfg.get("siard_stream_inline_threshold_mb")
+        if _thr_cfg:
+            _thr_default = str(_thr_cfg)
+        else:
+            try:
+                from siard_workflow.core import sysmem
+                _thr_default = str(sysmem.auto_stream_inline_threshold_mb())
+            except Exception:
+                _thr_default = "50"
+        thr_var = ctk.StringVar(value=_thr_default)
+        self._vars["siard_stream_inline_threshold_mb"] = thr_var
+        thr_cell = ctk.CTkFrame(frm, fg_color="transparent")
+        thr_cell.grid(row=r, column=1, padx=12, pady=6, sticky="e")
+        ctk.CTkEntry(thr_cell, textvariable=thr_var, width=80,
+                     fg_color=COLORS["bg"],
+                     font=ctk.CTkFont(family=FONTS["mono"], size=11)
+                     ).pack(side="left", padx=(0, 4))
+
+        def _auto_threshold():
+            try:
+                from siard_workflow.core import sysmem
+                mb = sysmem.auto_stream_inline_threshold_mb()
+                thr_var.set(str(mb))
+                total = sysmem.total_memory_bytes()
+                avail = sysmem.available_memory_bytes()
+                from tkinter import messagebox
+                messagebox.showinfo(
+                    "Minne-forslag",
+                    f"Installert RAM: "
+                    f"{round(total / 1024**3, 1) if total else '?'} GB\n"
+                    f"Ledig RAM: "
+                    f"{round(avail / 1024**3, 1) if avail else '?'} GB\n\n"
+                    f"Anbefalt terskel: {mb} MB\n\n"
+                    f"Filer under denne størrelsen behandles med DOM (raskt), "
+                    f"større filer streames rad-for-rad (konstant minne).",
+                    parent=self)
+            except Exception as exc:
+                from tkinter import messagebox
+                messagebox.showerror("Feil", str(exc), parent=self)
+
+        ctk.CTkButton(thr_cell, text="Auto", width=52,
+                      fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"],
+                      text_color=COLORS["on_accent"],
+                      font=ctk.CTkFont(family=FONTS["mono"], size=10),
+                      command=_auto_threshold).pack(side="left")
+        r += 1
+        ctk.CTkLabel(frm,
+                     text="Filer over terskelen leses rad-for-rad (streaming) for å "
+                          "unngå MemoryError; mindre filer bruker DOM (raskere). "
+                          "Auto = ~1 % av installert RAM.",
+                     font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                     text_color=COLORS["muted"],
+                     wraplength=560, justify="left").grid(
+                         row=r, column=0, columnspan=2,
+                         padx=14, pady=(0, 4), sticky="w"); r += 1
+
         # lo_convertible som kommaseparert tekstfelt
         ctk.CTkLabel(frm, text="Formater til PDF/A",
                      font=ctk.CTkFont(family=FONTS["mono"], size=11),
@@ -520,7 +581,8 @@ class SettingsDialog(ctk.CTkToplevel):
         cfg: dict = {}
         int_keys  = {"max_workers", "lo_batch_size", "lo_timeout",
                      "av_infected_rc", "av_timeout", "min_operation_status",
-                     "siard_compress_level", "ollama_port", "ollama_timeout"}
+                     "siard_compress_level", "ollama_port", "ollama_timeout",
+                     "siard_stream_inline_threshold_mb"}
         list_keys = {"lo_convertible", "rename_only"}
         args_keys = {"av_args"}
         dict_keys = {"lo_upgrade"}  # kommaseparert nøkkel=verdi → dict
