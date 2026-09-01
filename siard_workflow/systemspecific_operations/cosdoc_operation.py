@@ -53,6 +53,7 @@ from siard_workflow.core.context import WorkflowContext
 from siard_workflow.core.siard_format import (
     detect_siard_version, siard_version_transform,
     get_target_siard_version, is_siard_xml,
+    rewrite_siardversion_path,
     restore_xml_header,
 )
 
@@ -685,14 +686,19 @@ def _pack_zip(
     n_written = n_transformed = 0
 
     with zipfile.ZipFile(dst_path, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+        # Versjonsmarkør-mappa header/siardversion/<x.y>/ må følge
+        # mål-versjonen, ellers står kildeversjonen igjen i uttrekket.
         for de in dir_entries:
-            zf.writestr(zipfile.ZipInfo(de), b"")
+            zf.writestr(
+                zipfile.ZipInfo(rewrite_siardversion_path(
+                    de, target_version)), b"")
             n_written += 1
 
         for fp in sorted(extract_dir.rglob("*")):
             if not fp.is_file():
                 continue
             arc = str(fp.relative_to(extract_dir)).replace("\\", "/")
+            arc = rewrite_siardversion_path(arc, target_version)
             if is_siard_xml(arc):
                 data = fp.read_bytes()
                 data = siard_version_transform(data, target_version)

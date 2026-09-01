@@ -44,9 +44,118 @@ def detect_siard_version(metadata_bytes: bytes) -> str:
     return "2.1"
 
 
+# ── Versjonsreferanser i XML/XSD ──────────────────────────────────────────────
+#
+# Namespace-URI og version-attributtet er ikke de eneste stedene versjonen står.
+# header/metadata.xsd (og table.xsd) inneholder også en `versionType` som låser
+# version-attributtet til én enkelt verdi:
+#
+#     <xs:simpleType name="versionType">
+#       <xs:annotation>
+#         <xs:documentation>versionType is constrained to "2.2" for conformity
+#           with this XML schema</xs:documentation>
+#       </xs:annotation>
+#       <xs:restriction base="xs:string">
+#         <xs:whiteSpace value="collapse" />
+#         <xs:enumeration value="2.2" />
+#       </xs:restriction>
+#     </xs:simpleType>
+#
+# Blir denne stående på "2.2" mens metadata.xml skrives med version="2.1",
+# validerer ikke uttrekket mot sin egen XSD. Alle slike versjonsreferanser må
+# derfor skrives om sammen med namespace og version-attributt.
+
+# Et versjonstall på formen 2.1 / 2.2 — men ikke del av et lengre versjonstall.
+#   «2.2» / «2.2.»  (setningsslutt)         → treff
+#   «2.2.1.7»                               → ingen treff (xs:schema-revisjon)
+#   «12.2»                                  → ingen treff
+# Lookahead avviser derfor kun et påfølgende siffer, evt. med punktum foran.
+_VER_TOKEN_RE = re.compile(rb'(?<![0-9.])2\.[0-9]+(?!\.?[0-9])')
+
+# <xs:simpleType name="versionType"> … </xs:simpleType>  (namespace-tolerant)
+_VERSION_TYPE_BLOCK_RE = re.compile(
+    rb"<(?:[A-Za-z0-9_-]+:)?simpleType(?=[^>]*\bname\s*=\s*[\"\']versionType[\"\'])"
+    rb"[^>]*>.*?</(?:[A-Za-z0-9_-]+:)?simpleType\s*>",
+    re.DOTALL,
+)
+
+# <xs:attribute name="version" … fixed="2.2"/>  /  default="2.2"
+_VERSION_ATTR_DECL_RE = re.compile(
+    rb"<(?:[A-Za-z0-9_-]+:)?(?:attribute|element)"
+    rb"(?=[^>]*\bname\s*=\s*[\"\']version[\"\'])[^>]*/?>",
+)
+_FIXED_DEFAULT_RE = re.compile(
+    rb"((?:fixed|default)\s*=\s*[\"\'])(2\.[0-9]+)([\"\'])")
+
+# <xs:documentation> … </xs:documentation>  (namespace-tolerant)
+_DOCUMENTATION_RE = re.compile(
+    rb'<(?:[A-Za-z0-9_-]+:)?documentation(?:\s[^>]*)?>.*?'
+    rb'</(?:[A-Za-z0-9_-]+:)?documentation\s*>',
+    re.DOTALL,
+)
+
+# XML-kommentar
+_XML_COMMENT_RE = re.compile(rb'<!--.*?-->', re.DOTALL)
+
+# Fritekst (dokumentasjon/kommentar) skrives kun om når den faktisk handler om
+# SIARD-versjonen — ellers ville f.eks. «se kapittel 2.2» blitt endret.
+_VERSION_CONTEXT_RE = re.compile(rb'version|siard|ech-0165', re.IGNORECASE)
+
+
+def _rewrite_version_tokens(segment: bytes, dst: bytes) -> bytes:
+    """
+    Sett SIARD-versjonstall (2.x) i `segment` til `dst`, men la XML-kommentarer
+    stå urørt.
+
+    Den offisielle SIARD 2.1-XSD-en har en forklarende kommentar inne i selve
+    versionType-blokken:
+
+        <xs:enumeration value="2.1"/>
+        <!--  to be extended later with
+        <xs.enumeration value="2.2"/>
+        etc. -->
+
+    «2.2» der er en henvisning til en FRAMTIDIG versjon, ikke en erklæring om
+    filens egen versjon. Skrives den om blir kommentaren meningsløs («utvides
+    senere med 2.1»), og en ekte 2.1-fil ville blitt endret av en 2.1 → 2.1-
+    transformasjon. Kommentarer med reell versjonskontekst fanges i stedet av
+    `_rewrite_free_text`.
+    """
+    out = bytearray()
+    pos = 0
+    for m in _XML_COMMENT_RE.finditer(segment):
+        out += _VER_TOKEN_RE.sub(dst, segment[pos:m.start()])
+        out += m.group(0)          # kommentar bevares som den er
+        pos = m.end()
+    out += _VER_TOKEN_RE.sub(dst, segment[pos:])
+    return bytes(out)
+
+
+def _rewrite_free_text(data: bytes, dst: bytes) -> bytes:
+    """
+    Skriv om versjonstall i <xs:documentation>-blokker og XML-kommentarer — men
+    kun der teksten faktisk omtaler SIARD-versjonen, slik at f.eks. «se kapittel
+    2.2» i urelatert dokumentasjon står urørt.
+
+    Her erstattes tokens direkte (ikke via `_rewrite_version_tokens`, som med
+    vilje hopper over kommentarer): det ER kommentaren som skal skrives om når
+    den først har versjonskontekst.
+    """
+    def _sub(m: re.Match) -> bytes:
+        seg = m.group(0)
+        if not _VERSION_CONTEXT_RE.search(seg):
+            return seg
+        return _VER_TOKEN_RE.sub(dst, seg)
+
+    data = _DOCUMENTATION_RE.sub(_sub, data)
+    data = _XML_COMMENT_RE.sub(_sub, data)
+    return data
+
+
 def siard_version_transform(data: bytes, to_ver: str) -> bytes:
     """
-    Transformer SIARD namespace-URI-er og version-attributt til ønsket versjon.
+    Transformer SIARD namespace-URI-er, version-attributt og øvrige
+    versjonsreferanser til ønsket versjon.
 
     Per SIARD-standarden skal xmlns og xsi:schemaLocation bruke den generiske
     /siard/2/-URIen uavhengig av versjon:
@@ -55,7 +164,12 @@ def siard_version_transform(data: bytes, to_ver: str) -> bytes:
     Versjonerte URI-er (/2.1/ og /2.2/) erstattes derfor med den generiske /2/-URIen.
     Den generiske /2/-URIen forblir uendret (allerede korrekt).
 
-    version-attributtet i rot-elementet settes til to_ver ("2.1" eller "2.2").
+    I tillegg skrives følgende om til `to_ver`:
+      - version-attributtet i rot-elementet
+      - `versionType`-blokken i XSD-er (enumeration/pattern + dokumentasjon)
+      - fixed=/default= på en `version`-attributt-deklarasjon i XSD-er
+      - versjonstall i <xs:documentation> og XML-kommentarer som omtaler
+        SIARD/versjon
 
     Returnerer data uendret hvis to_ver ikke er '2.1' eller '2.2'.
     """
@@ -73,8 +187,69 @@ def siard_version_transform(data: bytes, to_ver: str) -> bytes:
     # Erstatt version-attributt i rot-elementet med ønsket versjon
     data = data.replace(b'version="2.1"', b'version="' + dst + b'"')
     data = data.replace(b'version="2.2"', b'version="' + dst + b'"')
+    data = data.replace(b"version='2.1'", b"version='" + dst + b"'")
+    data = data.replace(b"version='2.2'", b"version='" + dst + b"'")
+
+    # XSD: versionType låser version-attributtet til én enkelt verdi
+    data = _VERSION_TYPE_BLOCK_RE.sub(
+        lambda m: _rewrite_version_tokens(m.group(0), dst), data)
+
+    # XSD: <xs:attribute name="version" … fixed="2.2"/>
+    data = _VERSION_ATTR_DECL_RE.sub(
+        lambda m: _FIXED_DEFAULT_RE.sub(
+            lambda f: f.group(1) + dst + f.group(3), m.group(0)),
+        data)
+
+    # Fritekst: dokumentasjon og kommentarer som omtaler SIARD/versjon
+    data = _rewrite_free_text(data, dst)
 
     return data
+
+
+# ── header/siardversion/<v>/ — versjonsmarkør-mappa ───────────────────────────
+#
+# En SIARD-fil markerer versjonen sin med en (som regel tom) mappe
+# `header/siardversion/2.1/`. Ved nedgradering må dette mappenavnet skrives om
+# sammen med XML-innholdet — ellers står det fortsatt «2.2» i uttrekket.
+#
+# Mappenavnet er kilden til sannhet for KILDE-versjonen: XML-innholdet kan
+# allerede ha blitt normalisert til generisk /2/-namespace av et tidligere steg,
+# og da gir detect_siard_version() ikke lenger den opprinnelige versjonen.
+
+_SIARDVERSION_DIR_RE = re.compile(r"^header/siardversion/(\d+\.\d+)/",
+                                  re.IGNORECASE)
+_VER_SEGMENT_RE = re.compile(r"^\d+\.\d+$")
+
+
+def detect_folder_siard_version(namelist, fallback: str = "") -> str:
+    """
+    Les SIARD-versjonen ut av `header/siardversion/<x.y>/` i en ZIP-namelist.
+    Returnerer `fallback` hvis markør-mappa ikke finnes.
+    """
+    for name in namelist or ():
+        m = _SIARDVERSION_DIR_RE.match(name.replace("\\", "/"))
+        if m:
+            return m.group(1)
+    return fallback
+
+
+def rewrite_siardversion_path(name: str, target_version: str) -> str:
+    """
+    Skriv om versjonsleddet i `header/siardversion/<x.y>/...` til
+    `target_version`. Andre stier returneres uendret.
+    """
+    if target_version not in ("2.1", "2.2"):
+        return name
+    parts = name.split("/")
+    if (len(parts) < 3 or parts[0].lower() != "header"
+            or parts[1].lower() != "siardversion"):
+        return name
+    changed = False
+    for i in range(2, len(parts)):
+        if _VER_SEGMENT_RE.match(parts[i]) and parts[i] != target_version:
+            parts[i] = target_version
+            changed = True
+    return "/".join(parts) if changed else name
 
 
 def get_target_siard_version() -> str:

@@ -25,6 +25,7 @@ from siard_workflow.core.context import WorkflowContext
 from siard_workflow.core.siard_format import (
     detect_siard_version, siard_version_transform,
     get_target_siard_version, is_siard_xml,
+    detect_folder_siard_version, rewrite_siardversion_path,
 )
 from siard_workflow.core import external_lob
 
@@ -518,12 +519,18 @@ class RepackSiardOperation(BaseOperation):
             orig_dir_entries = [n for n in orig_dir_entries
                                 if not _lobdir.search(n)]
 
+        # Versjonsmarkør-mappa header/siardversion/<x.y>/ må følge
+        # mål-versjonen. Mappenavnet i original-ZIP-en er kilden til
+        # sannhet — XML-innholdet kan allerede ha blitt normalisert til
+        # generisk /2/-namespace av et tidligere steg i workflowen.
+        folder_version = detect_folder_siard_version(
+            orig_namelist, src_version)
+        if folder_version != target_version:
+            w(f"  Versjonsmarkør header/siardversion/: "
+              f"{folder_version} → {target_version}", "info")
+
         def _ver_path(name: str) -> str:
-            if (src_version and src_version != target_version
-                    and src_version in name
-                    and name.startswith("header/")):
-                return name.replace(src_version, target_version)
-            return name
+            return rewrite_siardversion_path(name, target_version)
 
         all_files = sorted(f for f in extract_dir.rglob("*") if f.is_file())
         n_total   = len(all_files)

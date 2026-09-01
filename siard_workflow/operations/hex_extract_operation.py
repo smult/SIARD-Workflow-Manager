@@ -27,6 +27,7 @@ from siard_workflow.core.base_operation import BaseOperation
 from siard_workflow.core.siard_format import (
     detect_siard_version, siard_version_transform,
     get_target_siard_version, is_siard_xml,
+    detect_folder_siard_version, rewrite_siardversion_path,
     extract_table_non_row_content,
 )
 
@@ -666,14 +667,11 @@ class HexExtractOperation(BaseOperation):
 
             # Finn faktisk mappeversjon i header/siardversion/<x.y>/ direkte
             # fra ZIP-listen — uavhengig av XML-namespace-deteksjon.
-            import re as _re
-            _folder_version = src_version
-            for _n in zin.namelist():
-                _fm = _re.match(r'header/siardversion/(\d+\.\d+)/',
-                                _n, _re.IGNORECASE)
-                if _fm:
-                    _folder_version = _fm.group(1)
-                    break
+            _folder_version = detect_folder_siard_version(
+                zin.namelist(), src_version)
+            if _folder_version != target_version:
+                w(f"  Versjonsmarkør header/siardversion/: "
+                  f"{_folder_version} → {target_version}", "info")
 
             w(f"  Kilde SIARD: {src_version}  →  "
               f"Mål SIARD: {target_version}", "info")
@@ -723,11 +721,7 @@ class HexExtractOperation(BaseOperation):
                 # Rename header/siardversion/<kilde>/ → header/siardversion/<mål>/
                 # basert på faktisk mappenavn (ikke XML-namespace-innhold).
                 def _ver_path_hex(name: str) -> str:
-                    if _folder_version and _folder_version != target_version \
-                            and _folder_version in name \
-                            and name.startswith("header/"):
-                        return name.replace(_folder_version, target_version)
-                    return name
+                    return rewrite_siardversion_path(name, target_version)
 
                 n_transformed = 0
                 if not dry_run:

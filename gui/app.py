@@ -1586,6 +1586,73 @@ class App(ctk.CTk):
 
         return False  # avbrutt
 
+    def _metadata_quality_preflight(self, ops: list) -> bool:
+        """
+        Skanner metadata.xml for innholdsfeil (filsti i <dbname>, omvendt
+        <dataOriginTimespan>) og tilbyr å sette inn MetadataQualityOperation
+        rett etter UnpackSiardOperation.
+
+        Merk: dette er METADATAKVALITET, ikke kompatibilitet. Begge feltene er
+        fri tekst i SIARD-skjemaet og DBPTK laster filen uansett — derfor er
+        rettingen operatørstyrt og aldri automatisk.
+
+        Returnerer True = fortsett kjøring, False = avbryt.
+        """
+        from siard_workflow.operations import UnpackSiardOperation
+        from siard_workflow.operations.metadata_quality_operation import (
+            MetadataQualityOperation, scan_metadata_quality)
+
+        # Kun relevant i pipeline-modus
+        if not any(isinstance(op, UnpackSiardOperation) for op in ops):
+            return True
+
+        # Allerede lagt til — ikke spør igjen
+        if any(isinstance(op, MetadataQualityOperation) for op in ops):
+            return True
+
+        # Rask skanning av SIARD-filene i køen
+        all_issues: dict = {}
+        for path in self.siard_queue:
+            found = scan_metadata_quality(path)
+            if found:
+                all_issues[path] = found
+
+        if not all_issues:
+            return True
+
+        lines = [
+            "Innholdsfeil i metadata.xml ble oppdaget.\n",
+            "Dette hindrer IKKE innlasting i DBPTK — begge feltene er fri tekst",
+            "i SIARD-skjemaet. Men innholdet er feil, og stien lekker intern",
+            "nettverksstruktur inn i et arkivobjekt som skal bevares langsiktig.\n",
+        ]
+        for path, issues in all_issues.items():
+            lines.append(f"  {path.name}:")
+            for issue in issues:
+                lines.append(f"    \u2022 {issue}")
+        lines += [
+            "",
+            "Vil du legge til «Rett metadata-kvalitet» automatisk etter "
+            "«Pakk ut SIARD»?",
+        ]
+
+        dialog = _PipelineSuggestionDialog(self, "\n".join(lines))
+        dialog.title("Metadata-kvalitetsproblemer oppdaget")
+        self.wait_window(dialog)
+
+        if dialog.result == "ja":
+            self.workflow_panel.insert_operation_after(
+                MetadataQualityOperation(), "unpack_siard")
+            self._log(
+                "«Rett metadata-kvalitet (dbname/datospenn)» lagt til etter "
+                "«Pakk ut SIARD»", "ok")
+            return True  # ops re-hentes av kalleren
+
+        if dialog.result == "nei":
+            return True  # operatøren avslo — fortsett uten
+
+        return False  # avbrutt
+
     def _report_preflight(self, ops: list) -> bool:
         """
         Spør om brukeren vil legge til 'Kjørerapport (PDF)' dersom den ikke
@@ -1776,6 +1843,12 @@ class App(ctk.CTk):
             return
 
         # Re-hent ops i tilfelle segfolder_fix ble lagt til
+        ops = list(self.workflow_panel.get_operations())
+
+        if not self._metadata_quality_preflight(ops):
+            return
+
+        # Re-hent ops i tilfelle metadata_quality ble lagt til
         ops = list(self.workflow_panel.get_operations())
 
         if not self._report_preflight(ops):

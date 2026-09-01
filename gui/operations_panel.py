@@ -23,6 +23,7 @@ from siard_workflow.operations import (
     WorkflowReportOperation, DiasPackageOperation,
     LobFolderFixOperation, SegFolderFixOperation, SiardMapperOperation,
     StandardizeExtOperation, DepotReportsOperation,
+    MetadataQualityOperation,
 )
 from siard_workflow.systemspecific_operations import CosDocMailMergeOperation
 from settings import save_op_params, save_config, get_config, _SETTINGS_FILE
@@ -623,6 +624,29 @@ OP_DEFS = [
         "params": [
             {"key": "output_suffix", "label": "Suffix ny SIARD-fil",
              "type": "str", "default": "_segfix"},
+        ],
+    },
+    {
+        "cls": MetadataQualityOperation,
+        "label": "Rett metadata-kvalitet (dbname/datospenn)",
+        "category": "Kompatibilitet",
+        "desc": (
+            "Retter to innholdsfeil i metadata.xml fra filbaserte uttrekk (typisk SC Full Convert): "
+            "filsti i <dbname> (f.eks. 'Data.Q:\\Ikava\\...\\Data' → 'Data') og <dataOriginTimespan> "
+            "med sluttdato før startdato. Normaliserer også datospennet til ISO-datoer. "
+            "Merk: dette er metadatakvalitet, ikke DBPTK-kompatibilitet — begge feltene er "
+            "fri tekst i SIARD-skjemaet og hindrer ikke innlasting. <connection> røres ikke. "
+            "Legges automatisk til etter 'Pakk ut SIARD' dersom problemer oppdages. "
+            "Støtter pipeline-modus og standalone-modus."
+        ),
+        "status": MetadataQualityOperation.status,
+        "params": [
+            {"key": "dbname", "label": "Nytt dbname (tom = utled fra sti)",
+             "type": "str", "default": ""},
+            {"key": "normalize_dates", "label": "Skriv datospenn som ISO-datoer",
+             "type": "bool", "default": True},
+            {"key": "output_suffix", "label": "Suffix ny SIARD-fil",
+             "type": "str", "default": "_metafix"},
         ],
     },
     {

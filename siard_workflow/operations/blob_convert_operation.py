@@ -49,12 +49,14 @@ from pathlib import Path, PurePosixPath
 from siard_workflow.core.base_operation import BaseOperation, OperationResult
 from siard_workflow.core.context import WorkflowContext
 from siard_workflow.core import external_lob
+from siard_workflow.core.lob_column_types import reconcile_lob_column_types
 from siard_workflow.core.blob_csv_logger import (
     BlobCsvLogger, ConversionErrorLogger, SiegfriedIdLogger,
 )
 from siard_workflow.core.siard_format import (
     detect_siard_version, siard_version_transform,
     get_target_siard_version, is_siard_xml,
+    detect_folder_siard_version, rewrite_siardversion_path,
     sanitize_metadata_schema_names,
     restore_xml_header, find_root_tag_start,
 )
@@ -1707,6 +1709,26 @@ class BlobConvertOperation(BaseOperation):
     modifies_content = True
     premis_event_type  = "Migration"
     premis_event_label = "formatkonvertering"
+
+    def premis_detail(self, result, ctx) -> str:
+        """Ta med LOB-kolonner som ble omtypet CLOB → BLOB.
+
+        Konvertering av tegn-LOB-innhold til PDF/A endrer kolonnens
+        faktiske innhold fra tegndata til binærdata; typeendringen er en
+        direkte følge av konverteringen og hører hjemme i samme event.
+        """
+        parts = []
+        data = result.data or {}
+        n_conv = data.get("konvertert") or data.get("converted") or 0
+        if n_conv:
+            parts.append(f"{n_conv} LOB-fil(er) konvertert til PDF/A")
+        details = data.get("lob_type_details") or []
+        if details:
+            parts.append(
+                f"{len(details)} LOB-kolonne(r) omtypet til "
+                f"BINARY LARGE OBJECT fordi innholdet nå er binært "
+                f"(<typeOriginal> bevart): " + "; ".join(details))
+        return "; ".join(parts) or "formatkonvertering utført"
     default_params = {
         "output_suffix":        "_konvertert",
         "libreoffice_bin":      "soffice",
@@ -2252,6 +2274,12 @@ class BlobConvertOperation(BaseOperation):
             lob_type_map=lob_type_map,
             col_meta=col_meta,
             conversion_registry=_pipeline_creg)
+
+        # LOB-kolonner som nå inneholder binærdata må også deklareres som
+        # binære — ellers krasjer DBPTK-innlastingen (se lob_column_types).
+        _lt = reconcile_lob_column_types(extract_dir, w)
+        stats["lob_columns_retyped"] = _lt["columns_retyped"]
+        stats["lob_type_details"] = _lt["details"]
         progress("phase_done")
 
         w("  Pipeline-modus: repakking overlates til 'Pakk sammen SIARD'.", "info")
@@ -2588,6 +2616,12 @@ class BlobConvertOperation(BaseOperation):
                     lob_type_map=lob_type_map,
                     col_meta=col_meta,
                     conversion_registry=_standalone_creg)
+
+                # LOB-kolonner som nå inneholder binærdata må også deklareres
+                # som binære — ellers krasjer DBPTK-innlastingen.
+                _lt = reconcile_lob_column_types(extract_dir, w)
+                stats["lob_columns_retyped"] = _lt["columns_retyped"]
+                stats["lob_type_details"] = _lt["details"]
                 progress("phase_done")
 
                 # ── Fase 5: Pakk ny SIARD ─────────────────────────────────────
@@ -5527,22 +5561,15 @@ class BlobConvertOperation(BaseOperation):
         # Bruker mapper-stien direkte (f.eks. header/siardversion/2.2/) i stedet
         # for å stole på detect_siard_version fra XML-innholdet, som kan ha
         # blitt transformert av et tidligere steg til generisk /2/-namespace.
-        import re as _re
-        _folder_version = src_version   # fallback til XML-detektert versjon
-        for _n in orig_namelist:
-            _fm = _re.match(r'header/siardversion/(\d+\.\d+)/', _n,
-                            _re.IGNORECASE)
-            if _fm:
-                _folder_version = _fm.group(1)
-                break
+        _folder_version = detect_folder_siard_version(
+            orig_namelist, src_version)
+        if _folder_version != target_version:
+            w(f"  Versjonsmarkør header/siardversion/: "
+              f"{_folder_version} → {target_version}", "info")
 
         # Hjelpefunksjon: erstatt versjon i siardversion-mappa i header-stier.
         def _ver_path(name: str) -> str:
-            if _folder_version and _folder_version != target_version \
-                    and _folder_version in name \
-                    and name.startswith("header/"):
-                return name.replace(_folder_version, target_version)
-            return name
+            return rewrite_siardversion_path(name, target_version)
 
         # Katalogoppføringer fra original ZIP (f.eks. header/siardversion/).
         # Disse er påkrevd for korrekt SIARD-validering, men filtreres bort
