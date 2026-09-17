@@ -147,6 +147,62 @@ def test_city_address_require_letters():
     assert should_anonymize(PiiType.ADDRESS, "12345") is False
 
 
+def test_identifier_guard():
+    """GUID/UUID, hash-er, nøkler og løpenumre skal ALDRI endres — verken via
+    navnematch (addressRootEntityId → «address»), Ollama-forslag eller ved
+    omskriving av enkeltverdier."""
+    from siard_workflow.core.anonymize.pii_detect import (
+        should_anonymize, looks_like_identifier, is_identifier_column,
+        is_identifier_field)
+    guids = ["9e7d823a-d64a-4374-ac3a-8a293064ccd0",
+             "728398ba-6cd9-4251-97e1-1d99912dd4bf",
+             "{4a72cb40-3d99-4ad2-9e16-8b59c32b92f0}"]
+    # Verdinivå
+    for g in guids:
+        assert looks_like_identifier(g), g
+    assert looks_like_identifier("a3f5c9e2b1d4f6a7c8e9")            # hex-nøkkel
+    assert looks_like_identifier("0x1F2E3D4C5B6A7988")               # hex med prefiks
+    assert looks_like_identifier("1234567")                          # løpenr
+    assert looks_like_identifier("1234-5678-90")                     # kontonr-form
+    assert looks_like_identifier("K-2024-00017")                     # saksnøkkel
+    assert looks_like_identifier("AB12345")
+    assert looks_like_identifier("dGhpcyBpcyBhIGtleQ==1234")          # base64-aktig
+    assert not looks_like_identifier("Storgata 1")
+    assert not looks_like_identifier("Fiktivveien 75")
+    assert not looks_like_identifier("Ola Nordmann")
+    assert not looks_like_identifier("Hansen")
+    assert not looks_like_identifier("Oslo")
+    assert not looks_like_identifier("Schweigaards gate 4B")
+    # Per-verdi-vakt ved omskriving
+    assert should_anonymize(PiiType.ADDRESS, guids[0]) is False
+    assert should_anonymize(PiiType.CITY, guids[1]) is False
+    assert should_anonymize(PiiType.FULL_NAME, "a3f5c9e2b1d4f6a7c8e9") is False
+    assert should_anonymize(PiiType.ADDRESS, "Storgata 1") is True
+    # Kolonnenavn
+    assert is_identifier_field("addressRootEntityId")
+    assert is_identifier_field("PersonGuid") and is_identifier_field("Adresse_ID")
+    assert is_identifier_field("ForeignKey") and is_identifier_field("SakRef")
+    assert not is_identifier_field("Adresse") and not is_identifier_field("Navn")
+    assert not is_identifier_field("Sluttid") and not is_identifier_field("Fritid")
+    # Kolonneklassifisering: det rammede tilfellet
+    cc = classify_column("addressRootEntityId", guids)
+    assert cc.pii_type == PiiType.OTHER and cc.source == "identifikator", cc
+    # Adressekolonne med GUID-verdier (navn uten Id-endelse) → verdiene avgjør
+    assert classify_column("Adresse", guids).pii_type == PiiType.OTHER
+    assert is_identifier_column(guids)
+    # Ekte adressekolonne påvirkes ikke
+    assert classify_column("Adresse", ["Storgata 1", "Kirkeveien 12"]).pii_type == PiiType.ADDRESS
+    # Navnekolonne med hash-verdier → OTHER; med navn → navn
+    assert classify_column("Navn", ["a3f5c9e2b1d4f6a7c8e9", "b4e6d0f3c2e5a7b8d9f0"]).pii_type == PiiType.OTHER
+    assert classify_column("Fornavn", ["Ola", "Kari"]).pii_type == PiiType.FIRST_NAME
+    # Verdibasert PII vinner over navnevakten: gyldige fnr i «PersonId» er PII
+    f1, f2 = fake_fnr("01010099991"), fake_fnr("02020099992")
+    assert classify_column("PersonId", [f1, f2]).pii_type == PiiType.FNR
+    assert classify_column("KontaktId", ["a@b.no", "c@d.no"]).pii_type == PiiType.EMAIL
+    # Postnr-vakt uendret (rene 4 sifre skal fortsatt kunne anonymiseres som postnr)
+    assert should_anonymize(PiiType.POSTNR, "0301") is True
+
+
 def test_new_keywords_and_exact_match():
     assert classify_column("Adresse 2", []).pii_type == PiiType.ADDRESS
     assert classify_column("Veinavn", []).pii_type == PiiType.ADDRESS
@@ -653,6 +709,7 @@ def _selftest():
     test_email_value_guard();              print("  ✓ e-post-verdivakt")
     test_city_address_require_letters();   print("  ✓ sted/adresse krever bokstaver")
     test_new_keywords_and_exact_match();   print("  ✓ nye nøkkelord + eksaktmatch")
+    test_identifier_guard();               print("  ✓ identifikator-vakt (GUID/nøkler endres aldri)")
     test_name_column_gate_rejects_nonnames(); print("  ✓ navn-gate avviser falske treff")
     test_freetext_name_spans();            print("  ✓ fritekst navn-spenn (også omvendt)")
     test_looks_like_person_name();         print("  ✓ verdi-heuristikk personnavn")

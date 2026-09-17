@@ -21,6 +21,7 @@ def _op_map() -> dict:
     from siard_workflow.operations.dias_package_operation import DiasPackageOperation
     from siard_workflow.operations.lobfolder_fix_operation import LobFolderFixOperation
     from siard_workflow.operations.segfolder_fix_operation import SegFolderFixOperation
+    from siard_workflow.operations.xsd_type_fix_operation import XsdTypeFixOperation
     from siard_workflow.operations.siardmapper_operation import SiardMapperOperation
     from siard_workflow.systemspecific_operations.cosdoc_operation import (
         CosDocMailMergeOperation,
@@ -39,6 +40,7 @@ def _op_map() -> dict:
         "dias_package":       DiasPackageOperation,
         "lobfolder_fix":      LobFolderFixOperation,
         "segfolder_fix":      SegFolderFixOperation,
+        "xsd_type_fix":       XsdTypeFixOperation,
         "siardmapper":        SiardMapperOperation,
     }
 

@@ -298,6 +298,68 @@ def is_excluded_field(col_name: str) -> bool:
     return bool(norm) and any(x in norm for x in _EXCLUDE_FIELDS)
 
 
+# ── Identifikator-vakt ────────────────────────────────────────────────────────
+# GUID/UUID, hash-er, nøkler og løpenumre er ikke persondata og skal ALDRI
+# skrives om — de bærer relasjonene i uttrekket. Rammet tilfelle (2026-09-17):
+# «addressRootEntityId» med GUID-verdier ble navnematchet på «address» og fikk
+# «Fiktivveien 75». Vakten virker på tre nivåer: kolonnenavn (…Id/…Guid/…Key),
+# kolonneverdier (andel identifikator-lignende) og per verdi ved omskriving.
+_UUID_RE = re.compile(
+    r"^\{?[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}?$")
+_HEX_RE  = re.compile(r"^(?:0x)?[0-9A-Fa-f]{12,}$")          # hash/hex-nøkkel
+_TOKEN_RE = re.compile(r"^[A-Za-z0-9._\-:/+=]+$")           # ett token uten mellomrom
+
+# Kolonnenavn-endelser som betegner nøkler/identifikatorer (normalisert navn).
+_ID_FIELD_SUFFIXES = ("id", "guid", "uuid", "key", "ref", "nokkel", "nøkkel",
+                      "fk", "pk", "identifier")
+# «…id» som IKKE er identifikator (tid, fritid, sluttid …)
+_ID_FIELD_NOT = ("tid",)
+
+
+def looks_like_identifier(value: str) -> bool:
+    """
+    True for verdier som er identifikatorer, ikke persondata:
+      • GUID/UUID (med eller uten klammer), hex-nøkler/hash-er (≥ 12 hex-tegn)
+      • rene tall (løpenr, kontonr, koder — evt. med bindestrek/mellomrom)
+      • ett token uten mellomrom der ≥ 30 % er sifre (AB12345, K-2024-001)
+        eller som er ≥ 20 tegn langt og inneholder sifre (base64-aktige nøkler)
+    Personnavn og adresser har mellomrom og/eller nesten ingen sifre.
+    """
+    v = (value or "").strip()
+    if not v:
+        return False
+    if _UUID_RE.match(v) or _HEX_RE.match(v):
+        return True
+    compact = v.replace("-", "").replace(" ", "").replace(".", "")
+    if compact.isdigit():
+        return True
+    if " " not in v and _TOKEN_RE.match(v):
+        n_dig = sum(ch.isdigit() for ch in v)
+        if n_dig and (n_dig / len(v) >= 0.3 or len(v) >= 20):
+            return True
+    return False
+
+
+def is_identifier_column(values: "list[str]") -> bool:
+    """True hvis minst halvparten av (ikke-tomme) verdiene er identifikatorer."""
+    vals = [v for v in (values or []) if v and v.strip()]
+    return bool(vals) and _ratio(vals, looks_like_identifier) >= 0.5
+
+
+def is_identifier_field(col_name: str) -> bool:
+    """
+    True hvis kolonnenavnet betegner en nøkkel/identifikator (…Id, …Guid,
+    …Key, …Ref, EntityId …). Slike kolonner får ingen navnebasert PII-
+    klassifisering; verdibasert deteksjon (gyldig fnr, e-post) gjelder fortsatt.
+    """
+    norm = _norm_col(col_name)
+    if not norm:
+        return False
+    if any(norm.endswith(x) for x in _ID_FIELD_NOT):
+        return False
+    return any(norm.endswith(x) for x in _ID_FIELD_SUFFIXES) or "guid" in norm or "uuid" in norm
+
+
 # Spesifikke navne-nøkkelord som er entydig personnavn (skal IKKE trenge
 # innholdssjekk). Generiske treff ("navn"/"name"/"person" osv.) er tvetydige —
 # f.eks. NavnBM/NavnNN/FagNavn er felt-/skjematitler, ikke personnavn.
@@ -507,11 +569,19 @@ def classify_column(col_name: str, sample_values: "list[str]",
     if vals and _ratio(vals, looks_like_filename) >= 0.5:
         return ColumnClass(PiiType.OTHER, "filename")
 
-    if norm and not any(ff in norm for ff in _NAME_FALSE_FRIENDS):
+    # Identifikatorer: nøkkelkolonner (…Id/…Guid/…Key) og kolonner med GUID/
+    # hash/løpenr-verdier får ingen navnebasert klassifisering. Verdibasert
+    # fnr-/e-postdeteksjon under gjelder fortsatt (et fnr i «PersonId» er PII).
+    id_field  = is_identifier_field(col_name)
+    id_values = is_identifier_column(vals)
+
+    if norm and not id_field and not any(ff in norm for ff in _NAME_FALSE_FRIENDS):
         for ptype, kws in _HEUR_ORDER:
             if any(_kw_match(kw, norm) for kw in kws):
-                # Navn-/sted-/adressetreff, men verdiene er numeriske → dette er
-                # en kode (f.eks. KommuneNr), ikke et navn. La kolonnen stå.
+                # Navn-/sted-/adressetreff, men verdiene er koder/identifikatorer
+                # (KommuneNr, GUID i «addressRootEntityId» …) → la kolonnen stå.
+                if ptype in (_NAMEISH | {PiiType.FREE_TEXT}) and id_values:
+                    break
                 if ptype in _NAMEISH and vals \
                         and _ratio(vals, lambda v: v.strip().isdigit()) >= 0.7:
                     break
@@ -535,6 +605,11 @@ def classify_column(col_name: str, sample_values: "list[str]",
         # Fritekst som faktisk INNEHOLDER innebygd PII (fnr/e-post/postnr)
         if _ratio(vals, lambda v: bool(find_all_pii(v))) >= 0.3:
             return ColumnClass(PiiType.FREE_TEXT, "value")
+
+    # Identifikator-kolonne uten verdibasert PII-treff → aldri anonymiser, og
+    # spør ikke Ollama (som gjerne foreslår «adresse» for GUID-er).
+    if id_field or id_values:
+        return ColumnClass(PiiType.OTHER, "identifikator")
 
     # Tvetydig — spør lokal Ollama hvis tilgjengelig
     if ollama is not None:
@@ -579,9 +654,10 @@ def should_anonymize(pii_type: PiiType, value: str) -> bool:
         return _looks_email(v)
     if pii_type in (PiiType.CITY, PiiType.ADDRESS):
         # Sted/adresse må inneholde bokstaver — beskytter rene tallkoder
-        # (f.eks. KommuneNr/VigoNr som Ollama av og til feilflagger som sted).
-        return any(ch.isalpha() for ch in v)
+        # (f.eks. KommuneNr/VigoNr som Ollama av og til feilflagger som sted) —
+        # og må ikke være en identifikator (GUID/hash/kode).
+        return any(ch.isalpha() for ch in v) and not looks_like_identifier(v)
     if pii_type in (PiiType.FIRST_NAME, PiiType.LAST_NAME, PiiType.FULL_NAME):
         # Endre kun verdier som faktisk har personnavn-form (ikke koder/etiketter)
-        return looks_like_person_name(v)
+        return looks_like_person_name(v) and not looks_like_identifier(v)
     return True

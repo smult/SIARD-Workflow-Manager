@@ -608,6 +608,12 @@ def _conversion_comment(version: str = "?") -> bytes:
             f" / {ts} / {hostname}-->\r\n").encode("utf-8")
 
 
+from siard_workflow.core.lob_naming import (
+    lob_file_stem as _lob_file_stem,
+    dbptk_names_enabled as _dbptk_names_enabled,
+)
+
+
 def _get_standardize_bin_ext() -> bool:
     """Les 'standardize_bin_ext' fra config.json (default True)."""
     try:
@@ -4946,15 +4952,18 @@ class BlobConvertOperation(BaseOperation):
 
         counter[0] += 1
         lob_counter = counter[0]
+        # Filnavn: recordN når dbptk_lob_names er på (DBPTK-validator P_4.2-3),
+        # ellers historisk recN / LOBnnnn.
         if lob_folder:
             lob_dir  = lob_folder
-            filename = f"rec{lob_counter}.{ext}"
+            filename = f"{_lob_file_stem(lob_counter, 'rec')}.{ext}"
         elif is_wpt_inline:
             lob_dir  = f"{base_path}/lob{wpt_col_idx}"
-            filename = f"rec{lob_counter}.{ext}"
+            filename = f"{_lob_file_stem(lob_counter, 'rec')}.{ext}"
         else:
             lob_dir  = f"{base_path}/lob{lob_counter}"
-            filename = f"LOB{lob_counter:04d}.{ext}"
+            filename = (f"record{lob_counter}.{ext}" if _dbptk_names_enabled()
+                        else f"LOB{lob_counter:04d}.{ext}")
         zip_sti_lob = f"{lob_dir}/{filename}"
 
         write_lob(zip_sti_lob, file_bytes)

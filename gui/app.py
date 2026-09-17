@@ -6,6 +6,7 @@ import sys
 import threading
 import queue
 import datetime
+import time
 from pathlib import Path
 
 import customtkinter as ctk
@@ -210,6 +211,9 @@ class App(ctk.CTk):
         self._auto_log_dir: Path | None = None
         self._global_temp_dir: Path | None = None
         self._output_dir_override: str = ""   # satt av preflight hvis output-disk har lite plass
+        self._preflight_active: bool = False
+        self._preflight_lines: list = []      # (nivå, melding) — kopieres til fil-loggen
+        self._pf_status: str | None = None
         self._conv_ctx = None
         self._stop_event        = threading.Event()
         self._pause_event       = threading.Event()
@@ -271,6 +275,9 @@ class App(ctk.CTk):
 
         self.format_chart = FormatChartPanel(left)
         self.format_chart.grid(row=2, column=0, padx=10, pady=(0, 10), sticky="ew")
+        # Skjult til det finnes formatdata — workflow-listen får høyden.
+        # Panelet viser/skjuler seg selv ved update_format()/reset().
+        self.format_chart.grid_remove()
 
         right = ctk.CTkFrame(self, fg_color="transparent")
         right.grid(row=1, column=1, padx=(6,12), pady=(0,0), sticky="nsew")
@@ -430,7 +437,7 @@ class App(ctk.CTk):
         ctk.CTkLabel(frm, text="SIARD-KØ",
                      font=ctk.CTkFont(family=FONTS["mono"], size=11, weight="bold"),
                      text_color=COLORS["muted"]).grid(
-                         row=0, column=0, sticky="w", padx=10, pady=(6, 2))
+                         row=0, column=0, sticky="w", padx=10, pady=(4, 0))
 
         # Drag-drop-felt
         self._drop_zone = ctk.CTkLabel(
@@ -441,8 +448,8 @@ class App(ctk.CTk):
             fg_color=COLORS["dropzone"],
             corner_radius=6,
             wraplength=180,
-            height=52)
-        self._drop_zone.grid(row=1, column=0, padx=8, pady=(2, 4), sticky="ew")
+            height=38)
+        self._drop_zone.grid(row=1, column=0, padx=8, pady=(2, 2), sticky="ew")
         # Oppdater wraplength én gang etter at layout er ferdig — unngår Configure-loop
         self.after(200, self._update_dropzone_wrap)
 
@@ -451,10 +458,20 @@ class App(ctk.CTk):
         self._setup_dnd()
 
         # Kø-liste
+        # Kompakt: kø-panelet deler venstrekolonnen med workflow-listen,
+        # som skal ha mest mulig av høyden.
+        _QUEUE_LIST_H = 90   # ~3 kø-rader før rulling
         self._queue_frame = ctk.CTkScrollableFrame(
-            frm, fg_color="transparent", height=100,
+            frm, fg_color="transparent", height=_QUEUE_LIST_H,
             scrollbar_button_color=COLORS["border"])
-        self._queue_frame.grid(row=2, column=0, padx=4, pady=(0, 6), sticky="ew")
+        # CTkScrollbar ber om 200 px høyde som standard, og CTkScrollableFrame
+        # vokser til rullefeltets ønskede høyde uavhengig av `height`. Uten
+        # dette ble kø-listen ~270 px (skalert) — sett rullefeltet eksplisitt.
+        try:
+            self._queue_frame._scrollbar.configure(height=_QUEUE_LIST_H)
+        except Exception:
+            pass
+        self._queue_frame.grid(row=2, column=0, padx=4, pady=(0, 4), sticky="ew")
         self._queue_frame.grid_columnconfigure(0, weight=1)
 
         self._queue_rows: list[ctk.CTkFrame] = []
@@ -1387,6 +1404,49 @@ class App(ctk.CTk):
 
     # ─── Kjoring ──────────────────────────────────────────────────────────────
 
+    def _pf(self, status: str) -> None:
+        """Sett resultattekst for gjeldende preflight-steg (vises i loggen)."""
+        self._pf_status = status
+
+    @staticmethod
+    def _ops_signature(ops: list) -> list:
+        return [(op.operation_id, sorted((k, repr(v)) for k, v in op.params.items()))
+                for op in ops]
+
+    def _run_preflight_step(self, label: str, fn, ops: list) -> bool:
+        """
+        Kjør ett preflight-steg med tilbakemelding i logg og statuslinje:
+        «▸ <steg> …» før, og «<resultat> (t s)» etter. Resultatet settes av
+        steget via _pf(); uten det brukes «ingen funn» (True) / «avbrutt»
+        (False), eller «arbeidsflyten oppdatert» hvis operasjonene endret seg.
+        """
+        self._pf_status = None
+        self._log(f"  ▸ {label} …", "info")
+        self._update_status_right(f"Preflight: {label} …")
+        self.update_idletasks()
+        before = self._ops_signature(ops)
+        t0 = time.monotonic()
+        try:
+            ok = bool(fn(ops))
+        except Exception as exc:
+            self._log(f"    FEIL i preflight «{label}»: {exc} — hopper over steget", "error")
+            return True
+        after = self._ops_signature(list(self.workflow_panel.get_operations()))
+        status = self._pf_status
+        if status is None:
+            if not ok:
+                status = "avbrutt av operatør"
+            elif after != before:
+                status = "funn — arbeidsflyten oppdatert (se over)"
+            else:
+                status = "ingen funn"
+        elif ok and after != before and "lagt til" not in status and "slått på" not in status:
+            status += " — arbeidsflyten oppdatert"
+        lvl = "muted" if ok and status.startswith(("ingen funn", "ikke aktuelt", "allerede")) \
+              else ("ok" if ok else "warn")
+        self._log(f"    {status} ({time.monotonic() - t0:.1f} s)", lvl)
+        return ok
+
     def _pipeline_preflight(self, ops: list) -> bool:
         """
         Sjekker om workflow inneholder operasjoner som krever utpakket SIARD
@@ -1400,12 +1460,14 @@ class App(ctk.CTk):
 
         needs_unpack = [op for op in ops if getattr(op, "requires_unpack", False)]
         if not needs_unpack:
+            self._pf("ikke aktuelt (ingen operasjoner krever utpakking)")
             return True   # ingen operasjoner krever utpakking
 
         has_unpack = any(isinstance(op, UnpackSiardOperation) for op in ops)
         has_repack = any(isinstance(op, RepackSiardOperation) for op in ops)
 
         if has_unpack and has_repack:
+            self._pf("allerede på plass (Pakk ut + Pakk sammen)")
             return True   # allerede konfigurert korrekt
 
         missing = []
@@ -1444,13 +1506,16 @@ class App(ctk.CTk):
             self._log(
                 "Pipeline-operasjoner lagt til: 'Pakk ut SIARD' og/eller "
                 "'Pakk sammen SIARD' — klikk Kjør for å starte.", "ok")
+            self._pf("operasjoner lagt til — klikk Kjør på nytt")
             return False   # stopp denne kjøringen; bruker klikker Kjør på nytt
 
         if dialog.result == "nei":
             # Fortsett uten pipeline-operasjoner (gammel ZIP-modus)
+            self._pf("operatøren fortsetter i ZIP-modus uten pipeline")
             return True
 
         # Avbrutt
+        self._pf("avbrutt av operatør")
         return False
 
     def _lobfolder_preflight(self, ops: list) -> bool:
@@ -1467,10 +1532,12 @@ class App(ctk.CTk):
 
         # Kun relevant i pipeline-modus
         if not any(isinstance(op, UnpackSiardOperation) for op in ops):
+            self._pf("ikke aktuelt (krever «Pakk ut SIARD»)")
             return True
 
         # Allerede lagt til — ikke spør igjen
         if any(isinstance(op, LobFolderFixOperation) for op in ops):
+            self._pf(f"«Korriger lobFolder» allerede i arbeidsflyten")
             return True
 
         # Rask skanning av SIARD-filene i køen
@@ -1482,6 +1549,8 @@ class App(ctk.CTk):
 
         if not all_issues:
             return True
+        self._pf(f"{sum(len(v) for v in all_issues.values())} funn i "
+                 f"{len(all_issues)} fil(er) — spør operatøren")
 
         lines = [
             "lobFolder-inkompatibiliteter ble oppdaget i SIARD-filen(e).\n",
@@ -1505,13 +1574,114 @@ class App(ctk.CTk):
             self.workflow_panel.insert_operation_after(
                 LobFolderFixOperation(), "unpack_siard")
             self._log(
-                "«Rett lobFolder (SCFC→DBPTK)» lagt til etter «Pakk ut SIARD»",
+                "«Korriger lobFolder (SCFC→DBPTK)» lagt til etter «Pakk ut SIARD»",
                 "ok")
+            self._pf("funn — «Korriger lobFolder» lagt til")
             return True  # ops re-hentes av kalleren
 
         if dialog.result == "nei":
+            self._pf((self._pf_status or "funn") + " → operatøren fortsetter uten retting")
             return True  # operatøren avslo — fortsett uten
 
+        self._pf("avbrutt av operatør")
+        return False  # avbrutt
+
+    def _lob_fullpath_preflight(self, ops: list) -> bool:
+        """
+        Skanner (stikkprøve) file=-referansene slik DBPTK-validatoren slår dem
+        opp (A_M_5.6-1-2: "content/" + lobFolder + file uten skilletegn).
+        Basenavn-referanser gir «not found external lob» for hver LOB selv om
+        filene finnes. Tilbyr å slå på «Full sti i file=» i «Korriger
+        lobFolder» (legges til om den mangler).
+
+        Valget er et reelt avveiningsspørsmål — KDRS Søk & Vis forventer
+        basenavn — og gjøres derfor alltid av operatøren.
+
+        Returnerer True = fortsett kjøring, False = avbryt.
+        """
+        from siard_workflow.operations import UnpackSiardOperation
+        from siard_workflow.operations.lobfolder_fix_operation import (
+            LobFolderFixOperation, scan_lob_ref_issues)
+
+        # Kun relevant i pipeline-modus
+        if not any(isinstance(op, UnpackSiardOperation) for op in ops):
+            self._pf("ikke aktuelt (krever «Pakk ut SIARD»)")
+            return True
+
+        existing = next((op for op in ops if isinstance(op, LobFolderFixOperation)), None)
+        if existing is not None and existing.params.get("full_file_paths"):
+            self._pf("allerede valgt («Full sti i file=» er på)")
+            return True   # allerede valgt — ikke spør igjen
+
+        hits: dict = {}
+        n_missing = 0
+        for path in self.siard_queue:
+            lr = scan_lob_ref_issues(path)
+            if lr and lr.get("fixable"):
+                hits[path] = lr
+            n_missing += (lr or {}).get("missing", 0)
+        if not hits:
+            if n_missing:
+                self._pf(f"ingen rettbare funn; {n_missing:,} referanser til filer "
+                         f"som mangler (se «XML-validering»)")
+            return True
+        self._pf(f"{sum(lr['fixable'] for lr in hits.values()):,} referanser DBPTK ikke "
+                 f"slår opp (stikkprøve) — spør operatøren")
+
+        lines = [
+            "LOB-referansene bruker basenavn (file=\"recordN.txt\").\n",
+            "DBPTK-validatoren (A_M_5.6-1-2) limer \"content/\" + lobFolder + file",
+            "uten skilletegn, finner ikke filen og rapporterer «not found external",
+            "lob» for HVER LOB — selv om filene finnes i arkivet.\n",
+        ]
+        for path, lr in hits.items():
+            ex = next((c for c in lr["columns"] if c["fixable"]), None)
+            approx = "minst " if lr.get("sampled") else ""
+            lines.append(f"  {path.name}: {approx}{lr['fixable']:,} referanser i "
+                         f"{lr['tables_scanned']} tabell(er)")
+            if ex:
+                lines.append(f"    \u2022 f.eks. {ex['schema']}/{ex['table']} c{ex['col']}: "
+                             f"file=\"{ex['example_ref']}\" → {ex['example_full']}")
+        if n_missing:
+            lines.append(f"\n  I tillegg {n_missing:,} referanser til filer som ikke "
+                         f"finnes i arkivet (se «XML-validering»).")
+        lines += [
+            "",
+            "«Full sti i file=» skriver content/schemaN/tableM/lobK/recordN.ext og",
+            "passerer både DBPTK-validatoren og -importen.",
+            "MERK: KDRS Søk & Vis forventer basenavn — svar Ja bare hvis",
+            "DBPTK-validering er målet for denne filen.",
+            "",
+            ("Vil du slå på «Full sti i file=» i «Korriger lobFolder»?"
+             if existing is not None else
+             "Vil du legge til «Korriger lobFolder» med «Full sti i file=» "
+             "etter «Pakk ut SIARD»?"),
+        ]
+
+        dialog = _PipelineSuggestionDialog(self, "\n".join(lines))
+        dialog.title("LOB-referanser: DBPTK-validatoren finner dem ikke")
+        self.wait_window(dialog)
+
+        if dialog.result == "ja":
+            if existing is not None:
+                existing.params["full_file_paths"] = True
+                self._log("«Full sti i file=» slått på i «Korriger lobFolder» "
+                          "(DBPTK A_M_5.6-1-2)", "ok")
+                self._pf("funn — «Full sti i file=» slått på")
+            else:
+                op = LobFolderFixOperation()
+                op.params["full_file_paths"] = True
+                self.workflow_panel.insert_operation_after(op, "unpack_siard")
+                self._log("«Korriger lobFolder (SCFC→DBPTK)» med «Full sti i file=» "
+                          "lagt til etter «Pakk ut SIARD»", "ok")
+                self._pf("funn — «Korriger lobFolder» med full sti lagt til")
+            return True  # ops re-hentes av kalleren
+
+        if dialog.result == "nei":
+            self._pf((self._pf_status or "funn") + " → operatøren fortsetter uten retting")
+            return True  # operatøren avslo — fortsett uten
+
+        self._pf("avbrutt av operatør")
         return False  # avbrutt
 
     def _segfolder_preflight(self, ops: list) -> bool:
@@ -1529,16 +1699,19 @@ class App(ctk.CTk):
 
         # Kun relevant i pipeline-modus
         if not any(isinstance(op, UnpackSiardOperation) for op in ops):
+            self._pf("ikke aktuelt (krever «Pakk ut SIARD»)")
             return True
 
         # Allerede lagt til — ikke spør igjen
         if any(isinstance(op, SegFolderFixOperation) for op in ops):
+            self._pf(f"«Fjern LOB-segmentering» allerede i arbeidsflyten")
             return True
 
         # SIARD 2.2 tillater segmentering — kun relevant ved nedgradering til 2.1
         try:
             from siard_workflow.core.siard_format import get_target_siard_version
             if get_target_siard_version() != "2.1":
+                self._pf("ikke aktuelt (mål-versjon er ikke 2.1)")
                 return True
         except Exception:
             pass
@@ -1552,6 +1725,7 @@ class App(ctk.CTk):
 
         if not all_issues:
             return True
+        self._pf(f"segmentering i {len(all_issues)} fil(er) — spør operatøren")
 
         lines = [
             "SIARD 2.2 LOB-segmentering (seg_N-mapper) ble oppdaget.\n",
@@ -1579,11 +1753,100 @@ class App(ctk.CTk):
             self._log(
                 "«Fjern LOB-segmentering (SIARD 2.2→2.1)» lagt til etter "
                 "«Pakk ut SIARD»", "ok")
+            self._pf("funn — «Fjern LOB-segmentering» lagt til")
             return True  # ops re-hentes av kalleren
 
         if dialog.result == "nei":
+            self._pf((self._pf_status or "funn") + " → operatøren fortsetter uten retting")
             return True  # operatøren avslo — fortsett uten
 
+        self._pf("avbrutt av operatør")
+        return False  # avbrutt
+
+    def _xsd_type_preflight(self, ops: list) -> bool:
+        """
+        Skanner SIARD-filene for tableX.xsd-avvik DBPTK-validatoren avviser:
+        kolonnetyper som ikke stemmer med metadata.xml (P_4.3-3, typisk
+        FLOAT(53) med xs:float) og datofasetter på dateType/dateTimeType
+        (T_6.3-1). Tilbyr å sette inn XsdTypeFixOperation rett etter
+        UnpackSiardOperation når minst ett avvik kan rettes tapsfritt.
+
+        Returnerer True = fortsett kjøring, False = avbryt.
+        """
+        from siard_workflow.operations import UnpackSiardOperation
+        from siard_workflow.operations.xsd_type_fix_operation import XsdTypeFixOperation
+        from siard_workflow.core.column_xsd_types import (
+            scan_xsd_type_issues, format_finding)
+
+        # Kun relevant i pipeline-modus
+        if not any(isinstance(op, UnpackSiardOperation) for op in ops):
+            self._pf("ikke aktuelt (krever «Pakk ut SIARD»)")
+            return True
+
+        # Allerede lagt til — ikke spør igjen
+        if any(isinstance(op, XsdTypeFixOperation) for op in ops):
+            self._pf(f"«Rett tableX.xsd» allerede i arbeidsflyten")
+            return True
+
+        all_fixable: dict = {}
+        n_manual = 0
+        for path in self.siard_queue:
+            found = scan_xsd_type_issues(path)
+            fixable = [f for f in found if f.get("fix_to")]
+            n_manual += len(found) - len(fixable)
+            if fixable:
+                all_fixable[path] = fixable
+
+        if not all_fixable:
+            if n_manual:
+                self._pf(f"ingen rettbare funn; {n_manual} avvik krever manuell "
+                         f"vurdering (se «XML-validering»)")
+            return True
+        self._pf(f"{sum(len(v) for v in all_fixable.values())} rettbare avvik i "
+                 f"{len(all_fixable)} fil(er) — spør operatøren")
+
+        lines = [
+            "tableX.xsd avviker fra det DBPTK-validatoren krever.\n",
+            "P_4.3-3: kolonnetyper må stemme med metadata.xml (f.eks. xs:double",
+            "for FLOAT(p), ikke xs:float). T_6.3-1: dateType/dateTimeType må ha",
+            "DBPTKs eksakte minInclusive/maxExclusive (år 0001–9999).",
+            "Rettingene er tapsfrie — ingen verdier i tableX.xml endres, og",
+            "metadata.xml røres ikke.\n",
+        ]
+        MAX_LINES = 12
+        for path, issues in all_fixable.items():
+            lines.append(f"  {path.name}: {len(issues)} rettbare avvik")
+            for f in issues[:MAX_LINES]:
+                lines.append(f"    \u2022 {format_finding(f)}")
+            if len(issues) > MAX_LINES:
+                lines.append(f"    … og {len(issues) - MAX_LINES} til")
+        if n_manual:
+            lines.append(f"\n  I tillegg {n_manual} avvik som ikke kan rettes "
+                         f"automatisk (se «XML-validering»).")
+        lines += [
+            "",
+            "Vil du legge til «Rett tableX.xsd» automatisk etter "
+            "«Pakk ut SIARD»?",
+        ]
+
+        dialog = _PipelineSuggestionDialog(self, "\n".join(lines))
+        dialog.title("tableX.xsd avviker fra DBPTK-kravene")
+        self.wait_window(dialog)
+
+        if dialog.result == "ja":
+            self.workflow_panel.insert_operation_after(
+                XsdTypeFixOperation(), "unpack_siard")
+            self._log(
+                "«Rett tableX.xsd (DBPTK P_4.3-3 / T_6.3-1)» lagt til etter "
+                "«Pakk ut SIARD»", "ok")
+            self._pf("funn — «Rett tableX.xsd» lagt til")
+            return True  # ops re-hentes av kalleren
+
+        if dialog.result == "nei":
+            self._pf((self._pf_status or "funn") + " → operatøren fortsetter uten retting")
+            return True  # operatøren avslo — fortsett uten
+
+        self._pf("avbrutt av operatør")
         return False  # avbrutt
 
     def _metadata_quality_preflight(self, ops: list) -> bool:
@@ -1604,10 +1867,12 @@ class App(ctk.CTk):
 
         # Kun relevant i pipeline-modus
         if not any(isinstance(op, UnpackSiardOperation) for op in ops):
+            self._pf("ikke aktuelt (krever «Pakk ut SIARD»)")
             return True
 
         # Allerede lagt til — ikke spør igjen
         if any(isinstance(op, MetadataQualityOperation) for op in ops):
+            self._pf(f"«Rett metadata-kvalitet» allerede i arbeidsflyten")
             return True
 
         # Rask skanning av SIARD-filene i køen
@@ -1619,6 +1884,8 @@ class App(ctk.CTk):
 
         if not all_issues:
             return True
+        self._pf(f"{sum(len(v) for v in all_issues.values())} funn i "
+                 f"{len(all_issues)} fil(er) — spør operatøren")
 
         lines = [
             "Innholdsfeil i metadata.xml ble oppdaget.\n",
@@ -1646,11 +1913,14 @@ class App(ctk.CTk):
             self._log(
                 "«Rett metadata-kvalitet (dbname/datospenn)» lagt til etter "
                 "«Pakk ut SIARD»", "ok")
+            self._pf("funn — «Rett metadata-kvalitet» lagt til")
             return True  # ops re-hentes av kalleren
 
         if dialog.result == "nei":
+            self._pf((self._pf_status or "funn") + " → operatøren fortsetter uten retting")
             return True  # operatøren avslo — fortsett uten
 
+        self._pf("avbrutt av operatør")
         return False  # avbrutt
 
     def _report_preflight(self, ops: list) -> bool:
@@ -1663,6 +1933,7 @@ class App(ctk.CTk):
         from siard_workflow.operations import WorkflowReportOperation
 
         if any(isinstance(op, WorkflowReportOperation) for op in ops):
+            self._pf("allerede med i arbeidsflyten")
             return True   # allerede med
 
         msg = (
@@ -1681,11 +1952,14 @@ class App(ctk.CTk):
             self._log(
                 "'Kjørerapport (PDF)' lagt til sist i workflowen "
                 "— klikk Kjør for å starte.", "ok")
+            self._pf("rapport lagt til — klikk Kjør på nytt")
             return False   # stopp denne kjøringen; bruker klikker Kjør på nytt
 
         if dialog.result == "nei":
+            self._pf("operatøren vil ikke ha sluttrapport")
             return True   # brukeren vil ikke ha rapport — fortsett uten
 
+        self._pf("avbrutt av operatør")
         return False       # avbrutt
 
     def _disk_space_preflight(self, ops: list) -> bool:
@@ -1704,6 +1978,7 @@ class App(ctk.CTk):
 
         blob_ops = [op for op in ops if isinstance(op, BlobConvertOperation)]
         if not blob_ops:
+            self._pf("ikke aktuelt (ingen BLOB-konvertering)")
             return True
 
         self._output_dir_override = ""   # nullstill fra forrige kjøring
@@ -1735,6 +2010,9 @@ class App(ctk.CTk):
             except Exception:
                 pass
 
+        if not temp_warnings and not output_warnings:
+            self._pf(f"tilstrekkelig temp- og output-plass for "
+                     f"{len(self.siard_queue)} fil(er)")
         # ── Temp-advarsel ────────────────────────────────────────────────────
         if temp_warnings:
             lines: list[str] = [
@@ -1761,7 +2039,9 @@ class App(ctk.CTk):
                 "Lite temp-diskplass", "\n".join(lines),
                 icon="warning", default="no",
             ):
+                self._pf("avbrutt: for lite temp-plass")
                 return False
+            self._pf("lite temp-plass — operatøren fortsetter")
 
         # ── Output-advarsel ──────────────────────────────────────────────────
         if output_warnings:
@@ -1786,6 +2066,7 @@ class App(ctk.CTk):
                 mustexist=True,
             )
             if not chosen:
+                self._pf("avbrutt: ingen alternativ lagringsmappe valgt")
                 return False   # Bruker avbrøt mappe-velger
 
             # Verifiser at valgt mappe faktisk har nok plass
@@ -1799,11 +2080,13 @@ class App(ctk.CTk):
                         f"— trenger minst {format_bytes(worst_needed)}.\n"
                         "Velg en annen mappe eller rydd opp plass.",
                     )
+                    self._pf("avbrutt: valgt mappe har for lite plass")
                     return False
             except Exception:
                 pass
 
             self._output_dir_override = chosen
+            self._pf(f"lite output-plass — alternativ lagringsmappe: {chosen}")
 
         return True
 
@@ -1826,45 +2109,54 @@ class App(ctk.CTk):
                 parent=self)
             return
 
-        if not self._pipeline_preflight(ops):
-            return
-
-        # Re-hent ops etter preflight — pipeline_preflight kan ha lagt til
-        # UnpackSiardOperation og RepackSiardOperation i panelet
+        # ── Preflight: synlig i logg og statuslinje ──────────────────────────
+        # Hvert steg logges med navn, resultat og tidsbruk. Steg som endrer
+        # arbeidsflyten (eller stopper kjøringen) logger det selv; dialoger
+        # vises kun ved funn. Ops re-hentes mellom stegene siden et steg kan
+        # ha lagt til eller endret operasjoner.
+        self.log_panel.clear()
+        self._log_entries.clear()
+        self._preflight_lines = []
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._log("=" * 56, "muted")
+        self._log(f"Preflight {ts} — {len(self.siard_queue)} fil(er), "
+                  f"{len(ops)} operasjon(er)", "step")
+        self._log("  Sjekker køen før kjøring. Dialog vises bare ved funn.", "muted")
+        self._preflight_active = True
+        self._status_spinner.configure(text="⏳")
+        t_pf = time.monotonic()
+        steps = [
+            ("Pipeline-modus (Pakk ut / Pakk sammen)",     self._pipeline_preflight),
+            ("lobFolder (SCFC→DBPTK)",                     self._lobfolder_preflight),
+            ("LOB-referanser (DBPTK A_M_5.6-1-2)",         self._lob_fullpath_preflight),
+            ("LOB-segmentering (SIARD 2.2→2.1)",           self._segfolder_preflight),
+            ("tableX.xsd (DBPTK P_4.3-3 / T_6.3-1)",       self._xsd_type_preflight),
+            ("Metadata-kvalitet (dbname/datospenn)",       self._metadata_quality_preflight),
+            ("Sluttrapport (PDF)",                         self._report_preflight),
+            ("Diskplass (temp/output)",                    self._disk_space_preflight),
+        ]
+        try:
+            for label, fn in steps:
+                ops = list(self.workflow_panel.get_operations())
+                if not self._run_preflight_step(label, fn, ops):
+                    self._log("Kjøringen startes ikke.", "warn")
+                    self._update_status_right("Preflight: kjøring ikke startet")
+                    return
+        finally:
+            self._preflight_active = False
+            if not self._running:
+                self._status_spinner.configure(text=" ")
+        self._log(f"Preflight ferdig ({time.monotonic() - t_pf:.1f} s) — starter kjøring",
+                  "ok")
+        self._update_status_right("Preflight ferdig — starter kjøring")
+        self.update_idletasks()
+        # Kopi til fil-loggen(e) som opprettes per SIARD i arbeidstråden
+        self._preflight_lines = list(self._log_entries)
         ops = list(self.workflow_panel.get_operations())
-
-        if not self._lobfolder_preflight(ops):
-            return
-
-        # Re-hent ops i tilfelle lobfolder_fix ble lagt til
-        ops = list(self.workflow_panel.get_operations())
-
-        if not self._segfolder_preflight(ops):
-            return
-
-        # Re-hent ops i tilfelle segfolder_fix ble lagt til
-        ops = list(self.workflow_panel.get_operations())
-
-        if not self._metadata_quality_preflight(ops):
-            return
-
-        # Re-hent ops i tilfelle metadata_quality ble lagt til
-        ops = list(self.workflow_panel.get_operations())
-
-        if not self._report_preflight(ops):
-            return
-
-        # Re-hent ops igjen i tilfelle rapport-operasjon ble lagt til
-        ops = list(self.workflow_panel.get_operations())
-
-        if not self._disk_space_preflight(ops):
-            return
 
         self._running = True
         self._current_run = None
         self.workflow_panel.set_running(True)
-        self.log_panel.clear()
-        self._log_entries.clear()
 
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._log("=" * 56, "muted")
@@ -2024,6 +2316,15 @@ class App(ctk.CTk):
                 file_logger = WorkflowFileLogger(log_dir, path.stem)
                 file_logger.__enter__()
                 ctx.metadata["file_logger"] = file_logger
+                # Preflight kjørte på hovedtråden før fil-loggen fantes —
+                # skriv den inn først, så loggfilen viser hva som ble sjekket.
+                _pf_lines = getattr(self, "_preflight_lines", None) or []
+                if _pf_lines:
+                    # GUI-nivåer og fil-loggerens LEVELS deler nøkler
+                    # (info/step/success/warn/error/muted); "ok" → success.
+                    for _lvl, _msg in _pf_lines:
+                        file_logger.log(_msg, "success" if _lvl == "ok" else _lvl)
+                    file_logger.log("", "info")
             except Exception:
                 pass
 
@@ -2538,8 +2839,10 @@ class App(ctk.CTk):
             from tkinter import messagebox
             ans = messagebox.askyesno(
                 "Ikke-standard LOB-filer funnet",
-                f"{count} LOB-fil(er) har ikke .bin-endelse.\n\n"
-                "Dette kan gi utfordringer i innsynsprogramvaren KDRS Søk & Vis.\n\n"
+                f"{count} LOB-fil(er) har ikke .bin/.txt-endelse eller "
+                f"heter ikke recordN.\n\n"
+                "Ikke-standard endelser kan gi utfordringer i KDRS Søk & Vis; "
+                "andre filnavn enn recordN underkjennes av DBPTK-validatoren.\n\n"
                 "Vil du legge til «Standardiser filendelser» i arbeidsflyten?",
                 parent=self)
             result_holder[0] = bool(ans)

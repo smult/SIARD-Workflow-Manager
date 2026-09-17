@@ -458,6 +458,14 @@ class SettingsDialog(ctk.CTkToplevel):
                      text_color=COLORS["muted"]).grid(
                          row=r, column=0, columnspan=2,
                          padx=14, pady=(0, 4), sticky="w"); r += 1
+        _rad("Standardiser LOB-filnavn til recordN",
+             "dbptk_lob_names", "bool", r, default=True); r += 1
+        ctk.CTkLabel(frm,
+                     text="Nye og omdøpte LOB-filer navngis recordN.bin/.txt — krav i DBPTK-validatoren (P_4.2-3)",
+                     font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                     text_color=COLORS["muted"]).grid(
+                         row=r, column=0, columnspan=2,
+                         padx=14, pady=(0, 4), sticky="w"); r += 1
 
         # ── SIARD-pakking (ZIP-kompresjon) ──────────────────────────────────
         _seksjon("SIARD-pakking", r); r += 1

@@ -170,12 +170,22 @@ class UnpackSiardOperation(BaseOperation):
         except Exception as exc:
             w(f"  Advarsel: kunne ikke sanere schema-navn: {exc}", "warn")
 
-        # ── Sjekk for ikke-standard LOB-filendelser ────────────────────────────
-        non_std = self._count_non_standard_lob_files(tmp)
-        if non_std > 0:
-            w(f"  ADVARSEL: {non_std} LOB-fil(er) med ikke-standard endelse "
+        # ── Sjekk for ikke-standard LOB-filendelser og -filnavn ───────────────
+        from siard_workflow.operations.standardize_ext_operation import (
+            count_non_standard_lob_files as _count_lob)
+        from siard_workflow.core.lob_naming import dbptk_names_enabled
+        non_ext, non_name = _count_lob(tmp)
+        if not dbptk_names_enabled():
+            non_name = 0
+        non_std = non_ext + non_name
+        if non_ext > 0:
+            w(f"  ADVARSEL: {non_ext} LOB-fil(er) med ikke-standard endelse "
               f"(ikke .bin/.txt) funnet. Kan gi utfordringer i KDRS Søk & Vis.",
               "warn")
+        if non_name > 0:
+            w(f"  ADVARSEL: {non_name} LOB-fil(er) heter ikke recordN.* "
+              f"(krav i DBPTK-validatoren P_4.2-3).", "warn")
+        if non_std > 0:
             ask_cb = ctx.metadata.get("ask_standardize_cb")
             if ask_cb:
                 try:

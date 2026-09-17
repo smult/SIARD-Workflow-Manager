@@ -49,6 +49,8 @@ class XMLValidationOperation(BaseOperation):
         "required_elements": ["dbName", "databaseProduct", "tables"],
         "check_table_xsd":   True,
         "check_table_xml":   True,   # parse hver tableX.xml for velformethet
+        "check_column_types": True,  # tableX.xsd: typer (P_4.3-3) + datofasetter (T_6.3-1)
+        "check_lob_refs":     True,  # file=-referanser slik DBPTK-validatoren slår dem opp (A_M_5.6-1-2)
     }
 
     _METADATA_PATHS = ["header/metadata.xml", "metadata.xml"]
@@ -138,6 +140,59 @@ class XMLValidationOperation(BaseOperation):
                             missing_xsd += 1
                     if not xml_files:
                         warnings.append("Ingen tableX.xml-filer funnet i Content/")
+
+                # ── 4b. Kolonnetyper metadata.xml ↔ tableX.xsd (P_4.3-3) ─────
+                if self.params.get("check_column_types", True):
+                    from siard_workflow.core.column_xsd_types import (
+                        check_zip as _check_types, format_finding as _fmt,
+                        rule_code as _rule)
+                    try:
+                        findings = _check_types(zf)
+                    except Exception as e:
+                        findings = []
+                        warnings.append(f"Kolonnetypesjekk feilet: {e}")
+                    else:
+                        if not findings:
+                            ok_msgs.append("tableX.xsd: kolonnetyper konsistente med "
+                                           "metadata.xml (P_4.3-3) og datofasetter "
+                                           "som DBPTK krever (T_6.3-1)")
+                    for f in findings:
+                        line = f"{_rule(f)} {_fmt(f)}"
+                        if f.get("fix_to"):
+                            line += " (rettes av «Rett tableX.xsd»)"
+                        errors.append(line)
+
+                # ── 4c. LOB-referanser slik DBPTK slår dem opp (A_M_5.6-1-2) ─
+                if self.params.get("check_lob_refs", True):
+                    from siard_workflow.operations.lobfolder_fix_operation import (
+                        check_lob_refs as _check_refs,
+                        describe_lob_ref_column as _describe_col)
+                    try:
+                        lr = _check_refs(zf)
+                    except Exception as e:
+                        lr = None
+                        warnings.append(f"LOB-referansekontroll feilet: {e}")
+                    if lr and lr["refs"]:
+                        if not lr["dbptk_fail"]:
+                            ok_msgs.append(
+                                f"LOB-referanser: {lr['refs']:,} file=-referanser i "
+                                f"{lr['tables_scanned']} tabell(er) slås opp av "
+                                f"DBPTK-validatoren (A_M_5.6-1-2)")
+                        else:
+                            for c in lr["columns"]:
+                                if c["dbptk_fail"]:
+                                    errors.append(f"A_M_5.6-1-2 {_describe_col(c)}")
+                            if lr["fixable"]:
+                                errors.append(
+                                    f"A_M_5.6-1-2 oppsummert: {lr['fixable']:,} referanser "
+                                    f"gir «not found external lob» i DBPTK-validatoren "
+                                    f"selv om filene finnes. Kjør «Korriger lobFolder» "
+                                    f"med «Full sti i file=» hvis DBPTK-validering er "
+                                    f"målet (KDRS Søk & Vis forventer basenavn).")
+                            if lr["missing"]:
+                                errors.append(
+                                    f"A_M_5.6-1-2 oppsummert: {lr['missing']:,} LOB-fil(er) "
+                                    f"finnes ikke i arkivet — kan ikke rettes automatisk")
 
                 # ── 5. Velformethet av tableX.xml ────────────────────────────
                 if self.params["check_table_xml"]:

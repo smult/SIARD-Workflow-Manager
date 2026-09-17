@@ -23,7 +23,7 @@ from siard_workflow.operations import (
     WorkflowReportOperation, DiasPackageOperation,
     LobFolderFixOperation, SegFolderFixOperation, SiardMapperOperation,
     StandardizeExtOperation, DepotReportsOperation,
-    MetadataQualityOperation,
+    MetadataQualityOperation, XsdTypeFixOperation,
 )
 from siard_workflow.systemspecific_operations import CosDocMailMergeOperation
 from settings import save_op_params, save_config, get_config, _SETTINGS_FILE
@@ -602,11 +602,40 @@ OP_DEFS = [
             "som hindrer LOB-indeksering i DBPTK (issue #1 / DBPTK #749): "
             "legger til database-nivå <lobFolder>content</lobFolder>, "
             "fjerner 'content/'-prefiks og avsluttende '/' fra kolonne-nivå lobFolder. "
-            "I pipeline-modus: modifiserer metadata.xml i den utpakkede mappen. "
+            "Opsjon «Full sti i file=»: skriver file=\"content/schemaN/tableM/lobK/recordN.ext\" "
+            "slik DBPTK-validatoren (A_M_5.6-1-2) krever — men KDRS Søk & Vis forventer "
+            "bare basenavn, så bruk kun når DBPTK-validering er målet. "
+            "I pipeline-modus: modifiserer metadata.xml (og tableX.xml) i den utpakkede mappen. "
             "Standalone: skriver ny <original>_lobfix.siard."
         ),
         "status": LobFolderFixOperation.status,
-        "params": [],
+        "params": [
+            {"key": "full_file_paths",
+             "label": "Full sti i file= (DBPTK-validator, ikke Søk & Vis)",
+             "type": "bool", "default": False},
+        ],
+    },
+    {
+        "cls": XsdTypeFixOperation,
+        "label": "Rett tableX.xsd (DBPTK P_4.3-3 / T_6.3-1)",
+        "category": "Kompatibilitet",
+        "desc": (
+            "Retter tableX.xsd slik DBPTK-validatoren krever. P_4.3-3: type=\"…\" "
+            "som ikke stemmer med kolonnetypen i metadata.xml, typisk FLOAT(53) med "
+            "xs:float → xs:double; kun tapsfrie utvidelser (xs:float→xs:double, "
+            "heltallsvarianter→xs:integer/xs:decimal). T_6.3-1: minInclusive/"
+            "maxExclusive på dateType og dateTimeType settes til DBPTKs eksakte "
+            "verdier (år 0001–9999; SCFC skriver 9999-12-31Z som avvises). "
+            "Andre avvik rapporteres for manuell vurdering. metadata.xml og "
+            "tableX.xml røres ikke. Legges automatisk til etter 'Pakk ut SIARD' "
+            "dersom rettbare avvik oppdages. Standalone: skriver ny "
+            "<original>_xsdfix.siard."
+        ),
+        "status": XsdTypeFixOperation.status,
+        "params": [
+            {"key": "output_suffix", "label": "Suffix ny SIARD-fil (standalone)",
+             "type": "str", "default": "_xsdfix"},
+        ],
     },
     {
         "cls": SegFolderFixOperation,
@@ -656,8 +685,10 @@ OP_DEFS = [
         "desc": (
             "Omdøper alle LOB-filer med ikke-standard endelser til .bin i SIARD-strukturen "
             "og oppdaterer XML-referansene tilsvarende med XML-kommentarer. "
-            "Legges automatisk til etter 'Pakk ut SIARD' dersom ikke-standard filer oppdages. "
-            "Gjør ingenting hvis 'Standardiser .bin' er deaktivert i globale innstillinger. "
+            "Med «Standardiser LOB-filnavn til recordN» (globale innstillinger) omdøpes også "
+            "recN/xrecN/LOBnnnn til recordN slik DBPTK-validatoren (P_4.2-3) krever. "
+            "Legges automatisk til etter 'Pakk ut SIARD' dersom slike filer oppdages. "
+            "Gjør ingenting hvis begge innstillingene er deaktivert. "
             "Støtter pipeline-modus og standalone-modus."
         ),
         "status": StandardizeExtOperation.status,
@@ -674,6 +705,12 @@ OP_DEFS = [
         "status": XMLValidationOperation.status,
         "params": [
             {"key": "check_table_xsd", "label": "Sjekk tableX.xsd", "type": "bool", "default": True},
+            {"key": "check_column_types",
+             "label": "tableX.xsd: kolonnetyper (P_4.3-3) og datofasetter (T_6.3-1)",
+             "type": "bool", "default": True},
+            {"key": "check_lob_refs",
+             "label": "LOB-referanser slik DBPTK-validatoren slår dem opp (A_M_5.6-1-2)",
+             "type": "bool", "default": True},
         ],
     },
     {

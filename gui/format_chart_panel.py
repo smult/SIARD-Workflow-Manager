@@ -83,9 +83,19 @@ class FormatChartPanel(ctk.CTkFrame):
 
     BAR_H      = 16   # min. søylehøyde px (skaleres med font)
     ROW_H      = 26   # min. totalhøyde per rad (skaleres med font)
-    MAX_ROWS   = 20   # maks antall format-rader å vise
-    MIN_HEIGHT = 60
-    MAX_HEIGHT = MAX_ROWS * ROW_H + 40   # header + rader
+    # Panelet deler venstrekolonnen med workflow-listen (den fleksible raden
+    # rett over), som må beholde det meste av høyden. Diagrammet får bare det
+    # som er til overs når workflow-raden har MIN_WORKFLOW_ROW px, og aldri
+    # mer enn HEIGHT_SHARE av raden eller MAX_ROWS rader. Formater utover det
+    # som får plass samles i én «øvrige»-rad. Panelet skjules helt når det er
+    # tomt.
+    MAX_ROWS         = 8
+    MIN_ROWS         = 3
+    HEIGHT_SHARE     = 0.40
+    MIN_WORKFLOW_ROW = 470   # header + liste (~250 px) + knapperad
+    HEADER_H         = 40    # «Filformater»-overskrift + paddings
+    MIN_HEIGHT       = 60
+    MAX_HEIGHT       = (MAX_ROWS + 1) * ROW_H + HEADER_H
     LABEL_BASE = 10   # base-fontstørrelse — SAMME som overskriften «Filformater»
 
     def __init__(self, parent, **kwargs):
@@ -118,6 +128,10 @@ class FormatChartPanel(ctk.CTkFrame):
         )
         self._canvas.grid(row=1, column=0, padx=6, pady=(0, 6), sticky="ew")
         self._canvas.bind("<Configure>", self._on_resize)
+        # Antall rader avhenger av kolonnens høyde — tegn om når den endres.
+        # _redraw setter bare ny canvas-høyde når den faktisk er endret, så
+        # dette gir ingen Configure-løkke.
+        self.master.bind("<Configure>", self._on_resize, add="+")
         self._built = True
 
         # Canvas-tegnet tekst bygger ikke på CTkFont, så den må tegnes om
@@ -143,6 +157,20 @@ class FormatChartPanel(ctk.CTkFrame):
         self._counts = dict(counts)
         self._redraw()
 
+    def _set_visible(self, visible: bool) -> None:
+        """
+        Skjul panelet når det ikke har innhold, slik at workflow-listen over
+        får høyden. grid() uten argumenter gjenoppretter lagret plassering.
+        """
+        try:
+            shown = bool(self.grid_info())
+        except Exception:
+            return
+        if visible and not shown:
+            self.grid()
+        elif not visible and shown:
+            self.grid_remove()
+
     def _redraw(self):
         if not self._built or not self._canvas:
             return
@@ -150,13 +178,9 @@ class FormatChartPanel(ctk.CTkFrame):
         c.delete("all")
 
         if not self._counts:
+            self._set_visible(False)
             return
-
-        # Sorter etter antall, ta de MAX_ROWS største
-        sorted_items = sorted(self._counts.items(), key=lambda x: -x[1])[:self.MAX_ROWS]
-        total   = sum(self._counts.values())
-        max_val = sorted_items[0][1] if sorted_items else 1
-        n_rows  = len(sorted_items)
+        self._set_visible(True)
 
         # Fontstørrelse følger +/- (samme base som overskriften «Filformater»).
         fs = FontRegistry.effective_size(self.LABEL_BASE)
@@ -173,19 +197,39 @@ class FormatChartPanel(ctk.CTkFrame):
         cell_font  = (FONTS["mono"], -px)
         measure    = tkfont.Font(root=c, family=FONTS["mono"], size=-px)
 
-        # Kolonnebredder måles ut fra faktisk tekst ved gjeldende font, slik at
-        # verken formatnavnet eller tallet bak streken kuttes.
-        label_texts = [f".{ext}" for ext, _ in sorted_items]
-        count_texts = [f"{count:,}" for _, count in sorted_items]
-        label_w = max((measure.measure(t) for t in label_texts), default=30) + 10
-        count_w = max((measure.measure(t) for t in count_texts), default=20) + 10
-
         # Rad-/søylehøyde skalerer med (piksel-)fonten så teksten får plass.
         bar_h = max(self.BAR_H, px + 4)
         row_h = max(self.ROW_H, bar_h + px)
 
+        # Antall rader ut fra plassen workflow-raden (raden over) ville hatt
+        # uten diagrammet. Før kolonnen er lagt ut brukes MAX_ROWS.
+        max_rows = self.MAX_ROWS
+        full = self._flexible_row_height()
+        if full > 200:
+            budget = min(full - self.MIN_WORKFLOW_ROW,
+                         full * self.HEIGHT_SHARE) - self.HEADER_H
+            fit = int(budget) // row_h - 1                     # −1: «øvrige»
+            max_rows = max(self.MIN_ROWS, min(self.MAX_ROWS, fit))
+
+        # Sorter etter antall; de max_rows største vises, resten som «øvrige»
+        all_items    = sorted(self._counts.items(), key=lambda x: -x[1])
+        sorted_items = all_items[:max_rows]
+        rest         = sum(n for _, n in all_items[max_rows:])
+        if rest:
+            sorted_items.append((f"øvrige ({len(all_items) - max_rows})", rest))
+        max_val = sorted_items[0][1] if sorted_items else 1
+        n_rows  = len(sorted_items)
+
+        # Kolonnebredder måles ut fra faktisk tekst ved gjeldende font, slik at
+        # verken formatnavnet eller tallet bak streken kuttes.
+        label_texts = [self._label(ext) for ext, _ in sorted_items]
+        count_texts = [f"{count:,}" for _, count in sorted_items]
+        label_w = max((measure.measure(t) for t in label_texts), default=30) + 10
+        count_w = max((measure.measure(t) for t in count_texts), default=20) + 10
+
         height = max(self.MIN_HEIGHT, n_rows * row_h + 6)
-        c.configure(height=height)
+        if int(c.cget("height")) != height:
+            c.configure(height=height)
 
         width = c.winfo_width()
         if width < 10:
@@ -204,7 +248,7 @@ class FormatChartPanel(ctk.CTkFrame):
             # Ledetekst (format) — høyrejustert mot søylestarten
             c.create_text(
                 label_w - 5, mid_y,
-                text=f".{ext}",
+                text=self._label(ext),
                 anchor="e",
                 fill=COLORS["text"],
                 font=cell_font,
@@ -230,6 +274,32 @@ class FormatChartPanel(ctk.CTkFrame):
                 font=cell_font,
             )
             y += row_h
+
+    def _flexible_row_height(self) -> int:
+        """
+        Høyden workflow-raden (grid-raden rett over dette panelet) ville hatt
+        uten diagrammet: dagens radhøyde pluss panelets egen høyde når det
+        vises. Returnerer 0 før layout er kjent.
+        """
+        try:
+            gi  = self.grid_info()
+            row = int(gi.get("row", 0)) if gi else 0
+            col = int(gi.get("column", 0)) if gi else 0
+            if row < 1:
+                return 0
+            above = self.master.grid_bbox(col, row - 1)
+            own   = self.winfo_height() if gi else 0
+            pad   = gi.get("pady", 0) if gi else 0
+            if isinstance(pad, (tuple, list)):
+                pad = sum(int(v) for v in pad)
+            return int(above[3]) + own + int(pad or 0)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _label(ext: str) -> str:
+        """Ledetekst for en rad: «.pdf», eller «øvrige (n)» for samlerad."""
+        return ext if ext.startswith("øvrige") else f".{ext}"
 
     def _on_resize(self, event):
         self._redraw()

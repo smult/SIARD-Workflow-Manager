@@ -791,8 +791,16 @@ class AnonymizeOperation(BaseOperation):
                 # Ollama-foranalysen foreslår en type på en kolonne heuristikken
                 # bommet på. Navneforslag bekreftes mot innhold (form + navne-
                 # ordbok); sted/fnr/e-post godtas (strenge per-verdi-vakter
-                # beskytter).
-                if sug_pt in _NAME_VALUE_TYPES:
+                # beskytter). Identifikator-kolonner (GUID/nøkler) avvises alltid.
+                from siard_workflow.core.anonymize.pii_detect import (
+                    is_identifier_column as _is_id_col,
+                    is_identifier_field as _is_id_field)
+                if (cc.source == "identifikator" or _is_id_field(name)
+                        or _is_id_col(samples.get(idx))):
+                    log_lines.append((f"    {info['table_name']}.{name}: "
+                                      f"OTHER (identifikator — Ollama-forslag "
+                                      f"{sug_pt.value} avvist)", "info"))
+                elif sug_pt in _NAME_VALUE_TYPES:
                     if self._is_name_column(samples.get(idx)):
                         cc = ColumnClass(sug_pt, "ollama-table")
                 else:

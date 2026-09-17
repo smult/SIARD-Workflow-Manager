@@ -61,6 +61,7 @@ _CONFIG_DEFAULTS: dict = {
     },
     "theme_mode":             "dark", # GUI-tema: "dark" eller "light"
     "standardize_bin_ext":    True,  # behold .bin/.txt-endelse etter konvertering
+    "dbptk_lob_names":        True,  # navngi LOB-filer recordN (krav i DBPTK-validatoren P_4.2-3)
     "siard_compress_level":   6,     # ZIP-kompresjon: 0=STORED, 1-9=DEFLATE
     "siard_compress_smart_skip": True,  # hopp over rekomprimering av jpg/png/zip/...
     "use_siegfried":          False, # bruk Siegfried/PRONOM i stedet for magic-bytes
