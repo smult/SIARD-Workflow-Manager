@@ -19,7 +19,12 @@ from __future__ import annotations
 import hashlib
 import threading
 
-from .pii_detect import PiiType, fnr_control_digits, _digits
+import datetime as _dt
+
+from .pii_detect import (
+    PiiType, fnr_control_digits, _digits, fnr_birthdate, fnr_period,
+    parse_date, format_date, KEY_TYPES,
+)
 
 _SALT = "siard-anon-v1"
 
@@ -71,47 +76,112 @@ def lorem_ipsum(n_words: int = 50, seed: str = "lorem") -> str:
 
 # ── Per-type generatorer ──────────────────────────────────────────────────────
 
-def fake_fnr(original: str) -> str:
-    """Syntetisk, mod-11-gyldig fødselsnummer (måned + 80). Deterministisk.
+# ── Fødselsdato og dekomponerbart fnr ────────────────────────────────────────
+#
+# Konsistensprinsipp: det fiktive fnr-et bygges av deler som hver KUN avhenger
+# av sin originaldel —
+#   datodel      = shift_birthdate(fødselsdato)          (samme funksjon som for
+#                                                          fødselsdato-kolonner)
+#   individnr    = f(original individnr) i samme århundreserie og med samme
+#                  kjønnsparitet
+#   kontroll     = beregnes på nytt (mod-11)
+# Dermed stemmer en fødselsdato-kolonne i én tabell med datodelen i fnr-et i
+# en annen, og et femsifret personnummer kan komponeres (dato + 5 sifre →
+# oppslag i felles mapping) når raden også har datoen.
+# Måneden i fnr-et markeres med +80 (Skatteetatens syntetiske område) slik at
+# ingen ekte person kan treffes; fødselsdato-kolonner viser den forskjøvne
+# datoen uten markering.
 
-    Beholder fødselsdag og -måned fra originalen der det er mulig (måned + 80
-    gir det norske syntetiske området), år beholdes; individnummer utledes av
-    hash og justeres til kontrollsifrene blir gyldige.
+MAX_SHIFT_DAYS = 365
+
+
+def shift_birthdate(dt: "_dt.date") -> "_dt.date":
+    """Deterministisk forskyvning 1–365 dager (aldri 0), innenfor samme
+    fnr-århundreserie (1854–1899 / 1900–1999 / 2000–2039). Avhenger KUN av
+    datoen, så alle kolonner som bærer samme dato får samme resultat."""
+    iso = dt.isoformat()
+    offset = 1 + stable_index(iso, "bd-offset", MAX_SHIFT_DAYS)
+    sign = 1 if stable_index(iso, "bd-sign", 2) else -1
+    start, end, _ = fnr_period(dt.year)
+    lo, hi = _dt.date(start, 1, 1), _dt.date(end, 12, 31)
+    cand = dt + _dt.timedelta(days=sign * offset)
+    if not (lo <= cand <= hi):
+        cand = dt - _dt.timedelta(days=sign * offset)
+    if not (lo <= cand <= hi):
+        cand = min(max(cand, lo), hi)
+        if cand == dt:
+            cand = dt + _dt.timedelta(days=1 if dt < hi else -1)
+    return cand
+
+
+def fake_birthdate(original: str) -> str:
+    """Forskjøvet fødselsdato i samme format som originalen (ISO m/ evt.
+    klokkeslett/Z, dd.mm.yyyy, dd/mm/yyyy, yyyymmdd). Ikke-dato → uendret."""
+    core = (original or "").rstrip("\x00")
+    parsed = parse_date(core)
+    if parsed is None:
+        return original
+    dt, fmt, rest = parsed
+    return format_date(shift_birthdate(dt), fmt, rest)
+
+
+def _fake_individ(orig_ind: int, year: int, seed: str) -> "list[int]":
+    """Kandidat-individnumre (prioritert) i samme århundreserie som `year` og
+    med samme kjønnsparitet som originalen."""
+    _, _, (lo, hi) = fnr_period(year)
+    parity = orig_ind % 2
+    cands = [n for n in range(lo, hi + 1) if n % 2 == parity]
+    start = stable_index(seed, "fnr-ind", len(cands))
+    return cands[start:] + cands[:start]
+
+
+def fake_fnr(original: str) -> str:
+    """Syntetisk, mod-11-gyldig og DEKOMPONERBART fødselsnummer (se over).
+
+    Datodelen = shift_birthdate(fødselsdato fra originalen) med måned + 80;
+    individnr i samme århundreserie og kjønnsparitet; kontrollsifre beregnes.
+    Ikke-11-sifret input (f.eks. femsifret personnummer uten dato) → se
+    fake_pnr5 / deterministiske sifre med samme lengde.
     """
     d = _digits(original)
-    # Ikke et fullt 11-sifret fnr (f.eks. 5-sifret «PersonNr» = individnr+kontroll)
-    # → behold lengden, generer deterministiske sifre. Unngår brudd på CHAR(n).
     if len(d) != 11:
         if not d:
             return original
+        if len(d) == 5:
+            return fake_pnr5(original)
         return "".join(str(stable_index(original, f"num{i}", 10))
                        for i in range(len(d)))
-    day = month = year = None
-    if len(d) >= 6:
-        day, month, year = int(d[0:2]), int(d[2:4]), int(d[4:6])
-        # Normaliser D-nummer (dag + 40) og allerede-syntetisk (måned + 80/40)
-        if day > 40:
-            day -= 40
-        if month > 80:
-            month -= 80
-        elif month > 40:
-            month -= 40
-    if not (day and 1 <= day <= 31 and month and 1 <= month <= 12):
-        day   = stable_index(original, "fnr-day", 28) + 1
-        month = stable_index(original, "fnr-month", 12) + 1
-        year  = stable_index(original, "fnr-year", 100)
-    if day > 28:
-        day = 28                       # trygt for alle måneder (syntetisk uansett)
-    syn_month = month + 80             # syntetisk område
-    base_ind = stable_index(original, "fnr-ind", 1000)
-    for attempt in range(1000):
-        ind = (base_ind + attempt) % 1000
-        d9 = f"{day:02d}{syn_month:02d}{year:02d}{ind:03d}"
+
+    bd = fnr_birthdate(d)
+    if bd is None:
+        # Ugyldig dato i originalen → deterministisk dato i 1900-serien
+        year = 1900 + stable_index(original, "fnr-year", 100)
+        bd = _dt.date(year, stable_index(original, "fnr-month", 12) + 1,
+                      stable_index(original, "fnr-day", 28) + 1)
+    new_bd = shift_birthdate(bd)
+    orig_ind = int(d[6:9])
+    date_part = f"{new_bd.day:02d}{new_bd.month + 80:02d}{new_bd.year % 100:02d}"
+    for ind in _fake_individ(orig_ind, new_bd.year, original):
+        d9 = f"{date_part}{ind:03d}"
         ctrl = fnr_control_digits(d9)
         if ctrl:
             k1, k2 = ctrl
             return f"{d9}{k1}{k2}"
-    return f"{day:02d}{syn_month:02d}{year:02d}00000"   # praktisk talt uoppnåelig
+    return f"{date_part}00000"   # praktisk talt uoppnåelig
+
+
+def fake_pnr5(original: str) -> str:
+    """Femsifret personnummer (individnr + kontroll) UTEN kjent fødselsdato:
+    deterministisk fem-til-fem-mapping med bevart kjønnsparitet. Konsistent
+    mellom femsifrede kolonner, men kontrollsifrene kan ikke stemme mot en
+    ukjent dato — bruk compose via fnr når raden har fødselsdato."""
+    d = _digits(original)
+    if len(d) != 5:
+        return original
+    parity = int(d[2]) % 2
+    ind = stable_index(original, "pnr5-ind", 500) * 2 + parity      # 0–999, samme paritet
+    ctrl = stable_index(original, "pnr5-ctrl", 100)
+    return f"{ind:03d}{ctrl:02d}"
 
 
 def fake_first_name(original: str) -> str:
@@ -187,6 +257,8 @@ def fake_postnr_value(original: str) -> str:
 
 _DISPATCH = {
     PiiType.FNR:        fake_fnr,
+    PiiType.PNR5:       fake_pnr5,
+    PiiType.BIRTHDATE:  fake_birthdate,
     PiiType.FIRST_NAME: fake_first_name,
     PiiType.LAST_NAME:  fake_last_name,
     PiiType.FULL_NAME:  fake_full_name,
@@ -243,6 +315,9 @@ class MappingStore:
 
     def __init__(self):
         self._map: dict[tuple[str, str], str] = {}
+        # Injektivitet for nøkkeltyper (fnr/pnr5/e-post): fiktive verdier som
+        # allerede er i bruk → to ulike originaler får aldri samme fake.
+        self._used: dict[str, set[str]] = {}
         self._lock = threading.Lock()
 
     def map(self, pii_type: PiiType, original: str) -> str:
@@ -267,6 +342,15 @@ class MappingStore:
                 while fake == seed and attempt < 8:
                     attempt += 1
                     fake = fake_value(pii_type, seed + "\x00" * attempt)
+                if pii_type in KEY_TYPES:
+                    used = self._used.setdefault(pii_type.value, set())
+                    # Kollisjon med en annen originals fake → trekk på nytt
+                    # (deterministisk). Datodelen i fnr påvirkes ikke (den er
+                    # seedet av datoen alene), kun individnummeret.
+                    while (fake in used or fake == seed) and attempt < 200:
+                        attempt += 1
+                        fake = fake_value(pii_type, seed + "\x00" * attempt)
+                    used.add(fake)
                 self._map[key] = fake
                 cached = fake
         return apply_case(original, cached) if is_name else cached

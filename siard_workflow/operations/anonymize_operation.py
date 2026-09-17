@@ -42,6 +42,10 @@ from siard_workflow.core.anonymize.pii_detect import (
 # Navnetyper som verifiseres mot innhold ved tvetydige kolonnenavn
 _NAME_VALUE_TYPES = (PiiType.FULL_NAME, PiiType.FIRST_NAME, PiiType.LAST_NAME)
 from siard_workflow.core.anonymize.fake_generators import MappingStore
+from siard_workflow.core.anonymize.pii_detect import (
+    is_birthdate_field, looks_like_date, is_pnr5_field, compose_fnr,
+    parse_date, fnr_birthdate, _digits,
+)
 from siard_workflow.core.anonymize import dummy_files
 
 
@@ -56,6 +60,12 @@ _TEXT_TYPES = ("VARCHAR", "CHAR", "NVARCHAR", "NCHAR", "TEXT", "STRING", "CLOB")
 def _is_text_type(col_type: str) -> bool:
     """True hvis kolonnetypen er tekst (kan inneholde PII)."""
     return any(t in (col_type or "").upper() for t in _TEXT_TYPES)
+
+
+def _is_date_type(col_type: str) -> bool:
+    """DATE/TIMESTAMP-typer (fødselsdato kan ligge her)."""
+    t = (col_type or "").upper()
+    return t.startswith("DATE") or t.startswith("TIMESTAMP")
 # Inline tekstcelle: <cN>tekst</cN>  (ikke selvlukkende fil-ref <cN .../>)
 _CELL_RE = re.compile(rb"<c(\d+)>(.*?)</c\1>", re.DOTALL)
 
@@ -702,6 +712,19 @@ class AnonymizeOperation(BaseOperation):
                 nvals = [v for v in samples.get(idx, []) if v and v.strip()]
                 if nvals and sum(1 for v in nvals if is_valid_fnr(v)) / len(nvals) >= 0.6:
                     heur[idx] = ColumnClass(PiiType.FNR, "value")
+                elif (_is_date_type(col["type"]) and is_birthdate_field(col["name"])
+                        and (not nvals or sum(1 for v in nvals if looks_like_date(v))
+                             / len(nvals) >= 0.5)):
+                    # Fødselsdato i DATE/TIMESTAMP-kolonne — eneste ikke-tekst-
+                    # type som klassifiseres på navn (verdiene må være datoer).
+                    heur[idx] = ColumnClass(PiiType.BIRTHDATE, "name")
+                elif (col["type"].startswith(("INT", "SMALLINT", "BIGINT", "NUMERIC",
+                                              "DECIMAL"))
+                        and nvals and is_pnr5_field(col["name"])
+                        and sum(1 for v in nvals if len(v.strip()) == 5
+                                and v.strip().isdigit()) / len(nvals) >= 0.5):
+                    # Femsifret personnummer lagret numerisk
+                    heur[idx] = ColumnClass(PiiType.PNR5, "name")
                 else:
                     heur[idx] = ColumnClass(PiiType.OTHER, "non-text")
                 continue
@@ -934,13 +957,61 @@ class AnonymizeOperation(BaseOperation):
         if not subset and not need_cell_rewrite and not need_digest_patch:
             return out
 
+        # Femsifret personnummer + fødselsdato/fnr i SAMME rad → komponer det
+        # opprinnelige 11-sifrede nummeret og slå det opp i felles mapping, slik
+        # at de fem siste sifrene stemmer med fnr-kolonner i andre tabeller.
+        pnr5_cols = [i for i, t in value_cols.items() if t is PiiType.PNR5]
+        fnr_cols  = [i for i, t in value_cols.items() if t is PiiType.FNR]
+        bd_cols   = [i for i, t in value_cols.items() if t is PiiType.BIRTHDATE]
+        compose   = bool(pnr5_cols and (fnr_cols or bd_cols))
+        out["pnr5_composed"] = 0
+        out["pnr5_fallback"] = 0
+
+        def _row_overrides(row_bytes: bytes) -> dict:
+            """{kolonneidx: fiktiv verdi} for femsifrede felt som kan komponeres."""
+            cells = {int(m.group(1)): _decode_cell(m.group(2))
+                     for m in _CELL_RE.finditer(row_bytes)}
+            overrides: dict = {}
+            src_fnr = next((cells[i] for i in fnr_cols
+                            if is_valid_fnr(cells.get(i, ""))), None)
+            src_bd = None
+            for i in bd_cols:
+                pd = parse_date(cells.get(i, ""))
+                if pd:
+                    src_bd = pd[0]
+                    break
+            if src_bd is None and src_fnr:
+                src_bd = fnr_birthdate(src_fnr)
+            for i in pnr5_cols:
+                val = (cells.get(i) or "").strip()
+                if val.isdigit() and len(val) < 5:
+                    val = val.zfill(5)             # INTEGER-lagret (ledende null borte)
+                if not (len(val) == 5 and val.isdigit()):
+                    continue
+                full = None
+                if src_fnr and _digits(src_fnr)[6:] == val:
+                    full = src_fnr
+                elif src_bd is not None:
+                    full = compose_fnr(src_bd, val)
+                if full:
+                    fake5 = self._mapping.map(PiiType.FNR, full)[6:]
+                    out["pnr5_composed"] += 1
+                else:
+                    fake5 = self._mapping.map(PiiType.PNR5, val)
+                    out["pnr5_fallback"] += 1
+                # Numerisk kolonne: ikke ledende null (verdien var uten)
+                orig = (cells.get(i) or "").strip()
+                overrides[i] = str(int(fake5)) if (orig.isdigit() and len(orig) < 5) else fake5
+            return overrides
+
         from siard_workflow.operations.blob_convert_operation import (
             _patch_line_with_digest)
 
-        def _rewrite_line(line: bytes) -> bytes:
+        def _rewrite_line(line: bytes, overrides: "dict | None" = None) -> bytes:
             if need_cell_rewrite and b"<c" in line:
                 line, nc, nf = self._rewrite_line_cells(
-                    line, value_cols, freetext_cols, inline_blob_cols, col_maxlen)
+                    line, value_cols, freetext_cols, inline_blob_cols, col_maxlen,
+                    row_overrides=overrides)
                 out["cells"]    += nc
                 out["freetext"] += nf
             if need_digest_patch and (b"file=" in line or b"href=" in line):
@@ -951,10 +1022,12 @@ class AnonymizeOperation(BaseOperation):
         kept = 0
         try:
             with open(xml_path, "rb") as src, open(tmp_path, "wb") as dst:
-                if not subset:
+                if not subset and not compose:
                     for line in src:
                         dst.write(_rewrite_line(line))
                 else:
+                    # Radbufret: filtrering (subset) og/eller komponering
+                    # (trenger alle cellene i raden før omskriving).
                     row_pos = -1
                     in_row = False
                     buf: list[bytes] = []
@@ -967,10 +1040,11 @@ class AnonymizeOperation(BaseOperation):
                             buf.append(line)
                             if b"</row>" in line:
                                 in_row = False
-                                if row_pos in keep_rows:
+                                if not subset or row_pos in keep_rows:
                                     kept += 1
+                                    ov = _row_overrides(b"".join(buf)) if compose else None
                                     for bl in buf:
-                                        dst.write(_rewrite_line(bl))
+                                        dst.write(_rewrite_line(bl, ov))
                                 # forkastet rad → skrives ikke
                             continue
                         dst.write(line)   # header/footer-linjer
@@ -983,6 +1057,11 @@ class AnonymizeOperation(BaseOperation):
                 pass
         if subset:
             out["kept_rows"] = kept
+        if out.get("pnr5_fallback"):
+            w(f"    {info.get('table_name', xml_path.stem)}: "
+              f"{out['pnr5_fallback']:,} femsifrede personnummer uten "
+              f"fødselsdato/fnr i raden → egen fem-til-fem-mapping (ikke "
+              f"konsistent med 11-sifrede kolonner)", "warn")
         return out
 
     @staticmethod
@@ -1018,12 +1097,14 @@ class AnonymizeOperation(BaseOperation):
     def _rewrite_line_cells(self, line: bytes, value_cols: dict,
                             freetext_cols: set,
                             inline_blob_cols: "set | None" = None,
-                            col_maxlen: "dict | None" = None
+                            col_maxlen: "dict | None" = None,
+                            row_overrides: "dict | None" = None
                             ) -> "tuple[bytes, int, int]":
         n_cells = 0
         n_free = 0
         inline_blob_cols = inline_blob_cols or set()
         col_maxlen = col_maxlen or {}
+        row_overrides = row_overrides or {}
 
         def _emit(grp1: bytes, idx: int, text: str) -> bytes:
             # Hard lengdegrense → aldri bryt skjemaets CHAR(n)
@@ -1048,6 +1129,10 @@ class AnonymizeOperation(BaseOperation):
                         + b"</c" + m.group(1) + b">")
             if idx in value_cols:
                 original = _decode_cell(inner)
+                # Komponert verdi fra raden (femsifret personnummer ↔ fnr)
+                if idx in row_overrides:
+                    n_cells += 1
+                    return _emit(m.group(1), idx, row_overrides[idx])
                 # Per-verdi-vakt: endre kun verdier som faktisk matcher typen
                 # (fnr=11 sifre, norsk telefon, aldri filnavn).
                 if not should_anonymize(value_cols[idx], original):

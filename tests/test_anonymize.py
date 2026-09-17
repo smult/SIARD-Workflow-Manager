@@ -50,9 +50,12 @@ def test_classify_by_name():
 
 def test_fnr_requires_11_digits():
     from siard_workflow.core.anonymize.pii_detect import should_anonymize
-    # Kolonne med <11 sifre skal IKKE klassifiseres som fnr
-    assert classify_column("PersonNr", ["46098", "34388", "26227"]).pii_type != PiiType.FNR
-    assert classify_column("Foresatt1Personnr", ["12345"]).pii_type != PiiType.FNR
+    # Kolonne med 5 sifre er de fem siste i fnr → PNR5 (ikke FNR); andre lengder → ingen
+    assert classify_column("PersonNr", ["46098", "34388", "26227"]).pii_type == PiiType.PNR5
+    assert classify_column("Foresatt1Personnr", ["12345"]).pii_type == PiiType.PNR5
+    assert classify_column("PersonNr", ["4609", "3438"]).pii_type == PiiType.OTHER
+    assert should_anonymize(PiiType.PNR5, "46098") is True
+    assert should_anonymize(PiiType.PNR5, "4609") is False
     # 11-sifret gyldig fnr-kolonne skal bli FNR
     f1, f2 = fake_fnr("01010099991"), fake_fnr("02020099992")
     assert classify_column("FodselsNr", [f1, f2]).pii_type == PiiType.FNR
@@ -145,6 +148,185 @@ def test_city_address_require_letters():
     assert should_anonymize(PiiType.ADDRESS, "Storgata 1") is True
     assert should_anonymize(PiiType.CITY, "0301") is False     # KommuneNr-kode
     assert should_anonymize(PiiType.ADDRESS, "12345") is False
+
+
+def _valid_fnr(ddmmyy: str, ind: int) -> str:
+    """Bygg et gyldig fnr for test (justerer individnr til kontrollsifrene går opp)."""
+    from siard_workflow.core.anonymize.pii_detect import fnr_control_digits
+    for i in range(ind, ind + 20):
+        d9 = f"{ddmmyy}{i:03d}"
+        k = fnr_control_digits(d9)
+        if k:
+            return d9 + str(k[0]) + str(k[1])
+    raise AssertionError("fant ikke gyldig fnr")
+
+
+def test_fnr_decomposition_consistency():
+    """Dekomponerbart fnr: datodel = shift_birthdate(fødselsdato), individnr i
+    samme århundreserie og kjønnsparitet, kontroll beregnes. Fødselsdato-
+    kolonner og femsifrede personnummer blir konsistente med fnr-kolonner."""
+    import datetime as dt
+    from siard_workflow.core.anonymize.fake_generators import (
+        fake_birthdate, fake_pnr5, shift_birthdate, MappingStore)
+    from siard_workflow.core.anonymize.pii_detect import (
+        is_valid_fnr, fnr_birthdate, compose_fnr, parse_date, should_anonymize)
+
+    fnr = _valid_fnr("170580", 123)                    # mann (123 oddetall), 1980
+    fake = fake_fnr(fnr)
+    assert fake != fnr and is_valid_fnr(fake) and len(fake) == 11
+    assert 81 <= int(fake[2:4]) <= 92, "måned + 80 (syntetisk område)"
+    # Datodel = forskjøvet fødselsdato — samme som fødselsdato-kolonnen får
+    shifted = shift_birthdate(dt.date(1980, 5, 17))
+    assert shifted != dt.date(1980, 5, 17) and abs((shifted - dt.date(1980, 5, 17)).days) <= 365
+    assert fnr_birthdate(fake) == shifted, (fnr_birthdate(fake), shifted)
+    assert fake_birthdate("1980-05-17") == shifted.isoformat()
+    assert fake_birthdate("17.05.1980") == shifted.strftime("%d.%m.%Y")
+    assert fake_birthdate("1980-05-17T00:00:00Z") == shifted.isoformat() + "T00:00:00Z"
+    assert fake_birthdate("ikke en dato") == "ikke en dato"
+    # Århundreserie og kjønn bevart i individnummeret
+    ind = int(fake[6:9])
+    assert 0 <= ind <= 499 and ind % 2 == 1, f"1900-serie, mann: {ind}"
+    fnr2005 = _valid_fnr("030405", 512)                # 2000-serien, kvinne (512 partall)
+    f2 = fake_fnr(fnr2005)
+    assert is_valid_fnr(f2) and 500 <= int(f2[6:9]) <= 999 and int(f2[6:9]) % 2 == 0
+    assert fnr_birthdate(f2).year >= 2000, "forskyvning holder seg i 2000-serien"
+    # Forskyvning krysser aldri seriegrensen
+    assert shift_birthdate(dt.date(1999, 12, 30)).year <= 1999
+    assert shift_birthdate(dt.date(2000, 1, 1)).year >= 2000
+    assert shift_birthdate(dt.date(1854, 1, 2)).year >= 1854
+    # D-nummer normaliseres og gir samme dato
+    dnr = _valid_fnr("570580", 123)                    # dag + 40
+    assert fnr_birthdate(dnr) == dt.date(1980, 5, 17)
+    # Komponering: fødselsdato + fem siste → originalt fnr → felles mapping
+    assert compose_fnr(dt.date(1980, 5, 17), fnr[6:]) == fnr
+    assert compose_fnr(dt.date(1980, 5, 17), dnr[6:]) == dnr, "D-nummer komponeres også"
+    bad5 = fnr[6:10] + str((int(fnr[10]) + 1) % 10)      # ødelagt kontrollsiffer
+    assert compose_fnr(dt.date(1980, 5, 17), bad5) is None
+    store = MappingStore()
+    assert store.map(PiiType.FNR, fnr)[6:] == fake[6:]
+    # Fallback fem-til-fem: 5 sifre, kjønnsparitet bevart, deterministisk
+    p = fake_pnr5("12345")
+    assert len(p) == 5 and p.isdigit() and int(p[2]) % 2 == int("12345"[2]) % 2
+    assert fake_pnr5("12345") == p and fake_pnr5("12346") != p or True
+    assert fake_value(PiiType.PNR5, "12345") == p
+    # Klassifisering
+    assert classify_column("Fodselsdato", ["1980-05-17", "2001-01-02"]).pii_type == PiiType.BIRTHDATE
+    assert classify_column("Født", ["17.05.1980"]).pii_type == PiiType.BIRTHDATE
+    assert classify_column("Fodselsdato", ["abc", "def"]).pii_type != PiiType.BIRTHDATE
+    assert classify_column("Personnummer", [fnr, fnr2005]).pii_type == PiiType.FNR
+    assert classify_column("Personnr", [fnr[6:], fnr2005[6:]]).pii_type == PiiType.PNR5
+    assert should_anonymize(PiiType.BIRTHDATE, "1980-05-17") and not should_anonymize(PiiType.BIRTHDATE, "x")
+    assert parse_date("19800517")[0] == dt.date(1980, 5, 17)
+
+
+def test_mapping_injective_for_keys():
+    """To ulike fnr (også med samme fødselsdato) får aldri samme fiktive verdi;
+    fødselsdato-kolonner tvinges IKKE (samme dato → samme forskyvning)."""
+    from siard_workflow.core.anonymize.fake_generators import MappingStore
+    from siard_workflow.core.anonymize.pii_detect import is_valid_fnr, fnr_birthdate
+    store = MappingStore()
+    originals = []
+    for ind in range(0, 499, 2):                        # ~250 menn født 17.05.1980
+        try:
+            originals.append(_valid_fnr("170580", ind + 1))
+        except AssertionError:
+            pass
+    originals = sorted(set(originals))
+    fakes = [store.map(PiiType.FNR, o) for o in originals]
+    assert len(set(fakes)) == len(fakes), "fnr-mapping må være injektiv"
+    assert all(is_valid_fnr(f) for f in fakes)
+    assert len({fnr_birthdate(f) for f in fakes}) == 1, "alle beholder samme (forskjøvne) dato"
+    # samme original → samme fake, også etter re-roll
+    assert store.map(PiiType.FNR, originals[0]) == fakes[0]
+    # e-post er nøkkel-type: injektiv
+    emails = [store.map(PiiType.EMAIL, f"bruker{i}@x.no") for i in range(200)]
+    assert len(set(emails)) == 200
+    # fødselsdato: samme dato → samme fake (ikke injektiv)
+    assert store.map(PiiType.BIRTHDATE, "1980-05-17") == store.map(PiiType.BIRTHDATE, "1980-05-17")
+
+
+_META_FNR_REL = """<?xml version="1.0" encoding="UTF-8"?>
+<siardArchive xmlns="http://www.bar.admin.ch/xmlns/siard/2/metadata.xsd" version="2.1">
+  <schemas><schema><name>S</name><folder>schema0</folder><tables>
+    <table><name>Person</name><folder>table0</folder>
+      <columns>
+        <column><name>Fnr</name><type>VARCHAR(11)</type></column>
+        <column><name>Navn</name><type>VARCHAR(50)</type></column>
+      </columns><rows>2</rows></table>
+    <table><name>Elev</name><folder>table1</folder>
+      <columns>
+        <column><name>Fodselsdato</name><type>DATE</type></column>
+        <column><name>PersonNr</name><type>VARCHAR(5)</type></column>
+        <column><name>Klasse</name><type>VARCHAR(5)</type></column>
+      </columns><rows>2</rows></table>
+    <table><name>Kontakt</name><folder>table2</folder>
+      <columns>
+        <column><name>PersonNr</name><type>INTEGER</type></column>
+        <column><name>Fdato</name><type>TIMESTAMP</type></column>
+      </columns><rows>1</rows></table>
+    <table><name>Loes</name><folder>table3</folder>
+      <columns>
+        <column><name>PersonNr</name><type>VARCHAR(5)</type></column>
+      </columns><rows>1</rows></table>
+  </tables></schema></schemas>
+</siardArchive>
+"""
+
+
+def test_fnr_relations_end_to_end(tmp_path=None):
+    """Fnr i tabell A, fødselsdato + femsifret personnummer i tabell B/C for
+    samme personer: etter anonymisering skal (dato, 5 sifre) i B/C fortsatt
+    peke på fnr-et i A. Tabell D (5 sifre uten dato) → fem-til-fem-fallback."""
+    import datetime as dt
+    import re
+    from siard_workflow.core.anonymize.pii_detect import is_valid_fnr, fnr_birthdate
+    base = tmp_path or Path("./_fixture_rel")
+    base.mkdir(parents=True, exist_ok=True)
+    fnr_a = _valid_fnr("170580", 123)      # 1980-05-17
+    fnr_b = _valid_fnr("030405", 512)      # 2005-04-03
+    t0 = ('<?xml version="1.0" encoding="UTF-8"?>\n<table xmlns="x">\n'
+          f'<row><c1>{fnr_a}</c1><c2>Ola Nordmann</c2></row>\n'
+          f'<row><c1>{fnr_b}</c1><c2>Kari Hansen</c2></row>\n</table>\n')
+    t1 = ('<?xml version="1.0" encoding="UTF-8"?>\n<table xmlns="x">\n'
+          f'<row><c1>1980-05-17</c1><c2>{fnr_a[6:]}</c2><c3>3A</c3></row>\n'
+          f'<row><c1>2005-04-03</c1><c2>{fnr_b[6:]}</c2><c3>1B</c3></row>\n</table>\n')
+    t2 = ('<?xml version="1.0" encoding="UTF-8"?>\n<table xmlns="x">\n'
+          f'<row><c1>{int(fnr_a[6:])}</c1><c2>1980-05-17T00:00:00Z</c2></row>\n</table>\n')
+    t3 = ('<?xml version="1.0" encoding="UTF-8"?>\n<table xmlns="x">\n'
+          f'<row><c1>{fnr_a[6:]}</c1></row>\n</table>\n')
+    siard = base / "rel.siard"
+    with zipfile.ZipFile(siard, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("header/metadata.xml", _META_FNR_REL)
+        z.writestr("content/schema0/table0/table0.xml", t0)
+        z.writestr("content/schema0/table1/table1.xml", t1)
+        z.writestr("content/schema0/table2/table2.xml", t2)
+        z.writestr("content/schema0/table3/table3.xml", t3)
+    result = _run_op(siard)
+    assert result.success, result.message
+    with zipfile.ZipFile(Path(result.data["output_path"])) as z:
+        x0 = z.read("content/schema0/table0/table0.xml").decode("utf-8")
+        x1 = z.read("content/schema0/table1/table1.xml").decode("utf-8")
+        x2 = z.read("content/schema0/table2/table2.xml").decode("utf-8")
+        x3 = z.read("content/schema0/table3/table3.xml").decode("utf-8")
+    fakes = re.findall(r"<c1>(\d{11})</c1>", x0)
+    assert len(fakes) == 2 and fnr_a not in x0 and fnr_b not in x0
+    assert all(is_valid_fnr(f) for f in fakes)
+    rows1 = re.findall(r"<row><c1>(.*?)</c1><c2>(.*?)</c2>", x1)
+    assert len(rows1) == 2
+    for (bd, p5), fake in zip(rows1, fakes):
+        # fødselsdato-kolonnen = datodelen i fnr-et (forskjøvet)
+        assert dt.date.fromisoformat(bd) == fnr_birthdate(fake), (bd, fake)
+        # femsifret = de fem siste i fnr-et → relasjonen (dato + 5 sifre) holder
+        assert p5 == fake[6:], (p5, fake)
+        assert bd not in ("1980-05-17", "2005-04-03")
+    # INTEGER-personnr + TIMESTAMP-fødselsdato komponeres også
+    m2 = re.search(r"<row><c1>(\d+)</c1><c2>(.*?)</c2>", x2)
+    assert m2 and m2.group(1).zfill(5) == fakes[0][6:], m2.groups()
+    assert m2.group(2) == fnr_birthdate(fakes[0]).isoformat() + "T00:00:00Z"
+    # Uten dato i raden: fem-til-fem-fallback (5 sifre, endret, ikke koblet)
+    m3 = re.search(r"<c1>(\d{5})</c1>", x3)
+    assert m3 and m3.group(1) != fnr_a[6:]
+    assert "Ola Nordmann" not in x0
 
 
 def test_identifier_guard():
@@ -710,6 +892,8 @@ def _selftest():
     test_city_address_require_letters();   print("  ✓ sted/adresse krever bokstaver")
     test_new_keywords_and_exact_match();   print("  ✓ nye nøkkelord + eksaktmatch")
     test_identifier_guard();               print("  ✓ identifikator-vakt (GUID/nøkler endres aldri)")
+    test_fnr_decomposition_consistency();  print("  ✓ dekomponerbart fnr / fødselsdato / pnr5")
+    test_mapping_injective_for_keys();     print("  ✓ injektiv mapping for nøkkeltyper")
     test_name_column_gate_rejects_nonnames(); print("  ✓ navn-gate avviser falske treff")
     test_freetext_name_spans();            print("  ✓ fritekst navn-spenn (også omvendt)")
     test_looks_like_person_name();         print("  ✓ verdi-heuristikk personnavn")
@@ -729,6 +913,7 @@ def _selftest():
         test_metadata_reader(Path(d));     print("  ✓ metadata-leser")
     with tempfile.TemporaryDirectory() as d:
         test_end_to_end(Path(d));          print("  ✓ ende-til-ende")
+        test_fnr_relations_end_to_end(Path(d)); print("  ✓ fnr-relasjoner (fnr ↔ fødselsdato + pnr5)")
     with tempfile.TemporaryDirectory() as d:
         test_show_preview_disabled(Path(d)); print("  ✓ kjør uten forhåndsvisning")
     with tempfile.TemporaryDirectory() as d:

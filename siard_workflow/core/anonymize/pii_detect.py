@@ -22,6 +22,8 @@ from enum import Enum
 class PiiType(str, Enum):
     """Type personidentifiserende informasjon. str-Enum → JSON-serialiserbar."""
     FNR        = "FNR"
+    PNR5       = "PNR5"        # de fem siste sifrene i fnr (individnr + kontroll)
+    BIRTHDATE  = "BIRTHDATE"   # fødselsdato (DATE/TIMESTAMP eller tekst)
     FIRST_NAME = "FIRST_NAME"
     LAST_NAME  = "LAST_NAME"
     FULL_NAME  = "FULL_NAME"
@@ -40,9 +42,16 @@ class PiiType(str, Enum):
 # stedsangivelser ned på stedsnivå (adresse/postnr/sted). Telefon anonymiseres
 # IKKE (PHONE er bevisst utelatt).
 VALUE_TYPES = frozenset({
-    PiiType.FNR, PiiType.FIRST_NAME, PiiType.LAST_NAME, PiiType.FULL_NAME,
+    PiiType.FNR, PiiType.PNR5, PiiType.BIRTHDATE,
+    PiiType.FIRST_NAME, PiiType.LAST_NAME, PiiType.FULL_NAME,
     PiiType.ADDRESS, PiiType.POSTNR, PiiType.CITY, PiiType.EMAIL,
 })
+
+# Nøkkel-lignende typer der to ulike originaler ALDRI skal få samme fiktive
+# verdi (bevarer entydige primær-/fremmednøkler). Navn/sted/dato er ikke
+# nøkler — der er sammenfall legitimt (og for fødselsdato nødvendig for
+# konsistens med datodelen i fnr).
+KEY_TYPES = frozenset({PiiType.FNR, PiiType.PNR5, PiiType.EMAIL})
 
 
 @dataclass
@@ -99,6 +108,149 @@ def is_valid_fnr(s: str) -> bool:
         return False
     k1, k2 = ctrl
     return k1 == int(d[9]) and k2 == int(d[10])
+
+
+# ── Fødselsdato og dekomponering av fnr ──────────────────────────────────────
+#
+# Fødselsnummer = DDMMYY (6) + individnr (3) + kontroll (2). Individnummeret
+# angir århundreserie:  000–499 → 1900–1999;  500–749 → 1854–1899 (år 54–99);
+# 500–999 → 2000–2039 (år 00–39);  900–999 → 1940–1999 (år 40–99).
+# Tredje individsiffer: oddetall = mann, partall = kvinne.
+# D-nummer: dag + 40.  H-nummer: måned + 40.  Syntetisk (Skatteetaten): måned + 80.
+
+import datetime as _dt
+
+# (start_år, slutt_år, (individ-fra, individ-til)) — seriene fnr kan uttrykke
+FNR_PERIODS = (
+    (1854, 1899, (500, 749)),
+    (1900, 1999, (0, 499)),
+    (2000, 2039, (500, 999)),
+)
+
+
+def fnr_period(year: int) -> "tuple[int, int, tuple[int, int]]":
+    for start, end, rng in FNR_PERIODS:
+        if start <= year <= end:
+            return start, end, rng
+    # utenfor det fnr kan uttrykke → nærmeste periode
+    return FNR_PERIODS[0] if year < 1854 else FNR_PERIODS[-1]
+
+
+def fnr_birthdate(fnr: str) -> "_dt.date | None":
+    """Fødselsdato (med århundre) fra et 11-sifret fnr, eller None hvis ugyldig
+    dato. Normaliserer D-/H-/syntetiske numre."""
+    d = _digits(fnr)
+    if len(d) != 11:
+        return None
+    day, month, yy, ind = int(d[0:2]), int(d[2:4]), int(d[4:6]), int(d[6:9])
+    if day > 40:
+        day -= 40
+    if month > 80:
+        month -= 80
+    elif month > 40:
+        month -= 40
+    if 500 <= ind <= 749 and yy >= 54:
+        year = 1800 + yy
+    elif 500 <= ind <= 999 and yy <= 39:
+        year = 2000 + yy
+    elif 900 <= ind <= 999:
+        year = 1900 + yy
+    else:
+        year = 1900 + yy
+    try:
+        return _dt.date(year, month, day)
+    except ValueError:
+        return None
+
+
+# Datoformater som gjenkjennes i celler (fødselsdato-kolonner). Gruppene gir
+# (år, måned, dag); `fmt` brukes til å skrive verdien tilbake i samme form.
+_DATE_FORMATS: "list[tuple[re.Pattern, str]]" = [
+    (re.compile(r"^(\d{4})-(\d{2})-(\d{2})(?P<rest>(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)?Z?)$"), "iso"),
+    (re.compile(r"^(\d{2})\.(\d{2})\.(\d{4})$"), "dmy-dot"),
+    (re.compile(r"^(\d{2})/(\d{2})/(\d{4})$"), "dmy-slash"),
+    (re.compile(r"^(\d{4})(\d{2})(\d{2})$"), "ymd-compact"),
+]
+
+
+def parse_date(value: str) -> "tuple[_dt.date, str, str] | None":
+    """(dato, format, rest) for en dato-lignende celleverdi, ellers None.
+    `rest` er evt. klokkeslett/Z som skal bevares uendret (ISO)."""
+    v = (value or "").strip()
+    if not v:
+        return None
+    for pat, fmt in _DATE_FORMATS:
+        m = pat.match(v)
+        if not m:
+            continue
+        try:
+            if fmt in ("iso", "ymd-compact"):
+                y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            else:
+                d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            rest = m.group("rest") if fmt == "iso" else ""
+            return _dt.date(y, mo, d), fmt, rest or ""
+        except ValueError:
+            return None
+    return None
+
+
+def format_date(dt: "_dt.date", fmt: str, rest: str = "") -> str:
+    if fmt == "iso":
+        return f"{dt.year:04d}-{dt.month:02d}-{dt.day:02d}{rest}"
+    if fmt == "dmy-dot":
+        return f"{dt.day:02d}.{dt.month:02d}.{dt.year:04d}"
+    if fmt == "dmy-slash":
+        return f"{dt.day:02d}/{dt.month:02d}/{dt.year:04d}"
+    return f"{dt.year:04d}{dt.month:02d}{dt.day:02d}"
+
+
+def looks_like_date(value: str) -> bool:
+    return parse_date(value) is not None
+
+
+def _is_5_digits(v: str) -> bool:
+    v = (v or "").strip()
+    return len(v) == 5 and v.isdigit()
+
+
+# _norm_col beholder æøå → både «fodselsdato» (ASCII) og «fødselsdato» må med
+_BIRTHDATE_KW = ("fodselsdato", "foedselsdato", "fødselsdato", "fodselsdag",
+                 "foedselsdag", "fødselsdag", "fodselsdatum", "fdato",
+                 "fodt", "foedt", "født", "birthdate", "birthday",
+                 "dateofbirth", "dob")
+
+
+_PNR_KW = ("personnummer", "personnr", "pnr", "pnummer", "individnr", "individnummer")
+
+
+def is_pnr5_field(col_name: str) -> bool:
+    """True hvis kolonnenavnet betegner personnummer (de fem siste sifrene)."""
+    norm = _norm_col(col_name)
+    return bool(norm) and any(_kw_match(kw, norm) for kw in _PNR_KW)
+
+
+def is_birthdate_field(col_name: str) -> bool:
+    """True hvis kolonnenavnet betegner fødselsdato."""
+    norm = _norm_col(col_name)
+    return bool(norm) and any(_kw_match(kw, norm) for kw in _BIRTHDATE_KW)
+
+
+def compose_fnr(birthdate: "_dt.date", pnr5: str) -> "str | None":
+    """Rekonstruer et gyldig 11-sifret fnr fra fødselsdato + femsifret
+    personnummer. Prøver vanlig nummer, D-nummer (dag+40) og H-nummer
+    (måned+40). None hvis ingen variant er mod-11-gyldig."""
+    p = _digits(pnr5)
+    if len(p) != 5:
+        return None
+    yy = birthdate.year % 100
+    for day, month in ((birthdate.day, birthdate.month),
+                       (birthdate.day + 40, birthdate.month),
+                       (birthdate.day, birthdate.month + 40)):
+        cand = f"{day:02d}{month:02d}{yy:02d}{p}"
+        if is_valid_fnr(cand):
+            return cand
+    return None
 
 
 # ── Regex for fritekst-spenn ──────────────────────────────────────────────────
@@ -232,7 +384,12 @@ def find_all_pii(text: str) -> "list[Span]":
 _HEUR_ORDER: "list[tuple[PiiType, tuple[str, ...]]]" = [
     (PiiType.FNR,        ("fodselsnummer", "foedselsnummer", "fodselsnr", "foedselsnr",
                           "personnummer", "personnr", "fnr", "pnr", "pnummer",
-                          "fnummer", "ssn", "fnumber", "fodselnr")),
+                          "fnummer", "ssn", "fnumber", "fodselnr",
+                          "fødselsnummer", "fødselsnr", "fødselsnr",
+                          "individnr", "individnummer")),
+    # Fødselsdato — DATE/TIMESTAMP-kolonner håndteres av operasjonen (ikke-tekst),
+    # tekstkolonner her (verdiene må se ut som datoer).
+    (PiiType.BIRTHDATE,  _BIRTHDATE_KW),
     (PiiType.EMAIL,      ("epostadresse", "epost", "email", "emailaddress", "mail",
                           "epostadr", "epostadresse1", "epostadresse2")),
     # NB: telefon anonymiseres ikke (utenfor omfanget) — ingen PHONE-heuristikk.
@@ -585,10 +742,18 @@ def classify_column(col_name: str, sample_values: "list[str]",
                 if ptype in _NAMEISH and vals \
                         and _ratio(vals, lambda v: v.strip().isdigit()) >= 0.7:
                     break
-                # Fnr må ha 11-sifrede verdier (kolonner med færre sifre, f.eks.
-                # 5-sifret PersonNr, skal IKKE matches som fnr).
-                if ptype is PiiType.FNR and vals \
-                        and _ratio(vals, _has_11_digits) < 0.5:
+                # Fnr-nøkkelord: 11-sifrede verdier → FNR; femsifrede verdier
+                # (individnr + kontroll, f.eks. «PersonNr» = de fem siste) → PNR5;
+                # andre lengder er ikke personnummer.
+                if ptype is PiiType.FNR and vals:
+                    if _ratio(vals, _has_11_digits) >= 0.5:
+                        return ColumnClass(PiiType.FNR, "name")
+                    if _ratio(vals, _is_5_digits) >= 0.5:
+                        return ColumnClass(PiiType.PNR5, "name")
+                    break
+                # Fødselsdato må ha datoverdier
+                if ptype is PiiType.BIRTHDATE and vals \
+                        and _ratio(vals, looks_like_date) < 0.5:
                     break
                 # Postnr må ha 4-sifrede verdier (ikke kontonr o.l.).
                 if ptype is PiiType.POSTNR and vals \
@@ -644,6 +809,10 @@ def should_anonymize(pii_type: PiiType, value: str) -> bool:
         return False
     if pii_type is PiiType.FNR:
         return _has_11_digits(v)
+    if pii_type is PiiType.PNR5:
+        return _is_5_digits(v)
+    if pii_type is PiiType.BIRTHDATE:
+        return looks_like_date(v)
     if pii_type is PiiType.PHONE:
         return is_norwegian_phone(v)
     if pii_type is PiiType.POSTNR:
