@@ -487,6 +487,14 @@ class RepackSiardOperation(BaseOperation):
         # Bestem destinasjonsfil
         suffix   = (self.params.get("output_suffix") or "_konvertert").strip()
         src_path = ctx.siard_path
+        # Anonymisert innhold skal alltid være synlig i filnavnet — et uttrekk
+        # med fiktive personopplysninger må ikke kunne forveksles med originalen.
+        if (ctx.get_result("anonymize") is not None
+                and "anonymisert" not in suffix.lower()
+                and "anonymisert" not in src_path.stem.lower()):
+            suffix += "_anonymisert"
+            w("  Anonymisering er med i arbeidsflyten → «_anonymisert» legges "
+              "til i filnavnet", "info")
         dst_path = src_path.with_name(src_path.stem + suffix + src_path.suffix)
         counter  = 1
         while dst_path.exists():

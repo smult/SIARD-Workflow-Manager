@@ -20,6 +20,7 @@ import hashlib
 import threading
 
 import datetime as _dt
+import re
 
 from .pii_detect import (
     PiiType, fnr_control_digits, _digits, fnr_birthdate, fnr_period,
@@ -202,31 +203,71 @@ def fake_full_name(original: str) -> str:
     return f"{first} {last}"
 
 
+_FAKE_PHONE_DIGITS = "12345678"
+
+
 def fake_phone(original: str) -> str:
-    """Fiktivt norsk 8-sifret telefonnummer. Bevarer ledende +47 hvis originalen
-    har det."""
-    first = "4" if stable_index(original, "ph-pre", 2) == 0 else "9"
-    rest = "".join(str(stable_index(original, f"ph{i}", 10)) for i in range(7))
-    number = first + rest
-    src = (original or "").strip()
-    if src.startswith("+47") or src.startswith("0047"):
-        return "+47" + number
-    return number
+    """Fast fiktivt telefonnummer «12 34 56 78» som beholder originalens form:
+    landkode (+47 / 0047 / +46 …) og gruppeskilletegn står som de var, mens
+    abonnentsifrene byttes med 1 2 3 4 5 6 7 8 (syklisk ved flere sifre).
+      «98 76 54 32»     → «12 34 56 78»
+      «+47 98 76 54 32» → «+47 12 34 56 78»
+      «98765432»        → «12345678»
+      «+46 70-123 45 67» → «+46 12-345 67 81»
+    Telefon er ikke nøkkel, så én felles fiktiv verdi er tilstrekkelig; lengden
+    bevares slik at CHAR(n)/INT-kolonner ikke brytes."""
+    src = (original or "").rstrip("\x00")
+    s = src.strip()
+    if not s:
+        return original
+    m = re.match(r"^(\+|00)(\d+)", s)
+    keep_prefix = 0
+    if m:
+        run = m.group(2)
+        # Landkodelengde: +1/+7 er ett siffer; nøyaktig tre sifre før
+        # skilletegn (+358 …) er tre; ellers to (+47, +46, +44 …). Kompakte
+        # numre («+4798765432») får dermed «+47» og ikke «+479».
+        cc_len = 1 if run[0] in "17" else (3 if len(run) == 3 else 2)
+        keep_prefix = len(m.group(1)) + cc_len
+    else:
+        digits_all = "".join(ch for ch in s if ch.isdigit())
+        if len(digits_all) == 10 and digits_all.startswith("47"):
+            # landkode 47 uten «+» — behold de to første sifrene
+            seen = 0
+            for i, ch in enumerate(s):
+                if ch.isdigit():
+                    seen += 1
+                    if seen == 2:
+                        keep_prefix = i + 1
+                        break
+    out = list(s)
+    n = 0
+    for i in range(keep_prefix, len(out)):
+        if out[i].isdigit():
+            out[i] = _FAKE_PHONE_DIGITS[n % len(_FAKE_PHONE_DIGITS)]
+            n += 1
+    lead = len(src) - len(src.lstrip())
+    trail = len(src) - len(src.rstrip())
+    return src[:lead] + "".join(out) + (src[len(src) - trail:] if trail else "")
 
 
 # Faste, tydelig fiktive verdier (etter ønske fra KDRS):
 #   adresse → «Fiktivveien <nr>», postnr → «9999», sted → «Fiktivby»,
-#   e-post  → «<fornavn>.<etternavn>@fiktivadresse.no»
+#   e-post  → «anon<n>@ymized.no», telefon → «12 34 56 78»
 _FAKE_POSTNR = "9999"
 _FAKE_CITY   = "Fiktivby"
 _FAKE_STREET = "Fiktivveien"
-_FAKE_EMAIL_DOMAIN = "fiktivadresse.no"
+_FAKE_EMAIL_DOMAIN = "ymized.no"
+_FAKE_EMAIL_USER   = "anon"
 
 
 def fake_email(original: str) -> str:
-    first = fake_first_name(original).lower()
-    last  = fake_last_name(original).lower()
-    return f"{first}.{last}@{_FAKE_EMAIL_DOMAIN}"
+    """«anon<n>@ymized.no». Tallet utledes deterministisk av originalen slik at
+    ulike e-postadresser forblir ulike (e-post er ofte brukernavn/nøkkel; se
+    KEY_TYPES — MappingStore garanterer entydighet). Alltid kortere enn en
+    vanlig e-postadresse, så CHAR(n) brytes ikke."""
+    n = stable_index(original, "mail", 999_999) + 1
+    return f"{_FAKE_EMAIL_USER}{n}@{_FAKE_EMAIL_DOMAIN}"
 
 
 def fake_address(original: str) -> str:
@@ -240,6 +281,11 @@ def fake_postnr(original: str) -> str:
 
 
 def fake_city(original: str) -> str:
+    """Sted/kommune: kjent kommunenavn → «Fiktiv» + stedsnavn-endelse
+    («Marnardal» → «Fiktivdal»), ellers «Fiktivby»."""
+    from .kommune_names import is_kommune_name, fake_kommune
+    if is_kommune_name(original):
+        return fake_kommune(original)
     return _FAKE_CITY
 
 

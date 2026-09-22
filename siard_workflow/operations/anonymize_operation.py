@@ -44,7 +44,9 @@ _NAME_VALUE_TYPES = (PiiType.FULL_NAME, PiiType.FIRST_NAME, PiiType.LAST_NAME)
 from siard_workflow.core.anonymize.fake_generators import MappingStore
 from siard_workflow.core.anonymize.pii_detect import (
     is_birthdate_field, looks_like_date, is_pnr5_field, compose_fnr,
-    parse_date, fnr_birthdate, _digits,
+    parse_date, fnr_birthdate, _digits, is_phone_field, looks_like_phone,
+    find_address_spans, decode_hex_text, encode_hex_text,
+    looks_like_identifier, looks_like_filename,
 )
 from siard_workflow.core.anonymize import dummy_files
 
@@ -280,6 +282,13 @@ class AnonymizeOperation(BaseOperation):
         "analysis_rows":         20,    # antall eksempelrader Ollama vurderer per tabell
         "ollama_freetext_limit": 200,   # maks antall fritekstceller sendt til Ollama
         "dry_run":               False,
+        # Kommunenavn (SSB 1990–2026) → «Fiktiv<endelse>» i ALLE tekstfelt og
+        # fritekst — også kolonner som ikke er klassifisert som PII.
+        "anonymize_kommune":     True,
+        # Skann ALLE øvrige tekstbærende felt (VARCHAR/CHAR/inline CLOB, også
+        # hex-kodet tekst) for innebygd PII: navn, fnr, e-post, telefon,
+        # gateadresse, kommunenavn. Ikke bare kolonner klassifisert som PII.
+        "scan_all_text":         True,
         # ── Datareduksjon (subset) ──────────────────────────────────────────
         # Når på: i stedet for å anonymisere HELE datasettet beholdes inntil
         # `subset_rows` rader fra hver tabell, pluss relaterte rader (foreldre
@@ -418,7 +427,15 @@ class AnonymizeOperation(BaseOperation):
 
         stats = {"tables": 0, "pii_columns": 0, "cells_anonymized": 0,
                  "freetext_cells": 0, "lobs_replaced": 0, "lob_columns": 0,
-                 "mappings": 0}
+                 "kommune_replaced": 0, "mappings": 0}
+        if self.params.get("anonymize_kommune", True):
+            from siard_workflow.core.anonymize.kommune_data import KOMMUNE_NAMES
+            w(f"  Kommunenavn: {len(KOMMUNE_NAMES)} kjente navn (SSB 1990–2026) "
+              f"erstattes med «Fiktiv<endelse>» i alle tekstfelt", "info")
+        if self.params.get("scan_all_text", True):
+            w("  Alle øvrige tekstfelt (også inline CLOB og hex-kodet tekst) skannes "
+              "for innebygd PII: navn, fnr, e-post, telefon, gateadresse", "info")
+        stats["scan_cells"] = 0
 
         # Fase 1: les tabeller
         progress("phase", phase=1, total_phases=4, label="Leser metadata.xml")
@@ -482,6 +499,8 @@ class AnonymizeOperation(BaseOperation):
                 stats["tables"]           += 1
                 stats["cells_anonymized"] += cell_stats["cells"]
                 stats["freetext_cells"]   += cell_stats["freetext"]
+                stats["kommune_replaced"] += cell_stats.get("kommune", 0)
+                stats["scan_cells"]       += cell_stats.get("scan", 0)
                 stats["lobs_replaced"]    += cell_stats["lobs"]
                 if "kept_rows" in cell_stats:
                     kept_counts[key] = cell_stats["kept_rows"]
@@ -720,6 +739,12 @@ class AnonymizeOperation(BaseOperation):
                     heur[idx] = ColumnClass(PiiType.BIRTHDATE, "name")
                 elif (col["type"].startswith(("INT", "SMALLINT", "BIGINT", "NUMERIC",
                                               "DECIMAL"))
+                        and nvals and is_phone_field(col["name"])
+                        and sum(1 for v in nvals if looks_like_phone(v)) / len(nvals) >= 0.5):
+                    # Telefonnummer lagret numerisk → «12345678» (samme lengde)
+                    heur[idx] = ColumnClass(PiiType.PHONE, "name")
+                elif (col["type"].startswith(("INT", "SMALLINT", "BIGINT", "NUMERIC",
+                                              "DECIMAL"))
                         and nvals and is_pnr5_field(col["name"])
                         and sum(1 for v in nvals if len(v.strip()) == 5
                                 and v.strip().isdigit()) / len(nvals) >= 0.5):
@@ -881,7 +906,7 @@ class AnonymizeOperation(BaseOperation):
     def _rewrite_table(self, root: Path, info: dict, xml_path: Path,
                        table_plans: dict, replace_lobs: bool, w,
                        keep_rows: "set | None" = None) -> dict:
-        out = {"cells": 0, "freetext": 0, "lobs": 0}
+        out = {"cells": 0, "freetext": 0, "lobs": 0, "kommune": 0, "scan": 0}
         if not xml_path.exists():
             return out
         subset = keep_rows is not None
@@ -951,7 +976,23 @@ class AnonymizeOperation(BaseOperation):
             if mlen:
                 col_maxlen[c["idx"]] = int(mlen.group(1))
 
-        need_cell_rewrite = bool(value_cols or freetext_cols or inline_blob_cols)
+        # Alle ØVRIGE tekstbærende kolonner (ikke PII-klassifiserte — de byttes i
+        # sin helhet — og ikke LOB/identifikator-kolonner) skannes for innebygd
+        # PII og kommunenavn. Verdier som er identifikatorer/filnavn hoppes over
+        # per celle.
+        scan_cols: set = set()
+        if (self.params.get("anonymize_kommune", True)
+                or self.params.get("scan_all_text", True)):
+            from siard_workflow.core.anonymize.pii_detect import is_identifier_field
+            scan_cols = {
+                c["idx"] for c in info["columns"]
+                if _is_text_type(c["type"]) and c["idx"] not in value_cols
+                and c["idx"] not in freetext_cols and c["idx"] not in info["lob_cols"]
+                and c["idx"] not in inline_blob_cols
+                and not is_identifier_field(c["name"])}
+
+        need_cell_rewrite = bool(value_cols or freetext_cols or inline_blob_cols
+                                 or scan_cols)
         need_digest_patch = bool(ren_bytes)
         # Ved subset må vi alltid strømme om for å filtrere rader, selv uten PII.
         if not subset and not need_cell_rewrite and not need_digest_patch:
@@ -1011,7 +1052,8 @@ class AnonymizeOperation(BaseOperation):
             if need_cell_rewrite and b"<c" in line:
                 line, nc, nf = self._rewrite_line_cells(
                     line, value_cols, freetext_cols, inline_blob_cols, col_maxlen,
-                    row_overrides=overrides)
+                    row_overrides=overrides, scan_cols=scan_cols,
+                    counters=out)
                 out["cells"]    += nc
                 out["freetext"] += nf
             if need_digest_patch and (b"file=" in line or b"href=" in line):
@@ -1098,13 +1140,38 @@ class AnonymizeOperation(BaseOperation):
                             freetext_cols: set,
                             inline_blob_cols: "set | None" = None,
                             col_maxlen: "dict | None" = None,
-                            row_overrides: "dict | None" = None
+                            row_overrides: "dict | None" = None,
+                            scan_cols: "set | None" = None,
+                            counters: "dict | None" = None
                             ) -> "tuple[bytes, int, int]":
         n_cells = 0
         n_free = 0
         inline_blob_cols = inline_blob_cols or set()
         col_maxlen = col_maxlen or {}
         row_overrides = row_overrides or {}
+        scan_cols = scan_cols or set()
+        kommune_on = bool(self.params.get("anonymize_kommune", True))
+        scan_on = bool(self.params.get("scan_all_text", True))
+        from siard_workflow.core.anonymize.kommune_names import replace_kommune_names
+
+        def _count(key: str, n: int = 1) -> None:
+            if n and counters is not None:
+                counters[key] = counters.get(key, 0) + n
+
+        def _count_kommune(n: int) -> None:
+            _count("kommune", n)
+
+        def _anonymize_text(text: str, whole_cell: bool) -> "tuple[str, int, int]":
+            """Kommunenavn + PII-spenn i én tekst. Returnerer (ny, n_kommune, n_spenn)."""
+            nk = ns = 0
+            if kommune_on:
+                text, nk = replace_kommune_names(text, whole_cell=whole_cell)
+            if scan_on:
+                spans = self._freetext_spans(text)
+                if spans:
+                    text = _apply_spans(text, spans, self._mapping)
+                    ns = len(spans)
+            return text, nk, ns
 
         def _emit(grp1: bytes, idx: int, text: str) -> bytes:
             # Hard lengdegrense → aldri bryt skjemaets CHAR(n)
@@ -1144,14 +1211,35 @@ class AnonymizeOperation(BaseOperation):
                 original = _decode_cell(inner)
                 if not original.strip():
                     return m.group(0)
-                # 1) Erstatt konkrete PII-spenn (personnavn via ordbok + fnr/e-post)
-                #    deterministisk PÅ PLASS — behold resten av teksten.
+                # Hex-kodet tekst (inline CLOB fra SCFC o.l.) → dekod, anonymiser
+                # innholdet, skriv tilbake som hex i samme koding/bokstavform.
+                hx = decode_hex_text(original)
+                if hx:
+                    plain, enc, upper = hx
+                    new_plain, nk, ns = _anonymize_text(plain, whole_cell=False)
+                    if nk or ns:
+                        _count_kommune(nk)
+                        n_cells += 1
+                        n_free += 1
+                        return _emit(m.group(1), idx, encode_hex_text(new_plain, enc, upper))
+                    return m.group(0)
+                # 0) Kommunenavn → Fiktiv<endelse> FØR navnespenn (fiktive
+                #    etternavn som Berg/Lund må ikke treffes etterpå).
+                nk = 0
+                if kommune_on:
+                    original, nk = replace_kommune_names(original)
+                    _count_kommune(nk)
+                # 1) Erstatt konkrete PII-spenn (personnavn via ordbok + fnr/e-post/
+                #    telefon/adresse) deterministisk PÅ PLASS — behold resten.
                 spans = self._freetext_spans(original)
                 if spans:
                     new_text = _apply_spans(original, spans, self._mapping)
                     n_cells += 1
                     n_free += 1
                     return _emit(m.group(1), idx, new_text)
+                if nk:
+                    n_cells += 1
+                    return _emit(m.group(1), idx, original)
                 # 2) Ingen eksplisitte spenn, men Ollama vurderer teksten som
                 #    kontekstuelt identifiserende → hele feltet blir Lorem ipsum.
                 if self._is_context_identifiable(original):
@@ -1159,6 +1247,25 @@ class AnonymizeOperation(BaseOperation):
                     n_cells += 1
                     n_free += 1
                     return _emit(m.group(1), idx, lorem_ipsum(words, seed=original))
+            if idx in scan_cols and inner.strip():
+                original = _decode_cell(inner)
+                # Identifikatorer (GUID/nøkler/koder) og filnavn røres aldri
+                if looks_like_identifier(original) or looks_like_filename(original):
+                    return m.group(0)
+                hx = decode_hex_text(original)
+                if hx:
+                    plain, enc, upper = hx
+                    new_plain, nk, ns = _anonymize_text(plain, whole_cell=False)
+                    if nk or ns:
+                        _count_kommune(nk); _count("scan", 1 if ns else 0)
+                        n_cells += 1
+                        return _emit(m.group(1), idx, encode_hex_text(new_plain, enc, upper))
+                    return m.group(0)
+                new_text, nk, ns = _anonymize_text(original, whole_cell=True)
+                if nk or ns:
+                    _count_kommune(nk); _count("scan", 1 if ns else 0)
+                    n_cells += 1
+                    return _emit(m.group(1), idx, new_text)
             return m.group(0)
 
         return _CELL_RE.sub(_repl, line), n_cells, n_free
@@ -1166,11 +1273,17 @@ class AnonymizeOperation(BaseOperation):
     @staticmethod
     def _freetext_spans(text: str) -> "list[Span]":
         """Finn PII-spenn i fritekst som skal byttes på plass: personnavn (via
-        navneordbok) + fødselsnummer + e-post. Telefon/postnr er utenfor omfang
-        for fritekst. Overlapp fjernes (fnr/e-post har prioritet over navn)."""
+        navneordbok) + fødselsnummer + e-post + norsk telefonnummer. Postnr er
+        utenfor omfang for fritekst. Overlapp fjernes (fnr/e-post/telefon har
+        prioritet over navn)."""
         spans = [s for s in find_all_pii(text)
-                 if s.pii_type in (PiiType.FNR, PiiType.EMAIL)]
+                 if s.pii_type in (PiiType.FNR, PiiType.EMAIL, PiiType.PHONE)]
         taken = [(s.start, s.end) for s in spans]
+        # Gateadresser (gatenavn + husnummer) → «Fiktivveien N»
+        for sp in find_address_spans(text):
+            if not any(not (sp.end <= a or sp.start >= b) for a, b in taken):
+                spans.append(sp)
+                taken.append((sp.start, sp.end))
         for sp in find_name_spans(text):
             if not any(not (sp.end <= a or sp.start >= b) for a, b in taken):
                 spans.append(sp)
@@ -1195,21 +1308,70 @@ class AnonymizeOperation(BaseOperation):
 
     # ── Forhåndsvisning / bekreftelse ─────────────────────────────────────────
 
+    # Etikett i forhåndsvisningen for øvrige tekstkolonner der innebygd PII /
+    # kommunenavn ble funnet i eksempelverdiene (ikke en PiiType — kolonnen
+    # byttes ikke i sin helhet, bare treffene inne i teksten).
+    SCAN_LABEL = "TEKST-SKANN"
+
+    def _preview_text(self, text: str, *, whole_cell: bool, freetext: bool) -> str:
+        """
+        Samme tekstlogikk som kjøringen (_rewrite_line_cells) — for
+        forhåndsvisningen: hex-kodet tekst dekodes, kommunenavn → Fiktiv…,
+        PII-spenn (navn/fnr/e-post/telefon/adresse) byttes, og resultatet
+        skrives tilbake i samme form. Identifikatorer/filnavn røres ikke i
+        skannede kolonner. Ollamas kontekstvurdering (Lorem ipsum) skjer kun
+        ved kjøring og vises ikke her.
+        """
+        from siard_workflow.core.anonymize.kommune_names import replace_kommune_names
+        if not text or not text.strip():
+            return text
+        if not freetext and (looks_like_identifier(text) or looks_like_filename(text)):
+            return text
+        hx = decode_hex_text(text)
+        plain = hx[0] if hx else text
+        out = plain
+        if self.params.get("anonymize_kommune", True):
+            out, _ = replace_kommune_names(out, whole_cell=(whole_cell and not hx))
+        if freetext or self.params.get("scan_all_text", True):
+            spans = self._freetext_spans(out)
+            if spans:
+                out = _apply_spans(out, spans, self._mapping)
+        if out == plain:
+            return text
+        return encode_hex_text(out, hx[1], hx[2]) if hx else out
+
     def _build_summary(self, plans: dict, lob_plans: dict) -> dict:
         preview_rows = int(self.params.get("preview_rows", 5) or 5)
+        scan_on = bool(self.params.get("scan_all_text", True)
+                       or self.params.get("anonymize_kommune", True))
         columns = []
         for (key, idx), p in plans.items():
             pt = p["pii_type"]
             if pt not in VALUE_TYPES and pt != PiiType.FREE_TEXT:
+                # Øvrige tekstkolonner: vis dem bare hvis skannet faktisk ville
+                # endret noe i eksempelverdiene (innebygd PII / kommunenavn).
+                if (not scan_on or pt is not PiiType.OTHER
+                        or p["source"] in ("non-text", "identifikator", "filename")):
+                    continue
+                examples = []
+                for val in p["samples"][:preview_rows]:
+                    after = self._preview_text(val, whole_cell=True, freetext=False)
+                    if after != val:
+                        examples.append({"before": val[:80], "after": after[:80]})
+                if examples:
+                    columns.append({
+                        "table": key, "column": p["col_name"],
+                        "pii_type": self.SCAN_LABEL,
+                        "source": "skann: innebygd PII/kommunenavn i eksempelverdier",
+                        "examples": examples})
                 continue
             examples = []
             for val in p["samples"][:preview_rows]:
                 if pt == PiiType.FREE_TEXT:
-                    # Fritekst: personnavn/fnr/e-post byttes på plass (resten
-                    # beholdes). Forhåndsvisningen viser regel-veien; Ollamas
-                    # kontekstuelle vurdering skjer ved kjøring.
-                    spans = self._freetext_spans(val) if val.strip() else []
-                    after = _apply_spans(val, spans, self._mapping) if spans else val
+                    # Fritekst: kommunenavn + personnavn/fnr/e-post/telefon/
+                    # adresse byttes på plass (resten beholdes); hex-kodet tekst
+                    # dekodes. Ollamas kontekstvurdering skjer ved kjøring.
+                    after = self._preview_text(val, whole_cell=False, freetext=True)
                 elif should_anonymize(pt, val):
                     after = self._mapping.map(pt, val)
                 else:
@@ -1352,6 +1514,10 @@ class AnonymizeOperation(BaseOperation):
         msg = (f"{stats.get('cells_anonymized', 0)} celler anonymisert, "
                f"{stats.get('lobs_replaced', 0)} LOB-filer byttet, "
                f"{stats.get('mappings', 0)} unike erstatninger")
+        if stats.get("kommune_replaced"):
+            msg += f", {stats['kommune_replaced']:,} kommunenavn → Fiktiv…"
+        if stats.get("scan_cells"):
+            msg += f", {stats['scan_cells']:,} øvrige tekstfelt med innebygd PII"
         if "subset_rows_kept" in stats:
             orig = stats.get("subset_original_rows", 0)
             msg += (f"  |  datasett redusert til {stats['subset_rows_kept']:,}"

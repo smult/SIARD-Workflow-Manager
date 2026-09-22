@@ -38,13 +38,13 @@ class PiiType(str, Enum):
 
 
 # Typer som anonymiseres som hel-celle-verdi (hele cellen byttes deterministisk).
-# Omfang (etter ønske fra KDRS): KUN personnavn, personnummer, e-post og
-# stedsangivelser ned på stedsnivå (adresse/postnr/sted). Telefon anonymiseres
-# IKKE (PHONE er bevisst utelatt).
+# Omfang: personnavn, fødselsnummer/personnummer/fødselsdato, e-post, telefon
+# (fra 2026-09-18: fast fiktivt nummer med originalens oppdeling) og
+# stedsangivelser ned på stedsnivå (adresse/postnr/sted).
 VALUE_TYPES = frozenset({
     PiiType.FNR, PiiType.PNR5, PiiType.BIRTHDATE,
     PiiType.FIRST_NAME, PiiType.LAST_NAME, PiiType.FULL_NAME,
-    PiiType.ADDRESS, PiiType.POSTNR, PiiType.CITY, PiiType.EMAIL,
+    PiiType.ADDRESS, PiiType.POSTNR, PiiType.CITY, PiiType.EMAIL, PiiType.PHONE,
 })
 
 # Nøkkel-lignende typer der to ulike originaler ALDRI skal få samme fiktive
@@ -224,6 +224,19 @@ _BIRTHDATE_KW = ("fodselsdato", "foedselsdato", "fødselsdato", "fodselsdag",
 _PNR_KW = ("personnummer", "personnr", "pnr", "pnummer", "individnr", "individnummer")
 
 
+# Ord som inneholder telefon-nøkkelord uten å være telefon («mobil» i automobil)
+_PHONE_FALSE_FRIENDS = ("automobil", "immobil", "mobilitet", "mobility", "mobilis")
+
+
+def is_phone_field(col_name: str) -> bool:
+    """True hvis kolonnenavnet betegner telefon/mobil/faks (tel1, Mobil, phone …)."""
+    norm = _norm_col(col_name)
+    if not norm or any(ff in norm for ff in _PHONE_FALSE_FRIENDS):
+        return False
+    kws = next(k for t, k in _HEUR_ORDER if t is PiiType.PHONE)
+    return any(_kw_match(kw, norm) for kw in kws)
+
+
 def is_pnr5_field(col_name: str) -> bool:
     """True hvis kolonnenavnet betegner personnummer (de fem siste sifrene)."""
     norm = _norm_col(col_name)
@@ -331,6 +344,38 @@ def is_norwegian_phone(s: str) -> bool:
     return digits[0] not in "01"   # norske abonnentnumre starter på 2–9
 
 
+_YEAR_RANGE_RE = re.compile(r"^\d{4}\s*[-/–]\s*\d{4}$")
+_INTL_PHONE_RE = re.compile(r"^(?:\+|00)(\d{1,3})[\s\-./]*(.*)$", re.DOTALL)
+_PHONE_CHARS_RE = re.compile(r"^[\d\s\-./()]+$")
+
+
+def looks_like_phone(value: str) -> bool:
+    """
+    Per-verdi-vakt for telefonkolonner — «med eller uten landkode og oppdeling»:
+      • med landkode (+47, 0047, +46 …): 6–14 sifre etter koden, kun sifre og
+        gruppeskilletegn (mellomrom, bindestrek, punktum, parentes)
+      • uten landkode: norsk 8-sifret nummer (første siffer 2–9), evt. med
+        gruppeskilletegn; «47» foran 8 sifre godtas
+    Avviser datoer, års-spenn (2017-2020), filnavn og fødselsnummer.
+    """
+    s = (value or "").strip()
+    if not s or looks_like_filename(s) or parse_date(s) or _YEAR_RANGE_RE.match(s):
+        return False
+    m = _INTL_PHONE_RE.match(s)
+    if m:
+        rest = m.group(2)
+        if rest and not _PHONE_CHARS_RE.match(rest):
+            return False
+        digits = _digits(rest)
+        return 6 <= len(digits) <= 14 and not is_valid_fnr(digits)
+    if not _PHONE_CHARS_RE.match(s):
+        return False
+    digits = _digits(s)
+    if len(digits) == 10 and digits.startswith("47"):
+        digits = digits[2:]
+    return len(digits) == 8 and digits[0] not in "01"
+
+
 def find_phone(text: str) -> "list[Span]":
     out: list[Span] = []
     for m in _PHONE_RE.finditer(text):
@@ -350,6 +395,69 @@ def find_postnr_sted(text: str) -> "list[Span]":
     for m in _POSTNR_STED_RE.finditer(text):
         out.append(Span(m.start(), m.end(), PiiType.POSTNR, m.group(0)))
     return out
+
+
+# Gateadresse i fritekst: «Storgata 12», «Kirkeveien 4B», «Schweigaards gate 10»,
+# «Nedre Storgate 5». Siste ord må slutte på en gatenavn-endelse og følges av
+# husnummer (evt. bokstav). Inntil to foranstilte ord med stor forbokstav.
+_STREET_SUFFIX = (r"(?:vei|veien|veg|vegen|gate|gata|gaten|all[ée]|alleen|plass|plassen|"
+                  r"bakken|stien|svingen|tunet|lia|haugen|kroken|terrasse|terrassen|torg|"
+                  r"torget|toppen|åsen|jordet|løkka|hagen|myra|stubben|ringen|faret)")
+# To former: (a) ett–to foranstilte ord med stor forbokstav + siste ord som er
+# eller slutter på endelsen («Schweigaards gate», «Nedre Kirkeveien»);
+# (b) ett ord med stor forbokstav og stamme + endelse («Storgata»). Et
+# frittstående «gate 3» med liten forbokstav matcher ikke.
+_ADDRESS_RE = re.compile(
+    r"(?<![\wæøåÆØÅ])"
+    + r"(?P<street>"
+    + r"(?:[A-ZÆØÅ][\wæøåé\-]*\s+){1,2}(?:[A-ZÆØÅa-zæøå][\wæøåé\-]*?)?" + _STREET_SUFFIX
+    + r"|[A-ZÆØÅ][\wæøåé\-]*?" + _STREET_SUFFIX
+    + r")"
+    + r"\s+(?P<nr>\d{1,4}(?:\s?[A-Za-z])?)(?![\wæøåÆØÅ])")
+
+
+def find_address_spans(text: str) -> "list[Span]":
+    """Gateadresser (gatenavn + husnummer) i fritekst → ADDRESS-spenn."""
+    if not text:
+        return []
+    return [Span(m.start(), m.end(), PiiType.ADDRESS, m.group(0))
+            for m in _ADDRESS_RE.finditer(text)]
+
+
+# ── Hex-kodet tekst (inline CLOB fra bl.a. SCFC — se hex_extract) ────────────
+_HEX_CELL_RE = re.compile(r"^[0-9A-Fa-f]+$")
+_HEX_TEXT_REJECT = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]")
+
+
+def decode_hex_text(value: str) -> "tuple[str, str, bool] | None":
+    """
+    (tekst, koding, store_bokstaver) hvis celleverdien er hex-kodet tekst
+    (≥ 16 hex-tegn, jevn lengde, dekoder til UTF-8 eller cp1252 uten
+    kontrolltegn) — ellers None. Brukes for å anonymisere INNE i hex-kodede
+    CLOB-celler og skrive resultatet tilbake i samme koding og bokstavform.
+    """
+    v = (value or "").strip()
+    if len(v) < 16 or len(v) % 2 or not _HEX_CELL_RE.match(v):
+        return None
+    try:
+        raw = bytes.fromhex(v)
+    except ValueError:
+        return None
+    for enc in ("utf-8", "cp1252"):
+        try:
+            text = raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+        if _HEX_TEXT_REJECT.search(text):
+            return None
+        upper = not any(ch.islower() for ch in v)
+        return text, enc, upper
+    return None
+
+
+def encode_hex_text(text: str, enc: str, upper: bool) -> str:
+    h = text.encode(enc, errors="replace").hex()
+    return h.upper() if upper else h
 
 
 def find_all_pii(text: str) -> "list[Span]":
@@ -392,7 +500,14 @@ _HEUR_ORDER: "list[tuple[PiiType, tuple[str, ...]]]" = [
     (PiiType.BIRTHDATE,  _BIRTHDATE_KW),
     (PiiType.EMAIL,      ("epostadresse", "epost", "email", "emailaddress", "mail",
                           "epostadr", "epostadresse1", "epostadresse2")),
-    # NB: telefon anonymiseres ikke (utenfor omfanget) — ingen PHONE-heuristikk.
+    # Telefon/mobil/faks. Korte former (tel/tlf/mob/fax/cell) matcher kun eksakt
+    # eller med tallsuffiks (tel1, tlf2, mob3) — se _kw_match.
+    (PiiType.PHONE,      ("telefon", "telefonnummer", "telefonnr", "telefonnumer",
+                          "tlf", "tlfnr", "tlfnummer", "tel", "telnr", "telnummer",
+                          "mobil", "mobilnr", "mobilnummer", "mobiltelefon", "mob",
+                          "mobnr", "mobnummer", "phone", "phonenumber", "phoneno",
+                          "telephone", "mobile", "mobilephone", "cellphone", "cell",
+                          "telefax", "fax", "faks", "faksnr", "faxnr")),
     (PiiType.POSTNR,     ("postnummer", "postnr", "postalcode", "postcode", "postkode",
                           "zipcode", "zip", "poststednr")),
     (PiiType.CITY,       ("bosted", "city", "kommune", "sted", "stad",
@@ -414,12 +529,13 @@ _HEUR_ORDER: "list[tuple[PiiType, tuple[str, ...]]]" = [
 # Korte/tvetydige nøkkelord som KUN skal matche eksakt kolonnenavn (ikke som
 # delstreng) — ellers gir de falske treff (f.eks. "ort" i "sortering").
 _EXACT_ONLY = frozenset({"vei", "veg", "gate", "by", "ort", "stad", "place",
-                         "street"})
+                         "street", "tel", "tlf", "mob", "fax", "cell"})
 
 
 def _kw_match(kw: str, norm: str) -> bool:
     if kw in _EXACT_ONLY:
-        return kw == norm
+        # eksakt, evt. med tallsuffiks (tel1, tlf2, mob3 …)
+        return kw == norm or kw == re.sub(r"\d+$", "", norm)
     return kw == norm or kw in norm
 
 
@@ -755,6 +871,12 @@ def classify_column(col_name: str, sample_values: "list[str]",
                 if ptype is PiiType.BIRTHDATE and vals \
                         and _ratio(vals, looks_like_date) < 0.5:
                     break
+                # Telefon må ha telefon-lignende verdier (ikke koder/datoer/år),
+                # og navnet må ikke være en falsk venn (automobil …)
+                if ptype is PiiType.PHONE and (
+                        any(ff in norm for ff in _PHONE_FALSE_FRIENDS)
+                        or (vals and _ratio(vals, looks_like_phone) < 0.5)):
+                    break
                 # Postnr må ha 4-sifrede verdier (ikke kontonr o.l.).
                 if ptype is PiiType.POSTNR and vals \
                         and _ratio(vals, _is_4_digits) < 0.5:
@@ -814,7 +936,7 @@ def should_anonymize(pii_type: PiiType, value: str) -> bool:
     if pii_type is PiiType.BIRTHDATE:
         return looks_like_date(v)
     if pii_type is PiiType.PHONE:
-        return is_norwegian_phone(v)
+        return looks_like_phone(v)
     if pii_type is PiiType.POSTNR:
         # Postnr endres kun for nøyaktig 4 sifre (ikke kontonr o.l.)
         return _is_4_digits(v)

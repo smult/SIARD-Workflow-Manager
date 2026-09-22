@@ -34,7 +34,8 @@ DEFAULT_EVENT_TYPE = "Adjustment"
 
 # Suffikser som strippes for å finne uttrekkets «base»-navn — samme liste som
 # DiasPackageOperation bruker, slik at premis-fila matcher de andre sidefilene.
-_SUFFIXES = ("_konvertert", "_hex_extracted", "_cosdoc", "_blob", "_dias")
+_SUFFIXES = ("_konvertert", "_hex_extracted", "_cosdoc", "_blob", "_dias",
+             "_anonymisert", "_stdext", "_lobfix", "_xsdfix", "_metafix", "_segfix")
 
 ET.register_namespace("premis", PREMIS_NS)
 ET.register_namespace("xsi", XSI_NS)

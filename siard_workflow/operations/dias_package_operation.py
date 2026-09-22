@@ -157,7 +157,8 @@ def _resolve_pending(token: str, siard_path: Path, ctx) -> "Path | None":
     Brukes av DiasPackageOperation.run() rett før ekstra-filer kopieres.
     """
     base = siard_path.stem
-    _suffixes = ("_konvertert", "_hex_extracted", "_cosdoc", "_blob", "_dias")
+    _suffixes = ("_konvertert", "_hex_extracted", "_cosdoc", "_blob", "_dias",
+                 "_anonymisert", "_stdext", "_lobfix", "_xsdfix", "_metafix", "_segfix")
     changed = True
     while changed:
         changed = False
@@ -344,7 +345,8 @@ class DiasPackageOperation(BaseOperation):
         # Kjører uavhengig av pending-token-systemet slik at filer ikke mangler
         # selv om dialogens extra_files er tom eller tokens feiler å løse.
         base = siard_path.stem
-        for _suf in ("_konvertert", "_hex_extracted", "_cosdoc", "_blob", "_dias"):
+        for _suf in ("_konvertert", "_hex_extracted", "_cosdoc", "_blob", "_dias",
+                     "_anonymisert", "_stdext", "_lobfix", "_xsdfix", "_metafix", "_segfix"):
             if base.lower().endswith(_suf.lower()):
                 base = base[: -len(_suf)]
         _ctx_meta  = ctx.metadata or {}

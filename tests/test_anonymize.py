@@ -43,8 +43,8 @@ def test_classify_by_name():
     assert classify_column("Etternavn", []).pii_type == PiiType.LAST_NAME
     assert classify_column("NAVN", []).pii_type == PiiType.FULL_NAME
     assert classify_column("EPOST", []).pii_type == PiiType.EMAIL
-    # Telefon er utenfor omfanget → ikke klassifisert/anonymisert
-    assert classify_column("Telefonnummer", []).pii_type == PiiType.OTHER
+    # Telefon er i omfanget (fra 2026-09-18)
+    assert classify_column("Telefonnummer", []).pii_type == PiiType.PHONE
     assert classify_column("Brukernavn", ["per", "ola"]).pii_type != PiiType.FULL_NAME
 
 
@@ -88,6 +88,112 @@ def test_phone_norwegian_only():
     assert classify_column("Periode", ["2017-2020", "2018-2021", "2019-2022"]).pii_type != PiiType.PHONE
 
 
+def test_phone_and_email_anonymization():
+    """Telefon: kolonner som telefon/tel1/mobil/mobnummer/phone/mobile med
+    telefon-lignende verdier anonymiseres til «12 34 56 78» / «+47 12 34 56 78»
+    med originalens oppdeling. E-post → anon<n>@ymized.no (entydig)."""
+    from siard_workflow.core.anonymize.pii_detect import (
+        looks_like_phone, should_anonymize, is_phone_field)
+    from siard_workflow.core.anonymize.fake_generators import (
+        fake_phone, fake_email, MappingStore)
+    # Kolonnenavn
+    for name in ("Telefon", "tel1", "TLF2", "Mobil", "mobnummer", "MobilNr", "phone",
+                 "Mobile", "Telefonnummer", "Fax", "mob"):
+        assert is_phone_field(name), name
+    for name in ("Hotel", "Titel", "Kapitel", "Automobilforhandler", "Faxmaskin"):
+        assert not is_phone_field(name), name
+    # Verdier: med/uten landkode og oppdeling
+    for v in ("98765432", "98 76 54 32", "987 65 432", "+47 98 76 54 32", "+4798765432",
+              "0047 98765432", "4798765432", "98-76-54-32", "+46 70-123 45 67",
+              "+1 (555) 123-4567", "+44 20 7946 0958"):
+        assert looks_like_phone(v), v
+    for v in ("12345678", "035235453", "1234567", "2017-2020", "2017 - 2020", "01.01.2020",
+              "20200101", "98765432.doc", "abc", "", "0301"):
+        assert not looks_like_phone(v), v
+    # Klassifisering krever telefon-lignende verdier
+    assert classify_column("Telefon", ["98765432", "+47 91 23 45 67"]).pii_type == PiiType.PHONE
+    assert classify_column("tel1", ["22334455", "99887766"]).pii_type == PiiType.PHONE
+    assert classify_column("Mobil", ["ja", "nei"]).pii_type != PiiType.PHONE
+    assert classify_column("Telefon", ["2017-2020", "2018-2021"]).pii_type != PiiType.PHONE
+    assert should_anonymize(PiiType.PHONE, "+47 98 76 54 32") is True
+    # Fast fiktivt nummer med bevart form
+    assert fake_phone("98 76 54 32") == "12 34 56 78"
+    assert fake_phone("+47 98 76 54 32") == "+47 12 34 56 78"
+    assert fake_phone("98765432") == "12345678"
+    assert fake_phone("+4798765432") == "+4712345678"
+    assert fake_phone("0047 98765432") == "0047 12345678"
+    assert fake_phone("4798765432") == "4712345678"
+    assert fake_phone("987 65 432") == "123 45 678"
+    assert fake_phone("+46 70-123 45 67") == "+46 12-345 67 81"
+    assert fake_phone(" 98765432 ") == " 12345678 "
+    assert len(fake_phone("+1 (555) 123-4567")) == len("+1 (555) 123-4567")
+    store = MappingStore()
+    assert store.map(PiiType.PHONE, "98 76 54 32") == "12 34 56 78"
+    assert store.map(PiiType.PHONE, "91 23 45 67") == "12 34 56 78", "telefon er ikke nøkkel — felles fiktiv verdi"
+    # E-post
+    e = fake_email("ola.nordmann@skole.no")
+    assert e.startswith("anon") and e.endswith("@ymized.no") and e == fake_email("ola.nordmann@skole.no")
+    assert fake_email("kari@x.no") != e
+    store2 = MappingStore()
+    fakes = {store2.map(PiiType.EMAIL, f"bruker{i}@firma.no") for i in range(300)}
+    assert len(fakes) == 300 and all(f.endswith("@ymized.no") for f in fakes)
+    # Fritekst: norsk telefon byttes på plass
+    from siard_workflow.operations.anonymize_operation import AnonymizeOperation, _apply_spans
+    txt = "Ring Per Hansen på 98 76 54 32 eller +47 91234567, e-post per@firma.no."
+    spans = AnonymizeOperation._freetext_spans(txt)
+    out = _apply_spans(txt, spans, MappingStore())
+    assert "98 76 54 32" not in out and "91234567" not in out and "per@firma.no" not in out
+    assert "12 34 56 78" in out and "+47 12345678" in out and "@ymized.no" in out, out
+
+
+def test_kommune_names():
+    """Kommunenavn (SSB 1990–2026, også nedlagte) → «Fiktiv<endelse>» i alle
+    tekstfelt og fritekst; tvetydige navn (Berg, Time …) bare med «kommune»
+    eller som hel celle; bokstavform og genitiv-s bevares."""
+    from siard_workflow.core.anonymize.kommune_names import (
+        fake_kommune, replace_kommune_names, is_kommune_name, AMBIGUOUS)
+    from siard_workflow.core.anonymize.kommune_data import KOMMUNE_NAMES
+    from siard_workflow.core.anonymize.fake_generators import fake_city
+    assert len(KOMMUNE_NAMES) > 450
+    for n in ("Marnardal", "Søgne", "Songdalen", "Mandal", "Lindesnes", "Oslo",
+              "Kristiansand", "Nord-Aurdal", "Nore og Uvdal", "Guovdageaidnu", "Herøy"):
+        assert is_kommune_name(n), n
+    assert fake_kommune("Marnardal") == "Fiktivdal"
+    assert fake_kommune("MARNARDAL") == "FIKTIVDAL"
+    assert fake_kommune("marnardal") == "fiktivdal"
+    assert fake_kommune("Lindesnes") == "Fiktivnes"
+    assert fake_kommune("Kristiansand") == "Fiktivsand"
+    assert fake_kommune("Songdalen") == "Fiktivdalen"
+    assert fake_kommune("Nord-Aurdal") == "Fiktivdal"
+    assert fake_kommune("Nore og Uvdal") == "Fiktivdal"
+    assert fake_kommune("Oslo") == "Fiktivby" and fake_kommune("Bergen") == "Fiktivby"
+    assert fake_city("Marnardal") == "Fiktivdal" and fake_city("Ukjentsted") == "Fiktivby"
+    # Fritekst
+    t, n = replace_kommune_names("Pasienten bor i Marnardal og jobber ved Marnardal legesenter.")
+    assert n == 2 and "Marnardal" not in t and "Fiktivdal legesenter" in t, t
+    t, n = replace_kommune_names("Marnardals kommune, Søgne kommune og MANDAL.")
+    assert t == "Fiktivdals kommune, Fiktivby kommune og FIKTIVBY." or "Fiktivdals kommune" in t, t
+    assert n == 3
+    # Sammensetning uten ordgrense røres ikke
+    t, n = replace_kommune_names("Marnardalsveien 3")
+    assert n == 0 and t == "Marnardalsveien 3"
+    # Tvetydige navn: bare med «kommune» eller hel celle
+    assert "Berg" in AMBIGUOUS and "Time" in AMBIGUOUS and "Os" in AMBIGUOUS
+    t, n = replace_kommune_names("Signert av Kari Berg. Time: 14:00.")
+    assert n == 0 and t == "Signert av Kari Berg. Time: 14:00.", t
+    t, n = replace_kommune_names("Berg kommune og Time kommune")
+    assert n == 2 and "Berg" not in t and "Time" not in t, t
+    t, n = replace_kommune_names("BERG", whole_cell=True)
+    assert n == 1 and t == "FIKTIVBERG", t
+    t, n = replace_kommune_names(" Time ", whole_cell=True)
+    assert n == 1 and t.strip() == "Fiktivby", t
+    t, n = replace_kommune_names("Berg", whole_cell=False)
+    assert n == 0
+    # Fiktive etternavn fra generatoren skal ikke rammes i fritekst
+    t, n = replace_kommune_names("Per Lund og Kari Strand møtte Ola Moe")
+    assert n == 0, t
+
+
 def test_filenames_never_anonymized():
     from siard_workflow.core.anonymize.pii_detect import looks_like_filename, should_anonymize
     assert looks_like_filename("035235453.doc")
@@ -105,8 +211,9 @@ def test_fixed_fake_values():
         fake_address, fake_postnr, fake_city, fake_email, fake_postnr_value)
     assert fake_address("Storgata 12").startswith("Fiktivveien")
     assert fake_postnr("0150") == "9999"
-    assert fake_city("OSLO") == "Fiktivby"
-    assert fake_email("ola@skole.no").endswith("@fiktivadresse.no")
+    assert fake_city("OSLO") == "FIKTIVBY" and fake_city("Oslo") == "Fiktivby"   # bokstavform bevares
+    assert fake_email("ola@skole.no").endswith("@ymized.no")
+    assert fake_email("ola@skole.no").startswith("anon")
     assert fake_postnr_value("0150") == "9999"
     assert fake_postnr_value("0150 OSLO") == "9999 Fiktivby"
 
@@ -329,6 +436,165 @@ def test_fnr_relations_end_to_end(tmp_path=None):
     assert "Ola Nordmann" not in x0
 
 
+_META_KOMMUNE = """<?xml version="1.0" encoding="UTF-8"?>
+<siardArchive xmlns="http://www.bar.admin.ch/xmlns/siard/2/metadata.xsd" version="2.1">
+  <schemas><schema><name>S</name><folder>schema0</folder><tables>
+    <table><name>Ansatt</name><folder>table0</folder>
+      <columns>
+        <column><name>Arbeidsgiver</name><type>VARCHAR(80)</type></column>
+        <column><name>Poststed</name><type>VARCHAR(40)</type></column>
+        <column><name>Notat</name><type>NCLOB</type></column>
+        <column><name>Avdelingskode</name><type>VARCHAR(10)</type></column>
+      </columns><rows>2</rows></table>
+  </tables></schema></schemas>
+</siardArchive>
+"""
+
+
+def test_kommune_end_to_end(tmp_path=None):
+    """Kommunenavn erstattes gjennom selve radomskrivingen: i vanlige
+    tekstkolonner (ikke PII-klassifisert), i poststed (unntatt fra PII) og i
+    fritekst; koder uten kommunenavn står urørt."""
+    base = tmp_path or Path("./_fixture_kommune")
+    base.mkdir(parents=True, exist_ok=True)
+    siard = base / "kommune.siard"
+    t0 = ('<?xml version="1.0" encoding="UTF-8"?>\n<table xmlns="x">\n'
+          '<row><c1>Marnardal kommune</c1><c2>MARNARDAL</c2>'
+          '<c3>Flyttet fra Søgne til Marnardal i 2019. Kontakt Kari Berg.</c3><c4>AVD-7</c4></row>\n'
+          '<row><c1>Lindesnes legesenter</c1><c2>MANDAL</c2><c3>Ingen merknad.</c3><c4>AVD-9</c4></row>\n'
+          '</table>\n')
+    with zipfile.ZipFile(siard, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("header/metadata.xml", _META_KOMMUNE)
+        z.writestr("content/schema0/table0/table0.xml", t0)
+    result = _run_op(siard)
+    assert result.success, result.message
+    with zipfile.ZipFile(Path(result.data["output_path"])) as z:
+        xml = z.read("content/schema0/table0/table0.xml").decode("utf-8")
+    assert "<c1>Fiktivdal kommune</c1>" in xml, xml
+    assert "<c1>Fiktivnes legesenter</c1>" in xml, xml
+    assert xml.count("<c2>FIKTIVDAL</c2>") == 2, xml          # MARNARDAL og MANDAL → …dal
+    assert "Marnardal" not in xml and "Søgne" not in xml and "MANDAL" not in xml
+    assert "Fiktivby til Fiktivdal i 2019" in xml, xml
+    assert "Kari Berg" not in xml, "personnavn i fritekst anonymiseres fortsatt"
+    assert "<c4>AVD-7</c4>" in xml and "<c4>AVD-9</c4>" in xml, "koder urørt"
+    assert result.data.get("kommune_replaced", 0) >= 5, result.data
+
+
+def test_address_spans_and_hex_text():
+    """Gateadresser i fritekst → «Fiktivveien N»; hex-kodet tekst dekodes,
+    anonymiseres og skrives tilbake som hex."""
+    from siard_workflow.core.anonymize.pii_detect import (
+        find_address_spans, decode_hex_text, encode_hex_text)
+    from siard_workflow.operations.anonymize_operation import AnonymizeOperation, _apply_spans
+    txt = "Bor i Storgata 12, tidligere Schweigaards gate 4B og Nedre Kirkeveien 7. Møte kl 12."
+    spans = find_address_spans(txt)
+    assert [s.text for s in spans] == ["Storgata 12", "Schweigaards gate 4B", "Nedre Kirkeveien 7"], \
+        [s.text for s in spans]
+    assert find_address_spans("Saken har nr 12 og gate 3") == [] or \
+        all("gate 3" not in s.text for s in find_address_spans("Saken har nr 12"))
+    out = _apply_spans(txt, AnonymizeOperation._freetext_spans(txt), MappingStore())
+    assert "Storgata" not in out and "Schweigaards" not in out and "Kirkeveien" not in out
+    assert out.count("Fiktivveien") == 3 and "Møte kl 12." in out, out
+    # Hex-kodet tekst
+    plain = "Kontakt Ola Nordmann, tlf 98765432, Storgata 12, Marnardal."
+    hx = plain.encode("utf-8").hex().upper()
+    dec = decode_hex_text(hx)
+    assert dec and dec[0] == plain and dec[1] == "utf-8" and dec[2] is True
+    assert decode_hex_text("48656C6C6F") is None            # for kort (< 16)
+    assert decode_hex_text("Storgata 12") is None
+    assert decode_hex_text(bytes(range(32)).hex()) is None  # binært
+    lower = plain.encode("cp1252").hex()
+    d2 = decode_hex_text(lower)
+    assert d2 and d2[2] is False
+    assert encode_hex_text("Å", "cp1252", True) == "C5" and encode_hex_text("Å", "utf-8", False) == "c385"
+
+
+_META_SCAN = """<?xml version="1.0" encoding="UTF-8"?>
+<siardArchive xmlns="http://www.bar.admin.ch/xmlns/siard/2/metadata.xsd" version="2.1">
+  <schemas><schema><name>S</name><folder>schema0</folder><tables>
+    <table><name>Journal</name><folder>table0</folder>
+      <columns>
+        <column><name>Info</name><type>VARCHAR(200)</type></column>
+        <column><name>Tekst</name><type>CLOB</type></column>
+        <column><name>Kode</name><type>VARCHAR(10)</type></column>
+        <column><name>ObjektId</name><type>VARCHAR(40)</type></column>
+        <column><name>Verdi</name><type>VARCHAR(60)</type></column>
+      </columns><rows>1</rows></table>
+  </tables></schema></schemas>
+</siardArchive>
+"""
+
+
+def test_scan_all_text_end_to_end(tmp_path=None):
+    """Innebygd PII i en vanlig VARCHAR-kolonne (ikke klassifisert) og i en
+    hex-kodet inline CLOB anonymiseres; koder og GUID-er står urørt."""
+    base = tmp_path or Path("./_fixture_scan")
+    base.mkdir(parents=True, exist_ok=True)
+    siard = base / "scan.siard"
+    fnr = _valid_fnr("170580", 123)
+    plain = f"Pasient Ola Nordmann ({fnr}), tlf 98 76 54 32, Storgata 12, Marnardal. E-post ola@x.no"
+    hexclob = plain.encode("utf-8").hex().upper()
+    t0 = ('<?xml version="1.0" encoding="UTF-8"?>\n<table xmlns="x">\n'
+          f'<row><c1>{plain}</c1><c2>{hexclob}</c2><c3>AVD-7</c3>'
+          '<c4>9e7d823a-d64a-4374-ac3a-8a293064ccd0</c4>'
+          '<c5>Bor i Storgata 12, Marnardal</c5></row>\n</table>\n')
+    with zipfile.ZipFile(siard, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("header/metadata.xml", _META_SCAN)
+        z.writestr("content/schema0/table0/table0.xml", t0)
+    result = _run_op(siard)
+    assert result.success, result.message
+    with zipfile.ZipFile(Path(result.data["output_path"])) as z:
+        xml = z.read("content/schema0/table0/table0.xml").decode("utf-8")
+    import re
+    c1 = re.search(r"<c1>(.*?)</c1>", xml).group(1)
+    for leak in ("Nordmann", fnr, "98 76 54 32", "Storgata", "Marnardal", "ola@x.no"):
+        assert leak not in c1, (leak, c1)
+    assert "12 34 56 78" in c1 and "Fiktivveien" in c1 and "Fiktivdal" in c1 and "@ymized.no" in c1, c1
+    c2 = re.search(r"<c2>(.*?)</c2>", xml).group(1)
+    assert re.fullmatch(r"[0-9A-F]+", c2), "hex-kodet CLOB skrives tilbake som hex (store bokstaver)"
+    dec = bytes.fromhex(c2).decode("utf-8")
+    for leak in ("Nordmann", fnr, "Storgata", "Marnardal"):
+        assert leak not in dec, (leak, dec)
+    assert "Fiktivveien" in dec and "12 34 56 78" in dec, dec
+    assert "<c3>AVD-7</c3>" in xml and "9e7d823a-d64a-4374-ac3a-8a293064ccd0" in xml
+    # «Verdi» klassifiseres ikke som fritekst (kun adresse + kommune) → skanne-veien
+    c5 = re.search(r"<c5>(.*?)</c5>", xml).group(1)
+    assert "Storgata" not in c5 and "Marnardal" not in c5 and "Fiktivveien" in c5 and "Fiktivdal" in c5, c5
+    assert result.data.get("scan_cells", 0) >= 1, result.data
+    assert result.data.get("freetext_cells", 0) >= 2, result.data
+
+    # Forhåndsvisningen må vise det kjøringen faktisk gjør (kommunenavn i
+    # fritekst, hex-kodet CLOB, skannede øvrige kolonner) — ikke «uendret».
+    captured: dict = {}
+
+    def _cb(summary):
+        captured.update(summary)
+        return True
+    ctx = WorkflowContext(siard_path=siard)
+    ctx.metadata["anonymize_preview_cb"] = _cb
+    op = AnonymizeOperation(use_ollama=False)
+    op.params["output_suffix"] = "_anon2"
+    assert op.run(ctx).success
+    cols = {c["column"]: c for c in captured["columns"]}
+    info = cols["Info"]
+    assert info["pii_type"] == "FREE_TEXT"
+    assert all("Marnardal" not in e["after"] and "Fiktivdal" in e["after"] for e in info["examples"]), info
+    tekst = cols["Tekst"]
+    assert all(re.fullmatch(r"[0-9A-F]+", e["after"]) and e["after"] != e["before"]
+               for e in tekst["examples"]), "hex-CLOB vises som endret hex"
+    verdi = cols["Verdi"]
+    assert verdi["pii_type"] == AnonymizeOperation.SCAN_LABEL
+    assert verdi["examples"] and "Fiktivveien" in verdi["examples"][0]["after"] \
+        and "Fiktivdal" in verdi["examples"][0]["after"], verdi
+    assert "Kode" not in cols and "ObjektId" not in cols, "koder/GUID vises ikke som treff"
+    # Verdier som ikke endres vises heller ikke som treff i forhåndsvisningen
+    subj = "SERIALNUMBER=964966931, CN=MARNARDAL KOMMUNE, OU=Helse og Omsorg, O=MARNARDAL KO"
+    assert op._preview_text(subj, whole_cell=False, freetext=True) == \
+        "SERIALNUMBER=964966931, CN=FIKTIVDAL KOMMUNE, OU=Helse og Omsorg, O=FIKTIVDAL KO"
+    assert op._preview_text("CN=HELSEDIREKTORATET, C=NO", whole_cell=False, freetext=True) == \
+        "CN=HELSEDIREKTORATET, C=NO"
+
+
 def test_identifier_guard():
     """GUID/UUID, hash-er, nøkler og løpenumre skal ALDRI endres — verken via
     navnematch (addressRootEntityId → «address»), Ollama-forslag eller ved
@@ -474,8 +740,8 @@ def test_freetext_span_replacement():
     assert "per@example.no" not in anon("Kontakt per@example.no")
     f = fake_fnr("01010099991")
     assert f not in anon(f"Klient med fnr {f} i saken")
-    # Telefon er utenfor omfang → beholdes
-    assert "98765432" in anon("Ring kontoret på 98765432")
+    # Telefon er i omfanget (2026-09-18) → fast fiktivt nummer på plass
+    assert anon("Ring kontoret på 98765432") == "Ring kontoret på 12345678"
 
 
 def test_freetext_spans():
@@ -884,6 +1150,9 @@ def _selftest():
     test_fnr_validation_and_generation();  print("  ✓ fnr")
     test_fnr_requires_11_digits();         print("  ✓ fnr krever 11 sifre")
     test_phone_norwegian_only();           print("  ✓ telefon kun norsk mønster")
+    test_phone_and_email_anonymization();  print("  ✓ telefon (12 34 56 78) og e-post (anon@ymized.no)")
+    test_kommune_names();                  print("  ✓ kommunenavn → Fiktiv<endelse>")
+    test_address_spans_and_hex_text();     print("  ✓ adresse-spenn i fritekst + hex-kodet tekst")
     test_filenames_never_anonymized();     print("  ✓ filnavn endres aldri")
     test_fixed_fake_values();              print("  ✓ faste fiktive verdier")
     test_postnr_only_4_digits();           print("  ✓ postnr kun 4 sifre")
@@ -914,6 +1183,8 @@ def _selftest():
     with tempfile.TemporaryDirectory() as d:
         test_end_to_end(Path(d));          print("  ✓ ende-til-ende")
         test_fnr_relations_end_to_end(Path(d)); print("  ✓ fnr-relasjoner (fnr ↔ fødselsdato + pnr5)")
+        test_kommune_end_to_end(Path(d));  print("  ✓ kommunenavn ende-til-ende (kolonner + poststed + fritekst)")
+        test_scan_all_text_end_to_end(Path(d)); print("  ✓ innebygd PII i alle tekstfelt + hex-kodet CLOB")
     with tempfile.TemporaryDirectory() as d:
         test_show_preview_disabled(Path(d)); print("  ✓ kjør uten forhåndsvisning")
     with tempfile.TemporaryDirectory() as d:

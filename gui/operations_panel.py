@@ -559,6 +559,8 @@ OP_DEFS = [
             {"key": "use_ollama",           "label": "Bruk lokal Ollama (hvis kjører)", "type": "bool", "default": True},
             {"key": "replace_lobs",         "label": "Bytt BLOB/CLOB/filer til dummy", "type": "bool", "default": True},
             {"key": "replace_binary_media", "label": "Bytt også bilde/lyd/video",     "type": "bool", "default": True},
+            {"key": "anonymize_kommune",    "label": "Kommunenavn → Fiktiv… (alle tekstfelt)", "type": "bool", "default": True},
+            {"key": "scan_all_text",        "label": "Skann alle tekstfelt for innebygd PII (navn/fnr/e-post/tlf/adresse)", "type": "bool", "default": True},
             {"key": "show_preview",         "label": "Vis forhåndsvisning før endring", "type": "bool", "default": True},
             {"key": "preview_rows",         "label": "Antall eksempelrader i visning", "type": "int",  "default": 5},
             {"key": "analysis_rows",        "label": "Rader Ollama analyserer per tabell", "type": "int", "default": 20},

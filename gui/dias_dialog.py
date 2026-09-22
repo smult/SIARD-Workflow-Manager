@@ -69,7 +69,7 @@ _ALWAYS_PENDING: list[dict] = [
 
 # Kjente operasjonssuffikser som strippes for å finne opprinnelig arkivnavn
 _OP_SUFFIXES = [
-    "_konvertert", "_hex_extracted", "_cosdoc", "_blob", "_dias",
+    "_konvertert", "_hex_extracted", "_cosdoc", "_blob", "_dias", "_anonymisert",
 ]
 
 # ── Hjelpefunksjoner ──────────────────────────────────────────────────────────
