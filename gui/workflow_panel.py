@@ -404,6 +404,25 @@ class WorkflowPanel(ctk.CTkFrame):
         if not silent:
             self._validate_and_mark()
 
+    def insert_operation_before(self, op, before_id: str, *, silent: bool = False) -> None:
+        """Sett inn operasjon rett før den med gitt operation_id (ellers sist)."""
+        self.add_operation(op, silent=True)
+        self.move_operation_before(op, before_id, silent=silent)
+
+    def move_operation_before(self, op, before_id: str, *, silent: bool = False) -> bool:
+        """Flytt en eksisterende operasjon rett før den med gitt operation_id."""
+        row = next((r for r in self._rows if r.op is op), None)
+        if row is None:
+            return False
+        self._rows.remove(row)
+        idx = next((i for i, r in enumerate(self._rows)
+                    if r.op.operation_id == before_id), len(self._rows))
+        self._rows.insert(idx, row)
+        self._reindex()
+        if not silent:
+            self._validate_and_mark()
+        return True
+
     def load_workflow(self, wf):
         self.clear()
         for op in wf:

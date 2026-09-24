@@ -129,6 +129,12 @@ def _detect_ole2_type(data: bytes) -> "tuple[str, str, bool] | None":
 
     is_encrypted = "EncryptionInfo" in top_names
 
+    # Outlook-e-post (MSG) — sjekkes FØR Word-signaturer: en MSG med DOC-vedlegg
+    # inneholder «WordDocument» inne i vedleggsdataene.
+    if "__properties_version1.0" in top_names or any(
+            n.startswith("__substg1.0_") for n in top_names):
+        return "msg", "application/vnd.ms-outlook", False
+
     if is_encrypted and "EncryptedPackage" in top_names:
         if root_clsid == _CLSID_EXCEL:
             return ("xlsx",
@@ -211,6 +217,10 @@ def _detect(data: bytes) -> tuple[str, str, bool]:
     search_window = data[:512]
 
     if data[:4] == b"\xd0\xcf\x11\xe0" or stripped[:4] == b"\xd0\xcf\x11\xe0":
+        # MSG-strømnavn (UTF-16) i vinduet → Outlook-e-post, uansett vedlegg
+        if (b"_\x00_\x00s\x00u\x00b\x00s\x00t\x00g\x001\x00" in data[:262144]
+                and b"_\x00_\x00p\x00r\x00o\x00p\x00e\x00r\x00t\x00i\x00e\x00s\x00" in data[:262144]):
+            return "msg", "application/vnd.ms-outlook", False
         ole_type = _detect_ole2_type(data)
         if ole_type:
             return ole_type
@@ -243,14 +253,37 @@ def _detect(data: bytes) -> tuple[str, str, bool]:
     if stripped.startswith(b"<"):
         return "xml", "application/xml", False
 
+    # MIME-e-post (.eml) — tekst med e-posthoder; sjekkes før generell tekst
     try:
-        if b"\x00" not in data[:512] and data[:512]:
-            data[:512].decode("utf-8")
-            return "txt", "text/plain", False
-    except (UnicodeDecodeError, ValueError):
+        from siard_workflow.core.msg_to_pdf import is_eml_bytes
+        if is_eml_bytes(data):
+            return "eml", "message/rfc822", False
+    except Exception:
         pass
 
+    if _is_utf8_prefix(data[:512]):
+        return "txt", "text/plain", False
+
     return "bin", "application/octet-stream", False
+
+
+def _is_utf8_prefix(chunk: bytes) -> bool:
+    """
+    True hvis `chunk` er gyldig UTF-8 uten NUL. Et flerbyte-tegn (æ/ø/å = 2 byte,
+    € = 3 byte) som kuttes av vindusgrensen godtas: opptil 3 avsluttende byte
+    som utgjør starten på en gyldig sekvens ignoreres. Uten dette ble norsk
+    tekst tilfeldig klassifisert som «bin» når byte 512 falt midt i et tegn.
+    """
+    if not chunk or b"\x00" in chunk:
+        return False
+    try:
+        chunk.decode("utf-8")
+        return True
+    except UnicodeDecodeError as exc:
+        # Kun feil helt i slutten av vinduet (ufullstendig tegn) er akseptabelt
+        if exc.reason != "unexpected end of data":
+            return False
+        return exc.start >= len(chunk) - 3
 
 
 # ── Backend-klasse ────────────────────────────────────────────────────────────

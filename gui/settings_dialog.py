@@ -516,6 +516,33 @@ class SettingsDialog(ctk.CTkToplevel):
                          row=r, column=0, columnspan=2,
                          padx=14, pady=(0, 4), sticky="w"); r += 1
 
+        # ── Ghostscript (PDF/A-normalisering, valgfritt) ─────────────────────
+        _seksjon("Ghostscript (PDF/A-normalisering)", r); r += 1
+        _rad("Bruk Ghostscript når den finnes", "use_ghostscript", "bool", r,
+             default=True); r += 1
+        _rad("Sti til Ghostscript (gswin64c.exe, tom = finn selv)", "ghostscript_bin",
+             "str", r, default="", browse_file=True); r += 1
+        self._gs_status_lbl = ctk.CTkLabel(
+            frm, text=self._ghostscript_status_text(),
+            font=ctk.CTkFont(family=FONTS["mono"], size=11),
+            text_color=COLORS["muted"], anchor="w")
+        self._gs_status_lbl.grid(row=r, column=0, columnspan=2,
+                                 padx=14, pady=(0, 4), sticky="w"); r += 1
+        ctk.CTkButton(
+            frm, text="Installer / Oppdater Ghostscript",
+            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
+            font=ctk.CTkFont(family=FONTS["mono"], size=11),
+            command=self._install_ghostscript,
+        ).grid(row=r, column=1, padx=12, pady=(0, 4), sticky="e"); r += 1
+        ctk.CTkLabel(frm,
+                     text=("Gjør e-post-PDF-er (også PDF-vedlegg) om til gyldig PDF/A. Valgfritt — "
+                           "uten Ghostscript brukes LibreOffice alene. Lastes ned fra Artifex "
+                           "(GitHub, ca. 65 MB) og installeres i din brukermappe. AGPL-lisens."),
+                     font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                     text_color=COLORS["muted"], wraplength=640, justify="left").grid(
+                         row=r, column=0, columnspan=2,
+                         padx=14, pady=(0, 4), sticky="w"); r += 1
+
         # ── Ollama (lokal PII-deteksjon for anonymisering) ──────────────────
         _seksjon("Ollama (lokal PII-deteksjon)", r); r += 1
         _rad("Bruk lokal Ollama", "ollama_enabled", "bool", r, default=True); r += 1
@@ -704,6 +731,69 @@ class SettingsDialog(ctk.CTkToplevel):
         except Exception as exc:
             self._ollama_status_lbl.configure(
                 text=f"Status: feil ved test ({exc})", text_color=COLORS["muted"])
+
+    # ── Ghostscript-status + installasjon ────────────────────────────────────
+
+    def _ghostscript_status_text(self) -> str:
+        try:
+            from siard_workflow.core import ghostscript as _gs
+            gs = _gs.find_ghostscript()
+        except Exception:
+            gs = None
+        if not gs:
+            return "Status: ikke funnet"
+        return f"Status: Ghostscript {_gs.get_version(gs) or '?'} — {gs}"
+
+    def _install_ghostscript(self):
+        from siard_workflow.core import ghostscript as _gs
+        import tkinter.messagebox as _mb
+        import threading
+
+        existing = _gs.find_ghostscript()
+        if existing and not _mb.askyesno(
+                "Ghostscript finnes",
+                f"Ghostscript {_gs.get_version(existing) or ''} er allerede funnet:\n"
+                f"{existing}\n\nVil du laste ned og installere siste versjon likevel?",
+                parent=self):
+            return
+
+        prog = ctk.CTkToplevel(self)
+        prog.title("Installerer Ghostscript")
+        prog.configure(fg_color=COLORS["surface"])
+        prog.transient(self)
+        prog.grab_set()
+        prog.geometry("460x150")
+        prog.resizable(False, False)
+        msg_var = ctk.StringVar(value="Forbereder...")
+        ctk.CTkLabel(prog, textvariable=msg_var,
+                     font=ctk.CTkFont(family=FONTS["mono"], size=12),
+                     wraplength=420, justify="left"
+                     ).pack(padx=20, pady=20, anchor="w", fill="x")
+        result: dict = {"path": None, "err": None}
+
+        def _worker():
+            try:
+                result["path"] = str(_gs.install_ghostscript(
+                    lambda m: prog.after(0, lambda: msg_var.set(m))))
+            except Exception as exc:
+                result["err"] = str(exc)
+            prog.after(0, _done)
+
+        def _done():
+            prog.grab_release()
+            prog.destroy()
+            if result["err"]:
+                _mb.showerror("Installasjon feilet", result["err"], parent=self)
+                return
+            self._gs_status_lbl.configure(text=self._ghostscript_status_text())
+            if result["path"] and "ghostscript_bin" in self._vars:
+                try:
+                    self._vars["ghostscript_bin"].set(result["path"])
+                except Exception:
+                    pass
+            _mb.showinfo("Ferdig", "Ghostscript er klar til bruk.", parent=self)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     # ── Siegfried-status + installasjon ──────────────────────────────────────
 

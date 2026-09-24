@@ -24,6 +24,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Callable, Optional
+from siard_workflow.core.subproc import hidden_kwargs
 
 
 # ── PRONOM PUID → kort ext-streng (matcher dagens semantikk) ─────────────────
@@ -254,7 +255,7 @@ class SiegfriedIdentifier:
                 proc = subprocess.run(
                     [sf_exe, "-multi", "64", "-json", *chunk],
                     capture_output=True, text=True, timeout=600,
-                    encoding="utf-8", errors="replace",
+                    encoding="utf-8", errors="replace", **hidden_kwargs(),
                 )
                 if proc.returncode != 0 or not proc.stdout:
                     return None
@@ -294,7 +295,7 @@ class SiegfriedIdentifier:
             proc = subprocess.run(
                 [self.sf_exe, "-multi", "64", "-json", str(root)],
                 capture_output=True, text=True, timeout=1800,
-                encoding="utf-8", errors="replace",
+                encoding="utf-8", errors="replace", **hidden_kwargs(),
             )
             if proc.returncode != 0 or not proc.stdout:
                 return
@@ -382,7 +383,7 @@ class SiegfriedIdentifier:
             proc = subprocess.run(
                 [self.sf_exe, "-json", str(path)],
                 capture_output=True, text=True, timeout=30,
-                encoding="utf-8", errors="replace",
+                encoding="utf-8", errors="replace", **hidden_kwargs(),
             )
             if proc.returncode != 0 or not proc.stdout:
                 return ("bin", "application/octet-stream", False)

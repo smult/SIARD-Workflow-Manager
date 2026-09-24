@@ -27,6 +27,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 from typing import Callable, Optional
+from siard_workflow.core.subproc import hidden_kwargs
 
 
 _GITHUB_API = "https://api.github.com/repos/richardlehane/siegfried/releases/latest"
@@ -90,7 +91,7 @@ def get_version() -> Optional[str]:
         return None
     try:
         r = subprocess.run([p, "-version"], capture_output=True,
-                           text=True, timeout=5,
+                           text=True, timeout=5, **hidden_kwargs(),
                            encoding="utf-8", errors="replace")
         return (r.stdout or r.stderr).strip().split("\n")[0] or None
     except Exception:
@@ -210,7 +211,7 @@ def install_siegfried(progress: ProgressCb = None) -> Path:
     _say("Henter PRONOM-signaturer (sf -update)...")
     try:
         subprocess.run([str(sf_path), "-update"],
-                       capture_output=True, timeout=180, check=True)
+                       capture_output=True, timeout=180, check=True, **hidden_kwargs())
     except subprocess.CalledProcessError as exc:
         # Ikke fatal — sf kommer ofte med default.sig bundlet
         _say(f"  Advarsel: sf -update returnerte {exc.returncode}")
@@ -245,7 +246,7 @@ def update_signatures(progress: ProgressCb = None) -> bool:
         except Exception: pass
     try:
         subprocess.run([sf, "-update"], capture_output=True,
-                       timeout=180, check=True)
+                       timeout=180, check=True, **hidden_kwargs())
         return True
     except Exception:
         return False

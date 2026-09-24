@@ -50,6 +50,7 @@ from pathlib import Path, PurePosixPath
 
 from siard_workflow.core.base_operation import BaseOperation, OperationResult
 from siard_workflow.core.context import WorkflowContext
+from siard_workflow.core.subproc import hidden_kwargs
 from siard_workflow.core.siard_format import (
     detect_siard_version, siard_version_transform,
     get_target_siard_version, is_siard_xml,
@@ -301,6 +302,7 @@ def _lo_convert_batch(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=timeout_per_file * max(len(files), 1),
+            **hidden_kwargs(),
         )
         for f in files:
             out = dst_dir / f"{f.stem}.{ext}"
@@ -354,6 +356,7 @@ def _lo_convert(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=timeout,
+            **hidden_kwargs(),
         )
         # LibreOffice skriver output-filen med samme stamme som input
         stem = src.stem

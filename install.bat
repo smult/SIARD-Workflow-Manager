@@ -25,6 +25,23 @@ if %errorlevel% neq 0 (
 ) else (
     echo [OK] LibreOffice funnet i PATH
 )
+echo.
+echo Sjekker Ghostscript (valgfritt, PDF/A-normalisering av e-post)...
+where gswin64c >nul 2>&1
+if %errorlevel% equ 0 (
+    echo [OK] Ghostscript funnet i PATH
+) else (
+    if exist "%ProgramFiles%\gs" (
+        echo [OK] Ghostscript funnet i %ProgramFiles%\gs
+    ) else if exist "%LOCALAPPDATA%\Programs\gs" (
+        echo [OK] Ghostscript funnet i %LOCALAPPDATA%\Programs\gs
+    ) else if exist "%LOCALAPPDATA%\SIARDManager\ghostscript" (
+        echo [OK] Ghostscript funnet i %LOCALAPPDATA%\SIARDManager\ghostscript
+    ) else (
+        echo [ADVARSEL] Ghostscript ikke funnet - valgfritt.
+        echo            Installer fra Innstillinger ^> Ghostscript i programmet.
+    )
+)
 echo. 
 echo Trykk en tast for å fortsette
 pause >nul

@@ -8,3 +8,7 @@
 debug.log
 config.json
 extras/
+# Lokale eksempelfiler for testing (skal ikke i git)
+eksempelfiler/
+# Generert testuttrekk (inneholder eksempelfiler) — lag på nytt med testsiard/lag_testsiard.py
+testsiard/

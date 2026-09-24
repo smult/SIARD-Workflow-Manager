@@ -178,6 +178,98 @@ class _PipelineSuggestionDialog(ctk.CTkToplevel):
         self.destroy()
 
 
+class _LibreOfficeWarningDialog(ctk.CTkToplevel):
+    """
+    Advarsel om LibreOffice før kjøring (ødelagt installasjon, eller versjon
+    som henger ved gjenbruk av profil). result: "stopp" | "fortsett".
+    dont_show_again: brukeren krysset av for «ikke vis igjen» (kun gjenbruk).
+    """
+
+    def __init__(self, parent, title: str, message: str, *,
+                 can_continue: bool = True, allow_dont_show: bool = True):
+        super().__init__(parent)
+        self.result = "stopp"
+        self.dont_show_again = False
+        self.title(title)
+        self.resizable(False, False)
+        self.configure(fg_color=COLORS["bg"])
+        self.grab_set()
+        self.lift()
+        w, wrap = 620, 620 - 64
+
+        header = ctk.CTkFrame(self, fg_color=COLORS["panel"], corner_radius=0)
+        header.pack(side="top", fill="x")
+        ctk.CTkLabel(header, text=f"  ⚠  {title}",
+                     font=ctk.CTkFont(family=FONTS["mono"], size=13, weight="bold"),
+                     text_color=COLORS.get("warn", COLORS["accent"]), anchor="w"
+                     ).pack(side="left", padx=12, pady=10)
+
+        btn_row = ctk.CTkFrame(self, fg_color="transparent")
+        btn_row.pack(side="bottom", fill="x", padx=16, pady=14)
+        btn_row.grid_columnconfigure((0, 1, 2), weight=1)
+        ctk.CTkButton(btn_row, text="Stopp kjøringen",
+                      fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"],
+                      text_color=COLORS["on_accent"],
+                      font=ctk.CTkFont(family=FONTS["mono"], size=11, weight="bold"),
+                      height=34, command=self._stopp
+                      ).grid(row=0, column=0, padx=(0, 6), sticky="ew")
+        ctk.CTkButton(btn_row, text="Åpne nedlastingsside",
+                      fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+                      text_color=COLORS["btn_text"], border_color=COLORS["btn_border"],
+                      border_width=1, font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                      height=34, command=self._open_download
+                      ).grid(row=0, column=1, padx=3, sticky="ew")
+        if can_continue:
+            ctk.CTkButton(btn_row, text="Fortsett likevel",
+                          fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+                          text_color=COLORS["btn_text"], border_color=COLORS["btn_border"],
+                          border_width=1, font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                          height=34, command=self._fortsett
+                          ).grid(row=0, column=2, padx=(6, 0), sticky="ew")
+
+        self._dont_var = ctk.BooleanVar(value=False)
+        if allow_dont_show and can_continue:
+            ctk.CTkCheckBox(self, text="Ikke vis igjen for denne LibreOffice-installasjonen",
+                            variable=self._dont_var,
+                            font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                            text_color=COLORS["muted"]
+                            ).pack(side="bottom", anchor="w", padx=18, pady=(0, 2))
+
+        msg_frame = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        msg_frame.pack(side="top", fill="both", expand=True)
+        msg_label = ctk.CTkLabel(msg_frame, text=message,
+                                 font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                                 text_color=COLORS["text"], wraplength=wrap,
+                                 justify="left", anchor="nw")
+        msg_label.pack(padx=16, pady=(14, 8), fill="x", anchor="nw")
+        self.protocol("WM_DELETE_WINDOW", self._stopp)
+        self.bind("<Escape>", lambda _e: self._stopp())
+
+        self.update_idletasks()
+        needed = header.winfo_reqheight() + msg_label.winfo_reqheight() + btn_row.winfo_reqheight() + 100
+        h = max(280, min(needed, int(self.winfo_screenheight() * 0.85)))
+        x = parent.winfo_x() + (parent.winfo_width() - w) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - h) // 2
+        self.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _open_download(self):
+        import webbrowser
+        from siard_workflow.core.lo_runner import DOWNLOAD_URL
+        try:
+            webbrowser.open(DOWNLOAD_URL)
+        except Exception:
+            pass
+
+    def _stopp(self):
+        self.result = "stopp"
+        self.destroy()
+
+    def _fortsett(self):
+        self.result = "fortsett"
+        self.dont_show_again = bool(self._dont_var.get())
+        self.destroy()
+
+
 class App(ctk.CTk):
     TITLE   = "SIARD Workflow Manager"
     try:
@@ -1610,6 +1702,15 @@ class App(ctk.CTk):
 
         existing = next((op for op in ops if isinstance(op, LobFolderFixOperation)), None)
         if existing is not None and existing.params.get("full_file_paths"):
+            ids = [o.operation_id for o in ops]
+            pos = ops.index(existing)
+            later = {"hex_extract", "blob_convert", "anonymize", "standardize_ext"}
+            if any(i in later for i in ids[pos + 1:]) and "repack_siard" in ids:
+                self.workflow_panel.move_operation_before(existing, "repack_siard")
+                self._log("«Korriger lobFolder» med «Full sti i file=» flyttet rett "
+                          "før «Pakk sammen SIARD» (må kjøre etter HEX/BLOB)", "ok")
+                self._pf("allerede valgt — flyttet sist i arbeidsflyten")
+                return True
             self._pf("allerede valgt («Full sti i file=» er på)")
             return True   # allerede valgt — ikke spør igjen
 
@@ -1663,18 +1764,23 @@ class App(ctk.CTk):
         self.wait_window(dialog)
 
         if dialog.result == "ja":
+            # Full sti må skrives SIST (rett før «Pakk sammen SIARD»): HEX Inline
+            # Extract og BLOB-konvertering lager/omdøper LOB-filer og skriver
+            # nye referanser med bare filnavn — ellers blir formatet blandet.
             if existing is not None:
                 existing.params["full_file_paths"] = True
-                self._log("«Full sti i file=» slått på i «Korriger lobFolder» "
+                self.workflow_panel.move_operation_before(existing, "repack_siard")
+                self._log("«Full sti i file=» slått på i «Korriger lobFolder», og "
+                          "operasjonen er flyttet rett før «Pakk sammen SIARD» "
                           "(DBPTK A_M_5.6-1-2)", "ok")
-                self._pf("funn — «Full sti i file=» slått på")
+                self._pf("funn — «Full sti i file=» slått på, flyttet sist")
             else:
                 op = LobFolderFixOperation()
                 op.params["full_file_paths"] = True
-                self.workflow_panel.insert_operation_after(op, "unpack_siard")
+                self.workflow_panel.insert_operation_before(op, "repack_siard")
                 self._log("«Korriger lobFolder (SCFC→DBPTK)» med «Full sti i file=» "
-                          "lagt til etter «Pakk ut SIARD»", "ok")
-                self._pf("funn — «Korriger lobFolder» med full sti lagt til")
+                          "lagt til rett før «Pakk sammen SIARD»", "ok")
+                self._pf("funn — «Korriger lobFolder» med full sti lagt til sist")
             return True  # ops re-hentes av kalleren
 
         if dialog.result == "nei":
@@ -1923,6 +2029,117 @@ class App(ctk.CTk):
         self._pf("avbrutt av operatør")
         return False  # avbrutt
 
+    def _libreoffice_preflight(self, ops: list) -> bool:
+        """
+        Helsesjekk av LibreOffice FØR kjøring når arbeidsflyten bruker det
+        (BLOB-konvertering / CosDoc). Kjøres i bakgrunnstråd så vinduet ikke
+        fryser. Første gang for en installasjon tar det opptil ~50 s (gjenbruks-
+        testen); resultatet lagres per installasjon, så senere tar det ~5 s.
+
+        * LibreOffice virker ikke → advarsel, anbefalt å stoppe.
+        * Versjon som henger ved gjenbruk av profil (LibreOffice 26.2.1) →
+          advarsel med valg: stopp for å installere annen versjon, åpne
+          nedlastingssiden, eller fortsette (tregt) — evt. «ikke vis igjen».
+        """
+        from siard_workflow.core import lo_runner as _lr
+        from siard_workflow.core.libreoffice import find_libreoffice
+        uses_lo = [op for op in ops if op.operation_id in ("blob_convert", "cosdoc_mailmerge")]
+        if not uses_lo:
+            self._pf("ikke aktuelt (ingen LibreOffice-konvertering)")
+            return True
+        hint = ""
+        for op in uses_lo:
+            hint = str(op.params.get("libreoffice_bin", "") or "")
+            if hint:
+                break
+        lo_bin = find_libreoffice(hint or "soffice")
+        if not lo_bin:
+            dlg = _LibreOfficeWarningDialog(
+                self, "LibreOffice ikke funnet",
+                "Arbeidsflyten konverterer dokumenter med LibreOffice, men "
+                "LibreOffice ble ikke funnet.\n\nInstaller LibreOffice (anbefalt: siste "
+                "feilrettingsversjon i en moden serie) og prøv igjen, eller angi stien "
+                "i operasjonens innstillinger.", can_continue=True, allow_dont_show=False)
+            self.wait_window(dlg)
+            if dlg.result == "stopp":
+                self._pf("stoppet: LibreOffice ikke funnet")
+                return False
+            self._pf("LibreOffice ikke funnet — operatøren fortsetter")
+            return True
+
+        version = _lr.lo_version(lo_bin) or "ukjent versjon"
+        self._update_status_right(f"Preflight: tester LibreOffice {version} …")
+        import threading, tempfile, shutil as _sh, time as _time
+        result: dict = {}
+        work = Path(tempfile.mkdtemp(prefix="siard_lo_preflight_"))
+
+        def _run():
+            try:
+                result["r"] = _lr.health_check(lo_bin, work)
+            except Exception as exc:
+                result["r"] = (False, f"{type(exc).__name__}: {exc}", True)
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        dots = 0
+        while t.is_alive():
+            self.update()
+            _time.sleep(0.1)
+            dots += 1
+            if dots % 20 == 0:
+                self._update_status_right(
+                    f"Preflight: tester LibreOffice {version} … ({dots // 10} s)")
+        _sh.rmtree(work, ignore_errors=True)
+        ok, err, reuse_ok = result.get("r", (False, "ukjent feil", True))
+
+        if not ok:
+            dlg = _LibreOfficeWarningDialog(
+                self, "LibreOffice fungerer ikke",
+                f"LibreOffice {version} ({lo_bin}) klarte ikke å konvertere en enkel "
+                f"tekstfil.\n\nFeil: {err}\n\nDokumentkonverteringen vil feile. "
+                "Reparer eller installer LibreOffice på nytt før du kjører.\n\n"
+                "Test i ledetekst:\n  soffice --headless --convert-to pdf test.txt",
+                can_continue=True, allow_dont_show=False)
+            self.wait_window(dlg)
+            if dlg.result == "stopp":
+                self._pf(f"stoppet: LibreOffice {version} fungerer ikke")
+                return False
+            self._pf(f"LibreOffice {version} fungerer ikke — operatøren fortsetter")
+            return True
+
+        if reuse_ok:
+            self._pf(f"LibreOffice {version}: OK")
+            return True
+
+        if _lr.reuse_warning_acknowledged(lo_bin):
+            self._pf(f"LibreOffice {version}: henger ved gjenbruk av profil — ny profil "
+                     f"per kall (advarsel skjult etter valg)")
+            return True
+
+        msg = (
+            f"LibreOffice {version} henger når samme profil brukes mer enn én gang. "
+            "Dette er en feil i denne LibreOffice-versjonen.\n\n"
+            "Programmet kan jobbe rundt det ved å lage en ny profil for hvert "
+            "LibreOffice-kall, men det gir ca. 5 sekunder ekstra per kall. "
+            "E-postkonvertering (MSG/EML) og store uttrekk blir da betydelig tregere.\n\n"
+            "Anbefalt: stopp kjøringen og installer en annen LibreOffice-versjon — "
+            "siste feilrettingsversjon i en moden serie (per september 2026: 26.2.6), "
+            "eller 25.8.7 hvis feilen fortsatt finnes. Unngå x.y.0-utgivelser.\n\n"
+            "Programmet oppdager ny installasjon selv og tester på nytt ved neste kjøring.")
+        dlg = _LibreOfficeWarningDialog(
+            self, "LibreOffice-versjon med kjent feil", msg,
+            can_continue=True, allow_dont_show=True)
+        self.wait_window(dlg)
+        if dlg.result == "stopp":
+            self._log(f"Kjøringen stoppet for å bytte LibreOffice {version}. "
+                      f"Nedlasting: {_lr.DOWNLOAD_URL}", "warn")
+            self._pf(f"stoppet: LibreOffice {version} henger ved gjenbruk av profil")
+            return False
+        if dlg.dont_show_again:
+            _lr.acknowledge_reuse_warning(lo_bin)
+        self._pf(f"LibreOffice {version}: henger ved gjenbruk av profil — operatøren "
+                 f"fortsetter med ny profil per kall (tregere)")
+        return True
+
     def _report_preflight(self, ops: list) -> bool:
         """
         Spør om brukeren vil legge til 'Kjørerapport (PDF)' dersom den ikke
@@ -2102,6 +2319,7 @@ class App(ctk.CTk):
             return
 
         if self.workflow_panel.has_order_violations():
+            from tkinter import messagebox
             messagebox.showerror(
                 "Ugyldig arbeidsflyt",
                 "Arbeidsflyten har operasjoner i feil rekkefølge.\n"
@@ -2133,6 +2351,7 @@ class App(ctk.CTk):
             ("tableX.xsd (DBPTK P_4.3-3 / T_6.3-1)",       self._xsd_type_preflight),
             ("Metadata-kvalitet (dbname/datospenn)",       self._metadata_quality_preflight),
             ("Sluttrapport (PDF)",                         self._report_preflight),
+            ("LibreOffice (konvertering)",                 self._libreoffice_preflight),
             ("Diskplass (temp/output)",                    self._disk_space_preflight),
         ]
         try:
@@ -2342,6 +2561,13 @@ class App(ctk.CTk):
 
             ctx.metadata["step_results"] = []
 
+            # Prosjektfil: fullførte steg hoppes bare over så lenge ALLE steg
+            # før dem også ble hoppet over. Når ett steg må kjøres (ikke
+            # fullført, eller «Pakk ut» må gjentas fordi temp-mappa er borte),
+            # kjøres alle påfølgende steg — ellers blir f.eks. en ny, uendret
+            # utpakking pakket sammen uten konvertering, eller et nytt steg
+            # endrer en mappe som aldri pakkes sammen.
+            _pf_rerun_from: "int | None" = None
             for i, op in enumerate(wf):
                 # Sjekk stop FØR hvert nytt steg — blokker til Fortsett klikkes
                 if self._stop_event.is_set():
@@ -2357,7 +2583,7 @@ class App(ctk.CTk):
                     file_logger.log(f"[{i+1}] {op.label}", "step")
 
                 # ── Prosjektfil: hopp over fullførte steg ─────────────────────
-                if _pf and _pf.is_completed(op.operation_id):
+                if _pf and _pf_rerun_from is None and _pf.is_completed(op.operation_id):
                     _cp       = _pf._find(op.operation_id)
                     saved_ctx = _cp.ctx_data if _cp else {}
                     saved_out = _pf.get_output_siard(op.operation_id)
@@ -2412,6 +2638,19 @@ class App(ctk.CTk):
                             "elapsed":  0.0,
                         })
                         continue
+
+                if _pf and _pf_rerun_from is None:
+                    _pf_rerun_from = i
+                    _later_done = [o.label for o in list(wf)[i + 1:]
+                                   if _pf.is_completed(o.operation_id)]
+                    if _later_done:
+                        _msg = (f"  Prosjekt: «{op.label}» kjøres — derfor kjøres også "
+                                f"{len(_later_done)} påfølgende steg som var fullført "
+                                f"({', '.join(_later_done[:4])}"
+                                f"{' …' if len(_later_done) > 4 else ''})")
+                        self._log_queue.put(("log", _msg, "warn"))
+                        if file_logger:
+                            file_logger.log(_msg, "warn")
 
                 if not op.should_run(ctx):
                     self._log_queue.put(("skip", op.operation_id, op.label))

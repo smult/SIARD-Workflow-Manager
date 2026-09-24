@@ -400,10 +400,28 @@ def _err_clean(msg: str) -> str:
     # Fjern "Filer: ..." (interne batch-filnavn)
     idx = msg.find(". Filer: ")
     cleaned = msg[:idx] if idx >= 0 else msg
-    # Legg til hint om passordbeskyttelse ved LibreOffice-lastfeil
+    # LibreOffice kunne ikke åpne kildefilen. Mulige årsaker er mange — ikke
+    # gjett på passord (LO-helsesjekken fanger en ødelagt installasjon).
     if "source file could not be loaded" in cleaned:
-        cleaned += ". Trolig grunnet passordbeskyttelse og feil passord."
+        cleaned += (". LibreOffice kunne ikke åpne filen (passordbeskyttet, "
+                    "skadet eller format LibreOffice ikke støtter).")
     return cleaned
+
+
+class LibreOfficeUnavailable(RuntimeError):
+    """LibreOffice-installasjonen kan ikke konvertere dokumenter."""
+
+
+def lo_health_check(lo_bin: str, work_dir: Path, timeout: int = 120) -> "tuple[bool, str]":
+    """
+    Konverter en liten tekstfil til PDF med isolert profil — to ganger, for å
+    teste om gjenbruk av profil henger (se core/lo_runner.py). (True, "") når
+    LibreOffice fungerer; ellers (False, feilmelding). Modus for profiler
+    (gjenbruk / ny per kall) settes globalt i lo_runner.
+    """
+    from siard_workflow.core import lo_runner as _lr
+    ok, err, _reuse = _lr.health_check(lo_bin, Path(work_dir), timeout=timeout)
+    return ok, err
 
 
 def _strip_rtf_ole_objects(data: bytes) -> bytes:
@@ -1734,6 +1752,11 @@ class BlobConvertOperation(BaseOperation):
                 f"{len(details)} LOB-kolonne(r) omtypet til "
                 f"BINARY LARGE OBJECT fordi innholdet nå er binært "
                 f"(<typeOriginal> bevart): " + "; ".join(details))
+        repairs = data.get("lob_ref_repairs") or []
+        if repairs:
+            parts.append(
+                "file=-referanser pekt tilbake på eksisterende originalfil "
+                "(ikke konvertert): " + "; ".join(repairs))
         return "; ".join(parts) or "formatkonvertering utført"
     default_params = {
         "output_suffix":        "_konvertert",
@@ -1743,6 +1766,9 @@ class BlobConvertOperation(BaseOperation):
         "dry_run":              False,
         "temp_dir":             "",
         "pdfa_version":         _PDFA_DEFAULT,
+        # Outlook-e-post (.msg) → én PDF/A: meldingshode + tekst + vedlegg.
+        # PDF/A-2b, eller PDF/A-3 med innebygd original når pdfa_version er PDF/A-3.
+        "convert_msg":          True,
     }
 
     def run(self, ctx: WorkflowContext) -> OperationResult:
@@ -1875,7 +1901,10 @@ class BlobConvertOperation(BaseOperation):
             dst_path = Path(output_dir_override) / dst_path.name
             w(f"  Output-mappe: {dst_path.parent}  (alternativt lagringssted)", "info")
 
-        dst_path = self._resolve_dst_path(dst_path, w)
+        # Pipeline-modus: «Pakk sammen SIARD» bestemmer navnet — ikke vis en
+        # destinasjon her som kan avvike (f.eks. _konvertert_4.siard).
+        dst_path = self._resolve_dst_path(
+            dst_path, w if not getattr(ctx, "extracted_path", None) else (lambda *a, **k: None))
 
         # Velg temp-mappe: global (fra ctx), ellers finn beste disk automatisk
         td = ctx.metadata.get("temp_dir", "").strip() if hasattr(ctx, "metadata") else ""
@@ -1920,7 +1949,10 @@ class BlobConvertOperation(BaseOperation):
                           err_log=err_log)
         except Exception as exc:
             import traceback
-            w(f"  Uventet feil: {exc}\n{traceback.format_exc()}", "feil")
+            if isinstance(exc, LibreOfficeUnavailable):
+                w(f"  {exc}", "feil")          # allerede forklart — ingen traceback
+            else:
+                w(f"  Uventet feil: {exc}\n{traceback.format_exc()}", "feil")
             progress("finish", stats=stats)
             if csv_log:
                 csv_log.__exit__(None, None, None)
@@ -1954,15 +1986,24 @@ class BlobConvertOperation(BaseOperation):
 
         w("  OPPSUMMERING:", "step")
         STAT_LABELS = {
-            "detected":           "Detektert",
+            "identified":         "Identifisert (alle LOB-filer)",
+            "detected":           "Behandlet av LibreOffice",
             "converted":          "Konvertert til PDF/A",
             "kept":               "Beholdt originalformat",
             "failed":             "Konvertering feilet",
+            "msg_converted":      "E-post (MSG/EML) → PDF/A",
             "xml_updated":        "XML-noder oppdatert",
             "inline_extracted":   "Inline NBLOB/NCLOB",
             "missing_blob_refs":  "Manglende blob-refs i XML",
+            "lob_columns_retyped": "LOB-kolonner omtypet til BLOB",
         }
+        # Detaljlister vises som egne linjer (kun når de har innhold)
+        DETAIL_LISTS = {"lob_type_details": "Omtypet", "lob_ref_repairs": "Referanse rettet"}
         for k, v in stats.items():
+            if k in DETAIL_LISTS or isinstance(v, (list, dict)):
+                continue
+            if k == "lob_columns_retyped" and not v:
+                continue
             label = STAT_LABELS.get(k, k)
             if k == "converted" and v:
                 lvl = "ok"
@@ -1971,8 +2012,15 @@ class BlobConvertOperation(BaseOperation):
             else:
                 lvl = "info"
             w(f"    {label:<28} {v}", lvl)
+        for k, title in DETAIL_LISTS.items():
+            for item in stats.get(k) or []:
+                w(f"    {title}: {item}", "info")
+        _pipeline = bool(getattr(ctx, "extracted_path", None))
         if not self.params["dry_run"]:
-            w(f"    Ny SIARD: {dst_path}", "ok")
+            if _pipeline:
+                w("    Ny SIARD lages av «Pakk sammen SIARD» (navnet står der)", "info")
+            else:
+                w(f"    Ny SIARD: {dst_path}", "ok")
         w("=" * 56)
 
         progress("finish", stats=stats)
@@ -2285,7 +2333,8 @@ class BlobConvertOperation(BaseOperation):
         # binære — ellers krasjer DBPTK-innlastingen (se lob_column_types).
         _lt = reconcile_lob_column_types(extract_dir, w)
         stats["lob_columns_retyped"] = _lt["columns_retyped"]
-        stats["lob_type_details"] = _lt["details"]
+        stats["lob_type_details"] = _lt["retype_details"]
+        stats["lob_ref_repairs"] = _lt["repair_details"]
         progress("phase_done")
 
         w("  Pipeline-modus: repakking overlates til 'Pakk sammen SIARD'.", "info")
@@ -2627,7 +2676,8 @@ class BlobConvertOperation(BaseOperation):
                 # som binære — ellers krasjer DBPTK-innlastingen.
                 _lt = reconcile_lob_column_types(extract_dir, w)
                 stats["lob_columns_retyped"] = _lt["columns_retyped"]
-                stats["lob_type_details"] = _lt["details"]
+                stats["lob_type_details"] = _lt["retype_details"]
+                stats["lob_ref_repairs"] = _lt["repair_details"]
                 progress("phase_done")
 
                 # ── Fase 5: Pakk ny SIARD ─────────────────────────────────────
@@ -2665,6 +2715,41 @@ class BlobConvertOperation(BaseOperation):
                      conversion_registry: "dict | None" = None,
                      creg_lock: "threading.Lock | None" = None,
                      emit_phase_events: bool = True) -> None:
+        """
+        Kjør konverteringen med en egen, unik arbeidsmappe for denne kjøringen
+        (LibreOffice-profiler + batch- og retry-mapper), som alltid ryddes.
+
+        I pipeline-modus er extract_dir.parent selve temp-disken (f.eks. E:\\),
+        som deles av alle kjøringer. Faste navn der (lo_profiles/workerN, bN)
+        gjorde at samtidige kjøringer — flere programinstanser eller parallelle
+        køelementer — brukte samme LibreOffice-profil. LibreOffice kjører én
+        instans per profil, så kallet ble overlatt til den andre kjøringens
+        instans og ga «Ingen PDF produsert»; opprydningen slettet i tillegg den
+        andre kjøringens profiler.
+        """
+        lo_run_root = Path(tempfile.mkdtemp(prefix="siard_lo_", dir=extract_dir.parent))
+        try:
+            self._convert_all_run(
+                all_blobs, extract_dir, stats, w, progress, lo_bin, stop_ev,
+                pause_ev, csv_log=csv_log, xml_type_hints=xml_type_hints,
+                err_log=err_log, conversion_registry=conversion_registry,
+                creg_lock=creg_lock, emit_phase_events=emit_phase_events,
+                lo_run_root=lo_run_root)
+        finally:
+            shutil.rmtree(lo_run_root, ignore_errors=True)
+
+    def _convert_all_run(self, all_blobs: list[str], extract_dir: Path,
+                         stats: dict, w, progress,
+                         lo_bin: str,
+                         stop_ev: threading.Event,
+                         pause_ev: threading.Event,
+                         csv_log=None,
+                         xml_type_hints: dict | None = None,
+                         err_log=None,
+                         conversion_registry: "dict | None" = None,
+                         creg_lock: "threading.Lock | None" = None,
+                         emit_phase_events: bool = True,
+                         lo_run_root: "Path | None" = None) -> None:
         """
         Deteksjon parallelt + LO batch-konvertering med unik brukerprofil per instans.
         xml_type_hints: {filnavn: ext} fra type-kolonner i tableX.xml.
@@ -2761,6 +2846,26 @@ class BlobConvertOperation(BaseOperation):
                 return zip_sti, ("bin", "application/octet-stream", False)
 
             ext, mime, is_encrypted = _id.identify(data=data, path=p)
+
+            # ── Outlook-MSG ──────────────────────────────────────────────────
+            # MSG deler OLE2-container med DOC/XLS/PPT. Både Siegfried og
+            # magic-bytes kan feiltolke en MSG med Office-vedlegg som vedleggets
+            # format. Sjekk OLE2-katalogen i HELE filen (64 kB-vinduet kan
+            # mangle katalogsektoren).
+            if ext != "msg" and data[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
+                try:
+                    from siard_workflow.core.msg_to_pdf import is_msg_file as _is_msg
+                    if _is_msg(p):
+                        ext, mime, is_encrypted = "msg", "application/vnd.ms-outlook", False
+                except Exception:
+                    pass
+            elif ext in ("txt", "bin", "html", "xml"):
+                try:
+                    from siard_workflow.core.msg_to_pdf import is_eml_bytes as _is_eml
+                    if _is_eml(data):
+                        ext, mime, is_encrypted = "eml", "message/rfc822", False
+                except Exception:
+                    pass
 
             # ── Backend-uavhengig container-sjekk ────────────────────────────
             # Hvis den aktive identifieren ikke kjente igjen innholdet (bin/txt),
@@ -2999,12 +3104,15 @@ class BlobConvertOperation(BaseOperation):
         if _utf8_bin_count[0]:
             w(f"  UTF-8-kodet binærdata: {_utf8_bin_count[0]:,} filer gjenopprettet", "info")
 
+        stats["identified"] = len(det_results)
+
         # Steg B: Kategoriser
         to_convert:     list[tuple[int, str, str, str]] = []
         to_upgrade:     list[tuple[int, str, str, str]] = []  # gammel→ny format via LO
         to_rename_only: list[tuple[int, str, str, str]] = []
         to_wpt:         list[tuple[int, str, str, str]] = []  # WPTools native
         to_archive:     list[tuple[int, str, str, str]] = []  # komprimerte flerfil-arkiver
+        to_msg:         list[tuple[int, str, str, str]] = []  # Outlook-e-post → PDF/A
         unknown_items:  dict[str, list] = {}   # ext -> [(idx,zip_sti,ext,mime)]
 
         # Komprimerte formater som skal behandles spesielt
@@ -3045,6 +3153,8 @@ class BlobConvertOperation(BaseOperation):
 
             if ext == "wpt":
                 to_wpt.append((idx, zip_sti, ext, mime))
+            elif ext in ("msg", "eml") and self.params.get("convert_msg", True):
+                to_msg.append((idx, zip_sti, ext, mime))
             elif ext in ("txt", "xml", "bin"):
                 to_rename_only.append((idx, zip_sti, ext, mime))
             elif ext == "pdf" and self.params["skip_existing_pdf"]:
@@ -3155,6 +3265,7 @@ class BlobConvertOperation(BaseOperation):
             w(f"    Typer: {', '.join(f'{n}×{e.upper()}' for e,n in sorted(arc_fmt.items()))}", "info")
 
         w(f"  WPTools (wpt): {len(to_wpt):,}", "info")
+        w(f"  E-post (msg/eml): {len(to_msg):,}", "info")
         w(f"  Rename/behold: {len(to_rename_only):,}", "info")
 
         # Logg hva .txt-filer faktisk ble detektert som
@@ -3166,6 +3277,31 @@ class BlobConvertOperation(BaseOperation):
                 txt_by_ext[e] = txt_by_ext.get(e, 0) + 1
             parts = ", ".join(f"{n}×{e}" for e, n in sorted(txt_by_ext.items()))
             w(f"  .txt-deteksjon: {parts}", "info")
+
+        # Helsesjekk av LibreOffice før noe sendes dit: en ødelagt installasjon
+        # skal gi ÉN tydelig melding, ikke én feil per fil.
+        if (to_convert or to_upgrade or to_msg or to_archive or to_wpt) \
+                and not stop_ev.is_set():
+            _hc_dir = Path(tempfile.mkdtemp(prefix="siard_lo_check_", dir=extract_dir))
+            try:
+                _hc_ok, _hc_err = lo_health_check(lo_bin, _hc_dir)
+            finally:
+                shutil.rmtree(str(_hc_dir), ignore_errors=True)
+            if not _hc_ok:
+                w(f"  LibreOffice-helsesjekk FEILET: {_hc_err}", "feil")
+                w(f"  {lo_bin} kan ikke konvertere en enkel tekstfil. Ingen filer "
+                  f"er konvertert. Reparer eller installer LibreOffice på nytt, og "
+                  f"test med:  soffice --headless --convert-to pdf test.txt", "feil")
+                raise LibreOfficeUnavailable(
+                    f"LibreOffice fungerer ikke ({_hc_err}) — ingen filer konvertert")
+            from siard_workflow.core import lo_runner as _lr
+            if _lr.profile_reuse_ok():
+                w("  LibreOffice-helsesjekk: OK", "info")
+            else:
+                w("  LibreOffice-helsesjekk: OK, men denne LibreOffice-versjonen "
+                  "henger ved gjenbruk av profil — bruker ny profil per kall "
+                  "(ca. 5 s ekstra per kall). Vurder en annen LibreOffice-versjon.",
+                  "warn")
 
         # Steg B2: Arkiver — pakk ut, konverter innhold, repakk
         if to_archive and not stop_ev.is_set():
@@ -3180,6 +3316,13 @@ class BlobConvertOperation(BaseOperation):
                 to_upgrade, _upgrade_live, stats,
                 extract_dir, lo_bin, stop_ev, pause_ev,
                 csv_log, err_log, w, lock)
+
+        # Steg B4: Outlook-e-post → PDF/A (meldingshode + tekst + vedlegg)
+        if to_msg and not stop_ev.is_set():
+            self._convert_msgs(
+                to_msg, stats, extract_dir, lo_bin, stop_ev,
+                csv_log, err_log, w, lock, max_w,
+                conversion_registry, creg_lock, _standardize_bin)
 
         # Steg C: Rename-bare — behandle uten GUI-event per fil (kan vaere 100k+)
         # Send kun periodiske stats-oppdateringer for å holde GUI responsiv
@@ -3398,7 +3541,10 @@ class BlobConvertOperation(BaseOperation):
         batch_size    = min(max_batch, ideal_batch)
         all_batches   = [to_convert[i:i+batch_size]
                          for i in range(0, n_to_convert, batch_size)]
-        profiles_root = extract_dir.parent / "lo_profiles"
+        # Unik per kjøring (se _convert_all) — aldri delt med andre kjøringer
+        if lo_run_root is None:
+            lo_run_root = Path(tempfile.mkdtemp(prefix="siard_lo_", dir=extract_dir.parent))
+        profiles_root = lo_run_root / "profiles"
         profiles_root.mkdir(exist_ok=True)
 
         _zip_to_idx = {zip_sti: idx
@@ -3463,6 +3609,8 @@ class BlobConvertOperation(BaseOperation):
             if not input_map:
                 return True, "", []
 
+            from siard_workflow.core.lo_runner import prepare_profile as _prep
+            _prep(profile_dir)      # ny profil per kall hvis gjenbruk henger
             cmd = [
                 lo_bin,
                 f"-env:UserInstallation={_lo_profile_url(profile_dir)}",
@@ -3525,10 +3673,12 @@ class BlobConvertOperation(BaseOperation):
                             pass
 
             def _popen(c) -> subprocess.Popen:
+                from siard_workflow.core.subproc import hidden_kwargs
                 kwargs: dict = dict(
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
+                    **hidden_kwargs(),
                 )
                 if sys.platform != "win32":
                     kwargs["start_new_session"] = True
@@ -3849,7 +3999,7 @@ class BlobConvertOperation(BaseOperation):
                     continue
             try:
                 timeout   = self.params["lo_timeout"]
-                work_root = extract_dir.parent / f"b{batch_idx}"
+                work_root = lo_run_root / f"b{batch_idx}"
 
                 w(f"  Batch {batch_idx+1}/{len(all_batches)}: "
                   f"{len(batch)} filer (profil {profile_dir.name})", "info")
@@ -3994,7 +4144,7 @@ class BlobConvertOperation(BaseOperation):
                         except _qr.Empty:
                             continue
                     try:
-                        retry_root = extract_dir.parent / f"retry_s{size}_b{rb_idx}"
+                        retry_root = lo_run_root / f"retry_s{size}_b{rb_idx}"
                         lo_ok, lo_err, input_map = _run_lo_chunk(
                             rb_items, f"retry_s{size}_b{rb_idx}", rb_profile,
                             retry_timeout, retry_root)
@@ -4124,13 +4274,9 @@ class BlobConvertOperation(BaseOperation):
             out_dir.mkdir(parents=True, exist_ok=True)
             filter_str = f"{target_ext}:{lo_filter}"
             try:
-                result = subprocess.run(
-                    [lo_bin, "--headless", "--norestore",
-                     "--convert-to", filter_str,
-                     "--outdir", str(out_dir),
-                     str(src)],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    timeout=self.params.get("lo_timeout", 300))
+                from siard_workflow.core import lo_runner as _lr
+                _lr.convert(lo_bin, src, out_dir, filter_str, work_dir / "lo_profile",
+                            self.params.get("lo_timeout", 300))
                 # LO skriver til out_dir/<stem>.<target_ext>
                 expected = out_dir / (src.stem + "." + target_ext)
                 if expected.exists() and expected.stat().st_size > 0:
@@ -4266,6 +4412,141 @@ class BlobConvertOperation(BaseOperation):
         finally:
             shutil.rmtree(str(tmp_base), ignore_errors=True)
 
+    def _convert_msgs(self, to_msg: list, stats: dict, extract_dir: Path,
+                      lo_bin: str, stop_ev: threading.Event,
+                      csv_log, err_log, w, lock: threading.Lock, max_w: int,
+                      conversion_registry: "dict | None",
+                      creg_lock: "threading.Lock | None",
+                      standardize_bin: bool) -> None:
+        """
+        Outlook-e-post (.msg) → én PDF/A per fil (se core/msg_to_pdf.py):
+        toppside med meldingshode og vedleggsliste, meldingstekst, deretter
+        hvert vedlegg konvertert. PDF/A-2b, eller valgt PDF/A-3-nivå med
+        original-MSG innebygd. Navngivning som LO-løypa: <rot>.bin med
+        «Standardiser .bin», ellers <stamme>.msg.pdf. Ved feil beholdes
+        originalen (.msg / .bin).
+        """
+        from siard_workflow.core.msg_to_pdf import (
+            convert_msg_to_pdf, DEFAULT_LEVEL)
+        chosen = str(self.params.get("pdfa_version", _PDFA_DEFAULT))
+        level = chosen if chosen.startswith("PDF/A-3") else DEFAULT_LEVEL
+        timeout = int(self.params.get("lo_timeout", 300))
+        w(f"  Konverterer {len(to_msg):,} e-post (MSG/EML) til "
+          f"{level.split(' (')[0]}"
+          + (" med innebygd original" if level.startswith("PDF/A-3") else "")
+          + f" ({max_w} parallelle) ...", "info")
+
+        try:
+            from siard_workflow.core import ghostscript as _gs
+            _gsb = _gs.active_ghostscript()
+        except Exception:
+            _gsb = None
+        if _gsb:
+            w(f"  Ghostscript {_gs.get_version(_gsb) or ''}: PDF/A-normalisering av "
+              f"e-post-PDF (også PDF-vedlegg)", "info")
+        else:
+            w("  Ghostscript ikke funnet/aktivert: PDF-vedlegg tas med uten "
+              "PDF/A-kontroll (installer under Innstillinger → Ghostscript)", "info")
+
+        tmp_base = Path(tempfile.mkdtemp(prefix="siard_msg_", dir=extract_dir))
+        tls = threading.local()
+        counter = {"ok": 0, "fail": 0, "att": 0, "listed": 0}
+        n_logged = [0]
+
+        def _profile() -> Path:
+            if not getattr(tls, "profile", None):
+                tls.profile = tmp_base / f"lo_profile_{threading.get_ident()}"
+            return tls.profile
+
+        def _one(item) -> None:
+            idx, zip_sti, ext, mime = item
+            if stop_ev.is_set():
+                return
+            src = extract_dir / zip_sti
+            if not src.exists():
+                return
+            fra_sz = src.stat().st_size
+            p = PurePosixPath(zip_sti)
+            orig_basename = p.name
+            root_stem = orig_basename.split(".")[0]
+            src_ext = p.suffix.lstrip(".").lower()
+            work = tmp_base / f"m{idx}"
+            out_pdf = work / "result.pdf"
+            res = convert_msg_to_pdf(src, out_pdf, lo_bin, level, timeout,
+                                     work_dir=work, profile_dir=_profile())
+            if res.ok:
+                if standardize_bin:
+                    new_sti = str(p.parent / f"{root_stem}.bin")
+                    comment = (f"Filinnhold konvertert : .{ext} til .pdf ({res.summary})"
+                               + ("" if src_ext == "bin"
+                                  else f" - Filendelse endret fra .{src_ext} til .bin"))
+                else:
+                    new_sti = str(p.parent / f"{p.stem}.{ext}.pdf")
+                    comment = None
+                target = extract_dir / new_sti
+                try:
+                    shutil.move(str(out_pdf), str(target))
+                    if src.exists() and src.resolve() != target.resolve():
+                        src.unlink()
+                    if standardize_bin and comment and conversion_registry is not None \
+                            and creg_lock is not None:
+                        with creg_lock:
+                            conversion_registry[orig_basename] = (target, comment)
+                    with lock:
+                        stats["converted"] += 1
+                        stats["msg_converted"] = stats.get("msg_converted", 0) + 1
+                        counter["ok"] += 1
+                        counter["att"] += len(res.attachments)
+                        counter["listed"] += sum(a.status != "konvertert"
+                                                 and a.status != "tatt med (PDF)"
+                                                 for a in res.attachments)
+                        log_it = n_logged[0] < 40
+                        n_logged[0] += 1
+                    if log_it:
+                        w(f"  E-post: {orig_basename} → {PurePosixPath(new_sti).name} "
+                          f"({res.summary})", "ok")
+                    for warn in res.warnings[:3]:
+                        w(f"    {orig_basename}: {warn}", "warn")
+                    if csv_log:
+                        csv_log.write(zip_sti, fra_sz, ext, PurePosixPath(new_sti).name,
+                                      target.stat().st_size, "bin" if standardize_bin else "pdf",
+                                      f"{ext.upper()} → {level.split(' (')[0]}: {res.summary}")
+                    return
+                except Exception as exc:
+                    res.error = f"flytt feilet: {exc}"
+            # Feil: behold original (med .msg / .bin som i LO-løypa)
+            if standardize_bin:
+                tgt = extract_dir / str(p.parent / f"{root_stem}.bin")
+                if src.exists() and tgt != src:
+                    try:
+                        src.rename(tgt)
+                    except Exception:
+                        pass
+            else:
+                self._rename_file(extract_dir, zip_sti, ext)
+            with lock:
+                stats["failed"] += 1
+                counter["fail"] += 1
+            w(f"  E-post-konvertering feilet: {orig_basename} — beholdes som "
+              f"{ext.upper()} ({res.error})", "warn")
+            if err_log:
+                err_log.write(zip_sti, ext, f"{ext.upper()} → PDF/A feilet: {res.error}")
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_w) as pool:
+                futs = [pool.submit(_one, it) for it in to_msg]
+                for fut in concurrent.futures.as_completed(futs):
+                    try:
+                        fut.result()
+                    except Exception as exc:
+                        w(f"  [E-post-feil] {exc}", "warn")
+        finally:
+            shutil.rmtree(str(tmp_base), ignore_errors=True)
+        if n_logged[0] > 40:
+            w(f"  ... og {n_logged[0] - 40:,} e-post til (ikke listet)", "info")
+        w(f"  E-post ferdig: {counter['ok']:,} konvertert, {counter['fail']:,} feilet; "
+          f"{counter['att']:,} vedlegg ({counter['listed']:,} kun listet/feilet)", "info")
+
     def _process_archives(self,
                           to_archive:     list,
                           to_convert:     list,
@@ -4303,15 +4584,9 @@ class BlobConvertOperation(BaseOperation):
                 import subprocess as _sp
                 out_dir = tmp_work / "lo_out"
                 out_dir.mkdir(exist_ok=True)
-                result = _sp.run(
-                    [lo_bin,
-                     "--headless", "--norestore",
-                     "--convert-to", "pdf:writer_pdf_Export",
-                     "--outdir", str(out_dir),
-                     str(src)],
-                    stdout=_sp.PIPE, stderr=_sp.PIPE,
-                    timeout=self.params.get("lo_timeout", 300)
-                )
+                from siard_workflow.core import lo_runner as _lr
+                _lr.convert(lo_bin, src, out_dir, "pdf:writer_pdf_Export",
+                            tmp_work / "lo_profile", self.params.get("lo_timeout", 300))
                 for f in out_dir.iterdir():
                     if f.suffix.lower() == ".pdf":
                         return f

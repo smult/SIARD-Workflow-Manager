@@ -297,6 +297,19 @@ def find_inconsistent_lob_columns(extract_dir: Path) -> list[dict]:
     return found
 
 
+def ref_file_path(extract_dir: Path, lob_dir: Path, ref: str) -> Path:
+    """
+    Filen en file=-referanse peker på: full sti fra SIARD-rota
+    («content/schema0/table0/lob7/record1.bin», skrevet av «Korriger lobFolder»
+    med «Full sti i file=») løses mot utpakket rot; ellers relativt til
+    kolonnens lob-mappe.
+    """
+    r = ref.replace("\\", "/")
+    if r.startswith("content/"):
+        return Path(extract_dir) / r
+    return lob_dir / r
+
+
 def repair_dangling_lob_refs(extract_dir: Path, w=None) -> dict:
     """
     Rett file=-referanser som peker på en LOB-fil som ikke finnes.
@@ -372,14 +385,15 @@ def repair_dangling_lob_refs(extract_dir: Path, w=None) -> dict:
             for idx, by_stem in col_files.items():
                 lob_dir = col_dirs[idx]
                 for ext_set_ref in scan_table_lob_refs(txml, idx):
-                    if (lob_dir / ext_set_ref).exists():
+                    if ref_file_path(extract_dir, lob_dir, ext_set_ref).exists():
                         continue
                     stem = ext_set_ref.rsplit("/", 1)[-1].split(".", 1)[0]
                     cands = by_stem.get(stem, [])
                     if len(cands) == 1:
                         prefix = (ext_set_ref.rsplit("/", 1)[0] + "/"
                                   if "/" in ext_set_ref else "")
-                        fixes.setdefault(idx, {})[ext_set_ref] = prefix + cands[0]
+                        if prefix + cands[0] != ext_set_ref:
+                            fixes.setdefault(idx, {})[ext_set_ref] = prefix + cands[0]
                     else:
                         stats["unresolved"] += 1
                         if w:
@@ -462,7 +476,8 @@ def reconcile_lob_column_types(extract_dir: Path, w=None) -> dict:
     extract_dir = Path(extract_dir)
     stats = {"columns_retyped": 0, "files_renamed": 0,
              "refs_rewritten": 0, "refs_repaired": 0,
-             "unresolved_refs": 0, "details": []}
+             "unresolved_refs": 0, "details": [],
+             "retype_details": [], "repair_details": []}
 
     # Hengende referanser først: en referanse som peker på en fil som ikke
     # finnes gir samme NPE i DBPTK som typemismatchen, og må rettes før vi
@@ -471,6 +486,7 @@ def reconcile_lob_column_types(extract_dir: Path, w=None) -> dict:
     stats["refs_repaired"] = repair["refs_repaired"]
     stats["unresolved_refs"] = repair["unresolved"]
     stats["details"].extend(repair["details"])
+    stats["repair_details"] = list(repair["details"])
 
     inconsistent = find_inconsistent_lob_columns(extract_dir)
     if not inconsistent:
@@ -507,13 +523,13 @@ def reconcile_lob_column_types(extract_dir: Path, w=None) -> dict:
             lob_dir = resolve_lob_dir(
                 extract_dir, col["db_lob_folder"], col["lob_folder"], tdir)
             for old_ref, new_ref in ref_pairs:
-                src = lob_dir / old_ref
+                src = ref_file_path(extract_dir, lob_dir, old_ref)
                 if not src.exists():
                     if w:
                         w(f"    ADVARSEL: fant ikke {src} — hopper over", "warn")
                     continue
                 try:
-                    src.rename(lob_dir / new_ref)
+                    src.rename(ref_file_path(extract_dir, lob_dir, new_ref))
                     stats["files_renamed"] += 1
                 except OSError as exc:
                     if w:
@@ -536,6 +552,7 @@ def reconcile_lob_column_types(extract_dir: Path, w=None) -> dict:
         detail = (f"{c['schema']}/{c['table']}.{c['name']}: "
                   f"{c['type']} → {BINARY_LOB_TYPE}")
         stats["details"].append(detail)
+        stats["retype_details"].append(detail)
         if w:
             w(f"    {detail}", "ok")
 

@@ -41,6 +41,17 @@ Funksjonalitet omfatter blant annet:
 - Python 3.10+
 - Windows / macOS / Linux
 - LibreOffice for dokumentkonvertering
+- Valgfritt: Ghostscript for PDF/A-normalisering av e-post (MSG/EML) og PDF-vedlegg.
+  Installeres fra Innstillinger → Ghostscript (lastes ned fra Artifex på GitHub, ca. 65 MB,
+  til din brukermappe), eller finnes automatisk hvis den allerede er installert.
+  Uten Ghostscript brukes LibreOffice alene, og PDF-vedlegg tas med uten PDF/A-kontroll.
+
+Merk om LibreOffice 26.2: enkelte installasjoner henger når samme LibreOffice-profil
+brukes flere ganger. BLOB-konverteringen tester dette ved start og bruker i så fall ny
+profil per kall (ca. 5 s ekstra per kall). Loggen sier fra når det skjer.
+
+Lisenser: PyMuPDF og Ghostscript er AGPL (eller kommersiell lisens fra Artifex).
+Greit for intern bruk; vurder lisensen før eventuell videredistribusjon.
 
 ## Installasjon
     pip install -r requirements.txt

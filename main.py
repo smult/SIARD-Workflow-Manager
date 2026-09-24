@@ -62,6 +62,7 @@ def _ensure_dependencies() -> None:
             [sys.executable, "-m", "pip", "install", "--quiet", *missing],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         print("Installasjon fullført.")
     except subprocess.CalledProcessError as e:

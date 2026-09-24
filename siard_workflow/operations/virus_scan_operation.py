@@ -33,6 +33,7 @@ import zipfile
 from pathlib import Path
 
 from siard_workflow.core.base_operation import BaseOperation, OperationResult
+from siard_workflow.core.subproc import hidden_kwargs
 from siard_workflow.core.context import WorkflowContext
 
 
@@ -60,6 +61,7 @@ def _windows_defender_enabled() -> bool:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=10,
+            **hidden_kwargs(),
         )
         out = result.stdout.decode("utf-8", errors="replace").strip().lower()
         return out == "true"
@@ -296,6 +298,7 @@ class VirusScanOperation(BaseOperation):
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                **hidden_kwargs(),
             )
         except (FileNotFoundError, PermissionError, OSError) as exc:
             msg = f"Kunne ikke starte AV-program: {exc}"

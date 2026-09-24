@@ -66,6 +66,10 @@ _CONFIG_DEFAULTS: dict = {
     "siard_compress_smart_skip": True,  # hopp over rekomprimering av jpg/png/zip/...
     "use_siegfried":          False, # bruk Siegfried/PRONOM i stedet for magic-bytes
     "sf_executable":          "",    # sti til sf.exe (autoinstallert ved aktivering)
+    "use_ghostscript":        True,  # PDF/A-normalisering med Ghostscript når den finnes
+    "ghostscript_bin":        "",    # sti til gswin64c.exe (tom = finn automatisk)
+    "lo_profile_reuse_cache": {},    # {soffice-installasjon: gjenbruk av profil OK?} — se lo_runner
+    "lo_reuse_warning_ack":   [],    # installasjoner der «ikke vis igjen» er valgt for gjenbruksadvarselen
     "pdfa_version":           "PDF/A-2u (ISO 19005-2, level U)",  # standard PDF/A-versjon
     "disk_overhead_factor":   2.0,   # multiplikator for estimert temp-diskbehov
     "siard_output_version":   "2.1", # målversjon for eksportert SIARD ("2.1" eller "2.2")

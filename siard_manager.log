@@ -35,3 +35,10 @@ Traceback (most recent call last):
     func(path, *args, follow_symlinks=False)
     ~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 PermissionError: [WinError 5] Ingen tilgang: 'C:\\Users\\engebu\\AppData\\Local\\Temp\\anon_txz52_n2\\content\\schema0\\table382\\lob4\\record9998.txt'
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.
+warning: The `fitz` API is deprecated and will be removed in future. Use `import pymupdf` instead.

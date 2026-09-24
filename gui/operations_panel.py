@@ -502,6 +502,7 @@ OP_DEFS = [
              ]},
             {"key": "lo_timeout",         "label": "LibreOffice timeout (s)",       "type": "int",    "default": 300},
             {"key": "skip_existing_pdf",  "label": "Hopp over eksist. PDF",         "type": "bool",   "default": True},
+            {"key": "convert_msg",        "label": "E-post (MSG) → PDF/A m/ vedlegg", "type": "bool",   "default": True},
             {"key": "extract_inline",     "label": "Ekstraher inline NBLOB/NCLOB",  "type": "bool",   "default": True},
             {"key": "dry_run",            "label": "Tørkjøring (ikke skriv)",       "type": "bool",   "default": False},
         ],

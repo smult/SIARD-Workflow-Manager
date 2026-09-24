@@ -204,6 +204,7 @@ def _ps_disk_types() -> dict[str, tuple[str, str]]:
         raw = subprocess.check_output(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
             text=True, timeout=10, stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         ).strip()
         if not raw:
             return {}
