@@ -12,3 +12,7 @@ extras/
 eksempelfiler/
 # Generert testuttrekk (inneholder eksempelfiler) — lag på nytt med testsiard/lag_testsiard.py
 testsiard/
+
+# Bygg av programpakke (packaging/build_release.py)
+build/
+dist/

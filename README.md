@@ -53,15 +53,87 @@ profil per kall (ca. 5 s ekstra per kall). Loggen sier fra når det skjer.
 Lisenser: PyMuPDF og Ghostscript er AGPL (eller kommersiell lisens fra Artifex).
 Greit for intern bruk; vurder lisensen før eventuell videredistribusjon.
 
-## Installasjon
+### Sjekk av programvare og avhengigheter
+Programmet sjekker selv hva som er installert (se `dependencies.py`):
+- **Ved start (før vinduet åpnes):** Python-versjon, tkinter og påkrevde pakker
+  (customtkinter). Mangler en påkrevd pakke, spør programmet om den skal installeres
+  med pip. Svarer du nei, eller installasjonen feiler, får du kommandoen for å
+  installere manuelt.
+- **Etter oppstart:** Øvrige Python-pakker og eksterne programmer (LibreOffice,
+  Ghostscript, Siegfried, antivirus og Ollama) sjekkes i bakgrunnen. Status skrives i
+  loggen. Mangler noe som vanlig installasjon skal ha, vises en oversikt over hva som
+  ikke virker, med knapper for å installere (pip, Ghostscript, Siegfried), peke ut
+  LibreOffice eller åpne nedlastingssiden. «Ikke vis ved oppstart» gjelder til settet av
+  mangler endrer seg.
+- **Før kjøring (preflight «Programvare»):** Kun det operasjonene i arbeidsflyten
+  trenger. Mangler noe som får en operasjon til å feile eller gi feil resultat, velger
+  du mellom å installere, fortsette likevel eller stoppe. Mangler bare noe valgfritt,
+  skrives det i loggen og kjøringen fortsetter.
+- **Full oversikt:** Innstillinger → «Programvare og avhengigheter …».
+
+| Komponent | Nivå | Uten den |
+|---|---|---|
+| customtkinter | påkrevd | programmet starter ikke |
+| ReportLab | standard | ingen PDF-rapporter (Kjørerapport, Depotrapporter, Metadata-PDF) |
+| lxml | standard | SIARD Mapper virker ikke |
+| PyMuPDF, olefile | standard | e-post (MSG/EML) → PDF/A virker ikke; MSG behandles feilaktig som Word |
+| msoffcrypto-tool, python-docx, docx-mailmerge2 | standard | CosDoc-fletting virker ikke |
+| psutil | standard | enklere minneberegning for antall parallelle konverteringer |
+| tkinterdnd2 | standard | ingen dra-og-slipp (Legg til-knappen virker) |
+| LibreOffice | standard | Office-dokumenter, RTF, HTML m.m. konverteres ikke til PDF/A |
+| Antivirus (Defender/ClamAV) | standard | Virusskanning virker ikke |
+| Ghostscript | valgfri | e-post-PDF-er PDF/A-normaliseres ikke |
+| Siegfried | valgfri | magic-bytes brukes i stedet for PRONOM |
+| Ollama | valgfri | bare regelbasert PII-deteksjon i Anonymisering |
+| py7zr / rarfile (+UnRAR) | valgfri | 7z-/RAR-arkiver i LOB-er pakkes ikke ut |
+| python-magic-bin | valgfri | innebygd MIME-gjenkjenning i DIAS-pakke |
+
+## Ferdig programpakke (for maskiner uten nett)
+Programmet kan leveres som en ferdig pakke som ikke krever Python, pip eller nett:
+
+    SIARDManager-<versjon>-win64-komplett.zip
+      SIARDManager\SIARDManager.exe   programmet med Python og alle pakker innebygd
+      SIARDManager\_internal\         biblioteker og ressursfiler
+      SIARDManager\komponenter\       installasjonsfiler for LibreOffice, Ghostscript, Siegfried
+      SIARDManager\LES MEG.txt
+
+Pakk ut hele zip-filen til en skrivbar mappe og start `SIARDManager.exe`. Ved første
+oppstart tilbys installasjon av LibreOffice, Ghostscript og Siegfried rett fra
+`komponenter/`, uten nett og uten administratorrettigheter. De installeres i
+`%LOCALAPPDATA%\SIARDManager`, og LibreOffice installeres med `msiexec /a`.
+Innstillinger (`config.json`, `dias.json`) og loggen lagres ved siden av
+`SIARDManager.exe`. Er mappa skrivebeskyttet, lagres de i
+`%LOCALAPPDATA%\SIARDManager\data`. Er maskinen på nett, kan manglende komponenter
+også lastes ned og installeres fra programmet.
+
+Bygge pakken (Windows, med nett):
+
+    packaging\bygg.bat                          alle komponenter (ca. 600 MB zip)
+    packaging\bygg.bat --komponenter ingen      bare programmet
+    packaging\bygg.bat --komponenter gs,sf      uten LibreOffice
+    packaging\bygg.bat --lo-versjon 26.2.6      bestemt LibreOffice-versjon
+
+Byggeskriptet (`packaging/build_release.py`) gjør dette:
+- lager et eget byggemiljø (`build/venv`) med `requirements.txt`, de valgfrie
+  tilleggene og PyInstaller;
+- bygger `SIARDManager.exe` (`packaging/siard_manager.spec`);
+- laster ned komponentene (verifisert med SHA256/SHA512, mellomlagret i
+  `build/komponenter-cache`);
+- selvtester pakken (`SIARDManager.exe --selftest resultat.json`);
+- zipper resultatet til `dist/`.
+
+Selvtesten kan også kjøres på en ny maskin for å kontrollere pakken.
+
+## Installasjon fra kildekode
     pip install -r requirements.txt
     Eventuelt install.bat
     Endre navn på config_example.json til config.json, hvis det er første gang programmet kjøres fra denne
     lokasjonen.
 
 ## Kjør direkte
-    start.bat kjører opp programmet og sjekk av requirements. 
-    Ønsker du å kjøre direkte uten requirements hver gang kan kommandoen "python .\main.py" brukes.
+    start.bat starter programmet uten konsollvindu (pythonw). Manglende pakker oppdages
+    av programmet selv og installeres bare etter bekreftelse.
+    Kommandoen "python .\main.py" starter programmet med konsoll (nyttig ved feilsøking).
 
 ## Legge til en ny operasjon
 1. Lag klasse i siard_workflow/operations/ som arver BaseOperation

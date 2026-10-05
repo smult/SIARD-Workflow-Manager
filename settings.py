@@ -19,7 +19,10 @@ from pathlib import Path
 
 # ── Program-lokal konfigurasjon (config.json) ────────────────────────────────
 
-_PROGRAM_DIR  = Path(__file__).parent
+# Brukerdata: programmappa ved kildekodekjøring, mappa med SIARDManager.exe i
+# pakket program (se app_paths.data_dir)
+from app_paths import data_dir as _data_dir
+_PROGRAM_DIR  = _data_dir()
 _CONFIG_FILE  = _PROGRAM_DIR / "config.json"
 
 _CONFIG_DEFAULTS: dict = {
@@ -70,6 +73,7 @@ _CONFIG_DEFAULTS: dict = {
     "ghostscript_bin":        "",    # sti til gswin64c.exe (tom = finn automatisk)
     "lo_profile_reuse_cache": {},    # {soffice-installasjon: gjenbruk av profil OK?} — se lo_runner
     "lo_reuse_warning_ack":   [],    # installasjoner der «ikke vis igjen» er valgt for gjenbruksadvarselen
+    "deps_ack_signature":     "",    # sett av mangler brukeren har valgt å ikke se ved oppstart (dependencies.signature)
     "pdfa_version":           "PDF/A-2u (ISO 19005-2, level U)",  # standard PDF/A-versjon
     "disk_overhead_factor":   2.0,   # multiplikator for estimert temp-diskbehov
     "siard_output_version":   "2.1", # målversjon for eksportert SIARD ("2.1" eller "2.2")

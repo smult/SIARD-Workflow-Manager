@@ -163,11 +163,20 @@ _LO_UPGRADE: dict[str, str] = _get_lo_upgrade()
 
 _PDFA_VERSIONS: dict[str, tuple[str, str]] = {
     # label: (SelectPdfVersion, UseTaggedPDF)
+    # LibreOffice: 0 = vanlig PDF 1.7, 1 = PDF/A-1b, 2 = PDF/A-2b, 3 = PDF/A-3b,
+    # 4 = PDF/A-4. Verifisert med LibreOffice 26.2.6 (2026-10-05): tidligere
+    # verdier 6/7/9 ga VANLIG PDF uten PDF/A-identifikasjon. LibreOffice lager
+    # bare nivå B — «1a» og «2u» blir derfor PDF/A-1b/-2b (se _PDFA_PRODUCED).
     "PDF/A-1a (ISO 19005-1, level A)": ("1", "true"),
-    "PDF/A-1b (ISO 19005-1, level B)": ("2", "false"),
-    "PDF/A-2b (ISO 19005-2, level B)": ("6", "false"),
-    "PDF/A-2u (ISO 19005-2, level U)": ("7", "false"),
-    "PDF/A-3b (ISO 19005-3, level B)": ("9", "false"),
+    "PDF/A-1b (ISO 19005-1, level B)": ("1", "false"),
+    "PDF/A-2b (ISO 19005-2, level B)": ("2", "false"),
+    "PDF/A-2u (ISO 19005-2, level U)": ("2", "false"),
+    "PDF/A-3b (ISO 19005-3, level B)": ("3", "false"),
+}
+# Valg der LibreOffice lager et annet nivå enn navnet sier
+_PDFA_PRODUCED: dict[str, str] = {
+    "PDF/A-1a (ISO 19005-1, level A)": "PDF/A-1b",
+    "PDF/A-2u (ISO 19005-2, level U)": "PDF/A-2b",
 }
 _PDFA_DEFAULT = "PDF/A-2u (ISO 19005-2, level U)"
 
@@ -1842,6 +1851,11 @@ class BlobConvertOperation(BaseOperation):
             except Exception:
                 pass
 
+        if err_log is None:
+            # Uten loggmappe: registeret holdes i minnet (til kjørerapporten)
+            err_log = ConversionErrorLogger(None)
+            err_log.__enter__()
+
         w("=" * 56)
         w("  BLOB-KONVERTERING", "step")
         w("=" * 56)
@@ -1971,8 +1985,9 @@ class BlobConvertOperation(BaseOperation):
                 try:
                     err_log.__exit__(None, None, None)
                     if err_log.log_path and err_log.count > 0:
-                        w(f"  Feilogg ({err_log.count} feil): "
+                        w(f"  Feillogg ({err_log.count} fil(er)): "
                           f"{err_log.log_path}", "warn")
+                        w(f"  Komplett feilliste (regneark): {err_log.csv_path}", "warn")
                 except Exception:
                     pass
             if sf_log:
@@ -2015,6 +2030,14 @@ class BlobConvertOperation(BaseOperation):
         for k, title in DETAIL_LISTS.items():
             for item in stats.get(k) or []:
                 w(f"    {title}: {item}", "info")
+        # Filer som ikke ble konvertert — per årsak
+        if err_log is not None:
+            fs = err_log.summary()
+            stats["failure_summary"] = fs
+            if fs["total"]:
+                w(f"  IKKE KONVERTERT / PROBLEMER: {fs['total']:,} fil(er)", "warn")
+                for key, n in fs["counts"].items():
+                    w(f"    {fs['labels'][key]:<40} {n:,}", "warn")
         _pipeline = bool(getattr(ctx, "extracted_path", None))
         if not self.params["dry_run"]:
             if _pipeline:
@@ -2121,6 +2144,8 @@ class BlobConvertOperation(BaseOperation):
         if _ext_ref_map:
             _prepatch_external_refs(table_xml_map, extract_dir, _ext_ref_map, w)
         # Rapporter og annoter manglende referanser
+        if err_log is not None:
+            err_log.attach_siard(extract_dir)
         self._report_missing_refs(_missing_refs, extract_dir,
                                     stats, w, err_log)
         self._report_ref_format_counts(_ref_fmt, w)
@@ -2629,6 +2654,8 @@ class BlobConvertOperation(BaseOperation):
                 if _ext_ref_map:
                     _prepatch_external_refs(table_xml_map, extract_dir, _ext_ref_map, w)
                 # Rapporter og annoter manglende referanser
+                if err_log is not None:
+                    err_log.attach_siard(extract_dir)
                 self._report_missing_refs(_missing_refs, extract_dir,
                                             stats, w, err_log)
                 self._report_ref_format_counts(_ref_fmt, w)
@@ -2727,6 +2754,8 @@ class BlobConvertOperation(BaseOperation):
         instans og ga «Ingen PDF produsert»; opprydningen slettet i tillegg den
         andre kjøringens profiler.
         """
+        if err_log is not None and hasattr(err_log, "attach_siard"):
+            err_log.attach_siard(extract_dir)
         lo_run_root = Path(tempfile.mkdtemp(prefix="siard_lo_", dir=extract_dir.parent))
         try:
             self._convert_all_run(
@@ -2838,12 +2867,35 @@ class BlobConvertOperation(BaseOperation):
         # store .txt-filer er ekte tekst (ikke base64/hex-encoded blob).
         _DECODER_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
 
+        # Strukturkontroll (core/file_integrity.py): skadede kontorfiler sendes
+        # ikke til LibreOffice, som ellers lager PDF av binært søppel.
+        from siard_workflow.core.file_integrity import (
+            check_structure as _check_structure, CHECKED_FORMATS as _CHECKED_FORMATS)
+        _damaged: dict[str, str] = {}
+        _damaged_lock = threading.Lock()
+
         def _detect_one(zip_sti: str) -> tuple[str, tuple[str, str, bool]]:
+            res = _detect_one_raw(zip_sti)
+            ext, _mime, enc = res[1]
+            if not enc and ext in _CHECKED_FORMATS:
+                reason = _check_structure(extract_dir / zip_sti, ext)
+                if reason:
+                    with _damaged_lock:
+                        _damaged[zip_sti] = reason
+            return res
+
+        def _detect_one_raw(zip_sti: str) -> tuple[str, tuple[str, str, bool]]:
             p = extract_dir / zip_sti
             try:
                 data = p.read_bytes()[:65536]
-            except Exception:
+            except Exception as exc:
+                if err_log:
+                    err_log.write(zip_sti, PurePosixPath(zip_sti).suffix.lstrip(".").lower(),
+                                  f"Filen kunne ikke leses: {exc}", "skadet")
                 return zip_sti, ("bin", "application/octet-stream", False)
+            if not data and err_log:
+                err_log.write(zip_sti, PurePosixPath(zip_sti).suffix.lstrip(".").lower(),
+                              "Filen er tom (0 byte) — ingenting å konvertere", "tom")
 
             ext, mime, is_encrypted = _id.identify(data=data, path=p)
 
@@ -3149,6 +3201,19 @@ class BlobConvertOperation(BaseOperation):
                 to_rename_only.append((idx, zip_sti, ext, mime))
                 w(f"  {PurePosixPath(zip_sti).name}: passordbeskyttet "
                   f"({ext.upper()}) — beholdes uten konvertering", "warn")
+                if err_log:
+                    err_log.write(zip_sti, ext, "Passordbeskyttet — beholdt uten "
+                                  "konvertering", "passordbeskyttet")
+                continue
+
+            # Skadet kontorfil (strukturkontroll ved identifisering): beholdes
+            if zip_sti in _damaged:
+                to_rename_only.append((idx, zip_sti, ext, mime))
+                w(f"  {PurePosixPath(zip_sti).name}: {_damaged[zip_sti]} — beholdes "
+                  f"uten konvertering", "warn")
+                if err_log:
+                    err_log.write(zip_sti, ext, _damaged[zip_sti] + " — original beholdt",
+                                  "skadet")
                 continue
 
             if ext == "wpt":
@@ -3493,8 +3558,13 @@ class BlobConvertOperation(BaseOperation):
                     else:
                         w(f"    [WPT] {stem}.wpt — tekstuttrekk tomt", "warn")
                         kommentar = "WPTools native — tekstuttrekk feilet, beholdt original"
+                        if err_log:
+                            err_log.write(zip_sti, "wpt", "WPTools-dokument: tekstuttrekk "
+                                          "ga ingen tekst — original beholdt")
                 except Exception as exc:
                     w(f"    [FEIL] WPT-konvertering {stem}: {exc}", "feil")
+                    if err_log:
+                        err_log.write(zip_sti, "wpt", f"WPTools-konvertering feilet: {exc}")
                     kommentar = f"WPTools native — feil: {exc}"
 
                 with lock:
@@ -3557,6 +3627,9 @@ class BlobConvertOperation(BaseOperation):
         pdfa_version = self.params.get("pdfa_version", _PDFA_DEFAULT)
         pdfa_filter  = _build_pdfa_filter(pdfa_version)
         w(f"  PDF/A-format: {pdfa_version}", "info")
+        if pdfa_version in _PDFA_PRODUCED:
+            w(f"    LibreOffice lager bare nivå B — filene blir "
+              f"{_PDFA_PRODUCED[pdfa_version]}", "info")
 
         # Opprett et fast antall gjenbrukbare profiler — én per worker.
         # Disse initialiseres én gang og gjenbrukes for alle batches.
@@ -4386,7 +4459,8 @@ class BlobConvertOperation(BaseOperation):
                         w(f"  Oppgradering feilet: {blob_path.name} — beholder .{src_ext}", "warn")
                         if err_log:
                             err_log.write(zip_sti, src_ext,
-                                          f"Oppgradering {src_ext}→{target_ext} feilet")
+                                          f"Oppgradering {src_ext}→{target_ext} feilet "
+                                          f"— original beholdt", "oppgradering")
                         if csv_log:
                             new_name = f"{stem_base}.{src_ext}"
                             csv_log.write(
@@ -4566,10 +4640,17 @@ class BlobConvertOperation(BaseOperation):
 
         For hvert arkiv:
           - Pakk ut alle filer til en arbeidsmappe
-          - Identifiser innholdet (ext per fil)
-          - Konverter filer i _LO_CONVERTIBLE til PDF/A med LO
+          - Identifiser innholdet (ext per fil) — med samme MSG/EML-kontroll
+            som for vanlige LOB-er (full OLE2-katalog, EML i tekstfiler)
+          - E-post (MSG/EML) → én PDF/A per melding via core/msg_to_pdf.py
+            (toppside, tekst, vedlegg, Ghostscript-normalisering, PDF/A-3 med
+            innebygd original når valgt) — som Steg B4
+          - Filer i _LO_CONVERTIBLE → PDF/A med LO (valgt PDF/A-versjon)
+          - Arkiv i arkiv pakkes ut og behandles på samme måte (maks
+            _MAX_NEST nivåer) og legges tilbake som .zip (eller enkeltfil)
           - Pakk innholdet tilbake som .zip HVIS det var mer enn én fil,
-            ELLER erstatt blob med den ene utpakkede/konverterte filen
+            ELLER erstatt blob med den ene utpakkede/konverterte filen.
+            Mappestruktur inne i arkivet bevares.
           - Oppdater stats og rename-registrering på disk slik at
             _patch_all_xml finner riktig ny filnavn via stem-oppslag
         """
@@ -4577,22 +4658,57 @@ class BlobConvertOperation(BaseOperation):
 
         _standardize_bin = _get_standardize_bin_ext()
         _id = get_identifier()
+        _ARC_EXTS = {"zip", "gz", "bz2", "tar", "rar", "7z"}
+        _MAX_NEST = 3                      # arkiv i arkiv: maks dybde
+        _OLE2 = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+        timeout = int(self.params.get("lo_timeout", 300))
+        pdfa_label = str(self.params.get("pdfa_version", _PDFA_DEFAULT))
+        pdfa_filter = _build_pdfa_filter(pdfa_label)
+        convert_mail = bool(self.params.get("convert_msg", True))
+        from siard_workflow.core.msg_to_pdf import (
+            convert_msg_to_pdf, DEFAULT_LEVEL as _MSG_DEFAULT,
+            is_msg_file as _is_msg, is_eml_bytes as _is_eml)
+        # Samme nivåvalg som Steg B4: PDF/A-3 ⇒ innebygd original, ellers PDF/A-2b
+        mail_level = pdfa_label if pdfa_label.startswith("PDF/A-3") else _MSG_DEFAULT
 
-        def _lo_convert_file(src: Path, tmp_work: Path) -> Path | None:
-            """Konverter én fil med LO til PDF/A. Returnerer ferdig PDF eller None."""
+        def _lo_convert_file(src: Path, tmp_work: Path, n: int) -> Path | None:
+            """Konverter én fil med LO til valgt PDF/A. Returnerer PDF eller None."""
             try:
-                import subprocess as _sp
-                out_dir = tmp_work / "lo_out"
-                out_dir.mkdir(exist_ok=True)
+                out_dir = tmp_work / f"lo_out_{n}"      # egen mappe per fil
                 from siard_workflow.core import lo_runner as _lr
-                _lr.convert(lo_bin, src, out_dir, "pdf:writer_pdf_Export",
-                            tmp_work / "lo_profile", self.params.get("lo_timeout", 300))
-                for f in out_dir.iterdir():
-                    if f.suffix.lower() == ".pdf":
-                        return f
+                ok, _err = _lr.convert(lo_bin, src, out_dir, pdfa_filter,
+                                       tmp_work / "lo_profile", timeout)
+                pdf = out_dir / f"{src.stem}.pdf"
+                return pdf if ok and pdf.exists() else None
             except Exception:
-                pass
-            return None
+                return None
+
+        def _identify_inner(src: Path) -> tuple[str, bool]:
+            """Format for en fil i et arkiv — samme regler som for LOB-er."""
+            data = src.read_bytes()[:65536]
+            ext, _mime, enc = _id.identify(data=data, path=src)
+            # MSG deler OLE2-container med DOC/XLS/PPT — sjekk hele katalogen
+            if ext != "msg" and data[:8] == _OLE2:
+                try:
+                    if _is_msg(src):
+                        ext, enc = "msg", False
+                except Exception:
+                    pass
+            elif ext in ("txt", "bin", "html", "xml"):
+                try:
+                    if _is_eml(data):
+                        ext, enc = "eml", False
+                except Exception:
+                    pass
+            # Komprimert innhold som backend ikke kjente igjen
+            if ext in ("bin", "txt"):
+                try:
+                    m_ext, _m, m_enc = _detect(data)
+                    if m_ext in _ARC_EXTS:
+                        ext, enc = m_ext, m_enc
+                except Exception:
+                    pass
+            return ext, bool(enc)
 
         def _unpack_archive(path: Path, work_dir: Path) -> list[Path]:
             """Pakk ut arkiv til work_dir. Returnerer liste av utpakkede filer."""
@@ -4688,6 +4804,9 @@ class BlobConvertOperation(BaseOperation):
             inner_files = _unpack_archive(blob_path, work_dir)
             if not inner_files:
                 w(f"    Kunne ikke pakke ut — beholdes som {arc_ext}", "warn")
+                if err_log:
+                    err_log.write(zip_sti, arc_ext, "Arkivet kunne ikke pakkes ut (skadet, "
+                                  "ufullstendig eller ukjent arkivformat) — beholdt", "skadet")
                 with lock:
                     to_rename_only.append((idx, zip_sti, arc_ext, arc_mime))
                     n_fail[0] += 1
@@ -4695,33 +4814,10 @@ class BlobConvertOperation(BaseOperation):
 
             w(f"    Pakket ut: {len(inner_files)} fil(er)", "info")
 
-            # Identifiser og konverter innhold
-            result_files: list[Path] = []
-            for src in inner_files:
-                if not src.exists() or not src.is_file():
-                    continue
-                try:
-                    data = src.read_bytes()[:65536]
-                except Exception:
-                    result_files.append(src)
-                    continue
-
-                inner_ext, _, inner_enc = _id.identify(data=data, path=src)
-
-                if not inner_enc and inner_ext in _LO_CONVERTIBLE:
-                    w(f"    Konverterer: {src.name} ({inner_ext.upper()} → PDF/A)", "info")
-                    pdf = _lo_convert_file(src, lo_work)
-                    if pdf:
-                        result_files.append(pdf)
-                        with lock:
-                            stats["converted"] += 1
-                    else:
-                        w(f"    LO-konvertering feilet: {src.name} — beholdes", "warn")
-                        result_files.append(src)
-                        with lock:
-                            stats["failed"] += 1
-                else:
-                    result_files.append(src)
+            # Identifiser og konverter innhold (rekursivt for arkiv i arkiv)
+            counter = [0]
+            result_files = _process_entries(inner_files, work_dir, lo_work, 0,
+                                            zip_sti, counter)
 
             if not result_files:
                 with lock:
@@ -4731,7 +4827,7 @@ class BlobConvertOperation(BaseOperation):
 
             # Én fil: erstatt blob direkte
             if len(result_files) == 1:
-                single = result_files[0]
+                single = result_files[0][0]
                 if _standardize_bin:
                     # Behold original filendelse (.bin/.txt) — innholdet er nå utpakket.
                     target_ext = PurePosixPath(zip_sti).suffix.lstrip(".").lower()
@@ -4764,11 +4860,10 @@ class BlobConvertOperation(BaseOperation):
                     multi_ext = "zip"
                 new_name = f"{stem}.{multi_ext}"
                 new_path = blob_path.parent / new_name
+                tmp_zip = work_dir / "ny_container.zip"
                 try:
-                    with zipfile.ZipFile(new_path, "w",
-                                         compression=zipfile.ZIP_DEFLATED) as zout:
-                        for rf in result_files:
-                            zout.write(rf, rf.name)
+                    _write_zip(result_files, tmp_zip)
+                    shutil.move(str(tmp_zip), str(new_path))
                     if new_path != blob_path:
                         blob_path.unlink(missing_ok=True)
                     w(f"    {len(result_files)} filer → {new_name}", "ok")
@@ -4780,6 +4875,150 @@ class BlobConvertOperation(BaseOperation):
                     with lock:
                         to_rename_only.append((idx, zip_sti, arc_ext, arc_mime))
                         n_fail[0] += 1
+
+        def _write_zip(entries: "list[tuple[Path, str]]", target: Path) -> None:
+            """Skriv (fil, sti-i-arkivet) til zip; like stier får « (2)» osv."""
+            used: set = set()
+            with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+                for path, arcname in entries:
+                    name = arcname
+                    k = 2
+                    while name.lower() in used:
+                        p = PurePosixPath(arcname)
+                        name = str(p.with_name(f"{p.stem} ({k}){p.suffix}"))
+                        k += 1
+                    used.add(name.lower())
+                    zout.write(path, name)
+
+        def _process_entries(files: "list[Path]", root: Path, lo_work: Path,
+                             depth: int, arc_label: str,
+                             counter: list) -> "list[tuple[Path, str]]":
+            """
+            Behandle utpakkede filer. Returnerer [(fil, sti i arkivet)] for
+            innholdet som skal tilbake i arkivet (konvertert eller original).
+            """
+            ind = "    " + "  " * depth
+            out: "list[tuple[Path, str]]" = []
+            for src in files:
+                if not src.exists() or not src.is_file():
+                    continue
+                try:
+                    rel = src.relative_to(root).as_posix()
+                except ValueError:
+                    rel = src.name
+                if stop_ev.is_set():
+                    out.append((src, rel))
+                    continue
+                try:
+                    inner_ext, inner_enc = _identify_inner(src)
+                except Exception:
+                    out.append((src, rel))
+                    continue
+                counter[0] += 1
+                n = counter[0]
+                rel_p = PurePosixPath(rel)
+                if inner_enc:
+                    if err_log:
+                        err_log.write(f"{arc_label}!{rel}", inner_ext,
+                                      "Passordbeskyttet (fil i arkiv) — beholdt uten "
+                                      "konvertering", "passordbeskyttet")
+                    out.append((src, rel))
+                    continue
+
+                # ── E-post → PDF/A (samme løp som Steg B4, inkl. Ghostscript)
+                if inner_ext in ("msg", "eml") and not inner_enc and convert_mail:
+                    mdir = lo_work / f"mail_{n}"
+                    pdf = mdir / "result.pdf"
+                    res = convert_msg_to_pdf(src, pdf, lo_bin, mail_level, timeout,
+                                             work_dir=mdir / "w",
+                                             profile_dir=lo_work / "lo_profile")
+                    if res.ok and pdf.exists():
+                        out.append((pdf, f"{rel}.pdf"))
+                        w(f"{ind}E-post: {rel} → {rel_p.name}.pdf ({res.summary})", "ok")
+                        for warn in res.warnings[:3]:
+                            w(f"{ind}  {rel_p.name}: {warn}", "warn")
+                        with lock:
+                            stats["converted"] += 1
+                            stats["msg_converted"] = stats.get("msg_converted", 0) + 1
+                    else:
+                        out.append((src, rel))
+                        w(f"{ind}E-post-konvertering feilet: {rel} — beholdes "
+                          f"({res.error})", "warn")
+                        with lock:
+                            stats["failed"] += 1
+                        if err_log:
+                            err_log.write(f"{arc_label}!{rel}", inner_ext,
+                                          f"{inner_ext.upper()} → PDF/A feilet: {res.error}")
+                    continue
+
+                # ── Arkiv i arkiv
+                if inner_ext in _ARC_EXTS and not inner_enc:
+                    if depth + 1 >= _MAX_NEST:
+                        w(f"{ind}Arkiv i arkiv: {rel} — over {_MAX_NEST} nivåer, "
+                          f"beholdes uendret", "warn")
+                        out.append((src, rel))
+                        continue
+                    sub = lo_work / f"nest_{n}"
+                    sub.mkdir(parents=True, exist_ok=True)
+                    inner = _unpack_archive(src, sub)
+                    if not inner:
+                        w(f"{ind}Arkiv i arkiv: {rel} kunne ikke pakkes ut — beholdes",
+                          "warn")
+                        if err_log:
+                            err_log.write(f"{arc_label}!{rel}", inner_ext,
+                                          "Arkivet kunne ikke pakkes ut (skadet eller "
+                                          "ukjent arkivformat) — beholdt", "skadet")
+                        out.append((src, rel))
+                        continue
+                    w(f"{ind}Arkiv i arkiv: {rel} ({inner_ext.upper()}, "
+                      f"{len(inner)} fil(er))", "info")
+                    sub_res = _process_entries(inner, sub, lo_work, depth + 1,
+                                               f"{arc_label}!{rel}", counter)
+                    parent = rel_p.parent
+                    if len(sub_res) == 1:
+                        f, name = sub_res[0]
+                        out.append((f, str(parent / PurePosixPath(name).name)))
+                    elif sub_res:
+                        packed = lo_work / f"nest_{n}.zip"
+                        _write_zip(sub_res, packed)
+                        zname = rel_p.name if rel_p.suffix.lower() == ".zip" \
+                            else f"{rel_p.stem}.zip"
+                        out.append((packed, str(parent / zname)))
+                    else:
+                        out.append((src, rel))
+                    continue
+
+                # ── Dokument → PDF/A med LibreOffice
+                if not inner_enc and inner_ext in _LO_CONVERTIBLE:
+                    from siard_workflow.core.file_integrity import check_structure
+                    reason = check_structure(src, inner_ext)
+                    if reason:
+                        w(f"{ind}{rel}: {reason} — beholdes", "warn")
+                        out.append((src, rel))
+                        if err_log:
+                            err_log.write(f"{arc_label}!{rel}", inner_ext,
+                                          reason + " — original beholdt", "skadet")
+                        continue
+                    w(f"{ind}Konverterer: {rel} ({inner_ext.upper()} → "
+                      f"{pdfa_label.split(' (')[0]})", "info")
+                    pdf = _lo_convert_file(src, lo_work, n)
+                    if pdf:
+                        out.append((pdf, str(rel_p.with_suffix(".pdf"))))
+                        with lock:
+                            stats["converted"] += 1
+                    else:
+                        w(f"{ind}LO-konvertering feilet: {rel} — beholdes", "warn")
+                        out.append((src, rel))
+                        if err_log:
+                            err_log.write(f"{arc_label}!{rel}", inner_ext,
+                                          "LibreOffice laget ingen PDF/A (fil i arkiv) — "
+                                          "original beholdt")
+                        with lock:
+                            stats["failed"] += 1
+                    continue
+
+                out.append((src, rel))
+            return out
 
         try:
             max_arc_w = max(1, min(max_workers, len(to_archive), os.cpu_count() or 2))
@@ -4888,9 +5127,10 @@ class BlobConvertOperation(BaseOperation):
                     try:
                         err_log.write(
                             f"{xml_sti}::{it['ref']}",
-                            "missing",
+                            PurePosixPath(str(it['ref'])).suffix.lstrip(".").lower() or "-",
                             f"Referert fil ble ikke funnet eller lot seg "
                             f"ikke lese: {it['reason']}",
+                            "mangler",
                         )
                     except Exception:
                         pass

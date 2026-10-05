@@ -331,6 +331,8 @@ class App(ctk.CTk):
 
         # Sjekk for oppdateringer i bakgrunnen (2 sek forsinkelse for at GUI skal være klar)
         self.after(2000, self._check_for_updates)
+        # Programvare/avhengigheter (pakker + eksterne programmer) i bakgrunnen
+        self.after(1200, self._startup_dependency_check)
 
     # ─── UI ──────────────────────────────────────────────────────────────────
 
@@ -1115,12 +1117,12 @@ class App(ctk.CTk):
             if found:
                 set_config("lo_executable", found)
                 return
-            # Ikke funnet automatisk — la bruker peke ut plasseringen
-            self._prompt_for_libreoffice()
+            # Ikke funnet automatisk: vises i oppstartsoversikten over manglende
+            # programvare (_startup_dependency_check), med «Pek ut …» og «Last ned»
         except Exception:
             pass
 
-    def _prompt_for_libreoffice(self):
+    def _prompt_for_libreoffice(self, ask: bool = True):
         """Be bruker velge LibreOffice program-mappe og verifiser valget.
 
         Verifiseringen (siard_workflow.core.libreoffice.verify_libreoffice_path)
@@ -1130,7 +1132,7 @@ class App(ctk.CTk):
         from tkinter import filedialog, messagebox
         from siard_workflow.core.libreoffice import verify_libreoffice_path
 
-        if not messagebox.askyesno(
+        if ask and not messagebox.askyesno(
                 "LibreOffice ikke funnet",
                 "LibreOffice ble ikke funnet automatisk.\n\n"
                 "LibreOffice kreves for å konvertere dokumenter til PDF/A.\n\n"
@@ -1161,6 +1163,70 @@ class App(ctk.CTk):
                     "\n\nPrøv igjen?",
                     parent=self):
                 return
+
+    # ─── Programvare / avhengigheter ─────────────────────────────────────────
+
+    def _startup_dependency_check(self):
+        """
+        Sjekk Python-pakker og eksterne programmer i bakgrunnen etter oppstart
+        (se dependencies.py). Status logges alltid. Mangler noe som vanlig
+        installasjon skal ha, vises en oversikt over hva som ikke virker, med
+        installasjon etter bekreftelse — med mindre brukeren har valgt «ikke vis
+        igjen» for akkurat dette settet av mangler.
+        """
+        import threading
+        import dependencies as _deps
+        box: dict = {}
+
+        def _work():
+            try:
+                box["r"] = _deps.check_all()
+            except Exception as exc:
+                box["err"] = exc
+        t = threading.Thread(target=_work, daemon=True)
+        t.start()
+
+        def _poll():
+            try:
+                if t.is_alive():
+                    self.after(250, _poll)
+                    return
+                if "err" in box:
+                    self._log(f"Programvare-sjekk feilet: {box['err']}", "warn")
+                    return
+                statuses = box.get("r") or []
+                self._log_dependency_summary(statuses)
+                problems = _deps.startup_problems(statuses)
+                if not problems or self._running or self._preflight_active:
+                    return
+                if _deps.signature(problems) == get_config("deps_ack_signature", ""):
+                    return
+                from gui.dependencies_dialog import DependenciesDialog
+                dlg = DependenciesDialog(self, statuses, mode="startup")
+                self.wait_window(dlg)
+                if dlg.dont_show_again:
+                    set_config("deps_ack_signature",
+                               _deps.signature(_deps.startup_problems(dlg.statuses)))
+            except Exception:
+                pass            # f.eks. vinduet er lukket før sjekken ble ferdig
+        self.after(250, _poll)
+
+    def _log_dependency_summary(self, statuses: list) -> None:
+        import dependencies as _deps
+        missing = [s for s in statuses if s.missing]
+        n_ok = sum(1 for s in statuses if s.ok and s.in_use)
+        if not missing:
+            self._log(f"Programvare: alt på plass ({n_ok} komponenter)", "ok")
+            return
+        std = [s for s in missing if s.level != _deps.OPTIONAL]
+        self._log(f"Programvare: {n_ok} på plass, {len(std)} standard og "
+                  f"{len(missing) - len(std)} valgfri(e) mangler "
+                  f"(oversikt: Innstillinger → Programvare og avhengigheter)",
+                  "warn" if std else "muted")
+        for s in missing:
+            opt = s.level == _deps.OPTIONAL
+            self._log(f"  {'•' if opt else '✗'} {s.label}: {s.detail} — uten: {s.affects}",
+                      "muted" if opt else "warn")
 
     def _init_worker_config(self):
         """Sett max_workers og lo_batch_size fra maskinvare ved første kjøring (verdi == 0)."""
@@ -2029,6 +2095,75 @@ class App(ctk.CTk):
         self._pf("avbrutt av operatør")
         return False  # avbrutt
 
+    def _dependency_preflight(self, ops: list) -> bool:
+        """
+        Sjekk at Python-pakker og eksterne programmer som operasjonene i
+        arbeidsflyten trenger, er installert (se dependencies.py). LibreOffice
+        har eget steg. Det som bare gir redusert funksjonalitet, logges; det som
+        får en operasjon til å feile eller gi feil resultat, gir en dialog med
+        installasjon, «Fortsett likevel» og «Stopp».
+        """
+        import threading, shutil as _sh, time as _time
+        import dependencies as _deps
+        op_ids = {op.operation_id for op in ops}
+        box: dict = {}
+
+        def _work():
+            try:
+                box["r"] = _deps.check_all(only_ops=op_ids)
+            except Exception as exc:
+                box["err"] = exc
+        t = threading.Thread(target=_work, daemon=True)
+        t.start()
+        while t.is_alive():
+            self.update()
+            _time.sleep(0.05)
+        if "err" in box:
+            self._pf(f"kunne ikke sjekkes ({box['err']}) — fortsetter")
+            return True
+        statuses = box.get("r") or []
+        impacts = _deps.impacts_for_ops(ops, statuses, skip_keys=("libreoffice",))
+
+        def _own_av(op_id: str) -> bool:
+            # Virusskanning med eget, gyldig AV-program i operasjonens parametre
+            for op in ops:
+                if op.operation_id == op_id:
+                    p = str(op.params.get("av_executable", "") or "").strip()
+                    if p and (Path(p).exists() or _sh.which(p)):
+                        return True
+            return False
+        impacts = [i for i in impacts
+                   if not (i.dep.key == "antivirus" and _own_av(i.op_id))]
+        if not impacts:
+            self._pf("alt arbeidsflyten trenger er installert")
+            return True
+        soft = [i for i in impacts if not i.blocking]
+        hard = [i for i in impacts if i.blocking]
+        for i in soft:
+            self._log(f"    • «{i.op_label}»: {i.dep.label} mangler — {i.dep.affects}", "muted")
+        if not hard:
+            self._pf(f"{len(soft)} valgfri(e) komponent(er) mangler — redusert "
+                     f"funksjonalitet (se over)")
+            return True
+
+        from gui.dependencies_dialog import DependenciesDialog
+        dlg = DependenciesDialog(self, statuses, mode="preflight", impacts=impacts, ops=ops)
+        self.wait_window(dlg)
+        still = sorted({i.dep.label for i in hard
+                        if any(s.key == i.dep.key and s.missing for s in dlg.statuses)})
+        if dlg.result == "stopp":
+            self._pf("stoppet: mangler " + ", ".join(still or [i.dep.label for i in hard]))
+            return False
+        if still:
+            for i in hard:
+                if i.dep.label in still:
+                    self._log(f"    ✗ «{i.op_label}»: {i.dep.label} mangler — {i.dep.affects}",
+                              "warn")
+            self._pf("mangler " + ", ".join(still) + " — operatøren fortsetter")
+        else:
+            self._pf("manglende programvare installert")
+        return True
+
     def _libreoffice_preflight(self, ops: list) -> bool:
         """
         Helsesjekk av LibreOffice FØR kjøring når arbeidsflyten bruker det
@@ -2351,6 +2486,7 @@ class App(ctk.CTk):
             ("tableX.xsd (DBPTK P_4.3-3 / T_6.3-1)",       self._xsd_type_preflight),
             ("Metadata-kvalitet (dbname/datospenn)",       self._metadata_quality_preflight),
             ("Sluttrapport (PDF)",                         self._report_preflight),
+            ("Programvare (pakker og programmer)",         self._dependency_preflight),
             ("LibreOffice (konvertering)",                 self._libreoffice_preflight),
             ("Diskplass (temp/output)",                    self._disk_space_preflight),
         ]

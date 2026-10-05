@@ -103,10 +103,24 @@ def get_version() -> Optional[str]:
 ProgressCb = Optional[Callable[[str], None]]
 
 
-def install_siegfried(progress: ProgressCb = None) -> Path:
+ARCHIVE_GLOB = "siegfried_*win64*.zip"   # navn på arkiv i komponenter/
+SIG_DIRNAME = "siegfried-signaturer"     # medfølgende default.sig ved siden av arkivet
+
+
+def sf_home() -> Path:
+    """Siegfrieds standard hjemmemappe (der default.sig leses fra)."""
+    if sys.platform == "win32":
+        return Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "siegfried"
+    return Path.home() / "siegfried"
+
+
+def download_archive(dest_dir: Path, progress: ProgressCb = None,
+                     with_signatures: bool = True) -> Path:
     """
-    Last ned siste Siegfried fra GitHub, pakk ut, kjør sf -update.
-    Returnerer sti til sf-binær. Kaster Exception ved feil.
+    Last ned siste Siegfried-arkiv for plattformen til `dest_dir` (SHA256-
+    verifisert når sjekksum finnes). Med `with_signatures` hentes også PRONOM-
+    signaturene (default.sig) til `dest_dir/siegfried-signaturer/`, slik at en
+    offline-pakke kan installeres uten nett. Returnerer arkivets sti.
     """
     def _say(msg: str) -> None:
         if progress is not None:
@@ -116,24 +130,18 @@ def install_siegfried(progress: ProgressCb = None) -> Path:
                 pass
 
     patterns, binary_name = _asset_patterns()
-
-    # 1. Hent release-info
     _say("Henter release-info fra GitHub...")
     req = urllib.request.Request(_GITHUB_API,
                                  headers={"Accept": "application/vnd.github+json"})
     with urllib.request.urlopen(req, timeout=30) as r:
         rel = json.load(r)
-
     tag = rel.get("tag_name", "?")
     assets = rel.get("assets", [])
-
-    # Velg første asset som matcher et av plattformens mønstre
-    # (rangert etter prioritet — første mønster vinner)
+    # Velg første asset som matcher et av plattformens mønstre (prioritert)
     asset = None
     for pat in patterns:
         pat_low = pat.lower()
-        asset = next((a for a in assets
-                      if pat_low in a["name"].lower()), None)
+        asset = next((a for a in assets if pat_low in a["name"].lower()), None)
         if asset is not None:
             break
     if asset is None:
@@ -141,7 +149,6 @@ def install_siegfried(progress: ProgressCb = None) -> Path:
             f"Fant ingen Siegfried-asset som matcher {patterns} i "
             f"release {tag}. Tilgjengelig: "
             + ", ".join(a["name"] for a in assets))
-
     # Sjekksum-asset (valgfri) — Siegfried publiserer ikke alltid .sha256
     checksum_asset = next(
         (a for a in assets
@@ -149,18 +156,14 @@ def install_siegfried(progress: ProgressCb = None) -> Path:
          in a["name"]),
         None)
 
-    # 2. Last ned binær
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = dest_dir / asset["name"]
     _say(f"Laster ned {asset['name']} (Siegfried {tag})...")
-    tmp_dir = Path(tempfile.mkdtemp(prefix="sf_install_"))
-    archive_path = tmp_dir / asset["name"]
     try:
-        urllib.request.urlretrieve(asset["browser_download_url"],
-                                   str(archive_path))
+        urllib.request.urlretrieve(asset["browser_download_url"], str(archive_path))
     except urllib.error.URLError as exc:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
         raise RuntimeError(f"Nedlasting feilet: {exc}") from exc
-
-    # 3. Verifiser SHA256 hvis tilgjengelig
     if checksum_asset is not None:
         _say("Verifiserer SHA256...")
         try:
@@ -169,19 +172,32 @@ def install_siegfried(progress: ProgressCb = None) -> Path:
                 expected = r.read().decode("utf-8").strip().split()[0].lower()
             actual = hashlib.sha256(archive_path.read_bytes()).hexdigest().lower()
             if actual != expected:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
+                archive_path.unlink(missing_ok=True)
                 raise RuntimeError(
                     f"SHA256-feil for {asset['name']}: "
                     f"forventet {expected}, fikk {actual}")
         except urllib.error.URLError:
-            # Manglende sjekksum-asset er ikke fatal — vi har TLS fra GitHub
-            pass
+            pass    # manglende sjekksum er ikke fatal — vi har TLS fra GitHub
 
-    # 4. Pakk ut
-    _say("Pakker ut...")
-    target = install_target_dir()
+    if with_signatures:
+        _say("Henter PRONOM-signaturer (sf -update) til pakken...")
+        tmp = Path(tempfile.mkdtemp(prefix="sf_sig_"))
+        try:
+            sf = _extract(archive_path, tmp, binary_name)
+            sig_dir = dest_dir / SIG_DIRNAME
+            sig_dir.mkdir(exist_ok=True)
+            subprocess.run([str(sf), "-home", str(sig_dir), "-update"],
+                           capture_output=True, timeout=300, check=False, **hidden_kwargs())
+            if not (sig_dir / "default.sig").exists():
+                _say("  Advarsel: fikk ikke hentet default.sig")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    return archive_path
+
+
+def _extract(archive_path: Path, target: Path, binary_name: str) -> Path:
     target.mkdir(parents=True, exist_ok=True)
-    name_low = asset["name"].lower()
+    name_low = archive_path.name.lower()
     if name_low.endswith(".zip"):
         with zipfile.ZipFile(archive_path) as z:
             z.extractall(target)
@@ -189,47 +205,78 @@ def install_siegfried(progress: ProgressCb = None) -> Path:
         with tarfile.open(archive_path) as t:
             t.extractall(target)
     else:
-        raise RuntimeError(f"Ukjent arkivtype: {asset['name']}")
-
-    # 5. Finn binæren (kan ligge i en undermappe)
-    sf_path: Optional[Path] = None
-    for cand in target.rglob(binary_name):
-        if cand.is_file():
-            sf_path = cand
-            break
+        raise RuntimeError(f"Ukjent arkivtype: {archive_path.name}")
+    sf_path = next((c for c in target.rglob(binary_name) if c.is_file()), None)
     if sf_path is None:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
         raise RuntimeError(f"Fant ikke '{binary_name}' i utpakket arkiv.")
-
     if sys.platform != "win32":
         try:
             sf_path.chmod(0o755)
         except Exception:
             pass
+    return sf_path
 
-    # 6. Hent PRONOM-signaturer
-    _say("Henter PRONOM-signaturer (sf -update)...")
-    try:
-        subprocess.run([str(sf_path), "-update"],
-                       capture_output=True, timeout=180, check=True, **hidden_kwargs())
-    except subprocess.CalledProcessError as exc:
-        # Ikke fatal — sf kommer ofte med default.sig bundlet
-        _say(f"  Advarsel: sf -update returnerte {exc.returncode}")
-    except subprocess.TimeoutExpired:
-        _say("  Advarsel: sf -update timeout — bruker innebygde signaturer")
 
-    # 7. Rydd opp
-    shutil.rmtree(tmp_dir, ignore_errors=True)
+def install_from_archive(archive_path: Path, progress: ProgressCb = None,
+                         sig_dir: "Path | None" = None) -> Path:
+    """
+    Installer Siegfried fra et lokalt arkiv (offline). PRONOM-signaturer:
+    `sig_dir/default.sig` kopieres til Siegfrieds hjemmemappe når den mangler
+    der; ellers forsøkes `sf -update` (krever nett, ikke fatal).
+    """
+    def _say(msg: str) -> None:
+        if progress is not None:
+            try:
+                progress(msg)
+            except Exception:
+                pass
 
-    # 8. Lagre i config
+    _patterns, binary_name = _asset_patterns()
+    _say("Pakker ut Siegfried...")
+    sf_path = _extract(Path(archive_path), install_target_dir(), binary_name)
+    home = sf_home()
+    bundled_sig = Path(sig_dir) / "default.sig" if sig_dir else None
+    if bundled_sig and bundled_sig.exists():
+        if not (home / "default.sig").exists():
+            _say("Kopierer medfølgende PRONOM-signaturer...")
+            home.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(bundled_sig, home / "default.sig")
+    elif not (home / "default.sig").exists():
+        _say("Henter PRONOM-signaturer (sf -update)...")
+        try:
+            subprocess.run([str(sf_path), "-update"],
+                           capture_output=True, timeout=180, check=True, **hidden_kwargs())
+        except subprocess.CalledProcessError as exc:
+            _say(f"  Advarsel: sf -update returnerte {exc.returncode}")
+        except subprocess.TimeoutExpired:
+            _say("  Advarsel: sf -update timeout — bruker innebygde signaturer")
     try:
         from settings import set_config
         set_config("sf_executable", str(sf_path))
     except Exception:
         pass
-
     _say(f"Ferdig — sf installert til {sf_path}")
     return sf_path
+
+
+def install_siegfried(progress: ProgressCb = None) -> Path:
+    """
+    Last ned siste Siegfried fra GitHub, pakk ut, hent signaturer.
+    Returnerer sti til sf-binær. Kaster Exception ved feil.
+    """
+    tmp_dir = Path(tempfile.mkdtemp(prefix="sf_install_"))
+    try:
+        archive = download_archive(tmp_dir, progress, with_signatures=False)
+        sf_path = install_from_archive(archive, progress)
+        # Oppdater signaturene selv om en eldre default.sig finnes (som før)
+        try:
+            subprocess.run([str(sf_path), "-update"],
+                           capture_output=True, timeout=180, check=False, **hidden_kwargs())
+        except Exception:
+            pass
+        return sf_path
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def update_signatures(progress: ProgressCb = None) -> bool:

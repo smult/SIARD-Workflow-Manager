@@ -33,9 +33,14 @@ from settings import save_op_params, save_config, get_config, _SETTINGS_FILE
 # Autocomplete-datakilder
 # ─────────────────────────────────────────────────────────────────────────────
 
-_SOURCES_DIR        = Path(__file__).parent.parent / "siard_workflow" / "sources"
+import app_paths as _app_paths
+_SOURCES_DIR        = _app_paths.resource("siard_workflow", "sources")
 _KOMMUNENUMMER_CSV  = _SOURCES_DIR / "kommunenummer.csv"
-_KILDESYSTEM_CACHE  = _SOURCES_DIR / "kildesystem_cache.json"
+# Pakket program: ressursmappa er skrivebeskyttet — cachen skrives i datamappa,
+# og den medfølgende cachen brukes til første oppdatering (også uten nett)
+_KILDESYSTEM_SEED   = _SOURCES_DIR / "kildesystem_cache.json"
+_KILDESYSTEM_CACHE  = (_app_paths.data_dir() / "kildesystem_cache.json"
+                       if _app_paths.FROZEN else _KILDESYSTEM_SEED)
 _SHEETS_URL         = ("https://docs.google.com/spreadsheets/d/"
                        "1JJr_MBt97aZasAInCnvhGmyTcv7OizrYApQCkQOjyLw/export?format=csv")
 
@@ -84,13 +89,14 @@ def _get_kildesystem() -> list[str]:
 
 
 def _load_kildesystem_cache() -> list[str] | None:
-    try:
-        if _KILDESYSTEM_CACHE.exists():
-            data = json.loads(_KILDESYSTEM_CACHE.read_text(encoding="utf-8"))
-            if isinstance(data, list) and data:
-                return data
-    except Exception:
-        pass
+    for path in (_KILDESYSTEM_CACHE, _KILDESYSTEM_SEED):
+        try:
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, list) and data:
+                    return data
+        except Exception:
+            pass
     return None
 
 

@@ -9,6 +9,17 @@ if %errorlevel% neq 0 (
 ) else (
     echo [OK] Python funnet
 )
+python -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>&1
+if %errorlevel% neq 0 (
+    echo [FEIL] Programmet krever Python 3.10 eller nyere
+    python --version
+    exit /b
+)
+python -c "import tkinter" >nul 2>&1
+if %errorlevel% neq 0 (
+    echo [FEIL] Python mangler tkinter ^(Tcl/Tk^) - installer Python på nytt med "tcl/tk and IDLE"
+    exit /b
+)
 
 echo.
 
@@ -18,9 +29,10 @@ if %errorlevel% neq 0 (
     if exist "C:\Program Files\LibreOffice\program\soffice.exe" (
         echo [OK] LibreOffice funnet
     ) else (
-        echo [FEIL] LibreOffice ikke funnet
-	echo Installer LibreOffice fra https://www.libreoffice.org/
-	exit /b
+        echo [ADVARSEL] LibreOffice ikke funnet
+        echo            Uten LibreOffice konverteres ikke Office-dokumenter til PDF/A
+        echo            ^(BLOB-konvertering, CosDoc^). Resten av programmet virker.
+        echo            Installer fra https://www.libreoffice.org/
     )
 ) else (
     echo [OK] LibreOffice funnet i PATH
@@ -46,7 +58,10 @@ echo.
 echo Trykk en tast for å fortsette
 pause >nul
 echo Installerer avhengigheter...
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
+echo.
+echo Valgfrie tillegg ^(7z/RAR-arkiver i BLOB-konvertering, libmagic i DIAS^) kan
+echo installeres fra Innstillinger ^> Programvare og avhengigheter i programmet.
 echo.
 echo Starter SIARD Workflow Manager...
 python main.py

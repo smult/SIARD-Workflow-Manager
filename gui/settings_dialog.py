@@ -54,6 +54,12 @@ class SettingsDialog(ctk.CTkToplevel):
                      font=ctk.CTkFont(family=FONTS["mono"], size=11),
                      text_color=COLORS["muted"]).grid(
                          row=1, column=0, padx=20, pady=(0, 10), sticky="w")
+        ctk.CTkButton(hdr, text="Programvare og avhengigheter …",
+                      fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+                      text_color=COLORS["btn_text"], border_color=COLORS["btn_border"],
+                      border_width=1, font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                      command=self._open_dependencies,
+                      ).grid(row=0, column=1, rowspan=2, padx=20, sticky="e")
 
         # Innhold
         frm = ctk.CTkScrollableFrame(self, fg_color=COLORS["panel"],
@@ -675,7 +681,8 @@ class SettingsDialog(ctk.CTkToplevel):
                 )
                 if yes:
                     try:
-                        sf = _sf_inst.install_siegfried(progress=None)
+                        from siard_workflow.core import components as _C
+                        sf = _C.install("siegfried")   # medfølgende fil, ellers nedlasting
                         cfg["sf_executable"] = str(sf)
                     except Exception as exc:
                         _mb.showerror(
@@ -732,6 +739,27 @@ class SettingsDialog(ctk.CTkToplevel):
             self._ollama_status_lbl.configure(
                 text=f"Status: feil ved test ({exc})", text_color=COLORS["muted"])
 
+    # ── Programvare-oversikt ─────────────────────────────────────────────────
+
+    def _open_dependencies(self):
+        """Status for alle Python-pakker og eksterne programmer (dependencies.py)."""
+        import dependencies as _deps
+        from gui.dependencies_dialog import DependenciesDialog
+        dlg = DependenciesDialog(self, _deps.check_all(include_tools=False), mode="overview",
+                                 app=self.master, autocheck=True)
+        self.wait_window(dlg)
+        try:
+            self.grab_set()                  # tilbake til innstillingsvinduet
+        except Exception:
+            pass
+        # Installasjoner i oversikten kan ha endret status her
+        for attr, fn in (("_gs_status_lbl", self._ghostscript_status_text),
+                         ("_sf_status_lbl", self._siegfried_status_text)):
+            try:
+                getattr(self, attr).configure(text=fn())
+            except Exception:
+                pass
+
     # ── Ghostscript-status + installasjon ────────────────────────────────────
 
     def _ghostscript_status_text(self) -> str:
@@ -773,8 +801,9 @@ class SettingsDialog(ctk.CTkToplevel):
 
         def _worker():
             try:
-                result["path"] = str(_gs.install_ghostscript(
-                    lambda m: prog.after(0, lambda: msg_var.set(m))))
+                from siard_workflow.core import components as _C
+                result["path"] = str(_C.install(          # medfølgende fil, ellers nedlasting
+                    "ghostscript", lambda m: prog.after(0, lambda: msg_var.set(m))))
             except Exception as exc:
                 result["err"] = str(exc)
             prog.after(0, _done)
@@ -833,8 +862,9 @@ class SettingsDialog(ctk.CTkToplevel):
                         lambda m: prog.after(0, lambda: msg_var.set(m)))
                     result["ok"] = True
                 else:
-                    sf = _sf_inst.install_siegfried(
-                        lambda m: prog.after(0, lambda: msg_var.set(m)))
+                    from siard_workflow.core import components as _C
+                    sf = _C.install(                  # medfølgende fil, ellers nedlasting
+                        "siegfried", lambda m: prog.after(0, lambda: msg_var.set(m)))
                     result["ok"] = True
                     result["path"] = str(sf)
             except Exception as exc:

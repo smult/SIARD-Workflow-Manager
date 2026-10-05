@@ -76,6 +76,12 @@ def find_libreoffice(hint: str = "soffice") -> str | None:
                                 os.path.join(base, entry, "program", "soffice.exe"))
                 except OSError:
                     pass
+        # Installert av programmet selv (Innstillinger / oppstart, se
+        # siard_workflow/core/components.py) — nyeste versjon først
+        import glob as _glob
+        own = os.path.join(os.environ.get("LOCALAPPDATA", ""), "SIARDManager",
+                           "libreoffice", "*", "program", "soffice.exe")
+        candidates += sorted(_glob.glob(own), reverse=True)
         for c in candidates:
             if os.path.isfile(c):
                 return c

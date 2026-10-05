@@ -412,9 +412,10 @@ def decompress_rtf(data: bytes) -> bytes:
 
 # ── Rendering ────────────────────────────────────────────────────────────────
 
-_PDFA_LEVELS = {                  # label → SelectPdfVersion
-    "PDF/A-2b (ISO 19005-2, level B)": "6",
-    "PDF/A-3b (ISO 19005-3, level B)": "9",
+_PDFA_LEVELS = {                  # label → LibreOffice SelectPdfVersion
+    # 2 = PDF/A-2b, 3 = PDF/A-3b (6/9 ga vanlig PDF — verifisert LO 26.2.6)
+    "PDF/A-2b (ISO 19005-2, level B)": "2",
+    "PDF/A-3b (ISO 19005-3, level B)": "3",
 }
 DEFAULT_LEVEL = "PDF/A-2b (ISO 19005-2, level B)"
 

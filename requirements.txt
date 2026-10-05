@@ -9,3 +9,8 @@ docx-mailmerge2>=0.6
 python-docx>=1.1
 PyMuPDF>=1.24       # e-post → PDF/A (sammenslåing, bilder); AGPL
 olefile>=0.46       # Outlook MSG
+
+# Valgfrie tillegg (installeres fra Innstillinger > Programvare og avhengigheter):
+#   py7zr>=0.20               7z-arkiver i BLOB-konvertering
+#   rarfile>=4.0              RAR-arkiver i BLOB-konvertering (krever UnRAR/7-Zip)
+#   python-magic-bin>=0.4.14  MIME-type via libmagic i DIAS-pakke (Windows)

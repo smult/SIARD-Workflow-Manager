@@ -29,8 +29,12 @@ from siard_workflow.core import external_lob
 
 logger = logging.getLogger(__name__)
 
-# Programmappen er tre nivåer opp fra denne filen
-_PROGRAM_DIR = Path(__file__).parent.parent.parent
+# Brukerdata-mappa (programmappa, eller mappa med SIARDManager.exe når pakket)
+try:
+    from app_paths import data_dir as _data_dir
+    _PROGRAM_DIR = _data_dir()
+except Exception:
+    _PROGRAM_DIR = Path(__file__).parent.parent.parent
 _DIAS_JSON   = _PROGRAM_DIR / "dias.json"
 
 # Alle kjente feltnøkler med hardkodede fallback-verdier

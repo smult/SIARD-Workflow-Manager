@@ -187,6 +187,87 @@ def _say(progress: ProgressCb, msg: str) -> None:
             pass
 
 
+INSTALLER_GLOB = "gs*w64.exe"          # navn på installasjonsfil i komponenter/
+
+
+def download_installer(dest_dir: Path, progress: ProgressCb = None) -> Path:
+    """
+    Last ned siste 64-bit Windows-installasjonsfil (gs<versjon>w64.exe) fra
+    Artifex til `dest_dir`, verifisert mot SHA512SUMS. Returnerer filstien.
+    Brukes både ved installasjon med nett og når offline-pakken bygges.
+    """
+    _say(progress, "Henter utgivelsesinfo fra GitHub (ArtifexSoftware/ghostpdl-downloads)...")
+    req = urllib.request.Request(_GITHUB_API, headers={"Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        rel = json.load(r)
+    assets = rel.get("assets", [])
+    asset = next((a for a in assets if re.fullmatch(r"gs\d+w64\.exe", a["name"])), None)
+    if asset is None:
+        raise RuntimeError("Fant ingen 64-bit Windows-installasjonsfil (gs*w64.exe) i "
+                           f"utgivelse {rel.get('tag_name', '?')}")
+    sums = next((a for a in assets if a["name"].upper() == "SHA512SUMS"), None)
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    exe = dest_dir / asset["name"]
+    size_mb = asset.get("size", 0) / 1e6
+    _say(progress, f"Laster ned {asset['name']} ({size_mb:.0f} MB)...")
+    part = exe.with_suffix(".part")
+    urllib.request.urlretrieve(asset["browser_download_url"], str(part))
+    if sums is not None:
+        _say(progress, "Verifiserer SHA512...")
+        with urllib.request.urlopen(sums["browser_download_url"], timeout=30) as r:
+            lines = r.read().decode("utf-8", "replace").splitlines()
+        expected = next((ln.split()[0].lower() for ln in lines
+                         if ln.strip().endswith(asset["name"])), None)
+        actual = hashlib.sha512(part.read_bytes()).hexdigest().lower()
+        if expected and actual != expected:
+            part.unlink(missing_ok=True)
+            raise RuntimeError(f"SHA512 stemmer ikke for {asset['name']}")
+    part.replace(exe)
+    return exe
+
+
+def install_from_installer(exe: Path, progress: ProgressCb = None) -> Path:
+    """
+    Installer Ghostscript fra en lokal installasjonsfil (gs<versjon>w64.exe) til
+    %LOCALAPPDATA%\\SIARDManager\\ghostscript\\gs<versjon> — uten nett. Lagrer
+    stien i config (`ghostscript_bin`). Returnerer sti til gswin64c.exe.
+    """
+    if sys.platform != "win32":
+        raise RuntimeError("Installasjon fra fil støttes bare på Windows.")
+    exe = Path(exe)
+    ver = re.sub(r"\D", "", exe.name.split("w64")[0]) or "ny"
+    target = install_target_root() / f"gs{ver}"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _say(progress, f"Installerer Ghostscript til {target} ...")
+    # NSIS: /S = stille, /D=<sti> MÅ være siste argument og uten anførselstegn
+    args = ["/S", f"/D={target}"]
+    try:
+        subprocess.run([str(exe), *args], timeout=900, check=False, **hidden_kwargs())
+    except OSError as exc:
+        if getattr(exc, "winerror", None) != 740:       # 740 = krever heving
+            raise
+        _say(progress, "Installasjonsprogrammet krever administratorrettigheter — "
+                       "bekreft i Windows-dialogen...")
+        ps_args = ",".join(f"'{a}'" for a in args)
+        subprocess.run(["powershell", "-NoProfile", "-Command",
+                        f"Start-Process -FilePath '{exe}' -ArgumentList {ps_args} "
+                        f"-Verb RunAs -Wait"], timeout=900, check=False,
+                       **hidden_kwargs())
+    gs = next((p for p in target.rglob("gswin64c.exe") if p.is_file()), None)
+    if gs is None:
+        gs = find_ghostscript()
+    if gs is None:
+        raise RuntimeError("Installasjonen ble ikke fullført (fant ikke gswin64c.exe)")
+    try:
+        from settings import set_config
+        set_config("ghostscript_bin", str(gs))
+    except Exception:
+        pass
+    _say(progress, f"Ghostscript installert: {gs}")
+    return gs
+
+
 def install_ghostscript(progress: ProgressCb = None) -> Path:
     """
     Last ned og installer siste Ghostscript for Windows (64-bit) til
@@ -198,63 +279,8 @@ def install_ghostscript(progress: ProgressCb = None) -> Path:
             "Automatisk installasjon støttes bare på Windows. Installer "
             "Ghostscript med pakkebehandleren: «brew install ghostscript» "
             "(macOS) eller «sudo apt install ghostscript» (Linux).")
-    _say(progress, "Henter utgivelsesinfo fra GitHub (ArtifexSoftware/ghostpdl-downloads)...")
-    req = urllib.request.Request(_GITHUB_API, headers={"Accept": "application/vnd.github+json"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        rel = json.load(r)
-    assets = rel.get("assets", [])
-    asset = next((a for a in assets if re.fullmatch(r"gs\d+w64\.exe", a["name"])), None)
-    if asset is None:
-        raise RuntimeError("Fant ingen 64-bit Windows-installasjonsfil (gs*w64.exe) i "
-                           f"utgivelse {rel.get('tag_name', '?')}")
-    sums = next((a for a in assets if a["name"].upper() == "SHA512SUMS"), None)
-
     tmp = Path(tempfile.mkdtemp(prefix="gs_install_"))
     try:
-        exe = tmp / asset["name"]
-        size_mb = asset.get("size", 0) / 1e6
-        _say(progress, f"Laster ned {asset['name']} ({size_mb:.0f} MB)...")
-        urllib.request.urlretrieve(asset["browser_download_url"], str(exe))
-
-        if sums is not None:
-            _say(progress, "Verifiserer SHA512...")
-            with urllib.request.urlopen(sums["browser_download_url"], timeout=30) as r:
-                lines = r.read().decode("utf-8", "replace").splitlines()
-            expected = next((ln.split()[0].lower() for ln in lines
-                             if ln.strip().endswith(asset["name"])), None)
-            actual = hashlib.sha512(exe.read_bytes()).hexdigest().lower()
-            if expected and actual != expected:
-                raise RuntimeError(f"SHA512 stemmer ikke for {asset['name']}")
-
-        ver = re.sub(r"\D", "", asset["name"].split("w64")[0]) or "ny"
-        target = install_target_root() / f"gs{ver}"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        _say(progress, f"Installerer til {target} ...")
-        # NSIS: /S = stille, /D=<sti> MÅ være siste argument og uten anførselstegn
-        args = ["/S", f"/D={target}"]
-        try:
-            subprocess.run([str(exe), *args], timeout=900, check=False, **hidden_kwargs())
-        except OSError as exc:
-            if getattr(exc, "winerror", None) != 740:       # 740 = krever heving
-                raise
-            _say(progress, "Installasjonsprogrammet krever administratorrettigheter — "
-                           "bekreft i Windows-dialogen...")
-            ps_args = ",".join(f"'{a}'" for a in args)
-            subprocess.run(["powershell", "-NoProfile", "-Command",
-                            f"Start-Process -FilePath '{exe}' -ArgumentList {ps_args} "
-                            f"-Verb RunAs -Wait"], timeout=900, check=False,
-                           **hidden_kwargs())
-        gs = next((p for p in target.rglob("gswin64c.exe") if p.is_file()), None)
-        if gs is None:
-            gs = find_ghostscript()
-        if gs is None:
-            raise RuntimeError("Installasjonen ble ikke fullført (fant ikke gswin64c.exe)")
-        try:
-            from settings import set_config
-            set_config("ghostscript_bin", str(gs))
-        except Exception:
-            pass
-        _say(progress, f"Ghostscript installert: {gs}")
-        return gs
+        return install_from_installer(download_installer(tmp, progress), progress)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

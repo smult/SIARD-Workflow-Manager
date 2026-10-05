@@ -652,6 +652,77 @@ def _generate_pdf(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Filer som ikke ble konvertert (BLOB-konvertering)
+# ─────────────────────────────────────────────────────────────────────────────
+
+MAX_FAILURE_ROWS = 300          # resten står i feillista (CSV)
+
+
+def _failure_section(fs: dict, inner_w, _kv_table, s_sub, s_small,
+                     C_PRIMARY, C_BORDER, C_WHITE) -> list:
+    """Opptelling per årsak + tabell over filene (fra ConversionErrorLogger.summary)."""
+    from xml.sax.saxutils import escape
+    from reportlab.lib import colors as rl_colors
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.units import cm
+    from reportlab.platypus import Paragraph, Spacer, Table, TableStyle
+
+    labels = fs.get("labels", {})
+    counts = fs.get("counts", {})
+    total = int(fs.get("total", 0))
+    out: list = [Paragraph(f"Filer som ikke ble konvertert ({total:,})", s_sub)]
+    rows = [(f"{labels.get(k, k)}:", f"{n:,}") for k, n in counts.items()]
+    rows.append(("Totalt:", f"{total:,}"))
+    out.append(_kv_table(rows, col_w=[7 * cm, inner_w - 7 * cm]))
+    out.append(Spacer(1, 0.25 * cm))
+
+    cell = ParagraphStyle("FailCell", parent=s_small, fontSize=7.5, leading=9,
+                          spaceAfter=0, textColor=C_PRIMARY)
+    head = ParagraphStyle("FailHead", parent=cell, fontName="Helvetica-Bold",
+                          textColor=C_WHITE)
+    order = list(labels)
+    entries = sorted(fs.get("entries", []),
+                     key=lambda e: (order.index(e["kategori"])
+                                    if e["kategori"] in order else 99, e["fil"]))
+    shown = entries[:MAX_FAILURE_ROWS]
+    data = [[Paragraph(h, head) for h in ("Årsak", "Fil", "Tabell/kolonne", "Format", "Detaljer")]]
+    for e in shown:
+        fil = e["fil"].split("::")[-1]
+        data.append([
+            Paragraph(escape(labels.get(e["kategori"], e["kategori"])), cell),
+            Paragraph(escape(fil), cell),
+            Paragraph(escape(e.get("plassering", "")), cell),
+            Paragraph(escape(e.get("format", "")), cell),
+            Paragraph(escape(e.get("arsak", ""))[:400], cell),
+        ])
+    tbl = Table(data, colWidths=[inner_w * 0.17, inner_w * 0.30, inner_w * 0.17,
+                                 inner_w * 0.08, inner_w * 0.28], repeatRows=1)
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND",    (0, 0), (-1, 0), C_PRIMARY),
+        ("VALIGN",        (0, 0), (-1, -1), "TOP"),
+        ("GRID",          (0, 0), (-1, -1), 0.5, C_BORDER),
+        ("TOPPADDING",    (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 4),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [rl_colors.HexColor("#fdf2f2"), C_WHITE]),
+    ]))
+    out.append(tbl)
+    rest = total - len(shown)
+    note = []
+    if rest > 0:
+        note.append(f"{rest:,} fil(er) til er ikke vist her.")
+    if fs.get("csv_path"):
+        note.append(f"Komplett liste: {Path(fs['csv_path']).name}")
+    if fs.get("log_path"):
+        note.append(f"Feillogg: {Path(fs['log_path']).name}")
+    if note:
+        out.append(Spacer(1, 0.15 * cm))
+        out.append(Paragraph(escape("  ·  ".join(note)), s_small))
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Operasjonsspesifikke detaljseksjoner
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -783,7 +854,12 @@ def _op_detail(
             ("XML-filer oppdatert:",       f"{xml_upd:,}"),
             ("Konverteringsfeil:",         f"{failed:,}"),
         ]
-        out.append(_kv_table(rows))
+        _fs = op_data.get("failure_summary") or {}
+        if _fs.get("total"):
+            rows.append(("Ikke konvertert totalt:",
+                         f"{_fs['total']:,}  (skadede, tomme, manglende, passordbeskyttede "
+                         f"og feilede filer — se under)"))
+        out.append(_kv_table(rows, col_w=[4.6 * cm, inner_w - 4.6 * cm]))
 
         if include_charts and (converted + kept + failed) > 0:
             chart = _pie_chart(
@@ -805,7 +881,11 @@ def _op_detail(
                     "•  Rød = feil under konvertering",
                     s_caption))
 
-        if failed > 0:
+        fs = op_data.get("failure_summary") or {}
+        if fs.get("total"):
+            out.extend(_failure_section(fs, inner_w, _kv_table, s_sub, s_small,
+                                        C_PRIMARY, C_BORDER, C_WHITE))
+        elif failed > 0:
             out.append(Paragraph(
                 f"Advarsel: {failed} fil(er) kunne ikke konverteres. "
                 "Se kjøreloggen for detaljer om de aktuelle filene.",
