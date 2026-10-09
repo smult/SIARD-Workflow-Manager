@@ -160,9 +160,79 @@ def test_blob_and_report(tmp: Path) -> None:
     _ok("arkiv.dokumenter.fil" in pdf_text, "rapporten viser tabell/kolonne")
 
 
+def test_ole2_far_directory(tmp: Path) -> None:
+    """Word-fil der OLE2-katalogen ligger etter de første 64 kB og teksten
+    inneholder «Impress»: ble identifisert som PowerPoint og deretter avvist
+    som skadet (ekte tilfelle: Plania/Visma Unique, 2026-10-06)."""
+    print("test_ole2_far_directory")
+    sys.path.insert(0, str(_ROOT / "tests"))
+    from test_msg_to_pdf import _write_ole
+    from siard_workflow.core.identifiers.magic_bytes import MagicIdentifier, _detect
+    from siard_workflow.core.file_integrity import check_structure, ole2_office_type
+    word_clsid = bytes.fromhex("0609020000000000c000000000000046")
+    text = "Referat. Kurs i Impress for ansatte. ".encode("cp1252")  # 8-bit tekst, som i Word 97
+    # «1Table» skrives først → teksten havner innen de første 4 kB, som i den
+    # ekte filen; WordDocument gjør filen > 64 kB så katalogen havner utenfor
+    data = _write_ole({"WordDocument": b"\x00" * 80000, "1Table": text + b"t" * 5000},
+                      root_clsid=word_clsid)
+    f = tmp / "record132851.bin"
+    f.write_bytes(data)
+    head = data[:65536]
+    _ok(_detect(head)[0] == "ppt", "kun 64 kB: katalogen er utenfor vinduet → feiltolket som PPT")
+    _ok(MagicIdentifier().identify(data=head, path=f)[0] == "doc",
+        "med filsti: hele OLE2-katalogen leses → Word")
+    _ok(ole2_office_type(f)[0] == "doc" and check_structure(f, "doc") is None,
+        "strukturkontroll godtar Word-filen")
+    _ok(check_structure(f, "ppt") is not None, "som PowerPoint ville den blitt avvist (gammel feil)")
+
+
+def test_type_hint_text(tmp: Path) -> None:
+    """Typekolonnen sier «DOC», men filen er en SQL-spørring (lesbar tekst):
+    ble behandlet som Word og avvist som skadet (ekte tilfelle 2026-10-09).
+    Tekst skal beholdes som tekst; ukjent binærinnhold merket DOC som ikke er
+    Word, skal fortsatt avvises — med typekolonnen nevnt i årsaken."""
+    print("test_type_hint_text")
+    import settings
+    settings.set_config = lambda k, v: None
+    from siard_workflow.core.context import WorkflowContext
+    from siard_workflow.operations.blob_convert_operation import BlobConvertOperation
+    root = tmp / "hint"
+    sql = ("SELECT cast(ve.type as nvarchar) + '-' + cast(ve.vedtaksnr as nvarchar) "
+           "as vedtaksnummer, rP.FNavn, rP.ENavn FROM rVedtak ve, rPerson rP "
+           "WHERE ve.personid = rP.personid ORDER BY ve.Aar").encode("utf-8")
+    lob = _make_siard(root, {"record5.txt": sql, "record6.bin": bytes(range(1, 255)) * 8}, [])
+    (root / "content/schema0/table0/table0.xml").write_text(
+        '<table>\n'
+        '<row><c1>5</c1><c2 file="record5.txt"/><c3>DOC</c3></row>\n'
+        '<row><c1>6</c1><c2 file="record6.bin"/><c3>DOC</c3></row>\n'
+        '</table>\n', "utf-8")
+    logs: list = []
+    ctx = WorkflowContext(siard_path=tmp / "Hint.siard", metadata={
+        "file_logger": None,
+        "progress_cb": lambda ev, **k: logs.append(k.get("msg", "")) if ev == "log" else None,
+        "stop_event": threading.Event(), "pause_event": threading.Event()})
+    ctx.extracted_path = root
+    op = BlobConvertOperation()
+    op.params["extract_inline"] = True     # standard i GUI-et; bygger typekolonne-hint
+    r = op.run(ctx)
+    fs = r.data.get("failure_summary") or {}
+    bad = {e["fil"].split("/")[-1]: e for e in fs.get("entries", [])}
+    _ok(r.success and not any(k.startswith("record5") for k in bad),
+        f"SQL-tekst merket DOC regnes ikke som skadet ({sorted(bad)})")
+    _ok(any(p.name.startswith("record5") and p.read_bytes() == sql for p in lob.iterdir()),
+        "SQL-teksten beholdes uendret")
+    _ok("Typekolonne overstyrt av innhold" in "\n".join(logs) and "1 merket DOC" in "\n".join(logs),
+        "loggen sier at typekolonnen ble overstyrt")
+    e6 = next((e for k, e in bad.items() if k.startswith("record6")), None)
+    _ok(e6 is not None and e6["kategori"] == "skadet" and "Typekolonnen sier DOC" in e6["arsak"],
+        f"ukjent binærfil merket DOC: skadet, årsak nevner typekolonnen ({e6 and e6['arsak'][:70]})")
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="feilrapport_") as td:
         test_logger(Path(td))
+        test_ole2_far_directory(Path(td))
+        test_type_hint_text(Path(td))
         test_blob_and_report(Path(td))
     print("\nAlle tester OK")
     import os

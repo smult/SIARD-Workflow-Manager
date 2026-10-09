@@ -899,6 +899,31 @@ def _replace_file_attrs_in_line(
     return line, updates
 
 
+def _fmt_size(n_bytes: int) -> str:
+    """Lesbar størrelse: 412 KB, 6,2 MB, 1,3 GB (norsk desimalkomma)."""
+    n = float(max(0, n_bytes))
+    if n < 1024 * 1024:
+        return f"{max(1, round(n / 1024)) if n else 0} KB"
+    if n < 1024 ** 3:
+        mb = n / 1024 / 1024
+        return (f"{mb:.1f}".replace(".", ",") if mb < 10 else f"{mb:.0f}") + " MB"
+    return f"{n / 1024 ** 3:.1f}".replace(".", ",") + " GB"
+
+
+def _xml_patch_extras(col_map: dict, mime_cols: list, digest_cols: list) -> str:
+    """Tilleggsinfo for loggen — bare kolonner som faktisk oppdateres."""
+    parts = []
+    type_cols = sorted({t for v in (col_map or {}).values() for t in (v or [])})
+    if type_cols:
+        parts.append(("filtypekolonne " if len(type_cols) == 1 else "filtypekolonner ")
+                     + ", ".join(type_cols))
+    if mime_cols:
+        parts.append("MIME-kolonne " + ", ".join(f"c{c}" for c in mime_cols))
+    if digest_cols:
+        parts.append("sjekksumkolonne " + ", ".join(f"c{c}" for c in digest_cols))
+    return f" ({'; '.join(parts)})" if parts else ""
+
+
 def _build_lob_type_col_map(xml_path: Path,
                              table_blob_list: list[str]
                              ) -> dict[str, list[str]]:
@@ -1009,35 +1034,36 @@ def _build_type_hints_from_xml(xml_path: Path,
                     row_buf = [line]
                 elif in_row:
                     row_buf.append(line)
-                    if b"</row>" in line:
-                        in_row = False
-                        row_bytes = b"".join(row_buf)
+                # Raden er ferdig — også når hele <row>…</row> står på én linje
+                if in_row and b"</row>" in line:
+                    in_row = False
+                    row_bytes = b"".join(row_buf)
 
-                        # Finn file="..." i raden
-                        file_matches = re.findall(
-                            rb'file="([^"]+)"', row_bytes)
-                        if not file_matches:
-                            continue
+                    # Finn file="..." i raden
+                    file_matches = re.findall(
+                        rb'file="([^"]+)"', row_bytes)
+                    if not file_matches:
+                        continue
 
-                        # Finn type-verdier: alle tekst-noder som er kjente typer
-                        text_vals = re.findall(
-                            rb'<c\d+>([A-Za-z]{2,8})</c\d+>', row_bytes)
-                        row_type: str = ""
-                        for tv in text_vals:
-                            tv_up = tv.decode("utf-8", errors="ignore").strip().upper()
-                            if tv_up in _TYPE_MAP:
-                                row_type = _TYPE_MAP[tv_up]
-                                break
+                    # Finn type-verdier: alle tekst-noder som er kjente typer
+                    text_vals = re.findall(
+                        rb'<c\d+>([A-Za-z]{2,8})</c\d+>', row_bytes)
+                    row_type: str = ""
+                    for tv in text_vals:
+                        tv_up = tv.decode("utf-8", errors="ignore").strip().upper()
+                        if tv_up in _TYPE_MAP:
+                            row_type = _TYPE_MAP[tv_up]
+                            break
 
-                        if not row_type:
-                            continue
+                    if not row_type:
+                        continue
 
-                        # Knytt type til alle LOB-filer i raden
-                        for fname_b in file_matches:
-                            fname = fname_b.decode("utf-8", errors="ignore")
-                            basename = PurePosixPath(fname).name
-                            if basename in blob_basenames:
-                                result[basename] = row_type
+                    # Knytt type til alle LOB-filer i raden
+                    for fname_b in file_matches:
+                        fname = fname_b.decode("utf-8", errors="ignore")
+                        basename = PurePosixPath(fname).name
+                        if basename in blob_basenames:
+                            result[basename] = row_type
 
     except Exception:
         pass
@@ -2874,12 +2900,31 @@ class BlobConvertOperation(BaseOperation):
         _damaged: dict[str, str] = {}
         _damaged_lock = threading.Lock()
 
+        # Typekolonne-hint (se _detect_one_raw): tekstbaserte formater som
+        # lesbar tekst kan hintes til, og statistikk for loggen
+        _TEXT_HINT_EXTS = {"csv", "html", "htm", "xml"}
+        _hint_ignored: dict[str, int] = {}
+        _hinted: set = set()
+        _hint_lock = threading.Lock()
+
         def _detect_one(zip_sti: str) -> tuple[str, tuple[str, str, bool]]:
             res = _detect_one_raw(zip_sti)
             ext, _mime, enc = res[1]
             if not enc and ext in _CHECKED_FORMATS:
                 reason = _check_structure(extract_dir / zip_sti, ext)
                 if reason:
+                    # Feil Office-type (f.eks. Word gjenkjent som PowerPoint,
+                    # også fra Siegfried)? Avgjør ut fra hele OLE2-katalogen
+                    # før filen regnes som skadet.
+                    from siard_workflow.core.file_integrity import ole2_office_type
+                    full = ole2_office_type(extract_dir / zip_sti)
+                    if full and full[0] != ext and (full[2] or full[0] == "msg"
+                            or not _check_structure(extract_dir / zip_sti, full[0])):
+                        return zip_sti, full
+                    if zip_sti in _hinted:
+                        # Formatet kom fra typekolonnen, ikke fra innholdet
+                        reason = (f"Typekolonnen sier {ext.upper()}, men innholdet er "
+                                  f"ikke et gyldig {ext.upper()}-dokument ({reason})")
                     with _damaged_lock:
                         _damaged[zip_sti] = reason
             return res
@@ -3102,13 +3147,26 @@ class BlobConvertOperation(BaseOperation):
                             pass
 
             # ── XML-type-hint fra tabell-metadata ────────────────────────────
+            # Typekolonnen (f.eks. «DOC») sier hva systemet MENTE filen var.
+            # Den brukes når innholdet ikke er gjenkjent (bin), eller når
+            # tekstinnhold hintes som et tekstbasert format. Lesbar tekst blir
+            # aldri gjort om til et binært format (DOC/XLS/PDF …): da er
+            # typekolonnen feil (ekte tilfelle: SQL-spørringer merket DOC), og
+            # LibreOffice/strukturkontrollen ville behandlet teksten som et
+            # skadet Word-dokument.
             basename = PurePosixPath(zip_sti).name
             if ext in ("txt", "bin") and basename in hints:
                 hint_ext = hints[basename]
                 if hint_ext in _LO_CONVERTIBLE or hint_ext in _RENAME_ONLY_EXTS \
                         or hint_ext in ("rtf", "pdf"):
-                    ext  = hint_ext
-                    mime = f"application/{hint_ext}"
+                    if ext == "txt" and hint_ext not in _TEXT_HINT_EXTS:
+                        with _hint_lock:
+                            _hint_ignored[hint_ext] = _hint_ignored.get(hint_ext, 0) + 1
+                    else:
+                        ext  = hint_ext
+                        mime = f"application/{hint_ext}"
+                        with _hint_lock:
+                            _hinted.add(zip_sti)
 
             return zip_sti, (ext, mime, is_encrypted)
 
@@ -3157,6 +3215,10 @@ class BlobConvertOperation(BaseOperation):
             w(f"  UTF-8-kodet binærdata: {_utf8_bin_count[0]:,} filer gjenopprettet", "info")
 
         stats["identified"] = len(det_results)
+        if _hint_ignored:
+            w("  Typekolonne overstyrt av innhold (lesbar tekst beholdes som tekst): "
+              + ", ".join(f"{n:,} merket {e.upper()}"
+                          for e, n in sorted(_hint_ignored.items())), "info")
 
         # Steg B: Kategoriser
         to_convert:     list[tuple[int, str, str, str]] = []
@@ -5743,14 +5805,16 @@ class BlobConvertOperation(BaseOperation):
                 return
 
             xml_file_path = extract_dir / xml_sti
-            sz_mb = xml_file_path.stat().st_size // 1024 // 1024 if xml_file_path.exists() else 0
-            extras = []
-            if col_map:    extras.append(f"type-kol: {col_map}")
-            if mime_cols:  extras.append(f"mime-kol: c{mime_cols}")
-            if digest_cols: extras.append(f"digest-kol: c{digest_cols}")
-            w(f"  [{n_xml_done+1}/{n_xml_total}] {xml_sti} "
-              f"({sz_mb} MB, {len(renames):,} renames"
-              + (", " + ", ".join(extras) if extras else "") + ")", "info")
+            sz_bytes = xml_file_path.stat().st_size if xml_file_path.exists() else 0
+            with lock:
+                pos = n_xml_done + 1
+            # Én omdøpt fil står i `renames` både med filnavn og full sti —
+            # tell filer (unike mål), ikke nøkler
+            n_files = len({str(p) for p in renames.values()}
+                          | {str(p) for m in (col_renames or {}).values()
+                             for p in m.values()})
+            extras = _xml_patch_extras(col_map, mime_cols, digest_cols)
+            head = f"  [{pos}/{n_xml_total}] {xml_sti} ({_fmt_size(sz_bytes)})"
 
             # Les XML
             if xml_sti in xml_pre:
@@ -5769,6 +5833,10 @@ class BlobConvertOperation(BaseOperation):
             SIZE_THRESHOLD = 50 * 1024 * 1024
 
             if xml_sti not in xml_pre and xml_file_path.stat().st_size >= SIZE_THRESHOLD:
+                # Stor fil: oppdateres direkte på disk og tar tid — vis start
+                # og fremdrift (resultatet skrives av _patch_xml_file_inplace)
+                w(f"{head}: oppdaterer referanser til {n_files:,} fil(er) direkte "
+                  f"på disk{extras} …", "info")
                 n = self._patch_xml_file_inplace(xml_file_path, renames, w,
                                                   col_map=col_map,
                                                   mime_col_idxs=mime_cols,
@@ -5797,7 +5865,11 @@ class BlobConvertOperation(BaseOperation):
                     w(f"  FEIL skriv {xml_sti}: {exc}", "feil")
                     n = 0
 
-            w(f"    → {xml_sti}: {n:,} oppdateringer", "ok")
+            if n:
+                w(f"{head}: {n:,} filreferanse{'r' if n != 1 else ''} "
+                  f"oppdatert{extras}", "ok")
+            else:
+                w(f"{head}: ingen filreferanser endret", "info")
             with lock:
                 xml_updated += n
                 n_xml_done  += 1
@@ -5809,7 +5881,7 @@ class BlobConvertOperation(BaseOperation):
         with lock:
             stats["xml_updated"] += xml_updated
 
-        w(f"  XML ferdig: {xml_updated} referanser oppdatert", "info")
+        w(f"  XML ferdig: {xml_updated:,} filreferanse{'r' if xml_updated != 1 else ''} oppdatert", "info")
 
     def _patch_xml_bytes(self, xml_bytes: bytes, xml_sti: str,
                           renames: dict[str, Path],
@@ -5946,8 +6018,6 @@ class BlobConvertOperation(BaseOperation):
             return xml_bytes, 0
 
         result = _inject_conversion_comment(out_buf.getvalue())
-        w(f"    Streaming patch ({len(xml_bytes)//1024//1024} MB): "
-          f"{updates} oppdateringer", "ok")
         return result, updates
 
     def _patch_xml_file_inplace(
@@ -6051,13 +6121,12 @@ class BlobConvertOperation(BaseOperation):
                         pct = src.tell() / file_sz * 100 if file_sz else 0
                         msg = (f"    {xml_path.name}: "
                                f"{line_no:,}/{total_lines:,} linjer "
-                               f"({pct:.0f}%), {updates:,} oppdateringer")
+                               f"({pct:.0f}%), {updates:,} filreferanse{'r' if updates != 1 else ''} oppdatert")
                         w(msg, "info")
 
             tmp_path.replace(xml_path)
-            sz_mb    = xml_path.stat().st_size // 1024 // 1024
-            done_msg = (f"    Ferdig: {xml_path.name} ({sz_mb} MB), "
-                        f"{line_no:,} linjer, {updates:,} oppdateringer")
+            done_msg = (f"    Ferdig: {xml_path.name} ({_fmt_size(xml_path.stat().st_size)}), "
+                        f"{line_no:,} linjer, {updates:,} filreferanse{'r' if updates != 1 else ''} oppdatert")
             w(done_msg, "ok")
 
         except Exception as exc:

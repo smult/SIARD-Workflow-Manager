@@ -262,34 +262,25 @@ def test_collect_external_standalone(tmp: Path) -> None:
 
 def test_dias_sidecar(tmp: Path) -> None:
     print("test_dias_sidecar (eksternt fillager inkluderes i DIAS-content)")
-    from siard_workflow.operations.dias_package_operation import _copy_external_sidecar
+    from siard_workflow.operations.dias_package_operation import _external_sidecar_entries
 
     siard = _build_external_siard(tmp)   # arkiv.siard + arkiv.siard_documents/
-    # Etterlik content-bygging i DiasPackageOperation.run
-    content_dir = tmp / "content" / siard.stem
-    content_dir.mkdir(parents=True)
-    import shutil as _sh
-    _sh.copy2(siard, content_dir / siard.name)
-
     logs: list[str] = []
-    _copy_external_sidecar(siard, content_dir, logs.append)
-
-    side = content_dir / "arkiv.siard_documents" / "content" / "schema0" / "table2" / "lob4"
-    _ok((side / "rec1.bin").read_bytes() == b"BLOB-1",
-        "søstermappe kopiert inn i content/ ved siden av .siard")
+    entries = dict(_external_sidecar_entries(siard, logs.append))
+    rel = "arkiv.siard_documents/content/schema0/table2/lob4/rec1.bin"
+    _ok(rel in entries and entries[rel].read_bytes() == b"BLOB-1",
+        "søstermappens filer legges ved siden av .siard i content/ (fra kildestedet)")
     _ok(any("Eksternt fillager inkludert" in m for m in logs),
         "inkludering logget")
 
-    # Intern SIARD → ingen søstermappe kopieres
+    # Intern SIARD → ingen søstermappe
     intern = tmp / "intern.siard"
     with zipfile.ZipFile(intern, "w") as zf:
         zf.writestr("header/metadata.xml",
                     b'<siardArchive xmlns="http://www.bar.admin.ch/xmlns/siard/2/'
                     b'metadata.xsd"><lobFolder>content</lobFolder></siardArchive>')
-    cdir2 = tmp / "content2"
-    cdir2.mkdir()
-    _copy_external_sidecar(intern, cdir2, logs.append)
-    _ok(not any(cdir2.iterdir()), "intern SIARD: ingen søstermappe kopiert (no-op)")
+    _ok(_external_sidecar_entries(intern, logs.append) == [],
+        "intern SIARD: ingen søstermappe (tom liste)")
 
 
 def main() -> None:

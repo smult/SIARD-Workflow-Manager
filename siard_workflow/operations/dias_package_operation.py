@@ -466,103 +466,138 @@ class DiasPackageOperation(BaseOperation):
         meta = {**self.params,
                 "extra_files": json.dumps(metadata_extras, ensure_ascii=False)}
 
-        # Bygg content-mappa: kilde-SIARD og eventuelle konverterte varianter
-        with tempfile.TemporaryDirectory() as tmp_content:
-            content_dir = Path(tmp_content) / siard_path.stem
-            content_dir.mkdir()
+        # Temp-mappe for arbeidet (SIP-struktur + tar-fila): prosjektets
+        # temp-mappe (Endre temp-mappe), ellers samme auto-valg av disk som
+        # BLOB-konverteringen — aldri stille systemets %TEMP% (ofte C:).
+        _temp_base = _choose_temp_base(_ctx_meta, siard_path, needed, _wlog)
 
-            copied_siards: list[Path] = []
-            if content_siard_extras:
-                # Dialogbrukeren har eksplisitt valgt hvilke SIARD-filer som skal med
-                for ef in content_siard_extras:
-                    src = Path(ef["src"])
-                    if src.exists():
-                        shutil.copy2(src, content_dir / src.name)
-                        copied_siards.append(src)
-                        logger.info("Content SIARD inkludert: %s", src.name)
-                    else:
-                        logger.warning("Content SIARD ikke funnet: %s", src)
-                # Hvis original ikke er blant de valgte, ikke legg den til på nytt
-            else:
-                # Ingen eksplisitte content-valg: bruk kilde-SIARD (eksisterende atferd)
-                shutil.copy2(siard_path, content_dir / siard_path.name)
-                copied_siards.append(siard_path)
+        # Innholdet (SIARD-filer + eventuelt eksternt fillager) kopieres IKKE
+        # til temp: filene legges rett i tar-arkivet fra der de ligger, og
+        # sjekksummer beregnes fra de samme filene. Liste over
+        # (kildefil, sti under content/).
+        content_entries: "dict[str, Path]" = {}
+        copied_siards: list[Path] = []
+        if content_siard_extras:
+            # Dialogbrukeren har eksplisitt valgt hvilke SIARD-filer som skal med
+            for ef in content_siard_extras:
+                src = Path(ef["src"])
+                if src.exists():
+                    content_entries.setdefault(src.name, src)
+                    copied_siards.append(src)
+                    logger.info("Content SIARD inkludert: %s", src.name)
+                else:
+                    logger.warning("Content SIARD ikke funnet: %s", src)
+        else:
+            # Ingen eksplisitte content-valg: bruk kilde-SIARD
+            content_entries[siard_path.name] = siard_path
+            copied_siards.append(siard_path)
 
-            _file_log = (ctx.metadata or {}).get("file_logger")
+        _file_log = (ctx.metadata or {}).get("file_logger")
 
-            def _log_fn(msg: str) -> None:
-                logger.info(msg)
-                if _file_log:
-                    _file_log.log(msg, "info")
+        def _log_fn(msg: str) -> None:
+            logger.info(msg)
+            if _file_log:
+                _file_log.log(msg, "info")
 
-            # ── Eksternt fillager (ekstern lobFolder) ──────────────────────────
-            # Hvis en inkludert SIARD refererer et eksternt fillager (søster-
-            # mappe), MÅ mappen følge med i content/ ved siden av .siard-fila, så
-            # den relative <lobFolder>-referansen fortsatt løser opp i pakken.
-            for _src in copied_siards:
-                try:
-                    _copy_external_sidecar(_src, content_dir, _log_fn)
-                except Exception as exc:
-                    _log_fn(f"  Advarsel: kunne ikke inkludere eksternt "
-                            f"fillager for {_src.name}: {exc}")
-
-            # Hent temp-base fra ctx.metadata (satt av app.py) eller bruk systemtemp
-            _temp_base_s = (_ctx_meta.get("temp_dir") or "").strip()
-            _temp_base   = Path(_temp_base_s) if _temp_base_s and Path(_temp_base_s).is_dir() else None
-
+        # ── Eksternt fillager (ekstern lobFolder) ──────────────────────────────
+        # Hvis en inkludert SIARD refererer et eksternt fillager (søster-
+        # mappe), MÅ mappen følge med i content/ ved siden av .siard-fila, så
+        # den relative <lobFolder>-referansen fortsatt løser opp i pakken.
+        for _src in copied_siards:
             try:
-                aic_path = _build_dias_package(
-                    content_path = content_dir,
-                    out_root     = out_root,
-                    meta         = meta,
-                    log_fn       = _log_fn,
-                    temp_base    = _temp_base,
-                )
+                for rel, f in _external_sidecar_entries(_src, _log_fn):
+                    content_entries.setdefault(rel, f)
             except Exception as exc:
-                logger.exception("DIAS-pakking feilet")
-                return self._fail(f"DIAS-pakking feilet: {exc}")
+                _log_fn(f"  Advarsel: kunne ikke inkludere eksternt "
+                        f"fillager for {_src.name}: {exc}")
+
+        try:
+            aic_path = _build_dias_package(
+                content_path = sorted((f, rel) for rel, f in content_entries.items()),
+                out_root     = out_root,
+                meta         = meta,
+                log_fn       = _log_fn,
+                temp_base    = _temp_base,
+            )
+        except Exception as exc:
+            logger.exception("DIAS-pakking feilet")
+            return self._fail(f"DIAS-pakking feilet: {exc}")
 
         return self._ok(
             data={"aic_path": str(aic_path)},
             message=f"DIAS-pakke opprettet: {aic_path.name}")
 
 
+def _choose_temp_base(ctx_meta: dict, siard_path: Path, needed: int,
+                      log_fn) -> "Path | None":
+    """
+    Temp-rot for DIAS-pakkingen. Innholdet kopieres ikke; temp trenger plass
+    til tar-fila (~ pakkestørrelsen) før den flyttes til utmappa.
+      1. Prosjektets temp-mappe (ctx.metadata["temp_dir"], satt av GUI)
+      2. Auto: disken med mest ledig plass (disk_selector.best_temp_disk),
+         som BLOB-konverteringen
+      3. Systemets temp-mappe (siste utvei)
+    """
+    td = (ctx_meta.get("temp_dir") or "").strip()
+    if td and Path(td).is_dir():
+        base = Path(td)
+        how = "prosjektets temp-mappe"
+    else:
+        base, how = None, "systemets temp-mappe"
+        try:
+            from disk_selector import best_temp_disk
+            base = Path(best_temp_disk(min_free_bytes=max(int(needed * 1.1), 1),
+                                       siard_path=siard_path))
+            how = "auto-valgt disk"
+        except Exception:
+            base = None
+    shown = base or Path(tempfile.gettempdir())
+    try:
+        free = shutil.disk_usage(shown).free
+        warn = free < needed * 1.1
+    except Exception:
+        free, warn = 0, False
+    log_fn(f"  Temp for pakking: {shown} ({how}, {_fmt_bytes(free)} ledig"
+           f"{', trenger ca. ' + _fmt_bytes(int(needed * 1.1)) if warn else ''})")
+    if warn:
+        log_fn("  ADVARSEL: lite ledig plass på temp-disken — pakkingen kan feile. "
+               "Velg en annen temp-mappe med «Endre temp-mappe».")
+    return base
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Eksternt fillager i DIAS-pakke
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _copy_external_sidecar(src_siard: Path, content_dir: Path, log_fn) -> None:
+def _external_sidecar_entries(src_siard: Path, log_fn) -> "list[tuple[str, Path]]":
     """
     Hvis ``src_siard`` bruker et eksternt fillager (ekstern db-nivå
-    ``<lobFolder>``), kopier søstermappen inn i ``content_dir`` ved siden av
-    .siard-fila, med uendret navn. Da bevares den relative referansen
-    (``..\\<navn>.siard_documents\\content``) inne i DIAS-pakkens content/.
+    ``<lobFolder>``), returner søstermappens filer som (sti under content/,
+    kildefil) — mappen legges ved siden av .siard-fila med uendret navn, så
+    den relative referansen (``..\\<navn>.siard_documents\\content``) løser
+    opp i DIAS-pakkens content/. Ingenting kopieres.
 
-    No-op for interne arkiver eller når søstermappen ikke finnes.
+    Tom liste for interne arkiver eller når søstermappen ikke finnes.
     """
     try:
         with zipfile.ZipFile(src_siard, "r") as zf:
             meta = zf.read("header/metadata.xml")
     except Exception:
-        return
+        return []
     db = external_lob.read_db_lobfolder(meta)
     if not external_lob.is_external_lobfolder(db):
-        return
-
+        return []
     ext_base = external_lob.resolve_external_base(src_siard, db)   # <søster>/content
     sidecar = ext_base.parent
     if not sidecar.is_dir():
         log_fn(f"  [ADVARSEL] Eksternt fillager referert av {src_siard.name} "
                f"men mappen ble ikke funnet: {sidecar} — utelates fra pakken")
-        return
-
-    dst = content_dir / sidecar.name
-    if dst.exists():
-        return
-    n_files = sum(1 for p in sidecar.rglob("*") if p.is_file())
-    shutil.copytree(sidecar, dst)
+        return []
+    entries = [(f"{sidecar.name}/{p.relative_to(sidecar).as_posix()}", p)
+               for p in sorted(sidecar.rglob("*")) if p.is_file()]
     log_fn(f"  Eksternt fillager inkludert i DIAS-pakke: {sidecar.name}/ "
-           f"({n_files} fil(er))")
+           f"({len(entries)} fil(er))")
+    return entries
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -573,8 +608,20 @@ def _ts() -> str:
     return datetime.now().strftime("%Y-%m-%dT%H:%M:%S+02:00")
 
 
-def _gather_file_info(directory: str, prefix: str, log_fn) -> dict:
-    """SHA-256, MIME-type, størrelse og endringstidspunkt for alle filer i mappen."""
+def _content_entries(content) -> "list[tuple[Path, str]]":
+    """(kildefil, sti under content/) — fra en mappe eller en ferdig liste."""
+    if isinstance(content, (list, tuple)):
+        return [(Path(f), str(rel).replace("\\", "/")) for f, rel in content]
+    root = Path(content)
+    return [(p, p.relative_to(root).as_posix())
+            for p in sorted(root.rglob("*")) if p.is_file()]
+
+
+def _gather_file_info(directory, prefix: str, log_fn) -> dict:
+    """SHA-256, MIME-type, størrelse og endringstidspunkt for alle filer i
+    mappen — eller i en liste [(kildefil, sti under prefix)]."""
+    if isinstance(directory, (list, tuple)):
+        return _gather_entries_info(directory, prefix, log_fn)
     log_fn(f"Beregner sjekksummer for {prefix}...")
     _use_magic = False
     try:
@@ -607,7 +654,33 @@ def _gather_file_info(directory: str, prefix: str, log_fn) -> dict:
     return info_dict
 
 
-def _pack_sip(sip_dir: str, sip_id: str, content_path: str, log_fn):
+def _gather_entries_info(entries, prefix: str, log_fn) -> dict:
+    """Som _gather_file_info, for (kildefil, sti)-par (filer leses der de ligger)."""
+    log_fn(f"Beregner sjekksummer for {prefix}...")
+    try:
+        import magic as _magic  # type: ignore
+    except ImportError:
+        _magic = None
+    info_dict = {}
+    for full, rel in _content_entries(entries):
+        sha = hashlib.sha256()
+        mime = "application/octet-stream"
+        with open(full, "rb") as f:
+            chunk = f.read(4_000_000)
+            if _magic is not None and chunk:
+                try:
+                    mime = _magic.from_buffer(chunk, mime=True)
+                except Exception:
+                    pass
+            while chunk:
+                sha.update(chunk)
+                chunk = f.read(4_000_000)
+        mtime = datetime.fromtimestamp(os.path.getmtime(full)).strftime("%Y-%m-%dT%H:%M:%S+02:00")
+        info_dict[f"{prefix}/{rel}"] = [sha.hexdigest(), mime, os.stat(full).st_size, mtime]
+    return info_dict
+
+
+def _pack_sip(sip_dir: str, sip_id: str, content_path, log_fn):
     log_fn("Komprimerer SIP til tar-arkiv...")
     sip_dir_path = Path(sip_dir)
     sip_dir_parent = sip_dir_path.parent  # {tmp_out}/{sip_id}/content/
@@ -618,11 +691,10 @@ def _pack_sip(sip_dir: str, sip_id: str, content_path: str, log_fn):
             if file.is_file():
                 arcname = str(file.relative_to(sip_dir_parent)).replace("\\", "/")
                 tar.add(str(file), arcname=arcname)
-        # Content-filer: arkiveres som {sip_id}/content/xxx
-        for file in Path(content_path).rglob("*"):
-            if file.is_file():
-                rel = str(file.relative_to(Path(content_path))).replace("\\", "/")
-                tar.add(str(file), arcname=f"{sip_id}/content/{rel}")
+        # Content-filer: arkiveres som {sip_id}/content/xxx — leses direkte
+        # fra kildestedet (ingen mellomkopi)
+        for file, rel in _content_entries(content_path):
+            tar.add(str(file), arcname=f"{sip_id}/content/{rel}")
 
     shutil.rmtree(sip_dir_path)
 
@@ -995,7 +1067,7 @@ def _write_aic_log(path: str, aic_id: str, sip_id: str, create_date: str, meta: 
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_dias_package(
-    content_path: Path,
+    content_path: "Path | list",
     out_root:     Path,
     meta:         dict,
     log_fn,
@@ -1068,7 +1140,9 @@ def _build_dias_package(
     _write_sip_log(str(tarfile_dir / "log.xml"), sip_id, now, meta)
 
     info_dict = _gather_file_info(str(tarfile_dir), sip_id, log_fn)
-    info_dict.update(_gather_file_info(str(content_path), f"{sip_id}/content", log_fn))
+    info_dict.update(_gather_file_info(
+        content_path if isinstance(content_path, (list, tuple)) else str(content_path),
+        f"{sip_id}/content", log_fn))
 
     log_fn("Skriver premis.xml...")
     premis_path = str(tarfile_dir / "administrative_metadata" / "premis.xml")
@@ -1077,7 +1151,7 @@ def _build_dias_package(
     log_fn("Skriver mets.xml...")
     _write_sip_mets(str(tarfile_dir / "mets.xml"), premis_path, sip_id, now, info_dict, meta)
 
-    _pack_sip(str(tarfile_dir), sip_id, str(content_path), log_fn)
+    _pack_sip(str(tarfile_dir), sip_id, content_path, log_fn)
 
     log_fn("Skriver info.xml...")
     _write_sip_info(

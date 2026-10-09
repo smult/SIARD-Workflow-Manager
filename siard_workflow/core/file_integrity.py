@@ -48,6 +48,50 @@ _ZIP_FORMATS = {
 
 CHECKED_FORMATS = frozenset(_OLE2_FORMATS) | frozenset(_ZIP_FORMATS)
 
+_CLSID_EXCEL = "00020820-0000-0000-C000-000000000046"
+_CLSID_PPT = "64818D10-4F9B-11CF-86EA-00AA00B929E8"
+
+
+def ole2_office_type(path: Path) -> "tuple[str, str, bool] | None":
+    """
+    (ext, mime, kryptert) for en OLE2-fil, ut fra HELE katalogen (olefile).
+
+    Identifiseringen ser normalt bare de første 64 kB. Ligger OLE2-katalogen
+    lenger ut i filen (vanlig for Word-filer på 70 kB+), ser den ingen
+    strømnavn og faller tilbake til tekstsøk — som kan treffe ord i selve
+    dokumentteksten (f.eks. «Impress» → PowerPoint). Dette er den sikre
+    avgjørelsen. None når filen ikke er OLE2 eller typen er ukjent.
+    """
+    try:
+        with open(path, "rb") as f:
+            if f.read(8) != _OLE2_MAGIC:
+                return None
+        import olefile
+        with olefile.OleFileIO(str(path)) as ole:
+            top = {e[0] for e in ole.listdir(streams=True, storages=True)}
+            clsid = (ole.root.clsid or "").upper()
+    except Exception:
+        return None
+    if "__properties_version1.0" in top or any(n.startswith("__substg1.0_") for n in top):
+        return "msg", "application/vnd.ms-outlook", False
+    encrypted = "EncryptionInfo" in top
+    if encrypted and "EncryptedPackage" in top:
+        if clsid == _CLSID_EXCEL:
+            return ("xlsx", "application/vnd.openxmlformats-officedocument"
+                    ".spreadsheetml.sheet", True)
+        if clsid == _CLSID_PPT:
+            return ("pptx", "application/vnd.openxmlformats-officedocument"
+                    ".presentationml.presentation", True)
+        return ("docx", "application/vnd.openxmlformats-officedocument"
+                ".wordprocessingml.document", True)
+    if "WordDocument" in top:
+        return "doc", "application/msword", encrypted
+    if "Workbook" in top or "Book" in top:
+        return "xls", "application/vnd.ms-excel", encrypted
+    if "PowerPoint Document" in top:
+        return "ppt", "application/vnd.ms-powerpoint", encrypted
+    return None
+
 
 def check_structure(path: Path, ext: str) -> "str | None":
     """None når filen har formatets grunnstruktur, ellers en årsak (norsk)."""

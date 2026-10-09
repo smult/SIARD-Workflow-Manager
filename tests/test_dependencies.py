@@ -162,7 +162,12 @@ def test_gui() -> None:
     orig_startup = A.App._startup_dependency_check
     A.App._startup_dependency_check = lambda self: None   # testes eksplisitt under
     from gui.dependencies_dialog import DependenciesDialog
-    app = A.App(); app.after(1500, app.quit); app.mainloop(); app.update()
+    app = A.App()
+    # Pump hendelser i stedet for mainloop()+quit: på en travel maskin kan quit
+    # utløses før Tk-løkka starter, og mainloop() nullstiller quit-flagget → heng
+    import time as _time
+    for _ in range(40):
+        app.update(); _time.sleep(0.05)
     try:
         statuses = [
             _st("lxml", D.STANDARD, False, ops=("siardmapper",), blocking=("siardmapper",)),

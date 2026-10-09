@@ -86,10 +86,18 @@ def test_panel_move_before() -> None:
     sys.argv = ["app"]
     threading.Timer(60, lambda: os._exit(3)).start()
     from gui.app import App
+    # Oppstartssjekken av programvare kan åpne en modal dialog (f.eks. manglende
+    # antivirus på maskinen) som blokkerer testen — testes i test_dependencies.py
+    App._startup_dependency_check = lambda self: None
     from siard_workflow.operations import (UnpackSiardOperation, RepackSiardOperation,
                                            HexExtractOperation, BlobConvertOperation,
                                            LobFolderFixOperation)
-    app = App(); app.after(1500, app.quit); app.mainloop(); app.update()
+    app = App()
+    # Pump hendelser i stedet for mainloop()+quit: på en travel maskin kan quit
+    # utløses før Tk-løkka starter, og mainloop() nullstiller quit-flagget → heng
+    import time as _time
+    for _ in range(40):
+        app.update(); _time.sleep(0.05)
     try:
         wp = app.workflow_panel
         lf = LobFolderFixOperation()

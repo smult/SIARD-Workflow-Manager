@@ -302,7 +302,19 @@ class MagicIdentifier:
                 return ("bin", "application/octet-stream", False)
         if not data:
             return ("bin", "application/octet-stream", False)
-        return _detect(data)
+        res = _detect(data)
+        # OLE2: avgjør Word/Excel/PowerPoint/MSG ut fra hele katalogen når
+        # filen finnes — vinduet på 64 kB kan mangle katalogen (se
+        # file_integrity.ole2_office_type)
+        if path is not None and data[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
+            try:
+                from siard_workflow.core.file_integrity import ole2_office_type
+                full = ole2_office_type(Path(path))
+                if full:
+                    return full
+            except Exception:
+                pass
+        return res
 
     def pre_scan(self, root: Path,
                  files: Optional[list] = None,
