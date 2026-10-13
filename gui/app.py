@@ -2653,6 +2653,9 @@ class App(ctk.CTk):
             # Callback for å velge ny mål-mappe ved disk-plassmangel i DIAS-pakking
             ctx.metadata["ask_dias_output_dir_cb"] = self._ask_dias_output_dir
 
+            # Callback: Ghostscript-etterbehandling av PDF/A (BLOB-konvertering)
+            ctx.metadata["ask_gs_postprocess_cb"] = self._ask_gs_postprocess
+
             # Callback for forhåndsvisning/bekreftelse av SIARD-anonymisering
             ctx.metadata["anonymize_preview_cb"] = self._anonymize_preview_cb
 
@@ -3267,6 +3270,57 @@ class App(ctk.CTk):
         """
         from gui.anonymize_preview_dialog import ask_anonymize_confirm_modal
         return ask_anonymize_confirm_modal(self.after, self, summary)
+
+    def _ask_gs_postprocess(self, est: dict) -> bool:
+        """
+        Kalles fra BLOB-konverteringen (arbeidstråd) etter testen på et utvalg:
+        vis målt besparelse for utvalget og beregnet besparelse for alle
+        PDF/A-filene, og la brukeren velge. True = etterbehandle alle.
+        """
+        import threading as _threading
+        from tkinter import messagebox
+        from siard_workflow.operations.blob_convert_operation import _fmt_size
+        done = _threading.Event()
+        answer = [False]
+
+        def _show():
+            skipped = "".join(f"\n   • {n} beholdt: {r}"
+                              for r, n in est.get("skipped", {}).items())
+            mins = max(1, round(est.get("est_seconds", 0) / 60))
+            pct = f"{est['sample_saving_pct']:.1f}".replace(".", ",")   # norsk desimalkomma
+            n_total = f"{est['n_total']:,}".replace(",", " ")           # 48 210
+            labels = est.get("origin_labels", {})
+            groups = "".join(
+                f"\n   • {f'{n:,}'.replace(',', ' ')} {labels.get(o, o)}"
+                for o, n in est.get("origins", {}).items())
+            msg = (
+                "Dokumentkonverteringen er ferdig. PDF-filene kan etterbehandles med "
+                f"Ghostscript {est.get('gs_version', '')} for å spare lagringsplass:"
+                f"{groups}\n\n"
+                + ("MERK: «Tillat JPEG-omkoding av bilder» er slått på — bilder kan "
+                   "kodes om til JPEG (tapsbeheftet). Tekst, "
+                   if est.get("allow_jpeg") else
+                   "Innholdet endres ikke: bilder komprimeres ikke med tap, og tekst, ")
+                + "sidetall og utseende kontrolleres for hver fil. Filer som ikke blir "
+                "mindre — eller er signert, krypterte, har vedlegg eller skjemafelt — "
+                "beholdes. PDF-er som ikke var PDF/A, blir PDF/A.\n\n"
+                f"Test på {est['n_sample']} filer:\n"
+                f"   {_fmt_size(est['sample_before'])} → {_fmt_size(est['sample_after'])}  "
+                f"({pct} % mindre, {est['n_ok']} av {est['n_sample']} filer "
+                f"forbedret){skipped}\n\n"
+                f"Beregnet for alle {n_total} filer:\n"
+                f"   {_fmt_size(est['total_before'])} → ca. {_fmt_size(est['est_after'])}  "
+                f"(spart ca. {_fmt_size(est['est_saved'])})\n"
+                f"   Tidsbruk: ca. {mins} min\n\n"
+                "Vil du etterbehandle alle PDF-filene?\n"
+                "(Nei = ingen filer endres.)")
+            answer[0] = bool(messagebox.askyesno(
+                "Ghostscript-etterbehandling", msg, parent=self))
+            done.set()
+
+        self.after(0, _show)
+        done.wait()
+        return answer[0]
 
     def _ask_dias_output_dir(self, current_dir, needed_bytes: int,
                               free_bytes: int) -> "str | None":

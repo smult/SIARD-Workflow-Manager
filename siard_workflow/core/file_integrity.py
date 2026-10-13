@@ -17,6 +17,7 @@ zip-katalog og formatets hoveddel.
 """
 from __future__ import annotations
 
+import re
 import zipfile
 from pathlib import Path
 
@@ -47,6 +48,33 @@ _ZIP_FORMATS = {
 }
 
 CHECKED_FORMATS = frozenset(_OLE2_FORMATS) | frozenset(_ZIP_FORMATS)
+
+# ── Signerte PDF-er ───────────────────────────────────────────────────────────
+# Regel (KDRS, 2026-10-12): en signert PDF skal ALDRI røres av konvertering —
+# enhver omskriving (PDF/A, Ghostscript, sammenslåing) gjør signaturen ugyldig.
+#
+# En PDF-signatur har en signaturordbok med /ByteRange [a b c d] som angir
+# hvilke byte som er signert. Ordboken kan ikke ligge i en komprimert
+# objektstrøm (signaturverdien må kunne adresseres i filen), så et søk etter
+# /ByteRange i rådataene finner signaturer uten å tolke PDF-en — også i
+# krypterte filer, sertifiseringssignaturer (DocMDP) og tidsstempler.
+_BYTERANGE = re.compile(rb"/ByteRange\s*\[\s*\d+\s+\d+\s+\d+\s+\d+\s*\]")
+
+
+def is_signed_pdf(source: "Path | bytes") -> bool:
+    """True hvis PDF-en (fil eller bytes) har minst én digital signatur."""
+    try:
+        if isinstance(source, (bytes, bytearray, memoryview)):
+            data = bytes(source)
+        else:
+            data = Path(source).read_bytes()
+    except OSError:
+        return False
+    head = data[:1024]
+    if b"%PDF" not in head:
+        return False
+    return _BYTERANGE.search(data) is not None
+
 
 _CLSID_EXCEL = "00020820-0000-0000-C000-000000000046"
 _CLSID_PPT = "64818D10-4F9B-11CF-86EA-00AA00B929E8"

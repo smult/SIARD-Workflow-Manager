@@ -41,6 +41,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import zipfile
 import xml.etree.ElementTree as ET
 from collections import defaultdict
@@ -1781,6 +1782,17 @@ class BlobConvertOperation(BaseOperation):
         n_conv = data.get("konvertert") or data.get("converted") or 0
         if n_conv:
             parts.append(f"{n_conv} LOB-fil(er) konvertert til PDF/A")
+        gp = data.get("gs_postprocess") or {}
+        if gp.get("files"):
+            parts.append(
+                f"{gp['files']} PDF-fil(er) etterbehandlet med Ghostscript "
+                f"{gp.get('gs_version', '')} for mindre lagringsplass "
+                f"({gp['before']:,} → {gp['after']:,} byte; "
+                + ("JPEG-omkoding av bilder tillatt (tapsbeheftet)" if gp.get("allow_jpeg")
+                   else "bilder uten tapsbeheftet komprimering")
+                + "; tekst, sidetall og utseende kontrollert"
+                + (f"; {gp['became_pdfa']} gjort om til PDF/A" if gp.get("became_pdfa") else "")
+                + "; signerte PDF-er ikke rørt)")
         details = data.get("lob_type_details") or []
         if details:
             parts.append(
@@ -1804,6 +1816,13 @@ class BlobConvertOperation(BaseOperation):
         # Outlook-e-post (.msg) → én PDF/A: meldingshode + tekst + vedlegg.
         # PDF/A-2b, eller PDF/A-3 med innebygd original når pdfa_version er PDF/A-3.
         "convert_msg":          True,
+        # Ghostscript-etterbehandling av PDF/A fra LibreOffice: «spør» (test på
+        # utvalg + dialog), «ja» (alltid) eller «nei». Uten Ghostscript: ingenting.
+        "gs_postprocess":       "spør",
+        "gs_sample_size":       10,
+        # Tilvalg: la Ghostscript kode bilder om til JPEG (tapsbeheftet, større
+        # besparelse). Av som standard — bilder lagres da tapsfritt.
+        "gs_allow_jpeg":        False,
     }
 
     def run(self, ctx: WorkflowContext) -> OperationResult:
@@ -1849,6 +1868,8 @@ class BlobConvertOperation(BaseOperation):
 
         # Hent pause/stopp Events (trådsikre)
         stop_ev  = ctx.metadata.get("stop_event",  threading.Event())
+        # Dialog for Ghostscript-etterbehandling (gui/app.py) — None uten GUI
+        self._gs_ask_cb = ctx.metadata.get("ask_gs_postprocess_cb")
         pause_ev = ctx.metadata.get("pause_event", threading.Event())
 
         # CSV-detaljlogg og feilogg per kjøring
@@ -2033,6 +2054,7 @@ class BlobConvertOperation(BaseOperation):
             "kept":               "Beholdt originalformat",
             "failed":             "Konvertering feilet",
             "msg_converted":      "E-post (MSG/EML) → PDF/A",
+            "msg_signed_zip":     "  herav ZIP m/ signert PDF",
             "xml_updated":        "XML-noder oppdatert",
             "inline_extracted":   "Inline NBLOB/NCLOB",
             "missing_blob_refs":  "Manglende blob-refs i XML",
@@ -2790,6 +2812,11 @@ class BlobConvertOperation(BaseOperation):
                 err_log=err_log, conversion_registry=conversion_registry,
                 creg_lock=creg_lock, emit_phase_events=emit_phase_events,
                 lo_run_root=lo_run_root)
+            # Steg B5: Ghostscript-etterbehandling — etter all konvertering (også
+            # når ingenting gikk til LibreOffice), FØR tableX.xml patches
+            # (length/digest leses da)
+            self._gs_postprocess_collect(stats, w, int(self.params.get("max_workers", 4) or 4),
+                                         lo_run_root / "gs_post", stop_ev)
         finally:
             shutil.rmtree(lo_run_root, ignore_errors=True)
 
@@ -2898,6 +2925,11 @@ class BlobConvertOperation(BaseOperation):
         from siard_workflow.core.file_integrity import (
             check_structure as _check_structure, CHECKED_FORMATS as _CHECKED_FORMATS)
         _damaged: dict[str, str] = {}
+        # PDF/A-filer laget av LibreOffice i denne kjøringen (Ghostscript-
+        # etterbehandling, Steg B5)
+        _produced_pdfs: list[Path] = []
+        _system_pdfs: list[Path] = []          # eksisterende PDF-er fra systemet
+        self._pp_produced, self._pp_system = _produced_pdfs, _system_pdfs
         _damaged_lock = threading.Lock()
 
         # Typekolonne-hint (se _detect_one_raw): tekstbaserte formater som
@@ -3268,6 +3300,17 @@ class BlobConvertOperation(BaseOperation):
                                   "konvertering", "passordbeskyttet")
                 continue
 
+            # Signert PDF: røres ALDRI (konvertering gjør signaturen ugyldig)
+            if ext == "pdf":
+                from siard_workflow.core.file_integrity import is_signed_pdf
+                if is_signed_pdf(extract_dir / zip_sti):
+                    to_rename_only.append((idx, zip_sti, ext, mime))
+                    if err_log:
+                        err_log.write(zip_sti, ext, "Digitalt signert PDF — beholdt "
+                                      "uendret (konvertering ville gjort signaturen "
+                                      "ugyldig)", "signert")
+                    continue
+
             # Skadet kontorfil (strukturkontroll ved identifisering): beholdes
             if zip_sti in _damaged:
                 to_rename_only.append((idx, zip_sti, ext, mime))
@@ -3431,6 +3474,7 @@ class BlobConvertOperation(BaseOperation):
                   "warn")
 
         # Steg B2: Arkiver — pakk ut, konverter innhold, repakk
+        self._pp_archive_files = []     # arkiv-LOB-er med PDF (Steg B5)
         if to_archive and not stop_ev.is_set():
             self._process_archives(
                 to_archive, to_convert, to_rename_only, stats,
@@ -3523,6 +3567,8 @@ class BlobConvertOperation(BaseOperation):
 
             # Etter rename: finn ny filsti
             new_file = extract_dir / new_sti
+            if content_ext == "pdf":
+                _system_pdfs.append(new_file)      # Ghostscript-etterbehandling (B5)
             til_sz   = new_file.stat().st_size if new_file.exists() else fra_sz
 
             if csv_log:
@@ -3757,55 +3803,10 @@ class BlobConvertOperation(BaseOperation):
             lo_ok  = False
             lo_err = ""
 
-            def _kill_pid(pid: int) -> None:
-                """Drep prosess-tre ved PID. Bruker Win32 API direkte — ingen subprocess."""
-                if sys.platform == "win32":
-                    import ctypes, ctypes.wintypes
-                    TH32CS_SNAPPROCESS = 0x00000002
-                    class PROCESSENTRY32(ctypes.Structure):
-                        _fields_ = [
-                            ("dwSize",              ctypes.wintypes.DWORD),
-                            ("cntUsage",            ctypes.wintypes.DWORD),
-                            ("th32ProcessID",       ctypes.wintypes.DWORD),
-                            ("th32DefaultHeapID",   ctypes.POINTER(ctypes.c_ulong)),
-                            ("th32ModuleID",        ctypes.wintypes.DWORD),
-                            ("cntThreads",          ctypes.wintypes.DWORD),
-                            ("th32ParentProcessID", ctypes.wintypes.DWORD),
-                            ("pcPriClassBase",      ctypes.c_long),
-                            ("dwFlags",             ctypes.wintypes.DWORD),
-                            ("szExeFile",           ctypes.c_char * 260),
-                        ]
-                    k32 = ctypes.windll.kernel32
-                    # Bygg parent→children map fra snapshot
-                    snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-                    children: list[int] = []
-                    if snap != ctypes.wintypes.HANDLE(-1).value:
-                        pe = PROCESSENTRY32()
-                        pe.dwSize = ctypes.sizeof(PROCESSENTRY32)
-                        if k32.Process32First(snap, ctypes.byref(pe)):
-                            while True:
-                                if pe.th32ParentProcessID == pid:
-                                    children.append(pe.th32ProcessID)
-                                if not k32.Process32Next(snap, ctypes.byref(pe)):
-                                    break
-                        k32.CloseHandle(snap)
-                    # Drep barn rekursivt, deretter forelder
-                    for child_pid in children:
-                        _kill_pid(child_pid)
-                    PROCESS_TERMINATE = 0x0001
-                    h = k32.OpenProcess(PROCESS_TERMINATE, False, pid)
-                    if h:
-                        k32.TerminateProcess(h, 1)
-                        k32.CloseHandle(h)
-                else:
-                    import signal as _sig, os as _os
-                    try:
-                        _os.killpg(_os.getpgid(pid), _sig.SIGKILL)
-                    except Exception:
-                        try:
-                            _os.kill(pid, _sig.SIGKILL)
-                        except Exception:
-                            pass
+            # Prosesstre avsluttes med core/proc_kill.kill_process_tree: bare EKTE
+            # barn (opprettet etter LibreOffice og før den avsluttet) — aldri en
+            # gjenbrukt PID, aldri programmet selv (se modulens forklaring).
+            from siard_workflow.core.proc_kill import kill_process_tree as _kill_tree
 
             def _popen(c) -> subprocess.Popen:
                 from siard_workflow.core.subproc import hidden_kwargs
@@ -3860,10 +3861,10 @@ class BlobConvertOperation(BaseOperation):
                     if proc is None:
                         return
                     try:
-                        pid = proc.pid
                         # Drep prosessen FØRST — dette sender EOF til pipes og
-                        # unblokker readline() slik at pipe.close() ikke henger
-                        _kill_pid(pid)
+                        # unblokker readline() slik at pipe.close() ikke henger.
+                        # Popen-objektet (ikke PID) — se proc_kill.
+                        _kill_tree(proc)
                         # Lukk pipe-handles etter prosessen er drept
                         for pipe in (proc.stdin, proc.stdout, proc.stderr):
                             try:
@@ -4009,6 +4010,7 @@ class BlobConvertOperation(BaseOperation):
                         _wpt_path.unlink(missing_ok=True)
                     result_ext = "bin" if _standardize_bin else "pdf"
                     file_ok    = True
+                    _produced_pdfs.append(pdf_target)
                     if _standardize_bin and conversion_registry is not None \
                             and creg_lock is not None and _creg_comment:
                         with creg_lock:
@@ -4370,6 +4372,7 @@ class BlobConvertOperation(BaseOperation):
         shutil.rmtree(profiles_root, ignore_errors=True)
 
 
+
     def _upgrade_formats(self,
                          to_upgrade:    list,
                          upgrade_map:   dict,
@@ -4548,6 +4551,147 @@ class BlobConvertOperation(BaseOperation):
         finally:
             shutil.rmtree(str(tmp_base), ignore_errors=True)
 
+    def _gs_postprocess_collect(self, stats: dict, w, workers: int, work_root: Path,
+                                stop_ev: threading.Event) -> None:
+        """
+        Steg B5: samle PDF-er for Ghostscript-etterbehandling — PDF/A fra
+        LibreOffice, eksisterende PDF-er fra systemet og PDF-er i arkiver — og
+        kjør _gs_postprocess. Signerte PDF-er tas aldri med.
+        """
+        if stop_ev.is_set():
+            return
+        from siard_workflow.core import pdf_postprocess as _PP
+        from siard_workflow.core.file_integrity import is_signed_pdf as _signed
+        items: list = []
+        seen: set = set()
+
+        def _add(path: Path, origin: str, member: str = "") -> None:
+            key = (str(path), member)
+            if key in seen or not path.exists():
+                return
+            if not member and _signed(path):
+                return                     # signerte PDF-er røres aldri
+            seen.add(key)
+            items.append(_PP.PdfItem(path, member, origin))
+
+        for p in getattr(self, "_pp_produced", []):
+            _add(p, "libreoffice")
+        for p in getattr(self, "_pp_system", []):
+            _add(p, "system")
+        for p in getattr(self, "_pp_archive_files", []):
+            if zipfile.is_zipfile(p):
+                for m in _PP.zip_pdf_members(p):
+                    _add(p, "arkiv", m)
+            elif p.exists() and b"%PDF" in p.read_bytes()[:1024]:
+                _add(p, "arkiv")
+        if items:
+            self._gs_postprocess(items, stats, w, workers, work_root, stop_ev)
+
+    def _gs_postprocess(self, pdfs: "list", stats: dict, w, workers: int,
+                        work_root: Path, stop_ev: threading.Event) -> None:
+        """
+        Steg B5: tilby Ghostscript-etterbehandling av PDF-filene (PdfItem:
+        LibreOffice-PDF/A, systemets PDF-er, PDF-er i arkiver — se
+        core/pdf_postprocess.py). «spør»: test på et utvalg, vis målt og beregnet
+        besparelse, og la brukeren velge. Velger brukeren nei, røres ingen filer.
+        """
+        from siard_workflow.core import ghostscript as _gs
+        from siard_workflow.core import pdf_postprocess as PP
+        mode = str(self.params.get("gs_postprocess", "spør") or "spør").lower()
+        if mode == "nei":
+            return
+        gs = _gs.active_ghostscript()
+        if not gs:
+            w("  Ghostscript-etterbehandling: Ghostscript ikke funnet/aktivert — hoppet over",
+              "info")
+            return
+        pdfs = list(pdfs)
+        if not pdfs:
+            return
+        # PDF-er som ikke er PDF/A fra før, blir valgt PDF/A-del
+        _ver = str(self.params.get("pdfa_version", _PDFA_DEFAULT))
+        default_part = 1 if "PDF/A-1" in _ver else 3 if "PDF/A-3" in _ver else 2
+        _origins: dict = {}
+        for it in pdfs:
+            _origins[it.origin] = _origins.get(it.origin, 0) + 1
+        allow_jpeg = bool(self.params.get("gs_allow_jpeg", False))
+        lossless = not allow_jpeg
+        w("  Ghostscript-etterbehandling: bilder "
+          + ("kan kodes om til JPEG (tapsbeheftet — valgt i innstillingene)" if allow_jpeg
+             else "komprimeres ikke med tap"), "warn" if allow_jpeg else "info")
+        ask = getattr(self, "_gs_ask_cb", None)
+        if mode != "ja" and not callable(ask):
+            w("  Ghostscript-etterbehandling: ingen dialog tilgjengelig — filene røres ikke "
+              "(sett «Ghostscript-etterbehandling» til «ja» for å kjøre uten spørsmål)", "info")
+            return
+        timeout = int(self.params.get("lo_timeout", 300))
+        n_sample = max(1, int(self.params.get("gs_sample_size", 10) or 10))
+        done: list = []
+        try:
+            if mode != "ja":
+                sample = PP.pick_sample(pdfs, n_sample)
+                w(f"  Ghostscript-etterbehandling: tester {len(sample)} av {len(pdfs):,} "
+                  f"PDF-filer ("
+                  + ", ".join(f"{n:,} {PP.ORIGIN_LABELS.get(o, o)}" for o, n in _origins.items())
+                  + ") …", "step")
+                t0 = time.monotonic()
+                done = PP.run_many(sample, work_root / "utvalg", gs, workers, timeout, stop_ev,
+                                   default_part=default_part, lossless=lossless)
+                est = PP.estimate(done, pdfs, time.monotonic() - t0, workers)
+                est["gs_version"] = _gs.get_version(gs) or ""
+                est["allow_jpeg"] = allow_jpeg
+                w(f"    Utvalg: {est['sample_before']:,} → {est['sample_after']:,} byte "
+                  f"({str(round(est['sample_saving_pct'], 1)).replace('.', ',')} % mindre, "
+                  f"{est['n_ok']}/{est['n_sample']} "
+                  f"filer forbedret)", "info")
+                for reason, n in est["skipped"].items():
+                    w(f"    Beholdt i utvalget: {n} — {reason}", "info")
+                w(f"    Beregnet for alle {est['n_total']:,} filer: "
+                  f"{_fmt_size(est['total_before'])} → ca. {_fmt_size(est['est_after'])} "
+                  f"(spart ca. {_fmt_size(est['est_saved'])}, ca. "
+                  f"{max(1, round(est['est_seconds'] / 60))} min)", "info")
+                if not ask(est):
+                    w("  Ghostscript-etterbehandling: valgt bort — ingen filer endret", "info")
+                    return
+                w("  Ghostscript-etterbehandling: valgt — behandler alle filene …", "step")
+            _done_ids = {id(r.item) for r in done}
+            rest = [it for it in pdfs if id(it) not in _done_ids]
+            last = [0.0]
+
+            def _prog(k, n):
+                if time.monotonic() - last[0] > 5 or k == n:
+                    last[0] = time.monotonic()
+                    w(f"    Ghostscript: {k:,}/{n:,} filer", "info")
+            done += PP.run_many(rest, work_root / "alle", gs, workers, timeout, stop_ev, _prog,
+                                default_part=default_part, lossless=lossless)
+            n, before, after = PP.apply(done)
+            skipped: dict = {}
+            for r in done:
+                if not r.ok:
+                    skipped[r.reason] = skipped.get(r.reason, 0) + 1
+            by_origin: dict = {}
+            for r in done:
+                if r.ok:
+                    by_origin[r.item.origin] = by_origin.get(r.item.origin, 0) + 1
+            became = sum(1 for r in done if r.ok and r.became_pdfa)
+            stats["gs_postprocess"] = {"files": n, "before": before, "after": after,
+                                       "skipped": skipped, "by_origin": by_origin,
+                                       "became_pdfa": became,
+                                       "allow_jpeg": allow_jpeg,
+                                       "gs_version": _gs.get_version(gs) or ""}
+            pct = (1 - after / before) * 100 if before else 0
+            w(f"  Ghostscript-etterbehandling ferdig: {n:,} filer, {_fmt_size(before)} → "
+              f"{_fmt_size(after)} (spart {_fmt_size(before - after)}, "
+              + f"{pct:.1f}".replace(".", ",") + " %)", "ok")
+            for origin, k in by_origin.items():
+                w(f"    {PP.ORIGIN_LABELS.get(origin, origin)}: {k:,}", "info")
+            if became:
+                w(f"    Herav {became:,} som ikke var PDF/A fra før (nå PDF/A)", "info")
+            for reason, k in skipped.items():
+                w(f"    Beholdt uendret: {k:,} — {reason}", "info")
+        finally:
+            shutil.rmtree(work_root, ignore_errors=True)
+
     def _convert_msgs(self, to_msg: list, stats: dict, extract_dir: Path,
                       lo_bin: str, stop_ev: threading.Event,
                       csv_log, err_log, w, lock: threading.Lock, max_w: int,
@@ -4563,7 +4707,7 @@ class BlobConvertOperation(BaseOperation):
         originalen (.msg / .bin).
         """
         from siard_workflow.core.msg_to_pdf import (
-            convert_msg_to_pdf, DEFAULT_LEVEL)
+            convert_msg_to_pdf, convert_msg_to_zip, DEFAULT_LEVEL)
         chosen = str(self.params.get("pdfa_version", _PDFA_DEFAULT))
         level = chosen if chosen.startswith("PDF/A-3") else DEFAULT_LEVEL
         timeout = int(self.params.get("lo_timeout", 300))
@@ -4610,14 +4754,26 @@ class BlobConvertOperation(BaseOperation):
             out_pdf = work / "result.pdf"
             res = convert_msg_to_pdf(src, out_pdf, lo_bin, level, timeout,
                                      work_dir=work, profile_dir=_profile())
+            out_kind = "pdf"
+            if not res.ok and res.signed_attachment:
+                # Signert PDF-vedlegg: zip med e-posten som PDF/A + de signerte
+                # PDF-ene urørt (signaturen må forbli gyldig)
+                out_pdf = work / "result.zip"
+                res = convert_msg_to_zip(src, out_pdf, lo_bin, level, timeout,
+                                         work_dir=work / "z", profile_dir=_profile())
+                out_kind = "zip"
             if res.ok:
+                what = ("ZIP (e-post som PDF/A + signert PDF urørt: "
+                        + ", ".join(res.zip_members[1:]) + ")") if out_kind == "zip" \
+                    else "PDF"
                 if standardize_bin:
                     new_sti = str(p.parent / f"{root_stem}.bin")
-                    comment = (f"Filinnhold konvertert : .{ext} til .pdf ({res.summary})"
+                    comment = (f"Filinnhold konvertert : .{ext} til .{out_kind} ({res.summary})"
+                               + (f" - {what}" if out_kind == "zip" else "")
                                + ("" if src_ext == "bin"
                                   else f" - Filendelse endret fra .{src_ext} til .bin"))
                 else:
-                    new_sti = str(p.parent / f"{p.stem}.{ext}.pdf")
+                    new_sti = str(p.parent / f"{p.stem}.{ext}.{out_kind}")
                     comment = None
                 target = extract_dir / new_sti
                 try:
@@ -4631,26 +4787,32 @@ class BlobConvertOperation(BaseOperation):
                     with lock:
                         stats["converted"] += 1
                         stats["msg_converted"] = stats.get("msg_converted", 0) + 1
+                        if out_kind == "zip":
+                            stats["msg_signed_zip"] = stats.get("msg_signed_zip", 0) + 1
                         counter["ok"] += 1
                         counter["att"] += len(res.attachments)
                         counter["listed"] += sum(a.status != "konvertert"
                                                  and a.status != "tatt med (PDF)"
                                                  for a in res.attachments)
-                        log_it = n_logged[0] < 40
+                        log_it = n_logged[0] < 40 or out_kind == "zip"
                         n_logged[0] += 1
                     if log_it:
                         w(f"  E-post: {orig_basename} → {PurePosixPath(new_sti).name} "
-                          f"({res.summary})", "ok")
+                          f"({res.summary})"
+                          + (f" — {what}" if out_kind == "zip" else ""), "ok")
                     for warn in res.warnings[:3]:
                         w(f"    {orig_basename}: {warn}", "warn")
                     if csv_log:
                         csv_log.write(zip_sti, fra_sz, ext, PurePosixPath(new_sti).name,
-                                      target.stat().st_size, "bin" if standardize_bin else "pdf",
-                                      f"{ext.upper()} → {level.split(' (')[0]}: {res.summary}")
+                                      target.stat().st_size,
+                                      "bin" if standardize_bin else out_kind,
+                                      f"{ext.upper()} → {level.split(' (')[0]}: {res.summary}"
+                                      + (f"; {what}" if out_kind == "zip" else ""))
                     return
                 except Exception as exc:
                     res.error = f"flytt feilet: {exc}"
-            # Feil: behold original (med .msg / .bin som i LO-løypa)
+            # Feil eller signert PDF-vedlegg: behold original (med .msg / .bin
+            # som i LO-løypa)
             if standardize_bin:
                 tgt = extract_dir / str(p.parent / f"{root_stem}.bin")
                 if src.exists() and tgt != src:
@@ -4660,6 +4822,18 @@ class BlobConvertOperation(BaseOperation):
                         pass
             else:
                 self._rename_file(extract_dir, zip_sti, ext)
+            if res.signed_attachment:
+                # Zip-filen kunne ikke lages: originalen beholdes uendret
+                with lock:
+                    stats["kept"] += 1
+                    counter["signed"] = counter.get("signed", 0) + 1
+                w(f"  E-post beholdt uendret: {orig_basename} — signert PDF-vedlegg "
+                  f"«{res.signed_attachment}», zip kunne ikke lages ({res.error})", "warn")
+                if err_log:
+                    err_log.write(zip_sti, ext, f"E-post med signert PDF-vedlegg "
+                                  f"«{res.signed_attachment}»: zip kunne ikke lages "
+                                  f"({res.error}) — beholdt uendret", "signert")
+                return
             with lock:
                 stats["failed"] += 1
                 counter["fail"] += 1
@@ -4680,6 +4854,12 @@ class BlobConvertOperation(BaseOperation):
             shutil.rmtree(str(tmp_base), ignore_errors=True)
         if n_logged[0] > 40:
             w(f"  ... og {n_logged[0] - 40:,} e-post til (ikke listet)", "info")
+        if counter.get("signed"):
+            w(f"  E-post med signert PDF-vedlegg der zip ikke kunne lages, beholdt "
+              f"uendret: {counter['signed']:,}", "warn")
+        if stats.get("msg_signed_zip"):
+            w(f"  E-post med signert PDF-vedlegg → ZIP (e-post som PDF/A + signert PDF "
+              f"urørt): {stats['msg_signed_zip']:,}", "info")
         w(f"  E-post ferdig: {counter['ok']:,} konvertert, {counter['fail']:,} feilet; "
           f"{counter['att']:,} vedlegg ({counter['listed']:,} kun listet/feilet)", "info")
 
@@ -4728,7 +4908,7 @@ class BlobConvertOperation(BaseOperation):
         pdfa_filter = _build_pdfa_filter(pdfa_label)
         convert_mail = bool(self.params.get("convert_msg", True))
         from siard_workflow.core.msg_to_pdf import (
-            convert_msg_to_pdf, DEFAULT_LEVEL as _MSG_DEFAULT,
+            convert_msg_to_pdf, convert_msg_to_zip, DEFAULT_LEVEL as _MSG_DEFAULT,
             is_msg_file as _is_msg, is_eml_bytes as _is_eml)
         # Samme nivåvalg som Steg B4: PDF/A-3 ⇒ innebygd original, ellers PDF/A-2b
         mail_level = pdfa_label if pdfa_label.startswith("PDF/A-3") else _MSG_DEFAULT
@@ -4905,6 +5085,8 @@ class BlobConvertOperation(BaseOperation):
                         blob_path.unlink(missing_ok=True)
                     w(f"    Enkeltfil → {new_name}", "ok")
                     with lock:
+                        self._pp_archive_files.append(new_path)
+                    with lock:
                         stats["kept"] += 1
                         n_ok[0] += 1
                 except Exception as exc:
@@ -4929,6 +5111,8 @@ class BlobConvertOperation(BaseOperation):
                     if new_path != blob_path:
                         blob_path.unlink(missing_ok=True)
                     w(f"    {len(result_files)} filer → {new_name}", "ok")
+                    with lock:
+                        self._pp_archive_files.append(new_path)
                     with lock:
                         stats["kept"] += 1
                         n_ok[0] += 1
@@ -5002,6 +5186,30 @@ class BlobConvertOperation(BaseOperation):
                         with lock:
                             stats["converted"] += 1
                             stats["msg_converted"] = stats.get("msg_converted", 0) + 1
+                    elif res.signed_attachment:
+                        # Signert PDF-vedlegg → zip (e-post som PDF/A + signert urørt)
+                        zpath = mdir / "result.zip"
+                        zres = convert_msg_to_zip(src, zpath, lo_bin, mail_level, timeout,
+                                                  work_dir=mdir / "z",
+                                                  profile_dir=lo_work / "lo_profile")
+                        if zres.ok and zpath.exists():
+                            out.append((zpath, f"{rel}.zip"))
+                            w(f"{ind}E-post: {rel} → {rel_p.name}.zip (e-post som PDF/A + "
+                              f"signert PDF urørt: {', '.join(zres.zip_members[1:])})", "ok")
+                            with lock:
+                                stats["converted"] += 1
+                                stats["msg_converted"] = stats.get("msg_converted", 0) + 1
+                                stats["msg_signed_zip"] = stats.get("msg_signed_zip", 0) + 1
+                        else:
+                            out.append((src, rel))
+                            w(f"{ind}E-post beholdt uendret: {rel} — signert PDF-vedlegg, "
+                              f"zip kunne ikke lages ({zres.error})", "warn")
+                            if err_log:
+                                err_log.write(f"{arc_label}!{rel}", inner_ext,
+                                              f"E-post med signert PDF-vedlegg "
+                                              f"«{res.signed_attachment}»: zip kunne ikke "
+                                              f"lages ({zres.error}) — beholdt uendret",
+                                              "signert")
                     else:
                         out.append((src, rel))
                         w(f"{ind}E-post-konvertering feilet: {rel} — beholdes "

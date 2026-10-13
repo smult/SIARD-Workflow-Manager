@@ -126,12 +126,26 @@ def _find_icc(gs: Path) -> "Path | None":
     return Path(hits[0]) if hits else None
 
 
+# Ingen tapsbeheftet bildebehandling (se to_pdfa)
+_LOSSLESS_ARGS = [
+    "-dAutoFilterColorImages=false", "-dAutoFilterGrayImages=false",
+    "-dColorImageFilter=/FlateEncode", "-dGrayImageFilter=/FlateEncode",
+    "-dDownsampleColorImages=false", "-dDownsampleGrayImages=false",
+    "-dDownsampleMonoImages=false", "-dPassThroughJPEGImages=true",
+]
+
+
 def to_pdfa(src: Path, dst: Path, part: int = 2, gs: "Path | None" = None,
-            timeout: float = 600) -> "tuple[bool, str]":
+            timeout: float = 600, lossless_images: bool = False) -> "tuple[bool, str]":
     """
     Normaliser `src` til PDF/A-`part`b i `dst` med Ghostscript. (True, "") ved
     suksess. Innebygde filer og tagging beholdes ikke — legg inn original-
     vedlegg (PDF/A-3) ETTER normaliseringen.
+
+    lossless_images: ingen tapsbeheftet omkoding eller nedsampling av bilder —
+    JPEG (og JPEG 2000 for PDF/A-2/3) sendes uendret gjennom, øvrige bilder
+    lagres med Flate. Standardinnstillingen kan ellers gjøre tapsfrie bilder om
+    til JPEG. Brukes ved etterbehandling (core/pdf_postprocess.py).
     """
     gs = gs or active_ghostscript()
     if not gs:
@@ -161,6 +175,8 @@ def to_pdfa(src: Path, dst: Path, part: int = 2, gs: "Path | None" = None,
                "-dNOOUTERSAVE", "-dPDFACompatibilityPolicy=1",
                "-sColorConversionStrategy=RGB", "-sProcessColorModel=DeviceRGB",
                "-sDEVICE=pdfwrite",
+               *(_LOSSLESS_ARGS + (["-dPassThroughJPXImages=true"] if part >= 2 else [])
+                 if lossless_images else []),
                f"--permit-file-read={str(icc.parent).replace(chr(92), '/')}/",
                f"-sOutputFile={tmp_out}", str(defps), str(src)]
         from siard_workflow.core.lo_runner import run_lo

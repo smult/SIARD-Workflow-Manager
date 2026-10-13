@@ -112,6 +112,7 @@ Bygge pakken (Windows, med nett):
     packaging\bygg.bat --komponenter ingen      bare programmet
     packaging\bygg.bat --komponenter gs,sf      uten LibreOffice
     packaging\bygg.bat --lo-versjon 26.2.6      bestemt LibreOffice-versjon
+    packaging\bygg.bat --publiser               bygg og last opp til GitHub-utgivelsen
 
 Byggeskriptet (`packaging/build_release.py`) gjør dette:
 - lager et eget byggemiljø (`build/venv`) med `requirements.txt`, de valgfrie
@@ -120,9 +121,26 @@ Byggeskriptet (`packaging/build_release.py`) gjør dette:
 - laster ned komponentene (verifisert med SHA256/SHA512, mellomlagret i
   `build/komponenter-cache`);
 - selvtester pakken (`SIARDManager.exe --selftest resultat.json`);
-- zipper resultatet til `dist/`.
+- zipper resultatet til `dist/`: `SIARDManager-<versjon>-win64.zip` (bare
+  programmet, brukes av automatisk oppdatering), `…-komplett.zip` (med
+  komponenter) og `SHA256SUMS.txt`;
+- med `--publiser`: laster opp filene til GitHub-utgivelsen med samme
+  versjonsnummer (`gh` må være innlogget). Finnes utgivelsen ikke, lages et
+  utkast som må publiseres på GitHub før programmene ser det.
 
 Selvtesten kan også kjøres på en ny maskin for å kontrollere pakken.
+
+### Automatisk oppdatering
+Ved oppstart sjekker programmet GitHub for ny versjon. Har utgivelsen en
+programpakke vedlagt, kan den lastes ned og installeres fra dialogen:
+1. pakken lastes ned, sjekksummen kontrolleres og den nye versjonen selvtestes;
+2. programmet spør om bekreftelse før noe endres;
+3. programmet lukkes, programfilene byttes ut (innstillinger, `dias.json`,
+   logger og `komponenter/` beholdes) og den nye versjonen startes. Feiler
+   byttet, legges forrige versjon tilbake. Forløpet står i `oppdatering.log`.
+
+Kjøres programmet fra kildekode i en git-kopi uten lokale endringer, tilbys
+`git pull` i stedet. Maskiner uten nett oppdateres som før ved å pakke ut ny zip.
 
 ## Installasjon fra kildekode
     pip install -r requirements.txt

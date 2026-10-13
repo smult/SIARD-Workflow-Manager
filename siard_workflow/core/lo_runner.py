@@ -16,13 +16,12 @@ To problemer som håndteres her
 
 2. **Tidsavbrudd etterlot `soffice.bin`.** `subprocess.run(timeout=…)` dreper
    bare startprosessen `soffice.exe`; selve LibreOffice (`soffice.bin`) ble
-   gående og kunne blokkere senere kall. `run_lo()` dreper hele prosesstreet.
+   gående og kunne blokkere senere kall. `run_lo()` dreper hele prosesstreet —
+   trygt mot PID-gjenbruk (core/proc_kill.py; tidligere `taskkill /T`).
 """
 from __future__ import annotations
 
-import os
 import shutil
-import signal
 import subprocess
 import sys
 import threading
@@ -69,20 +68,11 @@ def prepare_profile(profile_dir: Path) -> Path:
     return profile_dir
 
 
-def kill_tree(pid: int) -> None:
-    """Drep en prosess og alle barneprosesser (soffice.exe → soffice.bin)."""
-    try:
-        if sys.platform == "win32":
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=30, **hidden_kwargs())
-        else:
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
-    except Exception:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except Exception:
-            pass
+def kill_tree(proc) -> None:
+    """Drep en prosess og dens EKTE barneprosesser (soffice.exe → soffice.bin).
+    Ta helst Popen-objektet — se core/proc_kill.py (PID-gjenbruk)."""
+    from siard_workflow.core.proc_kill import kill_process_tree
+    kill_process_tree(proc)
 
 
 def run_lo(cmd: list[str], timeout: float) -> "tuple[int | None, bytes, bytes, bool]":
@@ -99,7 +89,7 @@ def run_lo(cmd: list[str], timeout: float) -> "tuple[int | None, bytes, bytes, b
         out, err = proc.communicate(timeout=timeout)
         return proc.returncode, out or b"", err or b"", False
     except subprocess.TimeoutExpired:
-        kill_tree(proc.pid)
+        kill_tree(proc)
         try:
             out, err = proc.communicate(timeout=10)
         except Exception:

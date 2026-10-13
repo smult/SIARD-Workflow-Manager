@@ -38,6 +38,27 @@ def _redirect_std_streams() -> None:
 
 _redirect_std_streams()
 
+
+# ── Krasjdiagnostikk ──────────────────────────────────────────────────────────
+# En krasj i C-kode (PyMuPDF, lxml, Tk …) eller stakkoverløp avslutter prosessen
+# uten Python-traceback — programmet «forsvinner». faulthandler skriver da
+# stakken for alle tråder til siard_manager_krasj.log, så det finnes et spor.
+def _enable_crash_log() -> None:
+    try:
+        import faulthandler
+        fh = open(app_paths.data_dir() / "siard_manager_krasj.log", "a",
+                  encoding="utf-8", buffering=1)
+        import datetime as _dt
+        fh.write(f"\n=== Programstart {_dt.datetime.now():%Y-%m-%d %H:%M:%S} "
+                 f"(pid {os.getpid()}) ===\n")
+        faulthandler.enable(file=fh, all_threads=True)
+        globals()["_CRASH_LOG_FH"] = fh      # må holdes åpen
+    except Exception:
+        pass
+
+
+_enable_crash_log()
+
 # Selvtest av pakket program (brukes av packaging/build_release.py):
 #   SIARDManager.exe --selftest resultat.json
 # (__main__-vakt: underprosesser importerer main.py som __mp_main__ med samme argv)

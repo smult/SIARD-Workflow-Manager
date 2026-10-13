@@ -16,3 +16,5 @@ testsiard/
 # Bygg av programpakke (packaging/build_release.py)
 build/
 dist/
+# Krasjlogg fra faulthandler (main.py)
+siard_manager_krasj.log

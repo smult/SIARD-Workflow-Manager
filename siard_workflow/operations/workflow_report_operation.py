@@ -854,6 +854,13 @@ def _op_detail(
             ("XML-filer oppdatert:",       f"{xml_upd:,}"),
             ("Konverteringsfeil:",         f"{failed:,}"),
         ]
+        _gp = op_data.get("gs_postprocess") or {}
+        if _gp.get("files"):
+            _b, _a = _gp.get("before", 0), _gp.get("after", 0)
+            rows.append(("Etterbehandlet (Ghostscript):",
+                         f"{_gp['files']:,} PDF/A-filer, {_human_size(_b)} → {_human_size(_a)} "
+                         f"(spart {_human_size(_b - _a)}, "
+                         f"{(1 - _a / _b) * 100 if _b else 0:.1f} %)"))
         _fs = op_data.get("failure_summary") or {}
         if _fs.get("total"):
             rows.append(("Ikke konvertert totalt:",

@@ -152,6 +152,9 @@ def main() -> int:
     ap.add_argument("--uten-venv", action="store_true",
                     help="bruk gjeldende Python i stedet for build/venv (raskere, mindre rent)")
     ap.add_argument("--ingen-zip", action="store_true", help="bare bygg mappa")
+    ap.add_argument("--publiser", action="store_true",
+                    help="last opp pakkene + SHA256SUMS.txt til GitHub-utgivelsen for "
+                         "versjonen (gh CLI); finnes den ikke, lages et utkast")
     args = ap.parse_args()
     if sys.platform != "win32":
         raise SystemExit("Pakken bygges på Windows.")
@@ -196,7 +199,8 @@ def main() -> int:
 
     rep = selftest(app)
     # Filer selvtesten skrev i programmappa skal ikke med i pakken
-    for f in ("siard_manager.log", "config.json", "dias.json", "kildesystem_cache.json"):
+    for f in ("siard_manager.log", "siard_manager_krasj.log", "config.json", "dias.json",
+              "kildesystem_cache.json"):
         (app / f).unlink(missing_ok=True)
     if not rep.get("ok"):
         raise SystemExit("Selvtesten feilet — pakken er ikke komplett (se over)")
@@ -205,17 +209,63 @@ def main() -> int:
         log(f"Ferdig: {app}  ({time.monotonic() - t0:.0f} s)")
         return 0
     DIST.mkdir(exist_ok=True)
-    suffix = "-komplett" if set(kinds) == {"libreoffice", "ghostscript", "siegfried"} else \
-        ("-" + "-".join(k[:2] for k in kinds) if kinds else "")
-    zpath = DIST / f"SIARDManager-{VERSION}-win64{suffix}.zip"
+    zips: list[Path] = []
+    # Programpakke uten komponenter — brukes av den automatiske oppdateringen
+    zips.append(_zip_app(app, DIST / f"SIARDManager-{VERSION}-win64.zip",
+                         exclude_top={"komponenter"}))
+    if kinds:
+        full = {"libreoffice", "ghostscript", "siegfried"}
+        suffix = "-komplett" if set(kinds) == full else "-" + "-".join(k[:2] for k in kinds)
+        zips.append(_zip_app(app, DIST / f"SIARDManager-{VERSION}-win64{suffix}.zip"))
+    sums = DIST / "SHA256SUMS.txt"
+    sums.write_text("".join(f"{_sha256(z)}  {z.name}\n" for z in zips), "utf-8")
+    for z in zips:
+        log(f"Ferdig: {z} ({z.stat().st_size / 1e6:.0f} MB)")
+    log(f"Sjekksummer: {sums}  ({time.monotonic() - t0:.0f} s)")
+    if args.publiser:
+        publish(VERSION, zips + [sums])
+    return 0
+
+
+def _zip_app(app: Path, zpath: Path, exclude_top: "set | None" = None) -> Path:
     log(f"Pakker {zpath.name}")
     with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
         for p in sorted(app.rglob("*")):
-            if p.is_file():
-                z.write(p, Path("SIARDManager") / p.relative_to(app))
-    log(f"Ferdig: {zpath} ({zpath.stat().st_size / 1e6:.0f} MB, "
-        f"{time.monotonic() - t0:.0f} s)")
-    return 0
+            rel = p.relative_to(app)
+            if p.is_file() and not (exclude_top and rel.parts[0] in exclude_top):
+                z.write(p, Path("SIARDManager") / rel)
+    return zpath
+
+
+def _sha256(p: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def publish(version: str, files: "list[Path]") -> None:
+    """Last opp til GitHub-utgivelsen `version` (gh CLI). Finnes den ikke, lages
+    et UTKAST — programmene ser det ikke før det publiseres på GitHub."""
+    gh = shutil.which("gh")
+    if not gh:
+        raise SystemExit("gh (GitHub CLI) finnes ikke — installer og kjør «gh auth login»")
+    exists = subprocess.run([gh, "release", "view", version], capture_output=True,
+                            cwd=ROOT).returncode == 0
+    if not exists:
+        log(f"Utgivelse {version} finnes ikke — lager utkast")
+        run([gh, "release", "create", version, "--draft",
+             "--title", f"SIARD Workflow Manager v{version}",
+             "--notes", "Programpakke for Windows. Pakk ut hele zip-fila og start "
+                        "SIARDManager.exe (se LES MEG.txt)."], cwd=ROOT)
+    log(f"Laster opp {len(files)} fil(er) til utgivelse {version} …")
+    run([gh, "release", "upload", version, "--clobber", *map(str, files)], cwd=ROOT)
+    if not exists:
+        log(f"Utkastet må publiseres på GitHub før programmene ser det: "
+            f"gh release edit {version} --draft=false")
+    log("Publisert.")
 
 
 if __name__ == "__main__":

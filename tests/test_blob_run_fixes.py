@@ -260,11 +260,13 @@ def test_no_console_windows() -> None:
     subprocess.run = lambda cmd, **k: seen.append(k)
     try:
         R.run_lo(["gswin64c.exe", "-v"], 5)
-        R.kill_tree(123)
+        n_after_run = len(seen)
+        R.kill_tree(123)        # Win32-API direkte (core/proc_kill) — ingen taskkill
     finally:
         subprocess.Popen, subprocess.run = og_popen, og_run
-    _ok(len(seen) == 2 and all(k.get("creationflags", 0) & subprocess.CREATE_NO_WINDOW for k in seen),
-        "run_lo (LibreOffice/Ghostscript) og kill_tree (taskkill) skjuler konsollvindu")
+    _ok(n_after_run == 1 and seen[0].get("creationflags", 0) & subprocess.CREATE_NO_WINDOW,
+        "run_lo (LibreOffice/Ghostscript) skjuler konsollvindu")
+    _ok(len(seen) == 1, "kill_tree starter ingen ekstern prosess (ingen taskkill-vindu)")
 
 
 def main() -> int:

@@ -97,6 +97,7 @@ class ConversionErrorLogger:
         "passordbeskyttet":  "Passordbeskyttet (ikke konvertert)",
         "mangler":           "Manglende fil (referert, finnes ikke)",
         "oppgradering":      "Formatoppgradering feilet",
+        "signert":           "Signert PDF (beholdt uendret)",
     }
     CSV_HEADER = ["fil", "plassering", "format", "kategori", "arsak"]
     MAX_ENTRIES_IN_MEMORY = 20000

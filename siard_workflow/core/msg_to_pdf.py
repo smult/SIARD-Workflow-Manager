@@ -205,6 +205,9 @@ class MsgAttachment:
     mime: str = ""
     embedded: "MsgMessage | None" = None      # vedlagt e-post
     hidden: bool = False
+    # Signert PDF tatt ut av e-posten og lagt urørt i zip-filen (se
+    # convert_msg_to_zip) — vises som plassholder på toppsiden
+    signed_in_zip: str = ""
 
 
 @dataclass
@@ -457,6 +460,11 @@ class MsgConversionResult:
     attachments: list[AttachmentResult] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     error: str = ""
+    # Navn på signert PDF-vedlegg: e-posten skal da ikke konverteres (signaturen
+    # ville blitt ugyldig) — originalen beholdes uendret
+    signed_attachment: str = ""
+    # convert_msg_to_zip: filene i zip-filen (e-post-PDF + urørte signerte PDF-er)
+    zip_members: list[str] = field(default_factory=list)
 
     @property
     def summary(self) -> str:
@@ -677,6 +685,12 @@ def convert_msg_to_pdf(msg_path: Path, out_pdf: Path, lo_bin: str,
         raw = msg_path.read_bytes()
         msg, kind = parse_email_file(msg_path)
         res.kind = kind
+        signed = find_signed_pdf_attachment(msg)
+        if signed:
+            res.signed_attachment = signed
+            res.error = (f"vedlegget «{signed}» er en signert PDF — e-posten beholdes "
+                         f"uendret (konvertering ville gjort signaturen ugyldig)")
+            return res
         return _render(msg, raw, msg_path.name, out_pdf, lo_bin, level, timeout,
                        tmp, profile, embed_original, res, _depth)
     except Exception as exc:
@@ -685,6 +699,138 @@ def convert_msg_to_pdf(msg_path: Path, out_pdf: Path, lo_bin: str,
     finally:
         if own_tmp:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _take_out_signed(msg: MsgMessage, prefix: str = "", _depth: int = 0,
+                     _used: "set | None" = None) -> "list[tuple[str, bytes]]":
+    """
+    Merk signerte PDF-vedlegg (også i vedlagte e-poster) som «ligger i zip»
+    og returner [(navn i zip, urørte bytes)]. Vedlagte e-poster som bare
+    finnes som MSG/EML-bytes tolkes, slik at de rendres med plassholder.
+    """
+    from siard_workflow.core.file_integrity import is_signed_pdf
+    used = _used if _used is not None else set()
+    out: list = []
+    for i, att in enumerate(msg.attachments):
+        name = att.name or f"vedlegg{i + 1}"
+        if att.embedded is None and att.data and _depth < 5 and \
+                (is_msg_bytes(att.data) or is_eml_bytes(att.data)):
+            try:
+                if is_msg_bytes(att.data):
+                    import olefile
+                    with olefile.OleFileIO(io.BytesIO(att.data)) as ole:
+                        inner = parse_msg(ole)
+                else:
+                    inner = parse_eml(att.data)
+                if find_signed_pdf_attachment(inner):
+                    att.embedded = inner
+            except Exception:
+                pass
+        if att.embedded is not None:
+            if _depth < 5:
+                sub_prefix = f"{prefix}{_safe_name(Path(name).stem, 'vedlagt e-post')}/"
+                out += _take_out_signed(att.embedded, sub_prefix, _depth + 1, used)
+            continue
+        if att.data and att.data[:1024].find(b"%PDF") >= 0 and is_signed_pdf(att.data):
+            base = _safe_name(Path(name).stem, f"signert{i + 1}") + ".pdf"
+            zname, k = prefix + base, 2
+            while zname.lower() in used:
+                zname = f"{prefix}{Path(base).stem} ({k}).pdf"
+                k += 1
+            used.add(zname.lower())
+            att.signed_in_zip = zname
+            out.append((zname, att.data))
+    return out
+
+
+def convert_msg_to_zip(msg_path: Path, out_zip: Path, lo_bin: str,
+                       level: str = DEFAULT_LEVEL, timeout: int = 300,
+                       work_dir: "Path | None" = None,
+                       profile_dir: "Path | None" = None) -> MsgConversionResult:
+    """
+    E-post med signert PDF-vedlegg → zip-fil med
+      <e-post>.pdf   meldingen (toppside, tekst, øvrige vedlegg) som PDF/A
+      <vedlegg>.pdf  de signerte PDF-ene, byte for byte urørt
+    Signerte PDF-er skal ikke røres (signaturen blir ugyldig ved omskriving);
+    toppsiden viser at de ligger i zip-filen. Skriver ikke `out_zip` ved feil.
+    """
+    import zipfile
+    if level not in _PDFA_LEVELS:
+        level = DEFAULT_LEVEL
+    res = MsgConversionResult(ok=False, level=level)
+    own_tmp = work_dir is None
+    tmp = Path(work_dir or tempfile.mkdtemp(prefix="msg2zip_"))
+    tmp.mkdir(parents=True, exist_ok=True)
+    profile = profile_dir or (tmp / "lo_profile")
+    try:
+        raw = msg_path.read_bytes()
+        msg, kind = parse_email_file(msg_path)
+        res.kind = kind
+        signed = _take_out_signed(msg)
+        if not signed:
+            res.error = "ingen signerte PDF-vedlegg"
+            return res
+        res.signed_attachment = signed[0][0]
+        mail_pdf = tmp / "epost.pdf"
+        _render(msg, raw, msg_path.name, mail_pdf, lo_bin, level, timeout, tmp, profile,
+                level.startswith("PDF/A-3"), res, 0)
+        if not res.ok:
+            return res
+        stem = _safe_name(Path(msg.subject or msg_path.stem).stem[:80], "e-post")
+        names = {n.lower() for n, _ in signed}
+        pdf_name = f"{stem} (e-post).pdf" if f"{stem}.pdf".lower() in names else f"{stem}.pdf"
+        part = out_zip.with_suffix(".part")
+        with zipfile.ZipFile(part, "w", zipfile.ZIP_DEFLATED) as z:
+            z.write(mail_pdf, pdf_name)
+            for zname, data in signed:
+                # ZIP_STORED: de signerte filene lagres som de er
+                z.writestr(zipfile.ZipInfo(zname, date_time=_dt.datetime.now().timetuple()[:6]),
+                           data, compress_type=zipfile.ZIP_STORED)
+        part.replace(out_zip)
+        res.zip_members = [pdf_name] + [n for n, _ in signed]
+        res.pdf_path = out_zip
+        return res
+    except Exception as exc:
+        res.ok = False
+        res.error = f"{type(exc).__name__}: {exc}"
+        return res
+    finally:
+        if own_tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+def find_signed_pdf_attachment(msg: MsgMessage, _depth: int = 0) -> str:
+    """
+    Navnet på første vedlegg som er en signert PDF (også i vedlagte e-poster),
+    ellers "". Signerte PDF-er skal ikke røres (se file_integrity.is_signed_pdf).
+    """
+    from siard_workflow.core.file_integrity import is_signed_pdf
+    for i, att in enumerate(msg.attachments):
+        name = att.name or f"vedlegg{i + 1}"
+        if att.embedded is not None:
+            if _depth < 5:
+                inner = find_signed_pdf_attachment(att.embedded, _depth + 1)
+                if inner:
+                    return f"{name} → {inner}"
+            continue
+        if not att.data:
+            continue
+        if att.data[:1024].find(b"%PDF") >= 0 and is_signed_pdf(att.data):
+            return name
+        if _depth < 5 and (is_msg_bytes(att.data) or is_eml_bytes(att.data)):
+            try:
+                if is_msg_bytes(att.data):
+                    import olefile
+                    with olefile.OleFileIO(io.BytesIO(att.data)) as ole:
+                        inner_msg = parse_msg(ole)
+                else:
+                    inner_msg = parse_eml(att.data)
+                inner = find_signed_pdf_attachment(inner_msg, _depth + 1)
+                if inner:
+                    return f"{name} → {inner}"
+            except Exception:
+                pass
+    return ""
 
 
 def _render(msg: MsgMessage, raw: "bytes | None", orig_name: str, out_pdf: Path,
@@ -699,6 +845,11 @@ def _render(msg: MsgMessage, raw: "bytes | None", orig_name: str, out_pdf: Path,
         ar = AttachmentResult(name=name, status="kun listet", size=len(att.data))
         adir = tmp / f"a{depth}_{i}"
         adir.mkdir(parents=True, exist_ok=True)
+        if att.signed_in_zip:
+            ar.status = "signert PDF, ligger urørt i zip-filen"
+            ar.note = f"«{att.signed_in_zip}»"
+            res.attachments.append(ar)
+            continue
         try:
             if att.embedded is not None:
                 if depth >= 3:
