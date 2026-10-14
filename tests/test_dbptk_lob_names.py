@@ -13,9 +13,10 @@ Bakgrunn (verifisert mot keeps/dbptk-developer og CGM_HS_MAN_konvertert.siard):
 
 Verifiserer:
   1. lob_naming-hjelperne mapper recN/xrecN/LOBnnnn → recordN, ellers None.
-  2. hex_extract: binær BLOB-kolonne — under terskel beholdes som hex, over
-     terskel → .bin; ren tekst-BLOB-kolonne omtypes til CLOB og dekodes
-     (inline / .txt, cp1252 → UTF-8); blandet kolonne beholdes som BLOB;
+  2. hex_extract: binær BLOB-kolonne — alle felt dekodes til .bin uansett
+     størrelse; ren tekst-BLOB-kolonne omtypes til CLOB og dekodes
+     (inline / .txt, cp1252 → UTF-8); blandet kolonne beholdes som BLOB og
+     alle felt dekodes til .bin; ingen rå hex igjen;
      CLOB som før; nye filer heter recordN (xrecN når innstillingen er av).
      Både pipeline-modus (filsystem) og standalone zip-modus.
   3. Standardiser filendelser: omdøper til recordN, bevarer endelse, hopper
@@ -216,9 +217,9 @@ def _check_hex_result(root: Path, res, xml: str, meta: str, xsd: str) -> None:
     _ok("<c2>hei</c2>" in xml, "kort CLOB dekodet inline til tekst (som før)")
     _ok('<c2 file="record2.txt"' in xml, "lang CLOB → record2.txt")
 
-    # Binær BLOB-kolonne beholdes
-    _ok(f"<c3>{_SHORT_BIN}</c3>" in xml,
-        "kort binær BLOB beholdt som hex — ikke tekst (T_6.0-2)")
+    # Binær BLOB-kolonne beholdes — alle felt dekodes til fil
+    _ok(_SHORT_BIN not in xml and '<c3 file="record1.bin"' in xml,
+        "kort binær BLOB dekodet til record1.bin — ikke rå hex, ikke tekst (T_6.0-2)")
     _ok('<c3 file="record2.bin"' in xml, "lang binær BLOB → record2.bin (aldri .txt)")
 
     # Ren tekst-BLOB omtypes og dekodes
@@ -238,13 +239,15 @@ def _check_hex_result(root: Path, res, xml: str, meta: str, xsd: str) -> None:
     _ok(xsd.count('name="clobType"') == 1 and xsd.count('name="blobType"') == 1,
         "tableX.xsd: typedefinisjonene ikke duplisert")
 
-    # Blandet kolonne beholdes som BLOB
-    _ok(f"<c5>{_MEMO_SHORT}</c5>" in xml,
-        "blandet BLOB-kolonne: kort tekstfelt beholdt som hex")
+    # Blandet kolonne beholdes som BLOB — alle felt dekodes til fil
+    _ok(f"<c5>{_MEMO_SHORT}</c5>" not in xml and '<c5 file="record1.bin"' in xml,
+        "blandet BLOB-kolonne: kort tekstfelt dekodet til record1.bin (ikke rå hex)")
     _ok('<c5 file="record2.bin"' in xml, "blandet BLOB-kolonne: langt felt → .bin")
+    _ok(not re.search(r"<c[35]>[0-9A-Fa-f]{4,}</c[35]>", xml),
+        "ingen rå hex igjen i BLOB-kolonnene")
 
-    _ok(res.data.get("hex_blob_kept_inline") == 2,
-        f"statistikk: 2 BLOB-felt beholdt som hex (fikk {res.data.get('hex_blob_kept_inline')})")
+    _ok(res.data.get("hex_blob_small_exported") == 2,
+        f"statistikk: 2 korte BLOB-felt dekodet til fil (fikk {res.data.get('hex_blob_small_exported')})")
     _ok(res.data.get("columns_retyped") == 1, "statistikk: 1 kolonne omtypet")
     _ok(res.data.get("retyped_columns") == ["schema0/table0.memo (c4): BINARY LARGE OBJECT → CLOB"],
         f"retyped_columns-detalj for PREMIS: {res.data.get('retyped_columns')}")
@@ -272,8 +275,12 @@ def test_hex_extract_blob_guard(tmp: Path) -> None:
         and (root / "content/schema0/table0/lob4/record2.txt").is_file()
         and (root / "content/schema0/table0/lob5/record2.bin").is_file(),
         "filene finnes i lobN/")
-    _ok((root / "content/schema0/table0/lob3/record2.bin").read_bytes() == _LONG_BIN,
-        "BLOB-innhold byte-eksakt")
+    _ok((root / "content/schema0/table0/lob3/record2.bin").read_bytes() == _LONG_BIN
+        and (root / "content/schema0/table0/lob3/record1.bin").read_bytes()
+        == bytes.fromhex(_SHORT_BIN)
+        and (root / "content/schema0/table0/lob5/record1.bin").read_bytes()
+        == bytes.fromhex(_MEMO_SHORT),
+        "BLOB-innhold byte-eksakt (også korte felt, cp1252-tekst uendret)")
     _ok((root / "content/schema0/table0/lob4/record2.txt").read_bytes()
         == bytes.fromhex(_MEMO_LONG), "tekst-LOB skrevet som UTF-8")
 

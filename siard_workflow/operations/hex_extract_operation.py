@@ -18,9 +18,11 @@ BLOB-kolonner (xs:hexBinary i tabell-XSD) forhåndsskannes per kolonne:
     og OMTYPES: <type> i metadata.xml → CLOB/NCLOB, og kolonnens
     type="blobType" i tableX.xsd → "clobType". Uten omtypingen ville
     dekodet tekst i en xs:hexBinary-celle gi XSD-brudd (DBPTK T_6.0-2).
-  * Ellers (binært eller blandet innhold) beholdes kolonnen som BLOB: felt
-    over terskelen eksporteres som .bin, felt under beholdes som hex (som er
-    gyldig xs:hexBinary-innhold).
+  * Ellers (binært eller blandet innhold) beholdes kolonnen som BLOB, og ALLE
+    hex-felt dekodes til .bin-filer uansett størrelse. Terskelen gjelder bare
+    tekstkolonner: en BLOB-celle kan bare holde hex eller en filreferanse —
+    dekodet tekst inline bryter xs:hexBinary (DBPTK T_6.0-2), og binærdata kan
+    bare dekodes til fil.
   4. Skriv ny SIARD: kopier alt unntatt behandlede tableX.xml direkte,
      erstatt disse med patchet versjon.
 """
@@ -240,10 +242,11 @@ def _scan_blob_columns(xml_src_bytes: bytes, table_info: dict,
               f"{_character_type_for(types.get(col, 'BLOB'))} og dekodes", "info")
         elif s["text"] and (s["bin"] or s["file"]):
             w(f"    {label}: blandet innhold ({s['text']} tekst, {s['bin']} binær, "
-              f"{s['file']} filreferanser) → beholdes BLOB; tekstfelt under "
-              f"terskel beholdes som hex", "warn")
+              f"{s['file']} filreferanser) → beholdes BLOB; alle {s['hex']} hex-felt "
+              f"dekodes til .bin-filer uansett størrelse", "warn")
         else:
-            w(f"    {label}: {s['hex']} hex-felt, binært → beholdes BLOB", "info")
+            w(f"    {label}: {s['hex']} hex-felt, binært → beholdes BLOB; dekodes til "
+              f".bin-filer uansett størrelse", "info")
     return retype
 
 
@@ -406,6 +409,10 @@ def _find_clob_tables_fs(extract_dir: Path) -> list[dict]:
     return _parse_clob_tables_from_xml(metadata_path.read_bytes())
 
 
+# Antall eksporterte felt per tabell som listes enkeltvis i loggen
+_LOG_FILES = 50
+
+
 def _process_table_fs(
     extract_dir:     Path,
     table_info:      dict,
@@ -496,23 +503,22 @@ def _process_table_fs(
                                 ext, data_bytes = "txt", _t.encode("utf-8")
 
                         try:
-                            # Felt under minimum dekodet lengde — ikke eksporter
+                            # Tekstfelt under minimum dekodet lengde — ikke eksporter
                             # til ekstern fil, men dekod hex-strengen INLINE slik
                             # at ferdig SIARD ikke inneholder rå hex.
-                            if len(decoded) < min_text_length:
+                            if len(decoded) < min_text_length and not is_blob:
                                 stats["hex_skipped"] = stats.get("hex_skipped", 0) + 1
-                                if is_blob:
-                                    # Binær BLOB-kolonne: hex ER gyldig innhold.
-                                    # Tekst her gir XSD-brudd (DBPTK T_6.0-2).
-                                    stats["hex_blob_kept_inline"] = (
-                                        stats.get("hex_blob_kept_inline", 0) + 1)
-                                    continue
                                 _txt = _hex_to_text(decoded)
                                 if _txt is not None:
                                     child.text = _txt
                                     stats["hex_inline_decoded"] = (
                                         stats.get("hex_inline_decoded", 0) + 1)
                                 continue
+                            if is_blob and len(decoded) < min_text_length:
+                                # BLOB-celle: bare hex eller filreferanse er
+                                # gyldig — dekodes derfor til fil uansett størrelse
+                                stats["hex_blob_small_exported"] = (
+                                    stats.get("hex_blob_small_exported", 0) + 1)
 
                             filename   = f"{lob_file_stem(row_counter, 'xrec')}.{ext}"
                             length     = len(data_bytes)
@@ -532,8 +538,9 @@ def _process_table_fs(
                             child.set("digestType", "MD5")
                             child.set("digest",     digest)
 
-                            w(f"    rad {row_counter}/{target_tag} → "
-                              f"lob{col_index}/{filename} ({length:,} bytes)", "info")
+                            if lob_written <= _LOG_FILES:
+                                w(f"    rad {row_counter}/{target_tag} → "
+                                  f"lob{col_index}/{filename} ({length:,} bytes)", "info")
 
                         except Exception as exc:
                             w(f"  [FEIL] LOB rad {row_counter}/{target_tag}: {exc}",
@@ -556,6 +563,8 @@ def _process_table_fs(
         except Exception:
             pass
 
+    if lob_written > _LOG_FILES:
+        w(f"    … og {lob_written - _LOG_FILES:,} felt til (ikke listet enkeltvis)", "info")
     w(f"  {table_name}: {lob_written} felt eksportert ({row_counter} rader)",
       "ok" if lob_written else "info")
     return lob_written
@@ -577,11 +586,11 @@ def _process_table(
     """
     Stream tableX.xml, dekod HEX CLOB-felt, skriv record{N}.txt,
     patch XML og skriv til zout.  Returnerer antall LOB-filer skrevet.
-    Felt kortere enn min_text_length tegn (etter dekoding) eksporteres
+    Tekstfelt kortere enn min_text_length tegn (etter dekoding) eksporteres
     ikke til ekstern fil, men hex-strengen dekodes INLINE slik at ferdig
     SIARD ikke inneholder rå hex. BLOB-kolonner med bare tekst legges til
-    i `retypes` og behandles som CLOB; øvrige BLOB-felt under terskelen
-    beholdes som hex (gyldig xs:hexBinary).
+    i `retypes` og behandles som CLOB; i øvrige BLOB-kolonner dekodes alle
+    hex-felt til .bin-filer uansett størrelse.
     """
     schema_folder = table_info["schema_folder"]
     folder        = table_info["folder"]
@@ -657,23 +666,22 @@ def _process_table(
                                 ext, data_bytes = "txt", _t.encode("utf-8")
 
                         try:
-                            # Felt under minimum dekodet lengde — ikke eksporter
+                            # Tekstfelt under minimum dekodet lengde — ikke eksporter
                             # til ekstern fil, men dekod hex-strengen INLINE slik
                             # at ferdig SIARD ikke inneholder rå hex.
-                            if len(decoded) < min_text_length:
+                            if len(decoded) < min_text_length and not is_blob:
                                 stats["hex_skipped"] = stats.get("hex_skipped", 0) + 1
-                                if is_blob:
-                                    # Binær BLOB-kolonne: hex ER gyldig innhold.
-                                    # Tekst her gir XSD-brudd (DBPTK T_6.0-2).
-                                    stats["hex_blob_kept_inline"] = (
-                                        stats.get("hex_blob_kept_inline", 0) + 1)
-                                    continue
                                 _txt = _hex_to_text(decoded)
                                 if _txt is not None:
                                     child.text = _txt
                                     stats["hex_inline_decoded"] = (
                                         stats.get("hex_inline_decoded", 0) + 1)
                                 continue
+                            if is_blob and len(decoded) < min_text_length:
+                                # BLOB-celle: bare hex eller filreferanse er
+                                # gyldig — dekodes derfor til fil uansett størrelse
+                                stats["hex_blob_small_exported"] = (
+                                    stats.get("hex_blob_small_exported", 0) + 1)
                             filename   = f"{lob_file_stem(row_counter, 'xrec')}.{ext}"
                             zip_path   = lob_folder + filename
                             length     = len(data_bytes)
@@ -693,8 +701,9 @@ def _process_table(
                             child.set("digestType", "MD5")
                             child.set("digest",     digest)
 
-                            w(f"    rad {row_counter}/{target_tag} → "
-                              f"{zip_path} ({length:,} bytes)", "info")
+                            if lob_written <= _LOG_FILES:
+                                w(f"    rad {row_counter}/{target_tag} → "
+                                  f"{zip_path} ({length:,} bytes)", "info")
 
                         except Exception as exc:
                             w(f"    [FEIL] CLOB rad {row_counter}/{target_tag}:"
@@ -719,6 +728,8 @@ def _process_table(
         except Exception:
             pass
 
+    if lob_written > _LOG_FILES:
+        w(f"    … og {lob_written - _LOG_FILES:,} felt til (ikke listet enkeltvis)", "info")
     w(f"  {table_name}: {lob_written} felt eksportert "
       f"({row_counter} rader)", "ok" if lob_written else "info")
     return lob_written
@@ -730,7 +741,7 @@ _STAT_LABELS = {
     "hex_exported":         "HEX-felt eksportert",
     "hex_skipped":          "HEX-felt under terskel",
     "hex_inline_decoded":   "HEX-felt dekodet inline",
-    "hex_blob_kept_inline": "BLOB-felt beholdt som hex",
+    "hex_blob_small_exported": "BLOB-felt under terskel → fil",
     "columns_retyped":      "BLOB-kolonner omtypet",
     "tables_patched":       "Tabeller patchet",
     "lob_before":           "LOB-filer (før)",
@@ -758,14 +769,16 @@ class HexExtractOperation(BaseOperation):
     default_params = {
         "dry_run":         False,
         "temp_dir":        "",
-        "min_text_length": 200,    # tekst kortere enn dette dekodes inline (ikke fil)
+        "min_text_length": 200,    # tekst kortere enn dette dekodes inline (ikke fil);
+                                   # BLOB-felt (binært/blandet) dekodes alltid til fil
     }
 
     @property
     def description(self) -> str:
-        return ("Dekoder inline HEX CLOB-tekst i tableX.xml og eksporterer "
-                "til eksterne .txt-filer. BLOB-kolonner med bare tekst "
-                "omtypes til CLOB. Kjøres før BLOB Konverter.")
+        return ("Dekoder all inline HEX i LOB-kolonner: kort tekst inline, lang "
+                "tekst til .txt-filer. BLOB-kolonner med bare tekst omtypes til "
+                "CLOB; i binære/blandede BLOB-kolonner dekodes alle felt til "
+                ".bin-filer uansett størrelse. Kjøres før BLOB Konverter.")
 
     def premis_detail(self, result, ctx) -> str:
         """Ta med BLOB-kolonner som ble omtypet til tegn-LOB.

@@ -303,11 +303,42 @@ class DiasPackageOperation(BaseOperation):
         "creator", "preserver",
     ]
 
+    def _apply_period(self, ctx: WorkflowContext, siard_path: Path) -> None:
+        """
+        Periode (STARTDATE/ENDDATE) fra uttrekket: <dataOriginTimespan> i
+        metadata.xml når den oppgir et spenn, ellers et estimat fra «Estimer
+        datospenn» i samme kjøring. Ellers brukes verdiene fra dialogen.
+        """
+        from siard_workflow.core.date_span import period_for_dias
+        fl = (ctx.metadata or {}).get("file_logger")
+
+        def _w(msg: str, lvl: str = "info") -> None:
+            logger.info(msg)
+            if fl:
+                fl.log(msg, lvl)
+
+        src = ctx.extracted_path if (ctx.extracted_path and ctx.extracted_path.is_dir()) \
+            else siard_path
+        found = period_for_dias(src, ctx.get_result("date_span"))
+        old = (str(self.params.get("period_start", "")).strip(),
+               str(self.params.get("period_end", "")).strip())
+        if not found:
+            if any(old):
+                _w(f"  Periode fra innstillingene: {old[0]} – {old[1]} "
+                   "(uttrekket oppgir ikke datospenn)")
+            return
+        start, end, origin = found
+        self.params["period_start"], self.params["period_end"] = start, end
+        _w(f"  Periode: {start} – {end} (fra {origin})")
+        if any(old) and old != (start, end):
+            _w(f"    Erstatter verdiene fra innstillingene ({old[0]} – {old[1]})", "warn")
+
     def run(self, ctx: WorkflowContext) -> OperationResult:
         siard_path = ctx.siard_path
         if not siard_path or not siard_path.exists():
             return self._fail("Ingen SIARD-fil i kontekst.")
 
+        self._apply_period(ctx, siard_path)
         missing = [k for k in self._REQUIRED_META if not str(self.params.get(k, "")).strip()]
         if missing:
             return self._fail(f"Manglende obligatoriske parametere: {', '.join(missing)}")

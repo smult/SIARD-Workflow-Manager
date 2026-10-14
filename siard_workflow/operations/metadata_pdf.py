@@ -114,6 +114,13 @@ def generate_metadata_pdf(
 
     _opts = options or {}
     _generate_er = _opts.get("generate_er_diagram", True)
+    # Estimert datospenn fra «Estimer datospenn» (date_span) — alltid merket som
+    # estimat. Når metadata.xml selv oppgir spennet, står det under «Tidsperiode»
+    # og ingenting estimeres.
+    _ds = _opts.get("date_span") or {}
+    if _ds.get("source") == "metadata":
+        _ds = {}
+    _ds_found = bool(_ds.get("found"))
 
     # ── Fargepalett ────────────────────────────────────────────────────────
     C_NAVY       = colors.Color(0.10, 0.22, 0.42)
@@ -378,7 +385,12 @@ def generate_metadata_pdf(
             ("DB-bruker",            _val(meta.get("db_user"))),
             ("Arkiveringsdato",      _val(meta.get("archival_date"))),
             ("Produsert av",         _val(meta.get("producer_app"))),
-            ("Tidsperiode",             _val(meta.get("data_origin_time_span"))),
+            ("Tidsperiode",             _val(meta.get("data_origin_time_span"))
+             + (" (ESTIMERT ut fra uttrekket — ikke nødvendigvis 100 % korrekt)"
+                if meta.get("data_origin_time_span_estimated") else "")),
+            *([("Estimert datospenn",
+                f"{_ds['from_year']}–{_ds['to_year']} (estimat fra uttrekket — se under)")]
+              if _ds_found else []),
             ("SIARD-versjon",        _val(meta.get("siard_version"))),
             ("Meldingssammendrag",   digest_str),
             ("Antall ZIP-poster",    str(meta.get("zip_entry_count", "–"))),
@@ -424,6 +436,31 @@ def generate_metadata_pdf(
         ]))
         story.append(t)
         story.append(Spacer(1, 6 * mm))
+
+        # ── Estimert datospenn (date_span) ────────────────────────────────
+        if _ds:
+            from xml.sax.saxutils import escape as _esc
+            story.append(Paragraph("Estimert datospenn (fra uttrekket)", style_h2))
+            if _ds_found:
+                txt = (f"<b>{_ds['from_year']}–{_ds['to_year']}</b> "
+                       f"({_esc(_ds.get('from_date', ''))} – {_esc(_ds.get('to_date', ''))}). "
+                       f"Grunnlag: {_esc(_ds.get('basis_text', ''))}; "
+                       f"sikkerhet: {_esc(_ds.get('confidence', ''))}.")
+                txt += (f" metadata.xml oppga «{_esc(_ds['metadata_timespan'])}», som ikke er "
+                        "et tolkbart datospenn." if _ds.get("metadata_timespan") else
+                        " metadata.xml oppga ikke datospenn.")
+                if _ds.get("written_to_metadata"):
+                    txt += (f" Estimatet er skrevet inn i metadata.xml "
+                            f"(&lt;dataOriginTimespan&gt;{_esc(_ds.get('written_value', ''))}"
+                            f"&lt;/dataOriginTimespan&gt;) med en XML-kommentar om at "
+                            f"verdien er estimert.")
+            else:
+                txt = _esc(_ds.get("message", "Ingen brukbare datoverdier funnet."))
+            story.append(Paragraph(txt, style_body))
+            story.append(Paragraph(
+                "<i>" + _esc(_ds.get("note") or "Estimat — ikke nødvendigvis 100 % korrekt.")
+                + "</i>", style_caption))
+            story.append(Spacer(1, 4 * mm))
 
         # ── Horisontalt søylediagram: topp-15 tabeller etter rader ────────
         all_tables = []

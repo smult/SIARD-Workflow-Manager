@@ -105,19 +105,37 @@ def validate_workflow(ops: list) -> list[tuple]:
 
         elif oid == "metadata_extract":
             r = _idxs(ops, "repack_siard")
+            ds = _idxs(ops, "date_span")
             if r and idx <= max(r):
                 msg = "Metadata-uttrekk skal ligge etter 'Pakk sammen SIARD'"
+            elif ds and idx <= max(ds):
+                msg = "Metadata-uttrekk skal ligge etter 'Estimer datospenn'"
 
         elif oid == "workflow_report":
             r = _idxs(ops, "repack_siard")
             m = _idxs(ops, "metadata_extract")
             d = _idxs(ops, "dias_package")
+            ds = _idxs(ops, "date_span")
             if r and idx <= max(r):
                 msg = "Kjørerapport skal ligge etter 'Pakk sammen SIARD'"
+            elif ds and idx <= max(ds):
+                msg = "Kjørerapport skal ligge etter 'Estimer datospenn'"
             elif m and idx <= max(m):
                 msg = "Kjørerapport skal ligge etter 'Metadata-uttrekk'"
             elif d and idx >= min(d):
                 msg = "Kjørerapport skal ligge før 'DIAS-pakking'"
+
+        elif oid == "date_span":
+            # Skriver et estimat inn i metadata.xml — i pipeline-modus på den
+            # utpakkede mappa (ellers en full kopi av SIARD-filen)
+            u = _idxs(ops, "unpack_siard")
+            r = _idxs(ops, "repack_siard")
+            writes = str(getattr(op, "params", {}).get("write_metadata", True)).lower() \
+                not in ("false", "0")
+            if writes and u and r and idx <= max(u):
+                msg = "'Estimer datospenn' skal ligge etter 'Pakk ut SIARD'"
+            elif writes and u and r and idx >= min(r):
+                msg = "'Estimer datospenn' skal ligge før 'Pakk sammen SIARD'"
 
         elif oid == "dias_package":
             if idx != n - 1:

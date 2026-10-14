@@ -1817,8 +1817,9 @@ class BlobConvertOperation(BaseOperation):
         # PDF/A-2b, eller PDF/A-3 med innebygd original når pdfa_version er PDF/A-3.
         "convert_msg":          True,
         # Ghostscript-etterbehandling av PDF/A fra LibreOffice: «spør» (test på
-        # utvalg + dialog), «ja» (alltid) eller «nei». Uten Ghostscript: ingenting.
-        "gs_postprocess":       "spør",
+        # utvalg + dialog), «Alltid» eller «Av» (standard). Uten Ghostscript:
+        # ingenting. Eldre lagrede verdier «ja»/«nei» godtas fortsatt.
+        "gs_postprocess":       "Av",
         "gs_sample_size":       10,
         # Tilvalg: la Ghostscript kode bilder om til JPEG (tapsbeheftet, større
         # besparelse). Av som standard — bilder lagres da tapsfritt.
@@ -4597,9 +4598,10 @@ class BlobConvertOperation(BaseOperation):
         """
         from siard_workflow.core import ghostscript as _gs
         from siard_workflow.core import pdf_postprocess as PP
-        mode = str(self.params.get("gs_postprocess", "spør") or "spør").lower()
-        if mode == "nei":
+        mode = str(self.params.get("gs_postprocess", "Av") or "Av").strip().lower()
+        if mode in ("av", "nei"):
             return
+        always = mode in ("alltid", "ja")
         gs = _gs.active_ghostscript()
         if not gs:
             w("  Ghostscript-etterbehandling: Ghostscript ikke funnet/aktivert — hoppet over",
@@ -4620,15 +4622,15 @@ class BlobConvertOperation(BaseOperation):
           + ("kan kodes om til JPEG (tapsbeheftet — valgt i innstillingene)" if allow_jpeg
              else "komprimeres ikke med tap"), "warn" if allow_jpeg else "info")
         ask = getattr(self, "_gs_ask_cb", None)
-        if mode != "ja" and not callable(ask):
+        if not always and not callable(ask):
             w("  Ghostscript-etterbehandling: ingen dialog tilgjengelig — filene røres ikke "
-              "(sett «Ghostscript-etterbehandling» til «ja» for å kjøre uten spørsmål)", "info")
+              "(sett «Ghostscript-etterbehandling» til «Alltid» for å kjøre uten spørsmål)", "info")
             return
         timeout = int(self.params.get("lo_timeout", 300))
         n_sample = max(1, int(self.params.get("gs_sample_size", 10) or 10))
         done: list = []
         try:
-            if mode != "ja":
+            if not always:
                 sample = PP.pick_sample(pdfs, n_sample)
                 w(f"  Ghostscript-etterbehandling: tester {len(sample)} av {len(pdfs):,} "
                   f"PDF-filer ("

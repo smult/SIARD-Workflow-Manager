@@ -282,6 +282,7 @@ class DiasParamDialog(ctk.CTkToplevel):
                       fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
                       font=ctk.CTkFont(family=FONTS["mono"], size=12),
                       command=self._load_from_mets).pack(side="left")
+        self._mets_row = mets_row
 
         # Params starter på rad 1 (rad 0 er METS-importknappen)
         for i, p in enumerate(self._op_def.get("params", [])):
@@ -386,6 +387,32 @@ class DiasParamDialog(ctk.CTkToplevel):
                     _entry.bind("<FocusOut>", lambda _, f=_fn: f())
 
             self._vars[p["key"]] = (var, p["type"])
+        self._prefill_period()
+
+    def _prefill_period(self):
+        """Periode fra <dataOriginTimespan> i den valgte SIARD-filen, når den finnes."""
+        if not self._siard_path or "period_start" not in self._vars:
+            return
+        try:
+            from siard_workflow.core.date_span import metadata_span, read_timespan
+            span = metadata_span(read_timespan(self._siard_path))
+        except Exception:
+            span = None
+        try:
+            import zipfile as _zf
+            from siard_workflow.core.date_span import ESTIMATE_MARK
+            with _zf.ZipFile(self._siard_path) as z:
+                estimated = ESTIMATE_MARK.encode("utf-8") in z.read("header/metadata.xml")
+        except Exception:
+            estimated = False
+        if not span:
+            return
+        self._vars["period_start"][0].set(span[0].isoformat())
+        self._vars["period_end"][0].set(span[1].isoformat())
+        ctk.CTkLabel(self._mets_row,
+                     text="Periode fra metadata.xml" + (" (estimert)" if estimated else ""),
+                     font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                     text_color=COLORS["muted"]).pack(side="left", padx=(12, 0))
 
     # ── METS-innlesing ────────────────────────────────────────────────────────
 

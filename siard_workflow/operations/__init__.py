@@ -15,6 +15,7 @@ from .pipeline_operations import UnpackSiardOperation, RepackSiardOperation
 from .standardize_ext_operation import StandardizeExtOperation
 from .workflow_report_operation import WorkflowReportOperation
 from .depot_reports_operation import DepotReportsOperation
+from .date_span_operation import DateSpanOperation
 from .standard_operations import (
     XMLValidationOperation,
     MetadataExtractOperation,
@@ -40,6 +41,7 @@ __all__ = [
     "StandardizeExtOperation",
     "WorkflowReportOperation",
     "DepotReportsOperation",
+    "DateSpanOperation",
     "XMLValidationOperation",
     "MetadataExtractOperation",
     "ConditionalOperation",

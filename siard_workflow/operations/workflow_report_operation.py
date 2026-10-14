@@ -655,6 +655,92 @@ def _generate_pdf(
 # Filer som ikke ble konvertert (BLOB-konvertering)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _date_span_section(ds: dict, inner_w, _kv_table, s_sub, s_small,
+                       C_PRIMARY, C_BORDER, C_WHITE, C_WARNING) -> list:
+    """Datospenn (date_span): fra metadata.xml, eller estimat — tydelig merket som estimat."""
+    from xml.sax.saxutils import escape
+    from reportlab.lib import colors as rl_colors
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.units import cm
+    from reportlab.platypus import Paragraph, Spacer, Table, TableStyle
+
+    note = ParagraphStyle("DsNote", parent=s_small, textColor=C_WARNING, fontName="Helvetica-Oblique")
+    kv_val = ParagraphStyle("DsKv", parent=s_small, fontSize=9, leading=11,
+                            textColor=C_PRIMARY, spaceAfter=0)
+
+    def _kv(rows: list) -> object:
+        """kv-tabell der lange verdier brytes (rene strenger brytes ikke i Table)."""
+        return _kv_table([(k, Paragraph(escape(v), kv_val) if len(v) > 60 else v)
+                          for k, v in rows], col_w=[4.4 * cm, inner_w - 4.4 * cm])
+    if ds and ds.get("source") == "metadata":
+        out: list = [Paragraph("Datospenn for uttrekket (fra metadata.xml)", s_sub)]
+        out.append(_kv([
+            ("Fra–til:", f"{ds['from_year']}–{ds['to_year']}  "
+                         f"({ds.get('from_date', '')} – {ds.get('to_date', '')})"),
+            ("Kilde:", f"metadata.xml <dataOriginTimespan> «{ds.get('metadata_timespan', '')}»"),
+            ("Estimert:", "JA — verdien ble estimert ut fra uttrekket ved en tidligere "
+                          "kjøring (se XML-kommentar i metadata.xml); ikke nødvendigvis "
+                          "100 % korrekt" if ds.get("metadata_estimated")
+             else "nei — metadata.xml oppgir spennet"),
+            ("DIAS-pakke:", "brukes som periode (STARTDATE/ENDDATE)"),
+        ]))
+        return out
+    out = [Paragraph("Estimert datospenn for uttrekket", s_sub)]
+    if not ds or not ds.get("found"):
+        out.append(Paragraph(escape(ds.get("message", "Ingen datoer funnet.") if ds else
+                                    "Ingen resultat."), s_small))
+        return out
+    rows = [
+        ("Estimert fra–til:", f"{ds['from_year']}–{ds['to_year']}  "
+                              f"({ds.get('from_date', '')} – {ds.get('to_date', '')})"),
+        ("Grunnlag:", ds.get("basis_text", "")),
+        ("Sikkerhet:", ds.get("confidence", "")),
+    ]
+    if ds.get("absolute_first"):
+        rows.append(("Ytterpunkter:", f"{ds['absolute_first']} – {ds['absolute_last']}"
+                     + (f" ({ds['outside_trim']:,} verdier regnet som avvik)"
+                        if ds.get("outside_trim") else "")))
+    rows.append(("metadata.xml:", f"«{ds['metadata_timespan']}» — ikke et tolkbart datospenn"
+                 if ds.get("metadata_timespan") else "oppga ikke datospenn"))
+    if ds.get("written_to_metadata"):
+        rows.append(("Skrevet til metadata.xml:",
+                     f"dataOriginTimespan = «{ds.get('written_value', '')}», "
+                     "med XML-kommentar om at verdien er estimert"))
+    if ds.get("tables_scanned"):
+        ts = ds["tables_scanned"]
+        rows.append(("Tabeller lest:", ", ".join(f"{t['table']} ({t['why']})" for t in ts[:12])
+                     + (f" … (+{len(ts) - 12})" if len(ts) > 12 else "")))
+    rows.append(("DIAS-pakke:", "brukes som periode (STARTDATE/ENDDATE)"))
+    out.append(_kv(rows))
+    out.append(Spacer(1, 0.15 * cm))
+    out.append(Paragraph(escape(ds.get("note", "Estimat — ikke nødvendigvis 100 % korrekt.")), note))
+    cols = [c for c in ds.get("columns", []) if c.get("primary") or c.get("excluded")][:15]
+    if cols:
+        cell = ParagraphStyle("DsCell", parent=s_small, fontSize=7.5, leading=9, spaceAfter=0)
+        head = ParagraphStyle("DsHead", parent=cell, fontName="Helvetica-Bold", textColor=C_WHITE)
+        data = [[Paragraph(h, head) for h in ("Tabell.kolonne", "Datoer", "I LOB-rader",
+                                              "År", "Merknad")]]
+        for c in cols:
+            data.append([Paragraph(escape(f"{c['table']}.{c['column']}"), cell),
+                         Paragraph(f"{c['n']:,}".replace(",", " "), cell),
+                         Paragraph(f"{c['n_lob']:,}".replace(",", " "), cell),
+                         Paragraph(escape(c.get("span", "")), cell),
+                         Paragraph(escape("utelatt: " + c["excluded"] if c.get("excluded")
+                                          else "brukt (rader med LOB-fil)" if c.get("lob_rows")
+                                          else "brukt (alle rader)"), cell)])
+        t = Table(data, colWidths=[inner_w * 0.36, inner_w * 0.11, inner_w * 0.12,
+                                   inner_w * 0.13, inner_w * 0.28], repeatRows=1)
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), C_PRIMARY), ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("GRID", (0, 0), (-1, -1), 0.5, C_BORDER),
+            ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [rl_colors.HexColor("#f8f9fa"), C_WHITE]),
+        ]))
+        out.append(Spacer(1, 0.2 * cm))
+        out.append(t)
+    return out
+
+
 MAX_FAILURE_ROWS = 300          # resten står i feillista (CSV)
 
 
@@ -905,6 +991,11 @@ def _op_detail(
         if out_path:
             out.append(Spacer(1, 0.2 * cm))
             out.append(Paragraph(f"Ny SIARD-fil: {Path(out_path).name}", s_small))
+
+    # ── Estimert datospenn ───────────────────────────────────────────────────
+    elif op_id == "date_span":
+        out.extend(_date_span_section(op_data, inner_w, _kv_table, s_sub, s_small,
+                                      C_PRIMARY, C_BORDER, C_WHITE, C_WARNING))
 
     # ── HEX Inline Extract ───────────────────────────────────────────────────
     elif op_id == "hex_extract":

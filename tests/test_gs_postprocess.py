@@ -202,6 +202,20 @@ def test_allow_jpeg(tmp: Path) -> None:
         "visuell kontroll godtar JPEG-versjonen (originalen urørt)")
 
 
+def test_default_off() -> None:
+    """Standard er «Av»: ingen test, ingen dialog, ingen filer endres."""
+    print("test_default_off")
+    from siard_workflow.operations.blob_convert_operation import BlobConvertOperation
+    op = BlobConvertOperation()
+    _ok(op.params["gs_postprocess"] == "Av", "standardvalget er «Av»")
+    asked: list = []
+    op._gs_ask_cb = lambda est: asked.append(est) or True
+    logs: list = []
+    op._gs_postprocess([object()], {}, lambda m, *a: logs.append(m), 2, Path("."),
+                       threading.Event())
+    _ok(not asked and not logs, "«Av»: ingen dialog og ingen behandling")
+
+
 def main() -> int:
     from siard_workflow.core import ghostscript as G
     from siard_workflow.core.libreoffice import find_libreoffice
@@ -209,6 +223,7 @@ def main() -> int:
     if not (G.active_ghostscript() and find_libreoffice("soffice")):
         print("LibreOffice/Ghostscript mangler — test hoppet over")
         return 0
+    test_default_off()
     with tempfile.TemporaryDirectory(prefix="gspost_") as td:
         tmp = Path(td)
 

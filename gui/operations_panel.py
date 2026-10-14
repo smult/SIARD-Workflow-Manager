@@ -23,7 +23,7 @@ from siard_workflow.operations import (
     WorkflowReportOperation, DiasPackageOperation,
     LobFolderFixOperation, SegFolderFixOperation, SiardMapperOperation,
     StandardizeExtOperation, DepotReportsOperation,
-    MetadataQualityOperation, XsdTypeFixOperation,
+    MetadataQualityOperation, XsdTypeFixOperation, DateSpanOperation,
 )
 from siard_workflow.systemspecific_operations import CosDocMailMergeOperation
 from settings import save_op_params, save_config, get_config, _SETTINGS_FILE
@@ -490,6 +490,30 @@ OP_DEFS = [
         ],
     },
     {
+        "cls": DateSpanOperation,
+        "label": "Estimer datospenn (fra–til)",
+        "category": "Innhold",
+        "desc": (
+            "Finner uttrekkets første og siste dato (fra–til). Oppgir metadata.xml et "
+            "datospenn (dataOriginTimespan), brukes det uten estimering. Ellers estimeres "
+            "spennet ut fra datoene i LOB-tabeller (rader med dokumenter) og journal-/"
+            "sakstabeller. Fødselsdatoer og frister utelates, og enkeltstående "
+            "feilregistreringer (1900-01-01 o.l.) avgjør ikke spennet. Et estimat merkes som "
+            "ESTIMAT i kjørerapporten og metadata-rapporten, og skrives inn i metadata.xml "
+            "med en XML-kommentar om at verdien er estimert. Spennet brukes også som periode "
+            "i DIAS-pakken. Legg operasjonen mellom 'Pakk ut SIARD' og 'Pakk sammen SIARD', "
+            "og før 'Metadata-uttrekk' og 'Kjørerapport'."
+        ),
+        "status": DateSpanOperation.status,
+        "params": [
+            {"key": "trim_percent", "label": "Ytterår med under (%) av datoene regnes som avvik",
+             "type": "float", "default": 0.05},
+            {"key": "write_metadata",
+             "label": "Skriv estimatet til metadata.xml (dataOriginTimespan, med kommentar)",
+             "type": "bool", "default": True},
+        ],
+    },
+    {
         "cls": BlobConvertOperation,
         "label": "BLOB Konverter til PDF/A",
         "category": "Innhold",
@@ -510,7 +534,7 @@ OP_DEFS = [
             {"key": "skip_existing_pdf",  "label": "Hopp over eksist. PDF",         "type": "bool",   "default": True},
             {"key": "convert_msg",        "label": "E-post (MSG) → PDF/A m/ vedlegg", "type": "bool",   "default": True},
             {"key": "gs_postprocess",     "label": "Ghostscript-etterbehandling",   "type": "choice",
-             "default": "spør", "choices": ["spør", "ja", "nei"]},
+             "default": "Av", "choices": ["Av", "Spør", "Alltid"]},
             {"key": "gs_sample_size",     "label": "Testutvalg (antall filer)",     "type": "int",    "default": 10},
             {"key": "gs_allow_jpeg",      "label": "Tillat JPEG-omkoding av bilder", "type": "bool",   "default": False},
             {"key": "extract_inline",     "label": "Ekstraher inline NBLOB/NCLOB",  "type": "bool",   "default": True},
@@ -521,7 +545,11 @@ OP_DEFS = [
         "cls": HexExtractOperation,
         "label": "HEX Inline Extract",
         "category": "Innhold",
-        "desc": "Dekoder inline HEX CLOB-tekst i tableX.xml og eksporterer til eksterne .txt-filer. Kjøres før BLOB Konverter.",
+        "desc": ("Dekoder all inline HEX i LOB-kolonner (tableX.xml). Tekst kortere enn "
+                 "min. tekstlengde dekodes inline, lengre tekst eksporteres til .txt-filer. "
+                 "BLOB-kolonner med bare tekst omtypes til CLOB; i binære/blandede "
+                 "BLOB-kolonner dekodes alle felt til .bin-filer uansett størrelse "
+                 "(en BLOB-celle kan ikke holde dekodet tekst). Kjøres før BLOB Konverter."),
         "status": HexExtractOperation.status,
         "params": [
             {"key": "min_text_length", "label": "Min. tekstlengde (tegn)",    "type": "int",  "default": 200},

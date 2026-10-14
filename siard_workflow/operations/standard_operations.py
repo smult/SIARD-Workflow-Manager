@@ -388,8 +388,12 @@ class MetadataExtractOperation(BaseOperation):
             if not entry:
                 raise FileNotFoundError("metadata.xml ikke funnet i SIARD-arkivet")
 
-            with zf.open(entry) as f:
-                root = ET.parse(f).getroot()
+            meta_raw = zf.read(entry)
+            # Estimert <dataOriginTimespan> (skrevet av «Estimer datospenn»)
+            from siard_workflow.core.date_span import ESTIMATE_MARK
+            meta["data_origin_time_span_estimated"] = (
+                ESTIMATE_MARK.encode("utf-8") in meta_raw)
+            root = ET.fromstring(meta_raw)
 
         # ── Rot-nivå-attributter ──────────────────────────────────────────
         # SIARD 2.x: versjon ligger som attributt på rot-elementet
@@ -604,6 +608,8 @@ class MetadataExtractOperation(BaseOperation):
                 from siard_workflow.operations.metadata_pdf import generate_metadata_pdf
                 pdf_opts = {
                     "generate_er_diagram": self.params.get("generate_er_diagram", True),
+                    # Estimert datospenn fra «Estimer datospenn» (date_span), om kjørt
+                    "date_span": ctx.get_result("date_span"),
                 }
                 generate_metadata_pdf(meta, ctx.siard_path, pdf_path, options=pdf_opts)
                 result_data["pdf_path"] = str(pdf_path)
