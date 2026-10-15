@@ -686,6 +686,15 @@ def _date_span_section(ds: dict, inner_w, _kv_table, s_sub, s_small,
         ]))
         return out
     out = [Paragraph("Estimert datospenn for uttrekket", s_sub)]
+    if ds and ds.get("found") and ds.get("accepted") is False:
+        out.append(_kv([
+            ("Estimert fra–til:", f"{ds['from_year']}–{ds['to_year']}  "
+                                  f"({ds.get('from_date', '')} – {ds.get('to_date', '')})"),
+            ("Grunnlag:", ds.get("basis_text", "")),
+            ("Brukt:", f"NEI — forkastet ({ds.get('accept_reason', '')}); ikke skrevet til "
+                       "metadata.xml, ikke brukt i DIAS-pakken"),
+        ]))
+        return out
     if not ds or not ds.get("found"):
         out.append(Paragraph(escape(ds.get("message", "Ingen datoer funnet.") if ds else
                                     "Ingen resultat."), s_small))
@@ -706,15 +715,42 @@ def _date_span_section(ds: dict, inner_w, _kv_table, s_sub, s_small,
         rows.append(("Skrevet til metadata.xml:",
                      f"dataOriginTimespan = «{ds.get('written_value', '')}», "
                      "med XML-kommentar om at verdien er estimert"))
-    if ds.get("tables_scanned"):
-        ts = ds["tables_scanned"]
-        rows.append(("Tabeller lest:", ", ".join(f"{t['table']} ({t['why']})" for t in ts[:12])
-                     + (f" … (+{len(ts) - 12})" if len(ts) > 12 else "")))
-    rows.append(("DIAS-pakke:", "brukes som periode (STARTDATE/ENDDATE)"))
+    for t in ds.get("tiers_tried", []):
+        rows.append(("Prøvd først:", t))
+    rows.append(("DIAS-pakke:", "brukes som periode (STARTDATE/ENDDATE)"
+                 if ds.get("accepted", ds.get("reliable", True))
+                 else "brukes ikke — estimatet er bare veiledende"))
     out.append(_kv(rows))
     out.append(Spacer(1, 0.15 * cm))
     out.append(Paragraph(escape(ds.get("note", "Estimat — ikke nødvendigvis 100 % korrekt.")), note))
-    cols = [c for c in ds.get("columns", []) if c.get("primary") or c.get("excluded")][:15]
+    tabs = ds.get("tables", [])[:40]
+    if tabs:
+        cell = ParagraphStyle("DsTCell", parent=s_small, fontSize=7.5, leading=9, spaceAfter=0)
+        head = ParagraphStyle("DsTHead", parent=cell, fontName="Helvetica-Bold", textColor=C_WHITE)
+        warn = ParagraphStyle("DsTWarn", parent=cell, textColor=C_WARNING, fontName="Helvetica-Bold")
+        data = [[Paragraph(h, head) for h in ("Tabell", "Hovedkolonne", "Datoer",
+                                              "Estimert fra–til", "Merknad")]]
+        for t in tabs:
+            span = f"{t['from_year']}–{t['to_year']}" if t.get("from_year") else "–"
+            note_txt = ("AVVIKER — holdt utenfor estimatet" if t.get("off")
+                        else "avviker fra estimatet" if t.get("deviates")
+                        else "brukt" + (" (rader med LOB-fil)" if t.get("lob_rows") else ""))
+            st = warn if (t.get("off") or t.get("deviates")) else cell
+            data.append([Paragraph(escape(t["table"]), cell), Paragraph(escape(t["column"]), cell),
+                         Paragraph(f"{t['n']:,}".replace(",", " "), cell),
+                         Paragraph(span, st), Paragraph(escape(note_txt), st)])
+        tt = Table(data, colWidths=[inner_w * 0.30, inner_w * 0.22, inner_w * 0.11,
+                                    inner_w * 0.15, inner_w * 0.22], repeatRows=1)
+        tt.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), C_PRIMARY), ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("GRID", (0, 0), (-1, -1), 0.5, C_BORDER),
+            ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [rl_colors.HexColor("#f8f9fa"), C_WHITE]),
+        ]))
+        out.append(Spacer(1, 0.2 * cm))
+        out.append(Paragraph("Tabeller i estimatet — estimert fra–til per tabell", s_small))
+        out.append(tt)
+    cols = [c for c in ds.get("columns", []) if c.get("excluded")][:15]
     if cols:
         cell = ParagraphStyle("DsCell", parent=s_small, fontSize=7.5, leading=9, spaceAfter=0)
         head = ParagraphStyle("DsHead", parent=cell, fontName="Helvetica-Bold", textColor=C_WHITE)
@@ -737,6 +773,7 @@ def _date_span_section(ds: dict, inner_w, _kv_table, s_sub, s_small,
             ("ROWBACKGROUNDS", (0, 1), (-1, -1), [rl_colors.HexColor("#f8f9fa"), C_WHITE]),
         ]))
         out.append(Spacer(1, 0.2 * cm))
+        out.append(Paragraph("Utelatte datokolonner", s_small))
         out.append(t)
     return out
 

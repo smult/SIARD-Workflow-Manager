@@ -496,21 +496,24 @@ OP_DEFS = [
         "desc": (
             "Finner uttrekkets første og siste dato (fra–til). Oppgir metadata.xml et "
             "datospenn (dataOriginTimespan), brukes det uten estimering. Ellers estimeres "
-            "spennet ut fra datoene i LOB-tabeller (rader med dokumenter) og journal-/"
-            "sakstabeller. Fødselsdatoer og frister utelates, og enkeltstående "
+            "spennet fra første nivå med datoer: sak-/journaltabeller → person-/klient-/"
+            "barnetabeller (opprettet-/registrert-dato) → LOB-tabeller (rader med fil). "
+            "Kjørerapporten viser fra–til per tabell, og avvikende tabeller holdes utenfor. "
+            "Fødselsdatoer og frister utelates, og enkeltstående "
             "feilregistreringer (1900-01-01 o.l.) avgjør ikke spennet. Et estimat merkes som "
-            "ESTIMAT i kjørerapporten og metadata-rapporten, og skrives inn i metadata.xml "
-            "med en XML-kommentar om at verdien er estimert. Spennet brukes også som periode "
-            "i DIAS-pakken. Legg operasjonen mellom 'Pakk ut SIARD' og 'Pakk sammen SIARD', "
+            "ESTIMAT. Når et spenn er funnet, velger du om det skal skrives inn i "
+            "metadata.xml (med XML-kommentar om at verdien er estimert) og brukes videre — "
+            "i rapportene og som periode i DIAS-pakken — eller forkastes. Legg operasjonen "
+            "tidlig, rett etter 'Pakk ut SIARD', "
             "og før 'Metadata-uttrekk' og 'Kjørerapport'."
         ),
         "status": DateSpanOperation.status,
         "params": [
             {"key": "trim_percent", "label": "Ytterår med under (%) av datoene regnes som avvik",
              "type": "float", "default": 0.05},
-            {"key": "write_metadata",
-             "label": "Skriv estimatet til metadata.xml (dataOriginTimespan, med kommentar)",
-             "type": "bool", "default": True},
+            {"key": "use_estimate",
+             "label": "Bruk funnet datospenn (skriv til metadata.xml og DIAS-pakke)",
+             "type": "choice", "choices": ["Spør", "Ja", "Nei"], "default": "Spør"},
         ],
     },
     {

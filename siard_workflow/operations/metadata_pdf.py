@@ -118,8 +118,8 @@ def generate_metadata_pdf(
     # estimat. Når metadata.xml selv oppgir spennet, står det under «Tidsperiode»
     # og ingenting estimeres.
     _ds = _opts.get("date_span") or {}
-    if _ds.get("source") == "metadata":
-        _ds = {}
+    if _ds.get("source") == "metadata" or _ds.get("accepted") is False:
+        _ds = {}                     # fra metadata.xml, eller forkastet av brukeren
     _ds_found = bool(_ds.get("found"))
 
     # ── Fargepalett ────────────────────────────────────────────────────────

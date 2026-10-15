@@ -80,9 +80,11 @@ class _PipelineSuggestionDialog(ctk.CTkToplevel):
     result: "ja" | "nei" | "avbryt"
     """
 
-    def __init__(self, parent, message: str):
+    def __init__(self, parent, message: str, heading: str = "Pipeline-modus anbefalt",
+                 yes_text: str = "Ja, legg til automatisk", no_text: str = "Nei, kjør uten",
+                 cancel: bool = True):
         super().__init__(parent)
-        self.result = "avbryt"
+        self.result = "avbryt" if cancel else "nei"
         self.title("Pipeline-forslag")
         self.resizable(False, False)
         self.grab_set()
@@ -98,7 +100,7 @@ class _PipelineSuggestionDialog(ctk.CTkToplevel):
         header.pack(side="top", fill="x", padx=0, pady=0)
         ctk.CTkLabel(
             header,
-            text="  Pipeline-modus anbefalt",
+            text=f"  {heading}",
             font=ctk.CTkFont(family=FONTS["mono"], size=13, weight="bold"),
             text_color=COLORS["accent"],
             anchor="w",
@@ -108,10 +110,10 @@ class _PipelineSuggestionDialog(ctk.CTkToplevel):
         # synlige og aldri skyves ut, uansett hvor langt innholdet er.
         btn_row = ctk.CTkFrame(self, fg_color="transparent")
         btn_row.pack(side="bottom", fill="x", padx=16, pady=14)
-        btn_row.grid_columnconfigure((0, 1, 2), weight=1)
+        btn_row.grid_columnconfigure((0, 1, 2) if cancel else (0, 1), weight=1)
 
         ctk.CTkButton(
-            btn_row, text="Ja, legg til automatisk",
+            btn_row, text=yes_text,
             fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"], text_color=COLORS["on_accent"],
             font=ctk.CTkFont(family=FONTS["mono"], size=11, weight="bold"),
             height=34,
@@ -119,20 +121,21 @@ class _PipelineSuggestionDialog(ctk.CTkToplevel):
         ).grid(row=0, column=0, padx=(0, 6), sticky="ew")
 
         ctk.CTkButton(
-            btn_row, text="Nei, kjør uten",
+            btn_row, text=no_text,
             fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
             font=ctk.CTkFont(family=FONTS["mono"], size=11),
             height=34,
             command=self._on_nei,
         ).grid(row=0, column=1, padx=3, sticky="ew")
 
-        ctk.CTkButton(
-            btn_row, text="Avbryt",
-            fg_color=COLORS["danger_bg"], hover_color=COLORS["danger_hover"], text_color=COLORS["danger_text"], border_color=COLORS["danger_border"], border_width=1,
-            font=ctk.CTkFont(family=FONTS["mono"], size=11),
-            height=34,
-            command=self._on_avbryt,
-        ).grid(row=0, column=2, padx=(6, 0), sticky="ew")
+        if cancel:
+            ctk.CTkButton(
+                btn_row, text="Avbryt",
+                fg_color=COLORS["danger_bg"], hover_color=COLORS["danger_hover"], text_color=COLORS["danger_text"], border_color=COLORS["danger_border"], border_width=1,
+                font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                height=34,
+                command=self._on_avbryt,
+            ).grid(row=0, column=2, padx=(6, 0), sticky="ew")
 
         # Meldingstekst i rullbar ramme — fyller plassen mellom header og
         # knapper. Rammen scroller dersom innholdet er høyere enn maks-høyden.
@@ -149,7 +152,7 @@ class _PipelineSuggestionDialog(ctk.CTkToplevel):
         )
         msg_label.pack(padx=16, pady=(14, 8), fill="x", anchor="nw")
 
-        self.protocol("WM_DELETE_WINDOW", self._on_avbryt)
+        self.protocol("WM_DELETE_WINDOW", self._on_avbryt if cancel else self._on_nei)
 
         # Dynamisk høyde ut fra faktisk innhold (klemt til 85 % av skjermen),
         # sentrert over foreldrevinduet.
@@ -2095,6 +2098,128 @@ class App(ctk.CTk):
         self._pf("avbrutt av operatør")
         return False  # avbrutt
 
+    def _date_span_preflight(self, ops: list) -> bool:
+        """
+        Mangler <dataOriginTimespan> (tolkbart datospenn) i metadata.xml, og
+        «Estimer datospenn» ikke er i arbeidsflyten: forklar operasjonen og
+        tilby å legge den til tidlig — rett etter «Pakk ut SIARD» når den finnes.
+
+        Returnerer True = fortsett kjøring, False = avbryt.
+        """
+        from siard_workflow.core.date_span import metadata_span, read_timespan
+        from siard_workflow.operations import DateSpanOperation
+
+        if any(op.operation_id == "date_span" for op in ops):
+            self._pf("«Estimer datospenn» allerede i arbeidsflyten")
+            return True
+        missing = []
+        for path in self.siard_queue:
+            ts = read_timespan(path)
+            if not metadata_span(ts):
+                missing.append((path, ts))
+        if not missing:
+            self._pf("alle filer oppgir datospenn")
+            return True
+        self._pf(f"{len(missing)} fil(er) uten datospenn — spør operatøren")
+
+        lines = ["metadata.xml oppgir ikke datospenn (<dataOriginTimespan>) for:\n"]
+        for path, ts in missing[:10]:
+            lines.append(f"  \u2022 {path.name}" + (f"  (står: «{ts}»)" if ts else "  (tomt)"))
+        if len(missing) > 10:
+            lines.append(f"  … og {len(missing) - 10} til")
+        lines += [
+            "",
+            "«Estimer datospenn (fra–til)» finner første og siste dato ut fra "
+            "datoverdiene i uttrekket — i prioritert rekkefølge sak-/journaltabeller, "
+            "person-/klienttabeller (opprettet-/registrert-dato) og LOB-tabeller. "
+            "Fødselsdatoer, frister og enkeltstående feilregistreringer avgjør ikke "
+            "spennet, og kjørerapporten viser fra–til per tabell.",
+            "",
+            "Når et datospenn er funnet, spør programmet om det skal skrives til "
+            "metadata.xml (med en XML-kommentar om at verdien er estimert) og brukes "
+            "videre, også som periode i DIAS-pakken. Svarer du nei, forkastes det.",
+            "",
+            "Vil du legge til «Estimer datospenn» "
+            + ("rett etter «Pakk ut SIARD»?"
+               if any(op.operation_id == "unpack_siard" for op in ops)
+               else "først i arbeidsflyten?"),
+        ]
+        dialog = _PipelineSuggestionDialog(self, "\n".join(lines),
+                                           heading="Datospenn mangler i metadata.xml")
+        dialog.title("Datospenn mangler")
+        self.wait_window(dialog)
+
+        if dialog.result == "ja":
+            from siard_workflow.core.workflow_validator import date_span_insert_index
+            ids = [op.operation_id for op in ops]
+            idx = date_span_insert_index(ids)
+            self.workflow_panel.insert_operation_at(DateSpanOperation(), idx)
+            where = ("etter «Pakk ut SIARD»" if "unpack_siard" in ids
+                     else "først i arbeidsflyten" if idx == 0 else "etter SHA256")
+            self._log(f"«Estimer datospenn (fra–til)» lagt til {where}", "ok")
+            self._pf(f"«Estimer datospenn» lagt til {where}")
+            return True
+        if dialog.result == "nei":
+            self._pf((self._pf_status or "funn") + " → operatøren fortsetter uten")
+            return True
+        self._pf("avbrutt av operatør")
+        return False
+
+    def _ask_date_span(self, res: dict) -> bool:
+        """
+        Kalles fra «Estimer datospenn» (arbeidstråd) når et datospenn er
+        estimert: skal det skrives til metadata.xml og brukes videre (rapporter
+        og DIAS-pakke)? True = ja, False = forkast og fortsett uten.
+        """
+        import threading as _threading
+        done = _threading.Event()
+        answer = [False]
+
+        def _show():
+            lines = [
+                f"Estimert datospenn: {res['from_year']}–{res['to_year']}  "
+                f"({res.get('from_date', '')} – {res.get('to_date', '')})",
+                f"Grunnlag: {res.get('basis_text', '')}",
+                f"Sikkerhet: {res.get('confidence', '')}",
+            ]
+            if not res.get("reliable", True):
+                lines += ["", "ADVARSEL: fant ingen sak-/journal-, person-/klient- eller "
+                              "LOB-tabeller med datoer — estimatet bygger på alle tabeller "
+                              "og er bare veiledende."]
+            tabs = res.get("tables", [])
+            if tabs:
+                lines += ["", "Per tabell (estimert fra–til):"]
+                for t in tabs[:12]:
+                    span = (f"{t['from_year']}–{t['to_year']}" if t.get("from_year")
+                            else "ingen datoer")
+                    flag = ("  ← AVVIKER, holdt utenfor" if t.get("off")
+                            else "  ← avviker" if t.get("deviates") else "")
+                    n_txt = f"{t['n']:,}".replace(",", " ")
+                    lines.append(f"  \u2022 {t['table']}.{t['column']}: {span} "
+                                 f"({n_txt} datoer){flag}")
+                if len(tabs) > 12:
+                    lines.append(f"  … og {len(tabs) - 12} tabell(er) til")
+            lines += [
+                "",
+                "Estimatet er ikke nødvendigvis 100 % korrekt.",
+                "",
+                "Ja: skriv datospennet til metadata.xml (<dataOriginTimespan>, med en "
+                "XML-kommentar om at verdien er estimert) og bruk det videre — i "
+                "rapportene og som periode i DIAS-pakken.",
+                "Nei: forkast estimatet og fortsett uten.",
+            ]
+            dlg = _PipelineSuggestionDialog(
+                self, "\n".join(lines), heading="Datospenn funnet",
+                yes_text="Ja, skriv og bruk", no_text="Nei, fortsett uten", cancel=False)
+            dlg.title("Estimert datospenn")
+            self.wait_window(dlg)
+            answer[0] = dlg.result == "ja"
+            done.set()
+
+        self.after(0, _show)
+        done.wait()
+        return answer[0]
+
     def _dependency_preflight(self, ops: list) -> bool:
         """
         Sjekk at Python-pakker og eksterne programmer som operasjonene i
@@ -2485,6 +2610,7 @@ class App(ctk.CTk):
             ("LOB-segmentering (SIARD 2.2→2.1)",           self._segfolder_preflight),
             ("tableX.xsd (DBPTK P_4.3-3 / T_6.3-1)",       self._xsd_type_preflight),
             ("Metadata-kvalitet (dbname/datospenn)",       self._metadata_quality_preflight),
+            ("Datospenn i metadata.xml",                   self._date_span_preflight),
             ("Sluttrapport (PDF)",                         self._report_preflight),
             ("Programvare (pakker og programmer)",         self._dependency_preflight),
             ("LibreOffice (konvertering)",                 self._libreoffice_preflight),
@@ -2655,6 +2781,9 @@ class App(ctk.CTk):
 
             # Callback: Ghostscript-etterbehandling av PDF/A (BLOB-konvertering)
             ctx.metadata["ask_gs_postprocess_cb"] = self._ask_gs_postprocess
+
+            # Callback: skal et estimert datospenn skrives til metadata.xml og brukes?
+            ctx.metadata["ask_date_span_cb"] = self._ask_date_span
 
             # Callback for forhåndsvisning/bekreftelse av SIARD-anonymisering
             ctx.metadata["anonymize_preview_cb"] = self._anonymize_preview_cb

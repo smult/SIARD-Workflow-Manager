@@ -404,6 +404,15 @@ class WorkflowPanel(ctk.CTkFrame):
         if not silent:
             self._validate_and_mark()
 
+    def insert_operation_at(self, op, index: int, *, silent: bool = False) -> None:
+        """Sett inn operasjon på posisjon `index` (0 = først; utenfor → sist)."""
+        self.add_operation(op, silent=True)
+        row = self._rows.pop()
+        self._rows.insert(max(0, min(index, len(self._rows))), row)
+        self._reindex()
+        if not silent:
+            self._validate_and_mark()
+
     def insert_operation_before(self, op, before_id: str, *, silent: bool = False) -> None:
         """Sett inn operasjon rett før den med gitt operation_id (ellers sist)."""
         self.add_operation(op, silent=True)

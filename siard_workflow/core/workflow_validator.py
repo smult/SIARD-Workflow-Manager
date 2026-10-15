@@ -22,6 +22,17 @@ def _before_hex_blob_idxs(ops: list) -> list[int]:
     ]
 
 
+def date_span_insert_index(op_ids: "list[str]") -> int:
+    """
+    Hvor «Estimer datospenn» settes inn når preflight foreslår den: rett etter
+    «Pakk ut SIARD» når den finnes, ellers først (etter en innledende SHA256,
+    som skal være første operasjon).
+    """
+    if "unpack_siard" in op_ids:
+        return op_ids.index("unpack_siard") + 1
+    return 1 if op_ids and op_ids[0] == "sha256" else 0
+
+
 def validate_workflow(ops: list) -> list[tuple]:
     """
     Returnerer liste av (op, melding) for hvert rekkefølgebrudd.
@@ -130,8 +141,7 @@ def validate_workflow(ops: list) -> list[tuple]:
             # utpakkede mappa (ellers en full kopi av SIARD-filen)
             u = _idxs(ops, "unpack_siard")
             r = _idxs(ops, "repack_siard")
-            writes = str(getattr(op, "params", {}).get("write_metadata", True)).lower() \
-                not in ("false", "0")
+            writes = (op.use_mode() != "nei") if hasattr(op, "use_mode") else True
             if writes and u and r and idx <= max(u):
                 msg = "'Estimer datospenn' skal ligge etter 'Pakk ut SIARD'"
             elif writes and u and r and idx >= min(r):

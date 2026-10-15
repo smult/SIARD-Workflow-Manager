@@ -3,8 +3,8 @@
 DateSpanOperation — uttrekkets første og siste dato (fra–til).
 
 Oppgir metadata.xml et spenn i <dataOriginTimespan>, brukes det (ingen
-estimering). Ellers estimeres spennet ut fra datoverdiene i LOB- og
-journal-/sakstabellene. Se core/date_span.py for metoden.
+estimering). Ellers estimeres spennet nivå for nivå: sak-/journaltabeller →
+person-/klienttabeller (opprettet-dato) → LOB-tabeller. Se core/date_span.py.
 
 Et estimat skrives inn i <dataOriginTimespan> (param write_metadata), med en
 XML-kommentar foran som sier at verdien er estimert:
@@ -32,11 +32,11 @@ class DateSpanOperation(BaseOperation):
     label = "Estimer datospenn (fra–til)"
     description = (
         "Finner uttrekkets første og siste dato. Oppgir metadata.xml et datospenn "
-        "(dataOriginTimespan), brukes det. Ellers estimeres spennet ut fra datoene i "
-        "LOB-tabeller (dokumenter) og journal-/sakstabeller — merket som estimat i "
-        "kjørerapporten og metadata-rapporten — og skrives inn i metadata.xml med en "
-        "XML-kommentar om at verdien er estimert. Spennet brukes også som periode i "
-        "DIAS-pakken."
+        "(dataOriginTimespan), brukes det. Ellers estimeres spennet fra sak-/"
+        "journaltabeller, ellers person-/klienttabeller (opprettet-dato), ellers "
+        "LOB-tabeller. Brukeren velger om et estimat skal skrives inn i metadata.xml "
+        "(med XML-kommentar om at verdien er estimert) og brukes videre — i rapportene "
+        "og som periode i DIAS-pakken — eller forkastes."
     )
     category = "Innhold"
     status = 1
@@ -48,8 +48,18 @@ class DateSpanOperation(BaseOperation):
 
     default_params = {
         "trim_percent": 0.05,    # ytterår med under denne andelen (%) av datoene er avvik
-        "write_metadata": True,  # skriv estimatet inn i <dataOriginTimespan>
+        # Bruk et estimert datospenn (skriv til metadata.xml, bruk i DIAS-pakken)?
+        # «Spør» = dialog i GUI; uten GUI som «Ja» for pålitelige estimater
+        "use_estimate": "Spør",
     }
+
+    def use_mode(self) -> str:
+        """«spør» | «ja» | «nei» — også eldre lagret write_metadata=False → «nei»."""
+        if str(self.params.get("write_metadata", True)).lower() in ("false", "0"):
+            return "nei"
+        v = str(self.params.get("use_estimate", "Spør")).strip().lower()
+        return "ja" if v.startswith(("ja", "alltid")) else \
+               "nei" if v.startswith(("nei", "aldri")) else "spør"
 
     def premis_should_record(self, result, ctx) -> bool:
         return bool(result.success) and bool((result.data or {}).get("written_to_metadata"))
@@ -105,16 +115,27 @@ class DateSpanOperation(BaseOperation):
               "et tolkbart datospenn — estimerer fra uttrekket", "warn")
         else:
             w("    metadata.xml oppgir ikke datospenn — estimerer fra uttrekket", "info")
+        for t in res.get("tiers_tried", []):
+            w(f"    Prøvd først — {t}", "info")
         if not res.get("found"):
             w(f"  {res.get('message')}", "warn")
             return self._ok(res, res.get("message", "Ingen datoer funnet"))
         w(f"  ESTIMERT DATOSPENN: {res['from_year']}–{res['to_year']}  "
           f"({res['from_date']} – {res['to_date']})", "ok")
         w(f"    Grunnlag: {res['basis_text']}; sikkerhet: {res['confidence']}", "info")
-        ts = res.get("tables_scanned", [])
-        if ts:
-            w("    Tabeller lest: " + ", ".join(f"{t['table']} ({t['why']})" for t in ts[:8])
-              + (f" … (+{len(ts) - 8})" if len(ts) > 8 else ""), "info")
+        tabs = res.get("tables", [])
+        if tabs:
+            w("    Per tabell (fra–til, hovedkolonne, antall datoer):", "info")
+            for t in tabs[:25]:
+                span = (f"{t['from_year']}–{t['to_year']}" if t.get("from_year")
+                        else "ingen brukbare datoer")
+                flag = ("  ← AVVIKER, holdt utenfor estimatet" if t.get("off")
+                        else "  ← avviker fra estimatet" if t.get("deviates") else "")
+                w(f"      {t['table']}.{t['column']}: {span}  ({t['n']:,} datoer"
+                  + (", rader med LOB-fil" if t.get("lob_rows") else "") + f"){flag}",
+                  "warn" if flag else "info")
+            if len(tabs) > 25:
+                w(f"      … og {len(tabs) - 25} tabell(er) til (se kjørerapporten)", "info")
         if res.get("outside_trim"):
             w(f"    {res['outside_trim']:,} datoverdier utenfor spennet regnes som avvik "
               f"(ytterpunkter {res['absolute_first']} – {res['absolute_last']})", "info")
@@ -122,15 +143,41 @@ class DateSpanOperation(BaseOperation):
         if excluded:
             w("    Ikke brukt: " + ", ".join(f"{c['table']}.{c['column']}" for c in excluded[:6])
               + (" …" if len(excluded) > 6 else "") + " (fødselsdato/frist o.l.)", "info")
-        w(f"    Brukes som periode i DIAS-pakken: {DS._full_date(res['from_date'], True)} – "
-          f"{DS._full_date(res['to_date'], False)}", "info")
+        if not res.get("reliable", True):
+            w("    Bare veiledende (fant ingen sak-/journal-, person-/klient- eller "
+              "LOB-tabeller med datoer)", "warn")
         w(f"    {DS.NOTE}", "info")
 
-        if self.params.get("write_metadata", True) not in (False, "False", "false", 0, "0"):
+        # Skal estimatet brukes? Spør brukeren (GUI), ellers innstillingen
+        mode = self.use_mode()
+        ask = ctx.metadata.get("ask_date_span_cb")
+        if mode == "nei":
+            accepted, why = False, "innstillingen «Bruk funnet datospenn» er Nei"
+        elif mode == "spør" and ask:
             try:
-                self._write_metadata(DS, ctx, pipeline, res, w)
+                accepted = bool(ask(res))
             except Exception as exc:
-                w(f"  [ADVARSEL] Kunne ikke skrive estimatet til metadata.xml: {exc}", "warn")
+                w(f"  [ADVARSEL] Spørsmål om datospenn feilet: {exc}", "warn")
+                accepted = False
+            why = "valgt av bruker" if accepted else "valgt bort av bruker"
+        else:
+            accepted = bool(res.get("reliable", True))
+            why = ("innstillingen «Bruk funnet datospenn»" if accepted
+                   else "bare veiledende — brukes ikke uten brukerens godkjenning")
+        res["accepted"] = accepted
+        res["accept_reason"] = why
+        if not accepted:
+            w(f"  Datospennet forkastes ({why}) — skrives ikke til metadata.xml og "
+              "brukes ikke videre", "warn")
+            return self._ok(res, f"Estimert datospenn {res['from_year']}–{res['to_year']} "
+                                 f"forkastet ({why})")
+        w(f"  Datospennet brukes ({why}) — skrives til metadata.xml og brukes som periode "
+          f"i DIAS-pakken: {DS._full_date(res['from_date'], True)} – "
+          f"{DS._full_date(res['to_date'], False)}", "ok")
+        try:
+            self._write_metadata(DS, ctx, pipeline, res, w)
+        except Exception as exc:
+            w(f"  [ADVARSEL] Kunne ikke skrive estimatet til metadata.xml: {exc}", "warn")
         return self._ok(res, f"Estimert datospenn {res['from_year']}–{res['to_year']} "
                              f"({res['confidence']} sikkerhet)"
                         + ("; skrevet til metadata.xml" if res.get("written_to_metadata")
