@@ -28,6 +28,7 @@ Fremdrift via ctx.metadata["progress_cb"]:
 from __future__ import annotations
 
 import concurrent.futures
+import struct
 import csv
 import datetime
 import hashlib
@@ -659,77 +660,292 @@ def _append_xml_comment_to_line(line: bytes, comment: str) -> bytes:
     return stripped + f' <!-- {comment} -->'.encode('utf-8') + newline
 
 
-def _patch_line_with_digest(
-        line: bytes,
-        ren_bytes: dict[bytes, bytes],
-        ren_paths: dict[bytes, Path]) -> tuple[bytes, int]:
-    """
-    Erstatt filnavn, length og digest i én XML-linje.
+_REF_MARKERS = (b'file="', b"file='", b'fileName="', b"fileName='",
+                b'href="',  b"href='")
+_RE_CELL_TAG = re.compile(rb"<c(\d+)\b")
+_RE_ATTR_LENGTH = re.compile(rb"(\slength=)([\"'])[^\"']*\2")
+_RE_ATTR_DIGEST = re.compile(rb"(\sdigest=)([\"'])[^\"']*\2")
 
-    Finner file="gammelt_navn", erstatter med nytt navn, og oppdaterer
-    length og digest-attributtene fra den faktiske nye filen på disk.
-    Returnerer (ny_linje, antall_endringer).
-    """
+
+# Lange operasjoner logger fremdrift minst så ofte (sekunder), selv mellom 10 %-stegene
+PROGRESS_HEARTBEAT_S = 30 * 60
+
+
+def _eta_text(t_start: float, now: float, pct: float) -> str:
+    """«, 2 t 10 min brukt, ca. 5 t 30 min igjen» ut fra andelen ferdig."""
+    used = now - t_start
+    if used < 60:
+        return ""
+
+    def _fmt(sec: float) -> str:
+        h, m = divmod(int(sec) // 60, 60)
+        return f"{h} t {m} min" if h else f"{m} min"
+    txt = f", {_fmt(used)} brukt"
+    if 0.5 <= pct < 100:
+        txt += f", ca. {_fmt(used * (100 - pct) / pct)} igjen"
+    return txt
+
+
+def _file_size_md5(path: Path) -> "tuple[bytes, bytes]":
+    """(lengde, MD5 i store bokstaver) for en fil — leses i blokker, ikke hele i RAM."""
     import hashlib as _hashlib
+    h = _hashlib.md5()
+    size = 0
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1 << 20)
+            if not chunk:
+                break
+            h.update(chunk)
+            size += len(chunk)
+    return str(size).encode(), h.hexdigest().upper().encode()
 
-    MARKERS = (b'file="', b"file='", b'fileName="', b"fileName='",
-               b'href="',  b"href='")
+
+def _make_ref_lookup(ren_bytes: "dict[bytes, bytes]", ren_paths: "dict[bytes, Path]",
+                     col_ren_bytes: "dict[int, dict[bytes, bytes]] | None" = None,
+                     col_ren_paths: "dict[int, dict[bytes, Path]] | None" = None):
+    """
+    Oppslag key (file=-verdi) + kolonne → (nytt filnavn, ny sti, opprinnelig filnavn).
+    Rekkefølge: eksakt nøkkel i kolonnens egne omdøpinger, eksakt nøkkel (også
+    full sti) globalt, deretter filnavn-delen i kolonnens og så de globale.
+    Ingen kopiering av ordbøkene per linje — O(1) per referanse.
+    """
+    col_ren_bytes = col_ren_bytes or {}
+    col_ren_paths = col_ren_paths or {}
+
+    def lookup(key: bytes, col: "int | None"):
+        base = key.rsplit(b"/", 1)[-1]
+        cb = col_ren_bytes.get(col) if col is not None else None
+        if cb is not None and key in cb:
+            return cb[key], col_ren_paths[col][key], base
+        if key in ren_bytes:
+            return ren_bytes[key], ren_paths[key], base
+        if base != key:
+            if cb is not None and base in cb:
+                return cb[base], col_ren_paths[col][base], base
+            if base in ren_bytes:
+                return ren_bytes[base], ren_paths[base], base
+        return None
+    return lookup
+
+
+def _patch_line_refs(line: bytes, lookup,
+                     comments: "dict[bytes, str] | None" = None,
+                     digests: "dict | None" = None
+                     ) -> "tuple[bytes, int, list[str]]":
+    """
+    Erstatt filnavn, length og digest for hver filreferanse i en XML-linje.
+
+    Hver referanse slås opp direkte (lookup) med kolonnen fra sitt eget
+    <cN>-element — også når hele raden står på én linje. length= og digest=
+    oppdateres bare i SAMME element, fra den nye filen på disk (eller fra
+    `digests` {sti: (lengde, md5)} når de er beregnet på forhånd).
+    Returnerer (ny_linje, antall_endringer, konverteringskommentarer).
+    """
     n = 0
-    for marker in MARKERS:
+    notes: list = []
+    for marker in _REF_MARKERS:
         pos = 0
         while True:
             idx = line.find(marker, pos)
             if idx == -1:
                 break
             start = idx + len(marker)
-            quote = marker[-1:]
-            end   = line.find(quote, start)
+            end = line.find(marker[-1:], start)
             if end == -1:
                 break
             key = line[start:end]
-            if key in ren_bytes:
-                # Direkte treff. ren_bytes[key] er alltid kun basename
-                # (v.name fra Path). Hvis key er en full sti, må vi bevare
-                # mappe-prefikset i den nye refen.
-                new_basename = ren_bytes[key]
-                new_path     = ren_paths[key]
-                if b"/" in key:
-                    dir_prefix = key.rsplit(b"/", 1)[0] + b"/"
-                    new_name   = dir_prefix + new_basename
-                else:
-                    new_name   = new_basename
-            elif b"/" in key:
-                # Fallback: full-sti-key ikke registrert direkte — slå opp på
-                # filnavn-delen alene, men bevar alltid mappe-prefikset.
-                # Slik forblir referansen konsistent: seg0/rec3.txt → seg0/rec3.bin,
-                # og content/schema0/.../rec3.txt → content/schema0/.../rec3.bin.
-                basename = key.rsplit(b"/", 1)[-1]
-                if basename not in ren_bytes:
-                    pos = end + 1
-                    continue
-                new_basename = ren_bytes[basename]
-                new_path     = ren_paths[basename]
-                dir_prefix   = key.rsplit(b"/", 1)[0] + b"/"
-                new_name     = dir_prefix + new_basename
-            else:
+            el_start = line.rfind(b"<", 0, idx)
+            m = _RE_CELL_TAG.match(line, el_start) if el_start >= 0 else None
+            hit = lookup(key, int(m.group(1)) if m else None)
+            if hit is None:
                 pos = end + 1
                 continue
-            # Erstatt filnavn
+            new_basename, new_path, orig_base = hit
+            new_name = (key.rsplit(b"/", 1)[0] + b"/" + new_basename) if b"/" in key \
+                else new_basename
             line = line[:start] + new_name + line[end:]
-            n   += 1
-            pos  = start + len(new_name) + 1
-            # Oppdater length og digest fra ny fil
+            n += 1
+            pos = start + len(new_name) + 1
+            el_start = max(el_start, 0)
+            el_end = line.find(b">", pos - 1)
+            el_end = len(line) if el_end == -1 else el_end + 1
             try:
-                data   = new_path.read_bytes()
-                size   = str(len(data)).encode()
-                digest = _hashlib.md5(data).hexdigest().upper().encode()
-                line = re.sub(rb'length="[^"]*"',  b'length="'  + size   + b'"', line)
-                line = re.sub(rb"length='[^']*'",  b"length='"  + size   + b"'", line)
-                line = re.sub(rb'digest="[^"]*"',  b'digest="'  + digest + b'"', line)
-                line = re.sub(rb"digest='[^']*'",  b"digest='"  + digest + b"'", line)
-            except Exception:
+                sd = digests.get(new_path) if digests else None
+                size, digest = sd if sd else _file_size_md5(new_path)
+                elem = line[el_start:el_end]
+                elem = _RE_ATTR_LENGTH.sub(lambda a: a[1] + a[2] + size + a[2], elem)
+                elem = _RE_ATTR_DIGEST.sub(lambda a: a[1] + a[2] + digest + a[2], elem)
+                line = line[:el_start] + elem + line[el_end:]
+                pos = el_start + len(elem)
+            except OSError:
                 pass   # fil ikke tilgjengelig — behold gammel verdi
-    return line, n
+            if comments:
+                c = comments.get(orig_base)
+                if c and c not in notes:
+                    notes.append(c)
+    return line, n, notes
+
+
+class _DigestCache:
+    """
+    Lengde og MD5 for filer som BLOB-konverteringen skrev, registrert når fila
+    flyttes på plass — så oppdateringen av tableX.xml slipper å åpne og lese
+    alle de nye filene på nytt (på Windows ca. 0,5 ms per fil).
+
+    En verdi brukes bare når fila fortsatt har samme størrelse og endringstid
+    (mtime) — er fila endret etterpå (f.eks. Ghostscript-etterbehandling),
+    beregnes den på nytt. Kompakt: nøkkel = hash av stien, verdi = 32 byte.
+    """
+
+    def __init__(self) -> None:
+        self._d: dict = {}
+        self._lock = threading.Lock()
+        self.hits = 0
+        self.misses = 0
+
+    @staticmethod
+    def _key(path) -> int:
+        return hash(os.path.normcase(os.fspath(path)))
+
+    def remember(self, path) -> None:
+        """Beregn og lagre lengde/MD5 for en ferdig skrevet fil (feil ignoreres)."""
+        import hashlib as _hashlib
+        try:
+            h = _hashlib.md5()
+            size = 0
+            with open(path, "rb") as f:
+                st = os.fstat(f.fileno())
+                while True:
+                    chunk = f.read(1 << 20)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+                    size += len(chunk)
+            if size != st.st_size:
+                return
+            packed = struct.pack("<qq", st.st_size, st.st_mtime_ns) + h.digest()
+        except OSError:
+            return
+        with self._lock:
+            self._d[self._key(path)] = packed
+
+    def get(self, path) -> "tuple[bytes, bytes] | None":
+        """(lengde, MD5 i store bokstaver) som i _file_size_md5, eller None."""
+        packed = self._d.get(self._key(path))
+        if packed is None:
+            self.misses += 1
+            return None
+        size, mtime = struct.unpack_from("<qq", packed)
+        try:
+            st = os.stat(path)
+        except OSError:
+            self.misses += 1
+            return None
+        if st.st_size != size or st.st_mtime_ns != mtime:
+            self.misses += 1
+            return None
+        self.hits += 1
+        return str(size).encode(), packed[16:].hex().upper().encode()
+
+    def __len__(self) -> int:
+        return len(self._d)
+
+
+def _ref_targets(line: bytes, lookup) -> "list[Path]":
+    """Nye filer en linje refererer til (samme oppslag som _patch_line_refs)."""
+    out = []
+    for marker in _REF_MARKERS:
+        pos = 0
+        while True:
+            idx = line.find(marker, pos)
+            if idx == -1:
+                break
+            start = idx + len(marker)
+            end = line.find(marker[-1:], start)
+            if end == -1:
+                break
+            el_start = line.rfind(b"<", 0, idx)
+            m = _RE_CELL_TAG.match(line, el_start) if el_start >= 0 else None
+            hit = lookup(line[start:end], int(m.group(1)) if m else None)
+            if hit is not None:
+                out.append(hit[1])
+            pos = end + 1
+    return out
+
+
+def _safe_size_md5(path: Path) -> "tuple[bytes, bytes] | None":
+    try:
+        return _file_size_md5(path)
+    except OSError:
+        return None
+
+
+# Tråder som leser nye filer og beregner MD5 parallelt (I/O + hashlib slipper GIL)
+_HASH_WORKERS = max(2, min(8, (os.cpu_count() or 4)))
+_PATCH_BATCH = 2000
+
+
+def _patch_lines(lines, lookup, comments=None, pool=None, batch: int = _PATCH_BATCH,
+                 known: "_DigestCache | None" = None):
+    """
+    Gi (linje, antall_endringer) i samme rekkefølge som `lines`. Linjene tas i
+    bunter: lengde/MD5 for de nye filene i bunten hentes fra `known` (registrert
+    under konverteringen) eller beregnes parallelt (pool), deretter oppdateres
+    linjene. Kommentarer legges etter noden.
+    """
+    def run(buf):
+        cache: dict = {}
+        if pool is not None or known is not None:
+            targets = {t for ln in buf if (b"file" in ln or b"href" in ln)
+                       for t in _ref_targets(ln, lookup)}
+            missing = []
+            targets = list(targets)
+            if known is None:
+                found = [None] * len(targets)
+            elif pool is not None and len(targets) > 1:
+                found = list(pool.map(known.get, targets))     # stat parallelt
+            else:
+                found = [known.get(t) for t in targets]
+            for t, r in zip(targets, found):
+                if r:
+                    cache[t] = r
+                else:
+                    missing.append(t)
+            if pool is not None and len(missing) > 1:
+                for t, r in zip(missing, pool.map(_safe_size_md5, missing)):
+                    if r:
+                        cache[t] = r
+        for ln in buf:
+            if b"file" in ln or b"href" in ln:
+                new, n, notes = _patch_line_refs(ln, lookup, comments, cache)
+                if n:
+                    for note in notes:
+                        new = _append_xml_comment_to_line(new, note)
+                    yield new, n
+                    continue
+            yield ln, 0
+
+    buf: list = []
+    for ln in lines:
+        buf.append(ln)
+        if len(buf) >= batch:
+            yield from run(buf)
+            buf = []
+    if buf:
+        yield from run(buf)
+
+
+def _patch_line_with_digest(
+        line: bytes,
+        ren_bytes: dict[bytes, bytes],
+        ren_paths: dict[bytes, Path]) -> tuple[bytes, int]:
+    """
+    Erstatt filnavn, length og digest i én XML-linje (se _patch_line_refs).
+    Returnerer (ny_linje, antall_endringer).
+    """
+    new_line, n, _ = _patch_line_refs(line, _make_ref_lookup(ren_bytes, ren_paths))
+    return new_line, n
 
 
 def _unpack_single_file(path: Path) -> tuple[bytes, str] | None:
@@ -1829,6 +2045,8 @@ class BlobConvertOperation(BaseOperation):
     def run(self, ctx: WorkflowContext) -> OperationResult:
         log = ctx.metadata.get("file_logger")
         pcb = ctx.metadata.get("progress_cb")
+        # Lengde/MD5 for konverterte filer — registreres når de skrives (se _DigestCache)
+        self._digest_cache = _DigestCache()
 
         # Les parallellitet og batch fra globale innstillinger (config.json)
         from settings import get_config as _get_cfg
@@ -4000,6 +4218,7 @@ class BlobConvertOperation(BaseOperation):
                 pdf_target.parent.mkdir(parents=True, exist_ok=True)
                 try:
                     shutil.move(str(pdf_path), str(pdf_target))
+                    self._remember_digest(pdf_target)
                     # Slett kildefilen — men ikke hvis den er lik målfilen
                     # (f.eks. _standardize_bin med src_ext=bin: pdf_target == orig)
                     orig = extract_dir / zip_sti
@@ -4465,6 +4684,7 @@ class BlobConvertOperation(BaseOperation):
                     new_path = blob_path.parent / new_name
                     try:
                         shutil.move(str(result_file), str(new_path))
+                        self._remember_digest(new_path)
                         blob_path.unlink(missing_ok=True)
                         til_sz = new_path.stat().st_size if new_path.exists() else 0
                         with lock:
@@ -4499,6 +4719,7 @@ class BlobConvertOperation(BaseOperation):
                                     _new_name = f"{stem_base}.doc.docx"
                                     _new_path = blob_path.parent / _new_name
                                     shutil.move(str(_retry_file), str(_new_path))
+                                    self._remember_digest(_new_path)
                                     blob_path.unlink(missing_ok=True)
                                     _til_sz = _new_path.stat().st_size if _new_path.exists() else 0
                                     with lock:
@@ -4780,6 +5001,7 @@ class BlobConvertOperation(BaseOperation):
                 target = extract_dir / new_sti
                 try:
                     shutil.move(str(out_pdf), str(target))
+                    self._remember_digest(target)
                     if src.exists() and src.resolve() != target.resolve():
                         src.unlink()
                     if standardize_bin and comment and conversion_registry is not None \
@@ -5110,6 +5332,7 @@ class BlobConvertOperation(BaseOperation):
                 try:
                     _write_zip(result_files, tmp_zip)
                     shutil.move(str(tmp_zip), str(new_path))
+                    self._remember_digest(new_path)
                     if new_path != blob_path:
                         blob_path.unlink(missing_ok=True)
                     w(f"    {len(result_files)} filer → {new_name}", "ok")
@@ -5467,6 +5690,12 @@ class BlobConvertOperation(BaseOperation):
               "Noen SIARD-konsumenter (særlig KDRS Søk & Vis) forventer "
               "kun basename (file=\"record5.bin\") og kan ha problemer "
               "med uvanlige format.", "warn")
+
+    def _remember_digest(self, path) -> None:
+        """Registrer lengde/MD5 for en konvertert fil (brukes av XML-oppdateringen)."""
+        cache = getattr(self, "_digest_cache", None)
+        if cache is not None:
+            cache.remember(path)
 
     def _rename_file(self, extract_dir: Path, zip_sti: str,
                      ext: str) -> str:
@@ -6026,23 +6255,10 @@ class BlobConvertOperation(BaseOperation):
             extras = _xml_patch_extras(col_map, mime_cols, digest_cols)
             head = f"  [{pos}/{n_xml_total}] {xml_sti} ({_fmt_size(sz_bytes)})"
 
-            # Les XML
-            if xml_sti in xml_pre:
-                xml_bytes = xml_pre[xml_sti]
-            else:
-                try:
-                    xml_bytes = xml_file_path.read_bytes()
-                except Exception as exc:
-                    w(f"  FEIL les {xml_sti}: {exc}", "feil")
-                    with lock:
-                        n_xml_done += 1
-                        progress("phase_progress", done=n_xml_done, total=n_xml_total)
-                    return
-
             # Patch
             SIZE_THRESHOLD = 50 * 1024 * 1024
 
-            if xml_sti not in xml_pre and xml_file_path.stat().st_size >= SIZE_THRESHOLD:
+            if xml_sti not in xml_pre and sz_bytes >= SIZE_THRESHOLD:
                 # Stor fil: oppdateres direkte på disk og tar tid — vis start
                 # og fremdrift (resultatet skrives av _patch_xml_file_inplace)
                 w(f"{head}: oppdaterer referanser til {n_files:,} fil(er) direkte "
@@ -6060,7 +6276,21 @@ class BlobConvertOperation(BaseOperation):
                     progress("phase_progress", done=n_xml_done, total=n_xml_total)
                 return
 
-            # Liten/middels fil eller pre-patchet: les inn, patch, skriv tilbake
+            # Liten/middels fil eller pre-patchet: les inn (store filer over leses
+            # aldri inn i minnet — de strømmes linje for linje)
+            if xml_sti in xml_pre:
+                xml_bytes = xml_pre[xml_sti]
+            else:
+                try:
+                    xml_bytes = xml_file_path.read_bytes()
+                except Exception as exc:
+                    w(f"  FEIL les {xml_sti}: {exc}", "feil")
+                    with lock:
+                        n_xml_done += 1
+                        progress("phase_progress", done=n_xml_done, total=n_xml_total)
+                    return
+
+            # Patch, skriv tilbake
             patched, n = self._patch_xml_bytes(xml_bytes, xml_sti, renames,
                                                extract_dir, w,
                                                col_renames=col_renames,
@@ -6092,6 +6322,10 @@ class BlobConvertOperation(BaseOperation):
             stats["xml_updated"] += xml_updated
 
         w(f"  XML ferdig: {xml_updated:,} filreferanse{'r' if xml_updated != 1 else ''} oppdatert", "info")
+        _dc = getattr(self, "_digest_cache", None)
+        if _dc is not None and (_dc.hits or _dc.misses):
+            w(f"    Lengde/MD5: {_dc.hits:,} fra konverteringen, "
+              f"{_dc.misses:,} beregnet under XML-oppdateringen", "info")
 
     def _patch_xml_bytes(self, xml_bytes: bytes, xml_sti: str,
                           renames: dict[str, Path],
@@ -6192,37 +6426,16 @@ class BlobConvertOperation(BaseOperation):
             for orig_name, cmt in line_comments.items():
                 _lc_bytes[orig_name.encode("utf-8")] = cmt
 
-        _COL_RE = re.compile(rb'<c(\d+)\b')
+        # Kolonnebevisst O(1)-oppslag per referanse (se _patch_line_refs)
+        lookup = _make_ref_lookup(ren_bytes, ren_paths, col_ren_bytes, col_ren_paths)
         updates = 0
         out_buf = io.BytesIO()
 
-        for line in io.BytesIO(xml_bytes):
-            if b'file' in line or b'href' in line:
-                # Kolonnebevissst oppslag: finn <cN> i linjen og bruk
-                # kolonne-spesifikke renames for kollisjons-filnavn
-                eff_bytes = ren_bytes
-                eff_paths = ren_paths
-                if col_ren_bytes:
-                    _m = _COL_RE.search(line)
-                    if _m:
-                        col_idx = int(_m.group(1))
-                        if col_idx in col_ren_bytes:
-                            eff_bytes = {**ren_bytes, **col_ren_bytes[col_idx]}
-                            eff_paths = {**ren_paths, **col_ren_paths[col_idx]}
-                # Pre-sjekk kommentar på original linje (før rename)
-                pending_comment: "str | None" = None
-                if _lc_bytes:
-                    for orig_b, cmt in _lc_bytes.items():
-                        if orig_b in line:
-                            pending_comment = cmt
-                            break
-                new_line, n = _patch_line_with_digest(line, eff_bytes, eff_paths)
-                if n > 0:
-                    line = new_line
-                    updates += n
-                    if pending_comment:
-                        line = _append_xml_comment_to_line(line, pending_comment)
-            out_buf.write(line)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=_HASH_WORKERS) as pool:
+            for line, n in _patch_lines(io.BytesIO(xml_bytes), lookup, _lc_bytes, pool,
+                                        known=getattr(self, "_digest_cache", None)):
+                updates += n
+                out_buf.write(line)
 
         if updates == 0:
             return xml_bytes, 0
@@ -6283,55 +6496,37 @@ class BlobConvertOperation(BaseOperation):
         file_sz     = xml_path.stat().st_size
         total_lines = _count_lines(xml_path)
         REPORT      = max(1, total_lines // 10)
-
-        _COL_RE_IP = re.compile(rb'<c(\d+)\b')
+        lookup      = _make_ref_lookup(ren_bytes, ren_paths, col_ren_bytes, col_ren_paths)
+        import time as _time
+        t_start = t_last = _time.monotonic()
 
         try:
             comment_written = False
             comment_bytes   = _conversion_comment()
 
             with open(xml_path, "rb") as src, \
-                 open(tmp_path, "wb", buffering=256 * 1024) as dst:
-                for line in src:
+                 open(tmp_path, "wb", buffering=256 * 1024) as dst, \
+                 concurrent.futures.ThreadPoolExecutor(max_workers=_HASH_WORKERS) as pool:
+                for line, n in _patch_lines(src, lookup, _lc_bytes, pool,
+                                            known=getattr(self, "_digest_cache", None)):
                     line_no += 1
-
-                    if b'file' in line or b'href' in line:
-                        eff_bytes = ren_bytes
-                        eff_paths = ren_paths
-                        if col_ren_bytes:
-                            _m = _COL_RE_IP.search(line)
-                            if _m:
-                                _ci = int(_m.group(1))
-                                if _ci in col_ren_bytes:
-                                    eff_bytes = {**ren_bytes, **col_ren_bytes[_ci]}
-                                    eff_paths = {**ren_paths, **col_ren_paths[_ci]}
-                        # Pre-sjekk kommentar på original linje
-                        pending_comment: "str | None" = None
-                        if _lc_bytes:
-                            for orig_b, cmt in _lc_bytes.items():
-                                if orig_b in line:
-                                    pending_comment = cmt
-                                    break
-                        new_line, n = _patch_line_with_digest(
-                            line, eff_bytes, eff_paths)
-                        if n > 0:
-                            line = new_line
-                            updates += n
-                            if pending_comment:
-                                line = _append_xml_comment_to_line(line,
-                                                                    pending_comment)
-
+                    updates += n
                     dst.write(line)
 
                     if not comment_written and b'?>' in line:
                         comment_written = True
                         dst.write(comment_bytes)
 
-                    if line_no % REPORT == 0 or line_no == total_lines:
+                    # Fremdrift hver 10 % — og uansett hver halvtime (lange filer)
+                    due = (line_no % 2048 == 0
+                           and _time.monotonic() - t_last >= PROGRESS_HEARTBEAT_S)
+                    if line_no % REPORT == 0 or line_no == total_lines or due:
+                        t_last = _time.monotonic()
                         pct = src.tell() / file_sz * 100 if file_sz else 0
                         msg = (f"    {xml_path.name}: "
                                f"{line_no:,}/{total_lines:,} linjer "
-                               f"({pct:.0f}%), {updates:,} filreferanse{'r' if updates != 1 else ''} oppdatert")
+                               f"({pct:.0f}%), {updates:,} filreferanse{'r' if updates != 1 else ''} oppdatert"
+                               + _eta_text(t_start, t_last, pct))
                         w(msg, "info")
 
             tmp_path.replace(xml_path)

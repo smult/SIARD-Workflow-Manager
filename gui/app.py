@@ -2800,7 +2800,10 @@ class App(ctk.CTk):
             run.start_time = time.time()
             file_logger = None
             try:
-                file_logger = WorkflowFileLogger(log_dir, path.stem)
+                # Livstegn hver halvtime — også i GUI-loggen
+                file_logger = WorkflowFileLogger(
+                    log_dir, path.stem,
+                    on_heartbeat=lambda m: self._log_queue.put(("log", m, "muted")))
                 file_logger.__enter__()
                 ctx.metadata["file_logger"] = file_logger
                 # Preflight kjørte på hovedtråden før fil-loggen fantes —
@@ -2848,6 +2851,7 @@ class App(ctk.CTk):
 
                 self._log_queue.put(("step_start", i, op.label))
                 if file_logger:
+                    file_logger.set_step(f"[{i+1}] {op.label}")
                     file_logger.log(f"[{i+1}] {op.label}", "step")
 
                 # ── Prosjektfil: hopp over fullførte steg ─────────────────────
@@ -3223,6 +3227,11 @@ class App(ctk.CTk):
                 elif kind == "conv_error":
                     _, kw = item
                     self._log(f"  [FEIL] {kw['file']}: {kw['error']}", "error")
+                elif kind == "log":
+                    # ("log", melding, nivå) — fra arbeidstråden og livstegnet
+                    _, msg, lvl = (tuple(item) + ("info",))[:3]
+                    self._log(msg, {"ok": "success", "feil": "error"}.get(lvl, lvl))
+                    needs_redraw = True
                 elif kind == "conv_log":
                     _, kw = item
                     msg = kw.get("msg", "")
