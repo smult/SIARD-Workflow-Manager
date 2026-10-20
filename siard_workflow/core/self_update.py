@@ -29,6 +29,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -38,6 +39,7 @@ ProgressCb = Optional[Callable[[int, int], None]]
 
 APP_EXE = "SIARDManager.exe"
 SUMS_NAME = "SHA256SUMS.txt"
+START_TIMEOUT_S = 20          # så lenge vi venter på at byttet-skriptet melder seg
 # Filer/mapper i programmappa som tilhører brukeren og ALDRI byttes ut
 KEEP = ("config.json", "dias.json", "siard_manager.log", "siard_manager_krasj.log",
         "kildesystem_cache.json", "komponenter", "oppdatering.log")
@@ -246,13 +248,40 @@ def launch_swap(new_app: Path, relaunch: bool = True) -> Path:
                       "utf-8-sig")
     flags = 0
     if sys.platform == "win32":
+        # IKKE DETACHED_PROCESS: startet fra SIARDManager.exe (vindusprogram uten
+        # konsoll) kjører PowerShell da aldri skriptet — programmet lukkes, men
+        # ingenting byttes og ingenting startes på nytt. CREATE_NO_WINDOW gir
+        # PowerShell en skjult konsoll, og prosessen lever videre etter os._exit.
         flags = (getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                 | getattr(subprocess, "DETACHED_PROCESS", 0)
                  | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
-    subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                      "-WindowStyle", "Hidden", "-File", str(script)],
-                     creationflags=flags, close_fds=True)
-    return log
+    proc = subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                             "-WindowStyle", "Hidden", "-File", str(script)],
+                            creationflags=flags, close_fds=True,
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    # Programmet skal bare lukkes når skriptet faktisk kjører: vent på at det
+    # skriver sin første linje (med vår pid) i loggen. Ellers — feilmelding,
+    # programmet blir stående, og ingenting er endret.
+    marker = f"pid {os.getpid()})"
+    deadline = time.monotonic() + START_TIMEOUT_S
+    while time.monotonic() < deadline:
+        try:
+            if marker in log.read_text("utf-8-sig", errors="replace"):
+                return log
+        except OSError:
+            pass
+        if proc.poll() is not None:
+            break
+        time.sleep(0.2)
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    raise RuntimeError(
+        "oppdateringsskriptet (PowerShell) startet ikke — programmet lukkes ikke, og "
+        "ingenting er endret. Kjøring av PowerShell-skript kan være sperret på denne "
+        "maskinen (gruppepolicy eller antivirus); last i så fall ned pakken og pakk "
+        "den ut manuelt.")
 
 
 def git_pull() -> "tuple[bool, str]":

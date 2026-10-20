@@ -409,6 +409,19 @@ def _dim(hex_color, factor=0.3):
     return "#{:02x}{:02x}{:02x}".format(r2, g2, b2)
 
 
+# Rekkefølgen på operasjonsfanene
+CATEGORY_ORDER = [
+    "Pipeline",
+    "Integritet",
+    "Sikkerhet",
+    "Kompatibilitet",
+    "Innhold",
+    "Systemspesifikt",
+    "Metadata",
+    "Rapport",
+    "SIP/AIP-pakking",
+]
+
 OP_DEFS = [
         # ── Pipeline-operasjoner ─────────────────────────────────────────────────
     {
@@ -793,7 +806,7 @@ OP_DEFS = [
         "cls":           DiasPackageOperation,
         "custom_dialog": "DiasParamDialog",
         "label":         "DIAS-pakking (SIP/AIC)",
-        "category":      "SIP/AIC-Pakking",
+        "category":      "SIP/AIP-pakking",
         "desc": (
             "Pakker den ferdigbehandlede SIARD-filen inn i et DIAS-pakkeformat "
             "i henhold til METS- og DIAS_PREMIS-standardene, klar for innsending "
@@ -1274,8 +1287,11 @@ class OperationsPanel(ctk.CTkFrame):
             min_status = 2
         visible = [d for d in OP_DEFS if d.get("status", 2) >= min_status]
 
-        # Bygg kun kategorier som har minst én synlig operasjon
-        categories = list(dict.fromkeys(d["category"] for d in visible))
+        # Bygg kun kategorier som har minst én synlig operasjon, i fast
+        # rekkefølge (CATEGORY_ORDER); ukjente kategorier legges bakerst
+        categories = sorted(dict.fromkeys(d["category"] for d in visible),
+                            key=lambda c: (CATEGORY_ORDER.index(c)
+                                           if c in CATEGORY_ORDER else len(CATEGORY_ORDER)))
         self._tabs = ctk.CTkTabview(
             self, height=90,
             fg_color=COLORS["panel"],

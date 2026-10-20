@@ -262,8 +262,10 @@ class UpdateDialog(ctk.CTkToplevel):
             shutil.rmtree(work, ignore_errors=True)
             self._say("Installasjonen ble avbrutt — ingenting er endret.")
             return
+        self._say("Starter installasjonen …")
+        self.update_idletasks()
         try:
-            SU.launch_swap(result["app"])
+            SU.launch_swap(result["app"])      # returnerer når skriptet kjører
         except Exception as exc:
             shutil.rmtree(work, ignore_errors=True)
             self._say(f"Kunne ikke starte installasjonen: {exc}", error=True)

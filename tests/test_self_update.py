@@ -114,6 +114,76 @@ def test_swap(tmp: Path) -> None:
         "loggen sier at forrige versjon ble gjenopprettet")
 
 
+_WINDOWLESS = r'''
+import os, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[3])
+import app_paths
+from siard_workflow.core import self_update as SU
+new, target = Path(sys.argv[1]), Path(sys.argv[2])
+SU.install_dir = lambda: target
+app_paths.data_dir = lambda: target
+SU.launch_swap(new, relaunch=False)
+os._exit(0)
+'''
+
+
+def test_launch_windowless(tmp: Path) -> None:
+    """
+    «Last ned og installer» fra SIARDManager.exe: et vindusprogram UTEN konsoll.
+    Med DETACHED_PROCESS kjørte PowerShell da aldri skriptet — programmet
+    lukket seg, men ingenting ble byttet og det startet ikke igjen (1.4.10–1.4.12).
+    """
+    print("test_launch_windowless")
+    pyw = Path(sys.executable).with_name("pythonw.exe")
+    if sys.platform != "win32" or not pyw.exists():
+        print("  (krever Windows og pythonw.exe)")
+        return
+    new, dst = _install(tmp, "vindu")
+    script = tmp / "vindu_start.py"
+    script.write_text(_WINDOWLESS, "utf-8")
+    subprocess.run([str(pyw), str(script), str(new), str(dst), str(_ROOT)], timeout=60)
+    log = dst / "oppdatering.log"
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        if log.exists() and "Oppdatering installert" in log.read_text("utf-8-sig"):
+            break
+        time.sleep(0.5)
+    _ok((dst / "SIARDManager.exe").read_text("utf-8") == "exe v2"
+        and (dst / "config.json").read_text("utf-8") == '{"min": "innstilling"}',
+        "startet fra et program uten konsoll (som SIARDManager.exe): filene byttes, "
+        "innstillinger beholdes")
+
+
+def test_launch_not_started(tmp: Path) -> None:
+    print("test_launch_not_started")
+    import app_paths
+    from siard_workflow.core import self_update as SU
+    new, dst = _install(tmp, "sperret")
+
+    class _Dead:
+        def poll(self):
+            return 1
+
+        def kill(self):
+            pass
+    saved = (SU.install_dir, app_paths.data_dir, SU.subprocess.Popen, SU.START_TIMEOUT_S)
+    SU.install_dir = lambda: dst
+    app_paths.data_dir = lambda: dst
+    SU.subprocess.Popen = lambda *a, **k: _Dead()      # PowerShell sperret / startet ikke
+    SU.START_TIMEOUT_S = 2
+    try:
+        try:
+            SU.launch_swap(new, relaunch=False)
+            raised = ""
+        except RuntimeError as exc:
+            raised = str(exc)
+    finally:
+        SU.install_dir, app_paths.data_dir, SU.subprocess.Popen, SU.START_TIMEOUT_S = saved
+    _ok("startet ikke" in raised and (dst / "SIARDManager.exe").read_text("utf-8") == "exe v1",
+        "skriptet starter ikke → feilmelding, programmet lukkes ikke, ingenting endret")
+
+
 class _Quiet(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -180,6 +250,8 @@ def main() -> int:
         tmp = Path(td)
         test_assets()
         test_swap(tmp)
+        test_launch_windowless(tmp)
+        test_launch_not_started(tmp)
         test_prepare(tmp)
     print("\nAlle tester OK")
     return 0
