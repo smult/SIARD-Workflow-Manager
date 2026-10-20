@@ -472,7 +472,24 @@ class ProgressPanel(ctk.CTkFrame):
                                           text_color=COLORS["text"])
             self._draw_simple()
 
-    def set_phase_progress(self, done: int, total: int, label: str = ""):
+    def set_phase_progress(self, done: int, total: int, label: str = "",
+                           text: str = "", eta: str = ""):
+        """
+        Fremdrift i gjeldende fase. text: ferdig statustekst (erstatter
+        «label done/total (pct)»), f.eks. «Pakker ut: 12/40 filer · 1,2 GB av 4 GB»;
+        total=0 med text = fortsatt ubestemt (f.eks. mens fillisten bygges).
+        eta: tekst i hjørnet, f.eks. «ca. 8 min igjen».
+        """
+        if text and self._simple_mode and not self._simple_done:
+            if total:
+                self._simple_pct = done / total
+                text = f"{text}  ({done / total * 100:.0f} %)"
+            self._simple_status.configure(text=text, text_color=COLORS["text"])
+            if eta:
+                self._eta_lbl.configure(text=eta, text_color=COLORS["muted"])
+            self._draw_simple()
+            if not total:
+                return
         pct = done / total if total else 0
         idx = self._current_phase - 1
         if 0 <= idx < len(self._phase_canvases):
@@ -482,7 +499,7 @@ class ProgressPanel(ctk.CTkFrame):
                 text=f"{done:,}/{total:,}" if total < 10000 else f"{pct*100:.0f}%",
                 text_color=COLORS["text"])
         # Simple-modus: oppdater den bestemte progressbaren med % ferdig
-        if self._simple_mode and not self._simple_done:
+        if self._simple_mode and not self._simple_done and not text:
             self._simple_pct = pct
             lbl = label or self._simple_phase_label
             self._simple_status.configure(

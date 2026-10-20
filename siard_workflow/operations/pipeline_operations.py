@@ -14,9 +14,11 @@ Anbefalt rekkefølge:
 """
 from __future__ import annotations
 
+import concurrent.futures
 import datetime
 import shutil
 import tempfile
+import time
 import zipfile
 from pathlib import Path, PurePosixPath
 
@@ -28,6 +30,48 @@ from siard_workflow.core.siard_format import (
     detect_folder_siard_version, rewrite_siardversion_path,
 )
 from siard_workflow.core import external_lob
+from siard_workflow.core.zip_progress import (
+    BIG_FILE, CHUNK, ByteProgress, extract_all, fmt_bytes, fmt_duration,
+    read_small, scan_files,
+)
+
+
+def _root_tag_end(head: bytes) -> int:
+    """
+    Posisjon rett etter rot-elementets starttag (etter XML-deklarasjon og
+    kommentarer). Navnerom og versjon står her — dataradene etter røres ikke
+    når en stor tableX.xml strømmes. Faller tilbake til siste linjeskift.
+    """
+    i = 0
+    while True:
+        i = head.find(b"<", i)
+        if i < 0 or i + 1 >= len(head):
+            break
+        nxt = head[i + 1:i + 2]
+        if nxt == b"?":
+            j = head.find(b"?>", i)
+            i = j + 2 if j >= 0 else len(head)
+        elif head.startswith(b"<!--", i):
+            j = head.find(b"-->", i)
+            i = j + 3 if j >= 0 else len(head)
+        elif nxt == b"!":
+            j = head.find(b">", i)
+            i = j + 1 if j >= 0 else len(head)
+        else:
+            j = head.find(b">", i)
+            if j >= 0:
+                return j + 1
+            break
+    return head.rfind(b"\n") + 1 or len(head)
+
+
+def _zip_workers() -> int:
+    """Tråder for utpakking/forhåndslesing — flere enn 4 gir ikke mer (diskbundet)."""
+    try:
+        from settings import get_config
+        return max(1, min(4, int(get_config("max_workers", 4) or 4)))
+    except Exception:
+        return 4
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -108,29 +152,26 @@ class UnpackSiardOperation(BaseOperation):
         w(f"  Pakker ut {siard_path.name} → {tmp} ...", "info")
         t0 = datetime.datetime.now()
 
+        # Fremdrift i bytes (jevn, også gjennom store tableX.xml), flere tråder
+        stop_ev = ctx.metadata.get("stop_event")
+
+        def _prog(n_files: int, n_bytes: int) -> ByteProgress:
+            w(f"  {n_files:,} filer, {fmt_bytes(n_bytes)} utpakket størrelse", "info")
+            return ByteProgress("Pakker ut", n_files, n_bytes, pcb, w)
         try:
-            with zipfile.ZipFile(siard_path, "r", allowZip64=True) as zf:
-                original_namelist: list[str] = zf.namelist()
-                n_total = len(original_namelist)
-                n_done = 0
-                REPORT = max(1, n_total // 40)
-
-                for name in original_namelist:
-                    try:
-                        zf.extract(name, tmp)
-                    except Exception as exc:
-                        w(f"  [ADVARSEL] Kunne ikke pakke ut {name}: {exc}", "warn")
-                    n_done += 1
-                    if n_done % REPORT == 0 or n_done == n_total:
-                        if pcb:
-                            pcb("phase_progress", done=n_done, total=n_total)
-
+            original_namelist, n_done = extract_all(
+                siard_path, tmp, _prog, workers=_zip_workers(),
+                stop=(stop_ev.is_set if stop_ev else None),
+                warn=lambda m: w(m, "warn"))
         except Exception as exc:
             shutil.rmtree(tmp, ignore_errors=True)
             return self._fail(f"Kunne ikke åpne SIARD: {exc}")
+        if stop_ev is not None and stop_ev.is_set():
+            shutil.rmtree(tmp, ignore_errors=True)
+            return self._fail("Utpakkingen ble stoppet")
 
         elapsed = (datetime.datetime.now() - t0).total_seconds()
-        w(f"  Pakket ut {n_done:,} filer på {elapsed:.1f}s", "ok")
+        w(f"  Pakket ut {n_done:,} filer på {fmt_duration(elapsed)}", "ok")
 
         ctx.extracted_path = tmp
         data = {
@@ -550,11 +591,14 @@ class RepackSiardOperation(BaseOperation):
         def _ver_path(name: str) -> str:
             return rewrite_siardversion_path(name, target_version)
 
-        all_files = sorted(f for f in extract_dir.rglob("*") if f.is_file())
+        w("  Finner filer …", "info")
+        all_files = scan_files(extract_dir, pcb)          # [(sti, størrelse)]
         n_total   = len(all_files)
         n_written = 0
         t0        = datetime.datetime.now()
-        REPORT    = max(1, n_total // 40)
+        total_bytes = sum(s for _p, s in all_files)
+        w(f"  {n_total:,} filer, {fmt_bytes(total_bytes)}", "info")
+        prog = ByteProgress("Pakker sammen", n_total, total_bytes, pcb, w)
 
         # Bestem kompresjonsnivå (per-instans override vinner over global config)
         from siard_workflow.core.siard_format import (
@@ -578,45 +622,90 @@ class RepackSiardOperation(BaseOperation):
                     dir_entry_out = _ver_path(dir_entry)
                     zf.writestr(zipfile.ZipInfo(dir_entry_out), b"")
 
-                # 2. Alle filer fra filsystemet
-                for file_path in all_files:
+                # 2. Alle filer fra filsystemet. Små filer leses på forhånd i
+                #    tråder (mens ZIP-en skrives), store strømmes i blokker —
+                #    ingen tableX.xml på flere GB leses inn i minnet.
+                def _write(file_path: Path, size: int, data: "bytes | None") -> None:
                     arc_name = str(
                         file_path.relative_to(extract_dir)).replace("\\", "/")
                     arc_name = _ver_path(arc_name)
-
-                    # SIARD XML-filer: transformer versjon
-                    if is_siard_xml(arc_name):
-                        try:
-                            data = siard_version_transform(
-                                file_path.read_bytes(), target_version)
-                        except Exception:
-                            data = file_path.read_bytes()
-                    else:
+                    if data is None and size < BIG_FILE:
                         data = file_path.read_bytes()
+                    if data is not None:
+                        # SIARD XML-filer: transformer versjon
+                        if is_siard_xml(arc_name):
+                            try:
+                                data = siard_version_transform(data, target_version)
+                            except Exception:
+                                pass
+                        # Smart-skip: tving STORED for filer som ER allerede
+                        # komprimerte (basert på magic-bytes, ikke filendelsen).
+                        # Tekstlige `.bin`-filer (xml/rtf/txt) komprimeres normalt.
+                        if (level > 0 and smart_skip
+                                and is_precompressed_bytes(data[:16])):
+                            zf.writestr(arc_name, data,
+                                        compress_type=zipfile.ZIP_STORED)
+                        else:
+                            # Følg ZipFile-konstruktørens nivå
+                            zf.writestr(arc_name, data)
+                        prog.add(len(data), files=1)
+                        return
+                    # Stor fil: strøm i blokker. Versjonstransformasjonen gjelder
+                    # navnerom/versjon i starten av fila (rot-element, XSD-hode)
+                    with open(file_path, "rb") as fh:
+                        head = fh.read(CHUNK)
+                        if is_siard_xml(arc_name):
+                            cut = _root_tag_end(head)
+                            rest_of_head = head[cut:]
+                            try:
+                                head = siard_version_transform(head[:cut], target_version)
+                            except Exception:
+                                head = head[:cut]
+                            head += rest_of_head
+                        if level > 0 and smart_skip and is_precompressed_bytes(head[:16]):
+                            zi = zipfile.ZipInfo(
+                                arc_name, date_time=time.localtime(time.time())[:6])
+                            zi.compress_type = zipfile.ZIP_STORED
+                            target = zi
+                        else:
+                            target = arc_name
+                        with zf.open(target, "w", force_zip64=True) as out:
+                            out.write(head)
+                            prog.add(len(head))
+                            while True:
+                                chunk = fh.read(CHUNK)
+                                if not chunk:
+                                    break
+                                out.write(chunk)
+                                prog.add(len(chunk))
+                    prog.add(files=1)
 
-                    # Smart-skip: tving STORED for filer som ER allerede
-                    # komprimerte (basert på magic-bytes, ikke filendelsen).
-                    # Tekstlige `.bin`-filer (xml/rtf/txt) komprimeres normalt.
-                    if (level > 0 and smart_skip
-                            and is_precompressed_bytes(data[:16])):
-                        zf.writestr(arc_name, data,
-                                    compress_type=zipfile.ZIP_STORED)
-                    else:
-                        # Følg ZipFile-konstruktørens nivå
-                        zf.writestr(arc_name, data)
-                    n_written += 1
+                import itertools
+                window = 256
+                with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=_zip_workers(),
+                        thread_name_prefix="forhandslesing") as pool:
+                    it = iter(all_files)
 
-                    if n_written % REPORT == 0 or n_written == n_total:
-                        if pcb:
-                            pcb("phase_progress", done=n_written, total=n_total)
+                    def _submit():
+                        return [(p, s, pool.submit(read_small, (p, s)))
+                                for p, s in itertools.islice(it, window)]
+                    cur = _submit()
+                    while cur:
+                        nxt = _submit()
+                        for p, s, fut in cur:
+                            _write(p, s, fut.result())
+                            n_written += 1
+                        cur = nxt
+                prog.finish()
 
         except Exception as exc:
             return self._fail(f"Kunne ikke pakke sammen SIARD: {exc}")
 
         elapsed = (datetime.datetime.now() - t0).total_seconds()
         size_mb = dst_path.stat().st_size / 1_048_576
-        w(f"  Skrevet {n_written:,} filer ({size_mb:.1f} MB) på {elapsed:.1f}s",
-          "ok")
+        w(f"  Skrevet {n_written:,} filer ({fmt_bytes(dst_path.stat().st_size)}) på "
+          f"{fmt_duration(elapsed)}", "ok")
         w(f"  Ny SIARD: {dst_path}", "ok")
 
         # Rydd temp

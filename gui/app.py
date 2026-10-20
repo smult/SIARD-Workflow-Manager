@@ -3222,7 +3222,8 @@ class App(ctk.CTk):
                 elif kind == "conv_phase_progress":
                     _, kw = item
                     self.progress_panel.set_phase_progress(
-                        kw["done"], kw["total"], kw.get("label", ""))
+                        kw["done"], kw["total"], kw.get("label", ""),
+                        text=kw.get("text", ""), eta=kw.get("eta", ""))
                     needs_redraw = True
                 elif kind == "conv_error":
                     _, kw = item
