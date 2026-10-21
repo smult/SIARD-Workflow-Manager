@@ -18,9 +18,11 @@ from __future__ import annotations
 
 import concurrent.futures
 import os
+import struct
 import threading
 import time
 import zipfile
+import zlib
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -149,71 +151,164 @@ def extract_all(zip_path: Path, dest: Path, progress_factory: Callable[[int, int
                 workers: int = 4, stop: "Optional[Callable[[], bool]]" = None,
                 warn: "Optional[Callable[[str], None]]" = None) -> "tuple[list[str], int]":
     """
-    Pakk ut hele arkivet til `dest` i `workers` tråder (hver med egen
-    ZipFile-instans). Returnerer (namelist, antall filer). progress_factory
-    (n_filer, bytes_totalt) lager fremdriftsobjektet når innholdet er kjent.
+    Pakk ut hele arkivet til `dest` i `workers` tråder. Returnerer (namelist,
+    antall filer). progress_factory(n_filer, bytes_totalt) lager
+    fremdriftsobjektet når innholdet er kjent.
+
+    Innholdsfortegnelsen leses ÉN gang. Per oppføring beholdes bare
+    posisjon, størrelser, metode, CRC og flagg i kompakte tall-arrayer (~32 byte),
+    og trådene leser rådata direkte fra filposisjonen. (1.4.14 åpnet SIARD-fila
+    på nytt for hver arbeidsbit — med 7,9 mill. oppføringer ble katalogen lest
+    64 ganger og prosessen brukte 20 GB minne.)
     """
+    from array import array
     dest_s = str(dest)
-    with zipfile.ZipFile(zip_path, "r", allowZip64=True) as zf:
-        infos = zf.infolist()
-        names = [zi.filename for zi in infos]
+    names: list = []
+    offs, csizes, sizes = array("Q"), array("Q"), array("Q")
+    crcs, kinds = array("L"), array("L")         # kind = metode | flagg << 16
+    idx = array("L")                             # oppføring → indeks i names
     dirs: set = set()
-    jobs: list = []
-    for zi in infos:
-        target = _target_path(zi.filename, dest_s)
-        if zi.is_dir():
-            dirs.add(target)
-        else:
-            dirs.add(os.path.dirname(target))
-            jobs.append((zi, target))
+    # Uten søppeltømming mens katalogen leses: millioner av ZipInfo-objekter
+    # utløser ellers gjentatte fulle gjennomganger av hele heapen (ingen
+    # sykler skapes her, så det er trygt)
+    import gc
+    gc_was = gc.isenabled()
+    gc.disable()
+    try:
+        _read_catalog(zip_path, dest_s, names, offs, csizes, sizes, crcs, kinds, idx, dirs)
+    finally:
+        if gc_was:
+            gc.enable()
     for d in sorted(dirs):                       # mapper først — ingen kappløp
         os.makedirs(d, exist_ok=True)
-    prog = progress_factory(len(jobs), sum(zi.file_size for zi, _t in jobs))
+    n_jobs = len(idx)
+    prog = progress_factory(n_jobs, sum(sizes))
+    return _extract_entries(zip_path, dest_s, names, offs, csizes, sizes, crcs, kinds,
+                            idx, prog, workers, stop, warn)
 
-    # Sammenhengende biter (leser ZIP-en sekvensielt per tråd), flere biter
-    # enn tråder slik at én stor fil ikke holder igjen resten
-    n_parts = max(1, min(len(jobs), workers * 16))
-    size = -(-len(jobs) // n_parts) if jobs else 1
-    parts = [jobs[i:i + size] for i in range(0, len(jobs), size)]
+
+def _read_catalog(zip_path, dest_s, names, offs, csizes, sizes, crcs, kinds, idx,
+                  dirs) -> None:
+    with zipfile.ZipFile(zip_path, "r", allowZip64=True) as zf:
+        for zi in zf.infolist():
+            names.append(zi.filename)
+            target = _target_path(zi.filename, dest_s)
+            if zi.is_dir():
+                dirs.add(target)
+                continue
+            dirs.add(os.path.dirname(target))
+            idx.append(len(names) - 1)
+            offs.append(zi.header_offset)
+            csizes.append(zi.compress_size)
+            sizes.append(zi.file_size)
+            crcs.append(zi.CRC & 0xFFFFFFFF)
+            kinds.append((zi.compress_type & 0xFFFF) | (zi.flag_bits << 16))
+        zf.filelist = []                          # frigi ZipInfo-objektene nå
+        zf.NameToInfo = {}
+
+
+def _extract_entries(zip_path, dest_s, names, offs, csizes, sizes, crcs, kinds, idx,
+                     prog: ByteProgress, workers: int, stop, warn) -> "tuple[list[str], int]":
+    n_jobs = len(idx)
+    # Sammenhengende biter (sekvensiell lesing per tråd), flere biter enn
+    # tråder slik at én stor fil ikke holder igjen resten
+    n_parts = max(1, min(n_jobs, workers * 16))
+    size = -(-n_jobs // n_parts) if n_jobs else 1
+    parts = [(i, min(i + size, n_jobs)) for i in range(0, n_jobs, size)]
+    fallback: list = []                          # krypterte/uvanlige metoder
+    fb_lock = threading.Lock()
+
+    def _warn(name: str, exc) -> None:
+        if warn:
+            warn(f"  [ADVARSEL] Kunne ikke pakke ut {name}: {exc}")
 
     def run(part) -> None:
-        with zipfile.ZipFile(zip_path, "r", allowZip64=True) as z:
-            for zi, target in part:
+        a, b = part
+        with open(zip_path, "rb") as fh:
+            for j in range(a, b):
                 if stop and stop():
                     return
+                name = names[idx[j]]
+                method, flags = kinds[j] & 0xFFFF, kinds[j] >> 16
+                if flags & 0x1 or method not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+                    with fb_lock:
+                        fallback.append(j)
+                    continue
+                target = _target_path(name, dest_s)
                 try:
-                    if zi.file_size >= BIG_FILE:
-                        with z.open(zi) as src, open(target, "wb") as dst:
-                            while True:
-                                chunk = src.read(CHUNK)
-                                if not chunk:
-                                    break
-                                dst.write(chunk)
-                                prog.add(len(chunk))
-                    else:
-                        # Små filer: lavnivå os.open/os.write (~10 % raskere enn
-                        # filobjekter når hver fil koster ~0,4 ms i filsystemet)
-                        data = z.read(zi)
-                        fd = os.open(target, _WFLAGS, 0o666)
-                        try:
-                            view = memoryview(data)
-                            while view:
-                                view = view[os.write(fd, view):]
-                        finally:
-                            os.close(fd)
-                        prog.add(len(data))
-                    prog.add(files=1)
+                    _extract_raw(fh, offs[j], csizes[j], sizes[j], method, crcs[j],
+                                 target, prog)
                 except Exception as exc:
-                    if warn:
-                        warn(f"  [ADVARSEL] Kunne ikke pakke ut {zi.filename}: {exc}")
-                    prog.add(files=1)
+                    _warn(name, exc)
+                prog.add(files=1)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers),
                                                thread_name_prefix="utpakking") as pool:
         for _ in pool.map(run, parts):
             pass
+    if fallback and not (stop and stop()):
+        with zipfile.ZipFile(zip_path, "r", allowZip64=True) as zf:
+            for j in fallback:
+                name = names[idx[j]]
+                try:
+                    with zf.open(name) as src, open(_target_path(name, dest_s), "wb") as dst:
+                        while True:
+                            chunk = src.read(CHUNK)
+                            if not chunk:
+                                break
+                            dst.write(chunk)
+                            prog.add(len(chunk))
+                except Exception as exc:
+                    _warn(name, exc)
+                prog.add(files=1)
     prog.finish()
-    return names, len(jobs)
+    return names, n_jobs
+
+
+def _extract_raw(fh, offset: int, csize: int, size: int, method: int, crc: int,
+                 target: str, prog: ByteProgress) -> None:
+    """Les én oppføring direkte fra filposisjonen (lokal header), dekomprimer og skriv."""
+    fh.seek(offset)
+    hdr = fh.read(30)
+    if len(hdr) < 30 or hdr[:4] != b"PK\x03\x04":
+        raise zipfile.BadZipFile("ugyldig lokal filheader")
+    n, m = struct.unpack_from("<HH", hdr, 26)
+    fh.seek(offset + 30 + n + m)
+    if size >= BIG_FILE or csize >= BIG_FILE:
+        dec = zlib.decompressobj(-15) if method == zipfile.ZIP_DEFLATED else None
+        left, run_crc = csize, 0
+        with open(target, "wb") as dst:
+            while left > 0:
+                raw = fh.read(min(CHUNK, left))
+                if not raw:
+                    raise EOFError("arkivet sluttet for tidlig")
+                left -= len(raw)
+                data = dec.decompress(raw) if dec else raw
+                run_crc = zlib.crc32(data, run_crc)
+                dst.write(data)
+                prog.add(len(data))
+            if dec:
+                tail = dec.flush()
+                run_crc = zlib.crc32(tail, run_crc)
+                dst.write(tail)
+                prog.add(len(tail))
+        if run_crc & 0xFFFFFFFF != crc:
+            raise zipfile.BadZipFile("feil CRC-32")
+        return
+    raw = fh.read(csize)
+    data = zlib.decompress(raw, -15) if method == zipfile.ZIP_DEFLATED else raw
+    if zlib.crc32(data) & 0xFFFFFFFF != crc:
+        raise zipfile.BadZipFile("feil CRC-32")
+    # Små filer: lavnivå os.open/os.write (~10 % raskere enn filobjekter når
+    # hver fil koster ~0,4 ms i filsystemet)
+    fd = os.open(target, _WFLAGS, 0o666)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+    finally:
+        os.close(fd)
+    prog.add(len(data))
 
 
 # ── Innpakking ───────────────────────────────────────────────────────────────

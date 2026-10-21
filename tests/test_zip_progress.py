@@ -98,6 +98,55 @@ def test_extract_all(tmp: Path) -> None:
     _ok(any("% —" in m for m in logs), "logglinje per 10 %")
 
 
+def test_extract_parse_once(tmp: Path) -> None:
+    """
+    Felles_Link_Hs_Pro (7,9 mill. filer): 1.4.14 åpnet SIARD-fila på nytt for
+    hver av 64 arbeidsbiter — katalogen ble lest 64 ganger, prosessen brukte
+    20 GB minne. Nå leses katalogen én gang; trådene leser rådata direkte.
+    """
+    print("test_extract_parse_once")
+    z = tmp / "mange.siard"
+    with zipfile.ZipFile(z, "w", zipfile.ZIP_DEFLATED) as zf:
+        for i in range(3000):
+            zf.writestr(f"content/schema0/table0/lob4/record{i}.txt", f"rad {i} ".encode() * 40)
+        zf.writestr(zipfile.ZipInfo("content/schema0/table0/lob4/lagret.bin"), b"S" * 500)
+        zf.writestr("content/schema0/table0/lob4/bz.bin", b"B" * 5000,
+                    compress_type=zipfile.ZIP_BZIP2)
+    opened = []
+    real = zipfile.ZipFile
+
+    class Counting(real):
+        def __init__(self, *a, **k):
+            opened.append(a[0])
+            super().__init__(*a, **k)
+    zipfile.ZipFile = Counting
+    try:
+        out = tmp / "mange_ut"
+        names, n = Z.extract_all(z, out, lambda nf, nb: Z.ByteProgress("x", nf, nb), workers=4)
+    finally:
+        zipfile.ZipFile = real
+    with real(z) as zf:
+        same = all((out / zi.filename).read_bytes() == zf.read(zi) for zi in zf.infolist())
+    _ok(n == 3002 and same, "alle filer riktig pakket ut (deflate, lagret og bzip2)")
+    _ok(len(opened) == 2,
+        f"katalogen leses én gang (+1 for bzip2-oppføringen), ikke per arbeidsbit: {len(opened)}")
+
+    # Ødelagt innhold oppdages (CRC-32), resten pakkes ut
+    bad = tmp / "skadet.siard"
+    with real(bad, "w", zipfile.ZIP_STORED) as zf:
+        zf.writestr("a.txt", b"A" * 100)
+        zf.writestr("b.txt", b"B" * 100)
+    raw = bytearray(bad.read_bytes())
+    raw[raw.index(b"A" * 100) + 10] = ord("X")
+    bad.write_bytes(bytes(raw))
+    warns: list = []
+    Z.extract_all(bad, tmp / "skadet_ut", lambda nf, nb: Z.ByteProgress("x", nf, nb),
+                  workers=2, warn=warns.append)
+    _ok(any("a.txt" in w_ and "CRC" in w_ for w_ in warns)
+        and (tmp / "skadet_ut" / "b.txt").read_bytes() == b"B" * 100,
+        "feil CRC-32 rapporteres; øvrige filer pakkes ut")
+
+
 def test_progress_big_file() -> None:
     print("test_progress_big_file")
     events: list = []
@@ -165,6 +214,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="zipprog_") as td:
         tmp = Path(td)
         test_extract_all(tmp)
+        test_extract_parse_once(tmp)
         test_progress_big_file()
         test_unpack_repack(tmp)
     print("\nAlle tester OK")
