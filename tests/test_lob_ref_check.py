@@ -12,7 +12,8 @@ Verifiserer:
      full sti (ok), manglende fil (missing), ekstern referanse (external).
   2. Stikkprøve (max_refs_per_table) og scan_lob_ref_issues.
   3. XMLValidationOperation rapporterer A_M_5.6-1-2 per kolonne + oppsummering,
-     og er grønn etter LobFolderFixOperation med full_file_paths.
+     og er grønn etter LobFolderFixOperation med DBPTK-validering (full sti).
+  4. preflight: ENTEN KDRS Søk & Vis (standard, anbefalt) ELLER DBPTK-validering.
 
 Kjør:  python -X utf8 tests/test_lob_ref_check.py
 """
@@ -133,7 +134,7 @@ def test_check(tmp: Path) -> None:
     _ok(by[("table92", 2)]["external"] == 1 and by[("table92", 2)]["dbptk_fail"] == 0,
         "ekstern referanse telles som ekstern, ikke som feil")
     d = describe_lob_ref_column(c89)
-    _ok("2 av 3" in d and "Full sti i file=" in d and "record3.txt" in d, f"rapportlinje: {d}")
+    _ok("2 av 3" in d and "DBPTK-validering (full sti)" in d and "enten/eller" in d and "record3.txt" in d, f"rapportlinje: {d}")
 
     # Stikkprøve
     with zipfile.ZipFile(siard) as zf:
@@ -151,7 +152,7 @@ def test_xml_validation_and_fix(tmp: Path) -> None:
     res = XMLValidationOperation().run(WorkflowContext(siard_path=siard, metadata=_null_log()))
     am = [e for e in res.data["errors"] if e.startswith("A_M_5.6-1-2")]
     _ok(len(am) == 3, f"XML-validering: 1 kolonnelinje + 2 oppsummeringer (fikk {len(am)})")
-    _ok(any("Full sti i file=" in e for e in am) and any("finnes ikke i arkivet" in e for e in am),
+    _ok(any("DBPTK-validering (full sti)" in e for e in am) and any("finnes ikke i arkivet" in e for e in am),
         "både rettbar og manglende oppsummert")
 
     op = LobFolderFixOperation()
@@ -181,11 +182,95 @@ def test_xml_validation_and_fix(tmp: Path) -> None:
     _ok(not any(e.startswith("A_M_5.6-1-2") for e in res3.data["errors"]), "sjekken kan slås av")
 
 
+def test_ref_target_choice(tmp: Path) -> None:
+    """Enten KDRS Søk & Vis (standard) eller DBPTK-validering — tydelig valg i preflight."""
+    print("test_ref_target_choice")
+    import customtkinter as ctk
+    from gui.app import App
+    import siard_workflow.operations.lobfolder_fix_operation as LF
+    from siard_workflow.operations import UnpackSiardOperation, RepackSiardOperation
+    _ok(LF.LobFolderFixOperation().params.get("ref_target") == LF.REF_KDRS
+        and not LF.LobFolderFixOperation().use_full_paths(),
+        "standard: KDRS Søk & Vis (filnavn beholdes)")
+    _ok(LF.LobFolderFixOperation(ref_target=LF.REF_DBPTK).use_full_paths()
+        and LF.LobFolderFixOperation(full_file_paths=True).use_full_paths(),
+        "DBPTK-validering → full sti (også eldre eksplisitt full_file_paths=True)")
+
+    root = ctk.CTk()
+    root.withdraw()
+    saved_scan = LF.scan_lob_ref_issues
+    LF.scan_lob_ref_issues = lambda path: {
+        "fixable": 555, "missing": 0, "sampled": True, "tables_scanned": 3,
+        "columns": [{"fixable": 1, "schema": "schema0", "table": "table1", "col": 4,
+                     "example_ref": "record1.txt",
+                     "example_full": "content/schema0/table1/lob4/record1.txt"}]}
+    inserted: list = []
+    seen: list = []
+
+    class _Panel:
+        def insert_operation_before(self, op, before_id, silent=False):
+            inserted.append((op, before_id))
+
+        def move_operation_before(self, op, before_id, silent=False):
+            inserted.append(("flyttet", before_id))
+
+    def answer(a):
+        def click():
+            tops = [w for w in root.winfo_children()
+                    if isinstance(w, ctk.CTkToplevel) and w.winfo_exists()]
+            if not tops:
+                root.after(150, click)
+                return
+            d = tops[0]
+            seen.append(d.title())
+            for w in d.winfo_children():
+                for b in w.winfo_children():
+                    try:
+                        seen.append(str(b.cget("text")))
+                    except Exception:
+                        pass
+            getattr(d, "_on_" + a)()
+        root.after(400, click)
+    try:
+        root.siard_queue = [tmp / "x.siard"]
+        root._pf_status = ""
+        root.logs = []
+        root._pf = lambda m: root.logs.append(m)
+        root._log = lambda m, lvl="info": root.logs.append(m)
+        root.workflow_panel = _Panel()
+        pre = App._lob_fullpath_preflight.__get__(root)
+        ops = [UnpackSiardOperation(), RepackSiardOperation()]
+
+        answer("ja")
+        _ok(pre(ops) is True and not inserted and "KDRS Søk & Vis (kun filnavn)" in root.logs[-1],
+            "valg «KDRS Søk & Vis (anbefalt)» → ingen endring av file=")
+        kd = seen.index("KDRS Søk & Vis (anbefalt)")
+        db = seen.index("DBPTK-validering (full sti)")
+        _ok(kd < db and "KDRS Søk & Vis eller DBPTK-validering" in seen[0]
+            and any("KDRS Søk & Vis eller DBPTK-validering" in t for t in seen[1:kd]),
+            "dialogen: tydelig enten/eller-overskrift, KDRS er første (uthevede) knapp")
+
+        answer("nei")
+        _ok(pre(ops) is True and inserted and inserted[-1][1] == "repack_siard"
+            and inserted[-1][0].use_full_paths(),
+            "valg «DBPTK-validering (full sti)» → «Korriger lobFolder» med full sti før «Pakk sammen»")
+
+        inserted.clear()
+        n_seen = len(seen)
+        _ok(pre(ops + [LF.LobFolderFixOperation()]) is True and len(seen) == n_seen
+            and not inserted and "filnavn beholdes" in root.logs[-1],
+            "«Korriger lobFolder» med standardvalg i arbeidsflyten → ingen dialog, KDRS")
+    finally:
+        LF.scan_lob_ref_issues = saved_scan
+        root.destroy()
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="lob_refs_") as td:
         tmp = Path(td)
         test_check(tmp)
         test_xml_validation_and_fix(tmp)
+        test_ref_target_choice(tmp)
     print("\nAlle tester OK")
     return 0
 

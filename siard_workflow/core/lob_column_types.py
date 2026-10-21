@@ -301,7 +301,7 @@ def ref_file_path(extract_dir: Path, lob_dir: Path, ref: str) -> Path:
     """
     Filen en file=-referanse peker på: full sti fra SIARD-rota
     («content/schema0/table0/lob7/record1.bin», skrevet av «Korriger lobFolder»
-    med «Full sti i file=») løses mot utpakket rot; ellers relativt til
+    med DBPTK-validering / full sti) løses mot utpakket rot; ellers relativt til
     kolonnens lob-mappe.
     """
     r = ref.replace("\\", "/")

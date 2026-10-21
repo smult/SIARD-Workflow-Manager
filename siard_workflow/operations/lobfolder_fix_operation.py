@@ -15,7 +15,19 @@ De tre problemene:
   3. Kolonne-nivå lobFolder har avsluttende '/'
      → doble skråstreker i stien: '...lob0//rec0.txt'
 
-Opsjon ``full_file_paths`` (default av):
+Valg ``ref_target`` — ENTEN KDRS Søk & Vis ELLER DBPTK-validering (default KDRS):
+
+  * REF_KDRS  «KDRS Søk & Vis (kun filnavn)»: file= beholder filnavnet
+    (file="record16.txt"). KDRS Søk & Vis finner filene; DBPTK-validatoren
+    melder «not found external lob» (A_M_5.6-1-2).
+  * REF_DBPTK «DBPTK-validering (full sti)»: file= får full content/-sti.
+    DBPTK-validatoren og -importen er fornøyd; KDRS Søk & Vis finner IKKE
+    filene.
+
+  Begge kan ikke oppfylles i samme fil. Eldre ``full_file_paths=True`` (satt
+  eksplisitt, f.eks. i en lagret arbeidsflyt) tolkes som REF_DBPTK.
+
+  Bakgrunn for full sti:
   DBPTK-VALIDATOREN (A_M_5.6-1-2, MetadataColumnsValidator) bygger stien
   ``"content/" + lobFolder + file`` UTEN skilletegn. Med kolonne-lobFolder
   ``schema0/table88/lob4`` og ``file="rec16.txt"`` blir det
@@ -127,7 +139,7 @@ def check_lob_refs(zf: zipfile.ZipFile, max_refs_per_table: int | None = None) -
 
     * dbptk_fail — referanser validatoren ikke finner med sin sammensetting
     * fixable    — av disse: filen finnes under content/… (løses med
-                   «Full sti i file=» i LobFolderFixOperation)
+                   «DBPTK-validering (full sti)» i LobFolderFixOperation)
     * missing    — filen finnes ikke i arkivet i det hele tatt
     * external   — eksterne/absolutte referanser (..-, /-, X:-, URI) — hoppes over
 
@@ -219,8 +231,8 @@ def describe_lob_ref_column(c: dict) -> str:
             f"{c['fixable']:,} av {c['refs']:,} LOB-referanser slås ikke opp av "
             f"DBPTK-validatoren (basenavn + lobFolder «{c['lob_folder'] or ''}» "
             f"uten '/'), men filene finnes — f.eks. file=\"{c['example_ref']}\" → "
-            f"{c['example_full']}. Løses med «Korriger lobFolder» + «Full sti i "
-            f"file=» (merk: KDRS Søk & Vis forventer basenavn)")
+            f"{c['example_full']}. Løses med «Korriger lobFolder» → «DBPTK-validering "
+            f"(full sti)» — men da finner KDRS Søk & Vis ikke filene (enten/eller)")
     if c["missing"]:
         ex = ", ".join(c["missing_examples"])
         parts.append(f"{c['missing']:,} LOB-fil(er) mangler i arkivet, f.eks. {ex}")
@@ -393,6 +405,14 @@ def _patch_table_stream(src, dst, schema_f: str, table_f: str,
 
 # ── Operasjonsklassen ─────────────────────────────────────────────────────────
 
+REF_KDRS = "KDRS Søk & Vis (kun filnavn)"
+REF_DBPTK = "DBPTK-validering (full sti)"
+
+
+def ref_target_is_dbptk(value) -> bool:
+    return str(value or "").strip().upper().startswith("DBPTK")
+
+
 class LobFolderFixOperation(BaseOperation):
     """
     Retter lobFolder-inkompatibiliteter mellom SCFC og DBPTK (issue #1).
@@ -422,8 +442,15 @@ class LobFolderFixOperation(BaseOperation):
     premis_event_type  = "Adjustment"
     premis_event_label = "lobFolder-korreksjon"
     default_params: dict = {
-        "full_file_paths": False,   # file="content/schemaN/tableM/lobK/recordN.ext"
+        # ENTEN KDRS Søk & Vis (filnavn) ELLER DBPTK-validering (full sti i file=)
+        "ref_target": REF_KDRS,
     }
+
+    def use_full_paths(self) -> bool:
+        """True = DBPTK-validering (full sti i file=), False = KDRS Søk & Vis."""
+        if self.params.get("full_file_paths") is True:      # eldre, eksplisitt valg
+            return True
+        return ref_target_is_dbptk(self.params.get("ref_target", REF_KDRS))
 
     def premis_should_record(self, result, ctx) -> bool:
         return bool(result.success) and (
@@ -440,7 +467,11 @@ class LobFolderFixOperation(BaseOperation):
             if pcb:
                 pcb("log", msg=msg, level=lvl)
 
-        full_paths = bool(self.params.get("full_file_paths", False))
+        full_paths = self.use_full_paths()
+        w("  Filreferanser (file=): " + (REF_DBPTK + " — KDRS Søk & Vis finner ikke "
+                                         "filene" if full_paths else
+                                         REF_KDRS + " — DBPTK-validatoren melder "
+                                         "«not found external lob»"), "info")
 
         # ── Pipeline-modus ────────────────────────────────────────────────────
         if ctx.extracted_path and ctx.extracted_path.is_dir():

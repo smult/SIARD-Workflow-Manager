@@ -659,17 +659,23 @@ OP_DEFS = [
             "som hindrer LOB-indeksering i DBPTK (issue #1 / DBPTK #749): "
             "legger til database-nivå <lobFolder>content</lobFolder>, "
             "fjerner 'content/'-prefiks og avsluttende '/' fra kolonne-nivå lobFolder. "
-            "Opsjon «Full sti i file=»: skriver file=\"content/schemaN/tableM/lobK/recordN.ext\" "
-            "slik DBPTK-validatoren (A_M_5.6-1-2) krever — men KDRS Søk & Vis forventer "
-            "bare basenavn, så bruk kun når DBPTK-validering er målet. "
+            "VALG — ENTEN KDRS Søk & Vis ELLER DBPTK-validering (begge går ikke): "
+            "«KDRS Søk & Vis» (standard) beholder filnavnet i file=, slik Søk & Vis "
+            "krever — DBPTK-validatoren melder da «not found external lob». "
+            "«DBPTK-validering» skriver full sti (file=\"content/schemaN/tableM/lobK/"
+            "recordN.ext\") slik DBPTK-validatoren (A_M_5.6-1-2) krever — da finner "
+            "KDRS Søk & Vis ikke filene. "
             "I pipeline-modus: modifiserer metadata.xml (og tableX.xml) i den utpakkede mappen. "
             "Standalone: skriver ny <original>_lobfix.siard."
         ),
         "status": LobFolderFixOperation.status,
         "params": [
-            {"key": "full_file_paths",
-             "label": "Full sti i file= (DBPTK-validator, ikke Søk & Vis)",
-             "type": "bool", "default": False},
+            {"key": "ref_target",
+             "label": "Filreferanser tilpasses (enten/eller)",
+             "type": "choice",
+             "choices": [LobFolderFixOperation.default_params["ref_target"],
+                         "DBPTK-validering (full sti)"],
+             "default": LobFolderFixOperation.default_params["ref_target"]},
         ],
     },
     {

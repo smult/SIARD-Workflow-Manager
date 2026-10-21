@@ -32,6 +32,7 @@ _CONFIG_DEFAULTS: dict = {
     "siardmapper_rows":      5,      # antall eksempelrader i SIARDMapper-dialogen
     "global_temp_dir":  "",          # tom = auto-velg ved filvalg
     "av_executable":    "",          # sti til antivirus-program
+    "av_warning_dismissed": False,   # preflight: ikke varsle om antivirus ved mange filer
     "lo_executable":    "",          # sti til LibreOffice soffice (auto-detektert ved oppstart)
     "av_args":          [],          # tom = auto-sett basert på program
     "av_infected_rc":   1,           # returkode som betyr funn

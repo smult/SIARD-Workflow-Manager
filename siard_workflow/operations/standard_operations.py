@@ -186,9 +186,10 @@ class XMLValidationOperation(BaseOperation):
                                 errors.append(
                                     f"A_M_5.6-1-2 oppsummert: {lr['fixable']:,} referanser "
                                     f"gir «not found external lob» i DBPTK-validatoren "
-                                    f"selv om filene finnes. Kjør «Korriger lobFolder» "
-                                    f"med «Full sti i file=» hvis DBPTK-validering er "
-                                    f"målet (KDRS Søk & Vis forventer basenavn).")
+                                    f"selv om filene finnes. Velg «DBPTK-validering (full "
+                                    f"sti)» i «Korriger lobFolder» hvis DBPTK-validering "
+                                    f"er målet — da finner KDRS Søk & Vis ikke filene "
+                                    f"(enten/eller; standard er KDRS Søk & Vis).")
                             if lr["missing"]:
                                 errors.append(
                                     f"A_M_5.6-1-2 oppsummert: {lr['missing']:,} LOB-fil(er) "

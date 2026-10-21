@@ -1749,20 +1749,24 @@ class App(ctk.CTk):
 
     def _lob_fullpath_preflight(self, ops: list) -> bool:
         """
-        Skanner (stikkprøve) file=-referansene slik DBPTK-validatoren slår dem
-        opp (A_M_5.6-1-2: "content/" + lobFolder + file uten skilletegn).
-        Basenavn-referanser gir «not found external lob» for hver LOB selv om
-        filene finnes. Tilbyr å slå på «Full sti i file=» i «Korriger
-        lobFolder» (legges til om den mangler).
+        Filreferansene (file=) kan tilpasses ENTEN KDRS Søk & Vis ELLER
+        DBPTK-validering — ikke begge:
 
-        Valget er et reelt avveiningsspørsmål — KDRS Søk & Vis forventer
-        basenavn — og gjøres derfor alltid av operatøren.
+          * KDRS Søk & Vis (standard): filnavn i file= («recordN.txt»).
+            DBPTK-validatoren (A_M_5.6-1-2) limer "content/" + lobFolder + file
+            uten skilletegn og melder «not found external lob» for hver LOB.
+          * DBPTK-validering: full sti i file= (content/schemaN/tableM/lobK/…).
+            Da finner KDRS Søk & Vis ikke filene.
+
+        Er «Korriger lobFolder» med i arbeidsflyten, avgjør innstillingen dens
+        (ingen dialog). Ellers spør vi bare når stikkprøven viser referanser
+        DBPTK-validatoren ikke finner — med KDRS Søk & Vis som anbefalt valg.
 
         Returnerer True = fortsett kjøring, False = avbryt.
         """
         from siard_workflow.operations import UnpackSiardOperation
         from siard_workflow.operations.lobfolder_fix_operation import (
-            LobFolderFixOperation, scan_lob_ref_issues)
+            REF_DBPTK, REF_KDRS, LobFolderFixOperation, scan_lob_ref_issues)
 
         # Kun relevant i pipeline-modus
         if not any(isinstance(op, UnpackSiardOperation) for op in ops):
@@ -1770,18 +1774,21 @@ class App(ctk.CTk):
             return True
 
         existing = next((op for op in ops if isinstance(op, LobFolderFixOperation)), None)
-        if existing is not None and existing.params.get("full_file_paths"):
+        if existing is not None:
+            if not existing.use_full_paths():
+                self._pf(f"«Korriger lobFolder»: {REF_KDRS} valgt — filnavn beholdes")
+                return True
             ids = [o.operation_id for o in ops]
             pos = ops.index(existing)
             later = {"hex_extract", "blob_convert", "anonymize", "standardize_ext"}
             if any(i in later for i in ids[pos + 1:]) and "repack_siard" in ids:
                 self.workflow_panel.move_operation_before(existing, "repack_siard")
-                self._log("«Korriger lobFolder» med «Full sti i file=» flyttet rett "
-                          "før «Pakk sammen SIARD» (må kjøre etter HEX/BLOB)", "ok")
-                self._pf("allerede valgt — flyttet sist i arbeidsflyten")
+                self._log("«Korriger lobFolder» med DBPTK-validering (full sti) flyttet "
+                          "rett før «Pakk sammen SIARD» (må kjøre etter HEX/BLOB)", "ok")
+                self._pf(f"«Korriger lobFolder»: {REF_DBPTK} — flyttet sist")
                 return True
-            self._pf("allerede valgt («Full sti i file=» er på)")
-            return True   # allerede valgt — ikke spør igjen
+            self._pf(f"«Korriger lobFolder»: {REF_DBPTK} valgt")
+            return True
 
         hits: dict = {}
         n_missing = 0
@@ -1795,66 +1802,59 @@ class App(ctk.CTk):
                 self._pf(f"ingen rettbare funn; {n_missing:,} referanser til filer "
                          f"som mangler (se «XML-validering»)")
             return True
-        self._pf(f"{sum(lr['fixable'] for lr in hits.values()):,} referanser DBPTK ikke "
-                 f"slår opp (stikkprøve) — spør operatøren")
+        self._pf(f"{sum(lr['fixable'] for lr in hits.values()):,} referanser med bare "
+                 f"filnavn (stikkprøve) — operatøren velger KDRS Søk & Vis eller DBPTK")
 
         lines = [
-            "LOB-referansene bruker basenavn (file=\"recordN.txt\").\n",
-            "DBPTK-validatoren (A_M_5.6-1-2) limer \"content/\" + lobFolder + file",
-            "uten skilletegn, finner ikke filen og rapporterer «not found external",
-            "lob» for HVER LOB — selv om filene finnes i arkivet.\n",
+            "Filreferansene (file=) kan tilpasses ENTEN KDRS Søk & Vis ELLER "
+            "DBPTK-validering — begge går ikke i samme fil.\n",
+            "KDRS SØK & VIS (anbefalt, standard)",
+            "  file=\"recordN.txt\" — filnavnet beholdes. Søk & Vis finner filene.",
+            "  DBPTK-validatoren melder da «not found external lob» (A_M_5.6-1-2) for",
+            "  hver LOB, selv om filene finnes i arkivet.\n",
+            "DBPTK-VALIDERING",
+            "  file=\"content/schemaN/tableM/lobK/recordN.ext\" — full sti. Passerer",
+            "  DBPTK-validatoren og -importen, men KDRS Søk & Vis finner IKKE filene.\n",
+            "Funnet i stikkprøven:",
         ]
         for path, lr in hits.items():
             ex = next((c for c in lr["columns"] if c["fixable"]), None)
             approx = "minst " if lr.get("sampled") else ""
-            lines.append(f"  {path.name}: {approx}{lr['fixable']:,} referanser i "
-                         f"{lr['tables_scanned']} tabell(er)")
+            lines.append(f"  {path.name}: {approx}{lr['fixable']:,} referanser med bare "
+                         f"filnavn i {lr['tables_scanned']} tabell(er)")
             if ex:
                 lines.append(f"    \u2022 f.eks. {ex['schema']}/{ex['table']} c{ex['col']}: "
                              f"file=\"{ex['example_ref']}\" → {ex['example_full']}")
         if n_missing:
             lines.append(f"\n  I tillegg {n_missing:,} referanser til filer som ikke "
                          f"finnes i arkivet (se «XML-validering»).")
-        lines += [
-            "",
-            "«Full sti i file=» skriver content/schemaN/tableM/lobK/recordN.ext og",
-            "passerer både DBPTK-validatoren og -importen.",
-            "MERK: KDRS Søk & Vis forventer basenavn — svar Ja bare hvis",
-            "DBPTK-validering er målet for denne filen.",
-            "",
-            ("Vil du slå på «Full sti i file=» i «Korriger lobFolder»?"
-             if existing is not None else
-             "Vil du legge til «Korriger lobFolder» med «Full sti i file=» "
-             "etter «Pakk ut SIARD»?"),
-        ]
+        lines += ["", "Hvilket mål skal filreferansene tilpasses?"]
 
-        dialog = _PipelineSuggestionDialog(self, "\n".join(lines))
-        dialog.title("LOB-referanser: DBPTK-validatoren finner dem ikke")
+        dialog = _PipelineSuggestionDialog(
+            self, "\n".join(lines),
+            heading="Filreferanser: KDRS Søk & Vis eller DBPTK-validering",
+            yes_text="KDRS Søk & Vis (anbefalt)",
+            no_text="DBPTK-validering (full sti)")
+        dialog.title("Filreferanser: velg KDRS Søk & Vis eller DBPTK-validering")
         self.wait_window(dialog)
 
         if dialog.result == "ja":
+            self._pf((self._pf_status or "funn") + f" → {REF_KDRS} (filnavn beholdes)")
+            self._log(f"Filreferanser: {REF_KDRS} — filnavn i file= beholdes "
+                      "(DBPTK-validatoren vil melde «not found external lob»)", "info")
+            return True
+
+        if dialog.result == "nei":
             # Full sti må skrives SIST (rett før «Pakk sammen SIARD»): HEX Inline
             # Extract og BLOB-konvertering lager/omdøper LOB-filer og skriver
             # nye referanser med bare filnavn — ellers blir formatet blandet.
-            if existing is not None:
-                existing.params["full_file_paths"] = True
-                self.workflow_panel.move_operation_before(existing, "repack_siard")
-                self._log("«Full sti i file=» slått på i «Korriger lobFolder», og "
-                          "operasjonen er flyttet rett før «Pakk sammen SIARD» "
-                          "(DBPTK A_M_5.6-1-2)", "ok")
-                self._pf("funn — «Full sti i file=» slått på, flyttet sist")
-            else:
-                op = LobFolderFixOperation()
-                op.params["full_file_paths"] = True
-                self.workflow_panel.insert_operation_before(op, "repack_siard")
-                self._log("«Korriger lobFolder (SCFC→DBPTK)» med «Full sti i file=» "
-                          "lagt til rett før «Pakk sammen SIARD»", "ok")
-                self._pf("funn — «Korriger lobFolder» med full sti lagt til sist")
+            op = LobFolderFixOperation(ref_target=REF_DBPTK)
+            self.workflow_panel.insert_operation_before(op, "repack_siard")
+            self._log("«Korriger lobFolder (SCFC→DBPTK)» med DBPTK-validering (full sti "
+                      "i file=) lagt til rett før «Pakk sammen SIARD» — KDRS Søk & Vis "
+                      "finner ikke filene i denne SIARD-filen", "ok")
+            self._pf(f"funn → {REF_DBPTK}: «Korriger lobFolder» lagt til sist")
             return True  # ops re-hentes av kalleren
-
-        if dialog.result == "nei":
-            self._pf((self._pf_status or "funn") + " → operatøren fortsetter uten retting")
-            return True  # operatøren avslo — fortsett uten
 
         self._pf("avbrutt av operatør")
         return False  # avbrutt
@@ -2097,6 +2097,90 @@ class App(ctk.CTk):
 
         self._pf("avbrutt av operatør")
         return False  # avbrutt
+
+    def _antivirus_preflight(self, ops: list) -> bool:
+        """
+        Uttrekk med svært mange filer (MANY_FILES) og aktivt antivirus: hver fil
+        som pakkes ut, skannes — 4–5 millioner små filer kan ta over en time
+        bare å opprette. Forklar, mål hastigheten i temp-mappa nå, anslå tiden
+        og oppgi mappa som bør unntas fra skanning. Nevner også mekanisk disk
+        og korte 8.3-navn. Bare informasjon: Fortsett / Fortsett, ikke vis igjen
+        / Avbryt. Returnerer True = fortsett, False = avbryt.
+        """
+        import tempfile as _tf
+        from siard_workflow.core import av_check as AV
+        if not ({"unpack_siard", "blob_convert", "hex_extract"}
+                & {op.operation_id for op in ops}):
+            self._pf("ikke aktuelt (ingen utpakking)")
+            return True
+        counts = {p: AV.zip_entry_count(p) or 0 for p in self.siard_queue}
+        n_max = max(counts.values(), default=0)
+        if n_max < AV.MANY_FILES:
+            self._pf(f"ikke aktuelt ({n_max:,} filer)".replace(",", " "))
+            return True
+        temp_root = Path(str(self._global_temp_dir)) if self._global_temp_dir \
+            else Path(_tf.gettempdir())
+        av = AV.active_antivirus()
+        vol = AV.volume_info(temp_root)
+        if not av and not vol.get("hdd"):
+            self._pf(f"{n_max:,} filer — ikke funnet aktivt antivirus".replace(",", " "))
+            return True
+        rate = AV.measure_file_rate(temp_root)
+        n_txt = f"{n_max:,}".replace(",", " ")
+        summary = (f"{n_txt} filer; antivirus: {', '.join(av) or 'ikke funnet'}"
+                   + (f"; {rate:,.0f} filer/s".replace(",", " ") if rate else "")
+                   + ("; HDD" if vol.get("hdd") else "")
+                   + ("; 8.3-navn på" if vol.get("short_names") else ""))
+        if get_config("av_warning_dismissed"):
+            self._pf(summary + " — varsel slått av")
+            return True
+        self._pf(summary + " — viser varsel")
+
+        lines = [f"Uttrekket har {n_txt} filer. Alle pakkes ut til temp-mappa "
+                 "for identifisering og konvertering, og pakkes inn igjen til slutt.", ""]
+        if av:
+            lines += [f"Antivirus er aktivt ({', '.join(av)}) og skanner hver fil som "
+                      "opprettes. Med millioner av små filer er det dette som tar tid "
+                      "— ikke selve utpakkingen.", ""]
+        if rate:
+            mins = max(1, round(n_max / rate / 60))
+            lines += [f"Målt nå: ca. {rate:,.0f} nye filer per sekund i temp-mappa. ".replace(",", " ")
+                      + f"Utpakkingen alene tar da minst ca. {mins} min, og "
+                        "sammenpakkingen omtrent like lenge.", ""]
+        if av:
+            lines += ["Et unntak i antivirus for temp-mappa gjør typisk utpakking, "
+                      "konvertering og sammenpakking 3–10 ganger raskere. Be IT legge "
+                      "inn unntak (sanntidsskanning) for:",
+                      f"    {temp_root}", ""]
+        if vol.get("hdd"):
+            lines += ["Temp-mappa ligger på en mekanisk disk (HDD). En SSD er langt "
+                      "raskere for mange små filer — velg en temp-mappe på en SSD i "
+                      "innstillingene.", ""]
+        if vol.get("short_names"):
+            drive = temp_root.resolve().drive or "disken"
+            lines += [f"Disken lager korte 8.3-filnavn, som går stadig tregere i mapper "
+                      f"med hundretusener av filer. Kan slås av (administrator): "
+                      f"fsutil 8dot3name set {drive} 1", ""]
+        lines += ["Dette er bare informasjon — kjøringen kan fortsette."]
+        dialog = _PipelineSuggestionDialog(self, "\n".join(lines),
+                                           heading="Mange filer og aktivt antivirus"
+                                           if av else "Mange filer på mekanisk disk",
+                                           yes_text="Fortsett",
+                                           no_text="Fortsett, ikke vis igjen")
+        dialog.title("Utpakking av mange filer")
+        self.wait_window(dialog)
+        if dialog.result == "nei":
+            try:
+                from settings import save_config
+                save_config({"av_warning_dismissed": True})
+            except Exception:
+                pass
+            self._pf((self._pf_status or "") + " → varsel slått av")
+            return True
+        if dialog.result == "ja":
+            return True
+        self._pf("avbrutt av operatør")
+        return False
 
     def _date_span_preflight(self, ops: list) -> bool:
         """
@@ -2615,6 +2699,7 @@ class App(ctk.CTk):
             ("Programvare (pakker og programmer)",         self._dependency_preflight),
             ("LibreOffice (konvertering)",                 self._libreoffice_preflight),
             ("Diskplass (temp/output)",                    self._disk_space_preflight),
+            ("Antivirus og temp-disk (mange filer)",       self._antivirus_preflight),
         ]
         try:
             for label, fn in steps:
