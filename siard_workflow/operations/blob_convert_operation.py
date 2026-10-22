@@ -787,6 +787,18 @@ def _patch_line_refs(line: bytes, lookup,
     return line, n, notes
 
 
+class _NameConflict(Exception):
+    """Målfila for en konvertert LOB finnes allerede og tilhører en annen LOB."""
+
+
+def _target_taken(target: Path, source: Path) -> bool:
+    """Sann når `target` finnes og IKKE er kildefila selv (ville overskrevet en annen LOB)."""
+    try:
+        return target.exists() and target.resolve() != Path(source).resolve()
+    except OSError:
+        return True
+
+
 class _DigestCache:
     """
     Lengde og MD5 for filer som BLOB-konverteringen skrev, registrert når fila
@@ -2276,6 +2288,8 @@ class BlobConvertOperation(BaseOperation):
             "msg_signed_zip":     "  herav ZIP m/ signert PDF",
             "xml_updated":        "XML-noder oppdatert",
             "inline_extracted":   "Inline NBLOB/NCLOB",
+            "inline_name_collisions": "  herav nytt navn (navnet fantes)",
+            "name_conflicts":     "Ikke konvertert: navnekonflikt",
             "missing_blob_refs":  "Manglende blob-refs i XML",
             "lob_columns_retyped": "LOB-kolonner omtypet til BLOB",
         }
@@ -4167,6 +4181,7 @@ class BlobConvertOperation(BaseOperation):
             """Håndter resultatet for én fil: flytt PDF eller behold original."""
             filename      = PurePosixPath(zip_sti).name
             orig_basename = PurePosixPath(zip_sti).name
+            _conflict     = False
             pdf_path  = out_dir / (batch_file.stem + ".pdf")
             ok_this   = pdf_path.exists()
 
@@ -4217,6 +4232,9 @@ class BlobConvertOperation(BaseOperation):
                 pdf_target = extract_dir / pdf_sti
                 pdf_target.parent.mkdir(parents=True, exist_ok=True)
                 try:
+                    # Aldri over en annen LOB med samme stamme (andre rader)
+                    if _target_taken(pdf_target, extract_dir / zip_sti):
+                        raise _NameConflict(pdf_target.name)
                     shutil.move(str(pdf_path), str(pdf_target))
                     self._remember_digest(pdf_target)
                     # Slett kildefilen — men ikke hvis den er lik målfilen
@@ -4236,6 +4254,18 @@ class BlobConvertOperation(BaseOperation):
                         with creg_lock:
                             conversion_registry[creg_basename] = (pdf_target,
                                                                    _creg_comment)
+                except _NameConflict as exc:
+                    w(f"    NAVNEKONFLIKT {zip_sti}: {exc} finnes allerede og tilhører "
+                      f"en annen LOB — ikke konvertert, originalen beholdes uendret",
+                      "feil")
+                    if err_log:
+                        err_log.write(zip_sti, ext,
+                                      f"Navnekonflikt: {exc} finnes allerede (annen LOB) "
+                                      "— ikke konvertert, original beholdt",
+                                      "navnekonflikt")
+                    result_ext = ext
+                    file_ok    = False
+                    _conflict  = True
                 except Exception as exc:
                     w(f"    Flytt feilet {filename}: {exc}", "feil")
                     result_ext = ext
@@ -4247,6 +4277,8 @@ class BlobConvertOperation(BaseOperation):
             with lock:
                 if file_ok:
                     stats["converted"] += 1
+                elif _conflict:
+                    stats["name_conflicts"] = stats.get("name_conflicts", 0) + 1
                 else:
                     if _standardize_bin:
                         # Konvertering feilet — omdøp til .bin (rotstamme) uansett
@@ -4683,6 +4715,8 @@ class BlobConvertOperation(BaseOperation):
                     new_name = f"{final_stem}.{target_ext}"
                     new_path = blob_path.parent / new_name
                     try:
+                        if _target_taken(new_path, blob_path):
+                            raise _NameConflict(new_name)
                         shutil.move(str(result_file), str(new_path))
                         self._remember_digest(new_path)
                         blob_path.unlink(missing_ok=True)
@@ -4718,6 +4752,8 @@ class BlobConvertOperation(BaseOperation):
                                 if _retry_file:
                                     _new_name = f"{stem_base}.doc.docx"
                                     _new_path = blob_path.parent / _new_name
+                                    if _target_taken(_new_path, blob_path):
+                                        raise _NameConflict(_new_name)
                                     shutil.move(str(_retry_file), str(_new_path))
                                     self._remember_digest(_new_path)
                                     blob_path.unlink(missing_ok=True)
@@ -5000,6 +5036,8 @@ class BlobConvertOperation(BaseOperation):
                     comment = None
                 target = extract_dir / new_sti
                 try:
+                    if _target_taken(target, src):
+                        raise _NameConflict(target.name)
                     shutil.move(str(out_pdf), str(target))
                     self._remember_digest(target)
                     if src.exists() and src.resolve() != target.resolve():
@@ -5856,6 +5894,7 @@ class BlobConvertOperation(BaseOperation):
         # over DOM-parsing hvis det ikke finnes inline-innhold.
         if not self._has_inline_candidates(xml_bytes, lob_col_map):
             return xml_bytes, {}, 0
+        self._ensure_lob_allocator(extract_dir)
 
         # ── Store filer: strøm rad-for-rad til disk (konstant minne) ──────────
         # Krever xml_path (kilde på disk) og extract_dir (der LOB-er/patchet XML
@@ -5914,6 +5953,25 @@ class BlobConvertOperation(BaseOperation):
         result = _restore_xml_header(xml_bytes, out.getvalue())
         return result, new_files, n_extracted
 
+    def _ensure_lob_allocator(self, extract_dir) -> None:
+        """Én navnetildeler per utpakket mappe — kjenner filene som finnes fra før."""
+        from siard_workflow.core.lob_naming import LobNameAllocator
+        root = Path(extract_dir) if extract_dir else None
+        cur = getattr(self, "_lob_alloc", None)
+        if cur is not None and getattr(cur, "root", None) == root:
+            return
+
+        def _names(lob_dir: str) -> list:
+            if root is None:
+                return []
+            try:
+                return [e.name for e in os.scandir(root / lob_dir) if e.is_file()]
+            except OSError:
+                return []
+        alloc = LobNameAllocator(_names)
+        alloc.root = root
+        self._lob_alloc = alloc
+
     # ── Delt per-element inline-behandling (DOM + streaming) ──────────────────
 
     def _extract_lob_from_element(self, elem, get_parent, lob_col_map: dict,
@@ -5971,15 +6029,29 @@ class BlobConvertOperation(BaseOperation):
         # Filnavn: recordN når dbptk_lob_names er på (DBPTK-validator P_4.2-3),
         # ellers historisk recN / LOBnnnn.
         if lob_folder:
-            lob_dir  = lob_folder
-            filename = f"{_lob_file_stem(lob_counter, 'rec')}.{ext}"
+            lob_dir = lob_folder
+            stem    = _lob_file_stem(lob_counter, 'rec')
         elif is_wpt_inline:
-            lob_dir  = f"{base_path}/lob{wpt_col_idx}"
-            filename = f"{_lob_file_stem(lob_counter, 'rec')}.{ext}"
+            lob_dir = f"{base_path}/lob{wpt_col_idx}"
+            stem    = _lob_file_stem(lob_counter, 'rec')
         else:
-            lob_dir  = f"{base_path}/lob{lob_counter}"
-            filename = (f"record{lob_counter}.{ext}" if _dbptk_names_enabled()
-                        else f"LOB{lob_counter:04d}.{ext}")
+            lob_dir = f"{base_path}/lob{lob_counter}"
+            stem    = (f"record{lob_counter}" if _dbptk_names_enabled()
+                       else f"LOB{lob_counter:04d}")
+        # Stammen må være LEDIG i mappa: konvertering og XML-oppdatering knytter
+        # filer sammen på stammen. Mappa kan allerede ha recordN-filer fra
+        # originalen (andre rader) — de ville ellers blitt overskrevet.
+        alloc = getattr(self, "_lob_alloc", None)
+        if alloc is not None:
+            free = alloc.take(lob_dir, stem)
+            if free != stem:
+                n_coll = stats.get("inline_name_collisions", 0) + 1
+                stats["inline_name_collisions"] = n_coll
+                if n_coll <= 5:
+                    w(f"    {lob_dir}: «{stem}» finnes fra før (annen rad) — ny fil "
+                      f"heter «{free}.{ext}»", "info")
+                stem = free
+        filename = f"{stem}.{ext}"
         zip_sti_lob = f"{lob_dir}/{filename}"
 
         write_lob(zip_sti_lob, file_bytes)
@@ -6037,6 +6109,7 @@ class BlobConvertOperation(BaseOperation):
 
         Returnerer (liste_over_lob_stier, antall_ekstrahert).
         """
+        self._ensure_lob_allocator(extract_dir)   # ledige filnavn i lob-mappene
         header = self._read_xml_header_prefix(xml_path)
         tmp_path = xml_path.with_suffix(xml_path.suffix + ".tmp_inline")
 

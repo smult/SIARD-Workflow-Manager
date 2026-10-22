@@ -42,7 +42,7 @@ from siard_workflow.core.column_xsd_types import patch_xsd_column_types
 from siard_workflow.core.lob_column_types import (
     is_lob_type as _std_is_lob_type, is_character_lob, set_column_type,
 )
-from siard_workflow.core.lob_naming import lob_file_stem
+from siard_workflow.core.lob_naming import LobNameAllocator, lob_file_stem
 from siard_workflow.core.siard_format import (
     detect_siard_version, siard_version_transform,
     get_target_siard_version, is_siard_xml,
@@ -445,6 +445,9 @@ def _process_table_fs(
 
     lob_written = 0
     row_counter = 0
+    # Ledige filnavn: lob-mappa kan ha recordN-filer fra originalen (andre rader)
+    alloc = LobNameAllocator(
+        lambda d: [e.name for e in os.scandir(d) if e.is_file()] if os.path.isdir(d) else [])
 
     tmp_fd, tmp_path_str = tempfile.mkstemp(suffix=".xml")
     os.close(tmp_fd)
@@ -520,7 +523,8 @@ def _process_table_fs(
                                 stats["hex_blob_small_exported"] = (
                                     stats.get("hex_blob_small_exported", 0) + 1)
 
-                            filename   = f"{lob_file_stem(row_counter, 'xrec')}.{ext}"
+                            filename   = (f"{alloc.take(str(lob_dir), lob_file_stem(row_counter, 'xrec'))}"
+                                          f".{ext}")
                             length     = len(data_bytes)
                             digest     = _md5_upper(data_bytes)
 
@@ -607,6 +611,14 @@ def _process_table(
 
     lob_written = 0
     row_counter = 0
+    # Ledige filnavn: lob-mappa kan ha recordN-filer fra originalen (andre rader)
+    _all_names = zin.namelist()
+
+    def _zip_names(d: str) -> list:
+        pre = d if d.endswith("/") else d + "/"
+        return [n[len(pre):] for n in _all_names
+                if n.startswith(pre) and "/" not in n[len(pre):]]
+    alloc = LobNameAllocator(_zip_names)
 
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=".xml")
     os.close(tmp_fd)
@@ -682,7 +694,8 @@ def _process_table(
                                 # gyldig — dekodes derfor til fil uansett størrelse
                                 stats["hex_blob_small_exported"] = (
                                     stats.get("hex_blob_small_exported", 0) + 1)
-                            filename   = f"{lob_file_stem(row_counter, 'xrec')}.{ext}"
+                            filename   = (f"{alloc.take(lob_folder, lob_file_stem(row_counter, 'xrec'))}"
+                                          f".{ext}")
                             zip_path   = lob_folder + filename
                             length     = len(data_bytes)
                             digest     = _md5_upper(data_bytes)

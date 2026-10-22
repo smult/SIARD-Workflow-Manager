@@ -46,6 +46,7 @@ og endres ikke av en formatkonvertering.
 
 from __future__ import annotations
 
+import os
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -162,13 +163,15 @@ def rewrite_table_refs_to_bin(
 
 
 def resolve_lob_dir(extract_dir: Path, db_lob_folder: str,
-                    col_lob_folder: str, table_dir: Path) -> Path:
+                    col_lob_folder: str, table_dir: Path,
+                    col_index: "int | None" = None) -> Path:
     """
     Finn mappa en kolonnes LOB-referanser er relative til.
 
     SIARD-oppslaget er <db-lobFolder>/<kolonne-lobFolder>/<file>. Vi prøver de
-    variantene som forekommer i praksis og returnerer den første som finnes;
-    ellers tabellmappa (der LOB-ene ligger når kolonnen ikke har lobFolder).
+    variantene som forekommer i praksis og returnerer den første som finnes.
+    Uten kolonne-lobFolder ligger LOB-ene i standardmappa
+    <tabell>/lob<kolonnenummer>/ (slik DBPTK også slår opp) — ellers tabellmappa.
     """
     col = (col_lob_folder or "").strip().strip("/")
     db = (db_lob_folder or "").strip().strip("/")
@@ -178,6 +181,8 @@ def resolve_lob_dir(extract_dir: Path, db_lob_folder: str,
         candidates.append(extract_dir / col)          # col inkluderer alt
         candidates.append(table_dir / col)            # relativt til tabellen
         candidates.append(table_dir / Path(col).name)  # kun siste ledd
+    if col_index is not None:
+        candidates.append(table_dir / f"lob{col_index}")  # standard uten lobFolder
     candidates.append(table_dir)
     for c in candidates:
         if c.is_dir():
@@ -329,7 +334,7 @@ def repair_dangling_lob_refs(extract_dir: Path, w=None) -> dict:
     Returnerer {"refs_repaired": n, "unresolved": n, "details": [...]}.
     """
     extract_dir = Path(extract_dir)
-    stats = {"refs_repaired": 0, "unresolved": 0, "details": []}
+    stats = {"refs_repaired": 0, "unresolved": 0, "details": [], "shared_files": 0}
 
     meta_path = extract_dir / "header" / "metadata.xml"
     if not meta_path.exists():
@@ -368,7 +373,7 @@ def repair_dangling_lob_refs(extract_dir: Path, w=None) -> dict:
                 if not is_lob_type(_txt(col, "type")):
                     continue
                 lob_dir = resolve_lob_dir(
-                    extract_dir, db_lob, _txt(col, "lobFolder"), tdir)
+                    extract_dir, db_lob, _txt(col, "lobFolder"), tdir, idx)
                 if not lob_dir.is_dir():
                     continue
                 by_stem: dict[str, list[str]] = {}
@@ -384,8 +389,14 @@ def repair_dangling_lob_refs(extract_dir: Path, w=None) -> dict:
             fixes: dict[int, dict[str, str]] = {}
             for idx, by_stem in col_files.items():
                 lob_dir = col_dirs[idx]
+                # Flere rader som peker på SAMME fil tyder på navnekollisjon (to LOB-er
+                # fikk samme filnavn, og den ene overskrev den andre)
+                seen: dict = {}
                 for ext_set_ref in scan_table_lob_refs(txml, idx):
-                    if ref_file_path(extract_dir, lob_dir, ext_set_ref).exists():
+                    target = ref_file_path(extract_dir, lob_dir, ext_set_ref)
+                    key = os.path.normcase(str(target))
+                    seen[key] = seen.get(key, 0) + 1
+                    if target.exists():
                         continue
                     stem = ext_set_ref.rsplit("/", 1)[-1].split(".", 1)[0]
                     cands = by_stem.get(stem, [])
@@ -401,6 +412,15 @@ def repair_dangling_lob_refs(extract_dir: Path, w=None) -> dict:
                               f"referansen «{ext_set_ref}» finnes ikke, og "
                               f"{len(cands)} kandidat(er) med samme stamme — "
                               f"ikke rettet", "warn")
+                shared = {k: c for k, c in seen.items() if c > 1}
+                if shared:
+                    stats["shared_files"] += len(shared)
+                    ex, cnt = next(iter(shared.items()))
+                    if w:
+                        w(f"    ADVARSEL: {sfolder}/{tfolder} c{idx}: {len(shared):,} LOB-fil(er) "
+                          f"brukes av flere rader (f.eks. {Path(ex).name} × {cnt}) — mulig "
+                          f"navnekollisjon der én LOB har overskrevet en annen; kontroller "
+                          f"uttrekket", "warn")
             if not fixes:
                 continue
 
@@ -521,7 +541,7 @@ def reconcile_lob_column_types(extract_dir: Path, w=None) -> dict:
         for col_index, ref_pairs in renames.items():
             col = by_index[col_index]
             lob_dir = resolve_lob_dir(
-                extract_dir, col["db_lob_folder"], col["lob_folder"], tdir)
+                extract_dir, col["db_lob_folder"], col["lob_folder"], tdir, col_index)
             for old_ref, new_ref in ref_pairs:
                 src = ref_file_path(extract_dir, lob_dir, old_ref)
                 if not src.exists():
