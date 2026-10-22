@@ -2104,8 +2104,10 @@ class App(ctk.CTk):
         som pakkes ut, skannes — 4–5 millioner små filer kan ta over en time
         bare å opprette. Forklar, mål hastigheten i temp-mappa nå, anslå tiden
         og oppgi mappa som bør unntas fra skanning. Nevner også mekanisk disk
-        og korte 8.3-navn. Bare informasjon: Fortsett / Fortsett, ikke vis igjen
-        / Avbryt. Returnerer True = fortsett, False = avbryt.
+        og korte 8.3-navn — med knapp som slår 8.3 av i et administrator-vindu
+        (gui/many_files_dialog.py). Vises også uten antivirus når temp-disken
+        lager 8.3-navn og én mappe har ≥ LARGE_FOLDER filer. Fortsett / Fortsett,
+        ikke vis igjen / Avbryt. Returnerer True = fortsett, False = avbryt.
         """
         import tempfile as _tf
         from siard_workflow.core import av_check as AV
@@ -2122,22 +2124,37 @@ class App(ctk.CTk):
             else Path(_tf.gettempdir())
         av = AV.active_antivirus()
         vol = AV.volume_info(temp_root)
-        if not av and not vol.get("hdd"):
-            self._pf(f"{n_max:,} filer — ikke funnet aktivt antivirus".replace(",", " "))
+        # Største mappe (oftest en LOB-mappe) — 8.3-navn bremser mer jo fuller den blir
+        big_dir, big_n = "", 0
+        for p in self.siard_queue:
+            for d, c in AV.largest_folders(p, top=1):
+                if c > big_n:
+                    big_dir, big_n = d, c
+        short_big = bool(vol.get("short_names")) and big_n >= AV.LARGE_FOLDER
+        if not av and not vol.get("hdd") and not short_big:
+            self._pf(f"{n_max:,}".replace(",", " ") + " filer — ikke funnet aktivt "
+                     "antivirus, HDD eller 8.3-problem")
             return True
         rate = AV.measure_file_rate(temp_root)
         n_txt = f"{n_max:,}".replace(",", " ")
-        summary = (f"{n_txt} filer; antivirus: {', '.join(av) or 'ikke funnet'}"
+        big_txt = f"{big_n:,}".replace(",", " ")
+        drive = temp_root.resolve().drive or "disken"
+        summary = (f"{n_txt} filer (største mappe {big_txt}); antivirus: "
+                   f"{', '.join(av) or 'ikke funnet'}"
                    + (f"; {rate:,.0f} filer/s".replace(",", " ") if rate else "")
                    + ("; HDD" if vol.get("hdd") else "")
-                   + ("; 8.3-navn på" if vol.get("short_names") else ""))
-        if get_config("av_warning_dismissed"):
+                   + (f"; 8.3-navn PÅ for {drive}" if vol.get("short_names") else
+                      f"; 8.3-navn av for {drive}" if vol.get("short_names") is False else ""))
+        # «Ikke vis igjen» gjelder antivirus/HDD — 8.3 kan rettes herfra, og vises
+        # så lenge det er på og en mappe er stor
+        if get_config("av_warning_dismissed") and not short_big:
             self._pf(summary + " — varsel slått av")
             return True
         self._pf(summary + " — viser varsel")
 
         lines = [f"Uttrekket har {n_txt} filer. Alle pakkes ut til temp-mappa "
-                 "for identifisering og konvertering, og pakkes inn igjen til slutt.", ""]
+                 "for identifisering og konvertering, og pakkes inn igjen til slutt.",
+                 f"Flest filer i én mappe: {big_dir or '–'} — {big_txt} filer.", ""]
         if av:
             lines += [f"Antivirus er aktivt ({', '.join(av)}) og skanner hver fil som "
                       "opprettes. Med millioner av små filer er det dette som tar tid "
@@ -2157,17 +2174,21 @@ class App(ctk.CTk):
                       "raskere for mange små filer — velg en temp-mappe på en SSD i "
                       "innstillingene.", ""]
         if vol.get("short_names"):
-            drive = temp_root.resolve().drive or "disken"
-            lines += [f"Disken lager korte 8.3-filnavn, som går stadig tregere i mapper "
-                      f"med hundretusener av filer. Kan slås av (administrator): "
-                      f"fsutil 8dot3name set {drive} 1", ""]
+            lines += [f"VIKTIG: {drive} lager korte 8.3-filnavn (som «RECORD~1.TXT») for "
+                      "hver fil. Det går stadig tregere jo flere filer en mappe har — "
+                      "allerede ved 300 000 filer i én mappe er det målbart, og mapper "
+                      "med millioner av filer kan bli svært trege. Slå det av før "
+                      "utpakkingen (se under).", ""]
         lines += ["Dette er bare informasjon — kjøringen kan fortsette."]
-        dialog = _PipelineSuggestionDialog(self, "\n".join(lines),
-                                           heading="Mange filer og aktivt antivirus"
-                                           if av else "Mange filer på mekanisk disk",
-                                           yes_text="Fortsett",
-                                           no_text="Fortsett, ikke vis igjen")
-        dialog.title("Utpakking av mange filer")
+        parts = (["antivirus"] if av else []) + (["mekanisk disk"] if vol.get("hdd") else []) \
+            + (["8.3-filnavn"] if vol.get("short_names") else [])
+        from gui.many_files_dialog import ManyFilesDialog
+        dialog = ManyFilesDialog(
+            self, "\n".join(lines), heading="Mange filer — " + ", ".join(parts),
+            short_names=bool(vol.get("short_names")), drive=drive,
+            commands=AV.disable_8dot3_commands(temp_root) if vol.get("short_names") else [],
+            run_elevated=AV.run_elevated,
+            recheck=lambda: AV.volume_info(temp_root).get("short_names"))
         self.wait_window(dialog)
         if dialog.result == "nei":
             try:
