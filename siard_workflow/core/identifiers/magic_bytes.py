@@ -208,9 +208,11 @@ def _detect(data: bytes) -> tuple[str, str, bool]:
         b"\x00\x00\xfe\xff",
     )
     stripped = data
+    had_bom = False
     for bom in _BOMS:
         if stripped.startswith(bom):
             stripped = stripped[len(bom):]
+            had_bom = True
             break
     stripped = stripped.lstrip(b" \t\r\n")
 
@@ -250,7 +252,10 @@ def _detect(data: bytes) -> tuple[str, str, bool]:
     if stripped[:16].startswith(b"<!WPTools_Format"):
         return "wpt", "application/x-wptools", False
 
-    if stripped.startswith(b"<"):
+    # XML/markup: NUL er bare lovlig i UTF-16 (med BOM) — ellers er det
+    # binærdata som tilfeldigvis starter med 0x3C (Extens: 6-byte poster
+    # «<» + NUL ble tatt for XML).
+    if stripped.startswith(b"<") and (had_bom or b"\x00" not in stripped[:512]):
         return "xml", "application/xml", False
 
     # MIME-e-post (.eml) — tekst med e-posthoder; sjekkes før generell tekst
@@ -264,7 +269,45 @@ def _detect(data: bytes) -> tuple[str, str, bool]:
     if _is_utf8_prefix(data[:512]):
         return "txt", "text/plain", False
 
+    if _is_legacy_text(data[:4096]):
+        return "txt", "text/plain", False
+
     return "bin", "application/octet-stream", False
+
+
+# Bytes over 0x7F som er definerte tegn i Windows-1252 (alt unntatt de
+# udefinerte 0x81, 0x8D, 0x8F, 0x90, 0x9D)
+_LEGACY_TEXT_HIGH = frozenset(range(0x80, 0x100)) - {0x81, 0x8D, 0x8F, 0x90, 0x9D}
+_LEGACY_TEXT_CTRL = frozenset((0x09, 0x0A, 0x0C, 0x0D))
+
+
+def _is_legacy_text(chunk: bytes) -> bool:
+    """
+    True hvis `chunk` er lesbar tekst i en 8-bits tegnkoding (Windows-1252 /
+    ISO-8859-1) — ikke gyldig UTF-8 pga. æ/ø/å o.l. Ekte tilfelle: Extens
+    (VAF) lagrer rapportbeskrivelser som tekst i LONG RAW-kolonner; de ble
+    stående som ukjent «bin».
+
+    Strengt for å unngå at korte binærverdier (hasher, poster) tas for tekst:
+    minst 16 byte, ingen kontrolltegn utenom tab/linjeskift, bare definerte
+    Windows-1252-tegn, minst 50 % ASCII-bokstaver/mellomrom og høyst 15 %
+    bytes over 0x7F (norsk tekst har typisk 1–3 %, tilfeldige data ~50 %).
+    """
+    n = len(chunk)
+    if n < 16 or b"\x00" in chunk:
+        return False
+    letters = high = 0
+    for c in chunk:
+        if c < 0x20:
+            if c not in _LEGACY_TEXT_CTRL:
+                return False
+        elif c >= 0x7F:
+            if c not in _LEGACY_TEXT_HIGH:
+                return False
+            high += 1
+        elif c == 0x20 or 0x41 <= c <= 0x5A or 0x61 <= c <= 0x7A:
+            letters += 1
+    return 0 < high <= 0.15 * n and letters >= 0.5 * n
 
 
 def _is_utf8_prefix(chunk: bytes) -> bool:

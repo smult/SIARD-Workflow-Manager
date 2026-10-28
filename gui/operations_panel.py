@@ -840,6 +840,9 @@ OP_DEFS = [
             {"key": "creator",              "label": "Skaper",                         "type": "str",    "default": DiasPackageOperation.default_params["creator"]},
             {"key": "preserver",            "label": "Bevaringsansvarlig",             "type": "str",    "default": DiasPackageOperation.default_params["preserver"]},
             {"key": "output_dir",           "label": "Utdatamappe (tom = SIARD-mappe)","type": "str",    "default": DiasPackageOperation.default_params["output_dir"]},
+            {"key": "confirm_before_packing",
+             "label": "Vis dette vinduet når DIAS-pakkingen starter",
+             "type": "bool", "default": DiasPackageOperation.default_params["confirm_before_packing"]},
         ],
     },
         # ── Rapport ──────────────────────────────────────────────────────────────

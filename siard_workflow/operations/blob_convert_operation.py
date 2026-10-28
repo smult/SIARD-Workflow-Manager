@@ -2286,6 +2286,7 @@ class BlobConvertOperation(BaseOperation):
             "failed":             "Konvertering feilet",
             "msg_converted":      "E-post (MSG/EML) → PDF/A",
             "msg_signed_zip":     "  herav ZIP m/ signert PDF",
+            "extens_png":         "Extens-bilde (DIB) → PNG",
             "xml_updated":        "XML-noder oppdatert",
             "inline_extracted":   "Inline NBLOB/NCLOB",
             "inline_name_collisions": "  herav nytt navn (navnet fantes)",
@@ -3243,6 +3244,17 @@ class BlobConvertOperation(BaseOperation):
                 except Exception:
                     pass
 
+            # ── Extens-bilde (innpakket Windows DIB uten filsignatur) ────────
+            # Gjenkjennes på lengdefeltene i starten og BITMAPINFOHEADER til
+            # slutt i fila (se core/extens_image.py) — før typekolonne-hint.
+            if ext == "bin" and not is_encrypted:
+                try:
+                    from siard_workflow.core import extens_image as _extens
+                    if _extens.analyse(p):
+                        ext, mime = _extens.EXT, _extens.MIME
+                except Exception:
+                    pass
+
             # Lazy "hele filinnhold" — leses kun én gang selv om flere
             # dekoder-branches trenger det. For txt-filer ble dette tidligere
             # lest TO ganger (én gang i base64-blokken, én gang i UTF-8-blokken),
@@ -3492,6 +3504,7 @@ class BlobConvertOperation(BaseOperation):
         to_wpt:         list[tuple[int, str, str, str]] = []  # WPTools native
         to_archive:     list[tuple[int, str, str, str]] = []  # komprimerte flerfil-arkiver
         to_msg:         list[tuple[int, str, str, str]] = []  # Outlook-e-post → PDF/A
+        to_extens:      list[tuple[int, str, str, str]] = []  # Extens-bilde (DIB) → PNG
         unknown_items:  dict[str, list] = {}   # ext -> [(idx,zip_sti,ext,mime)]
 
         # Komprimerte formater som skal behandles spesielt
@@ -3558,6 +3571,8 @@ class BlobConvertOperation(BaseOperation):
                 to_wpt.append((idx, zip_sti, ext, mime))
             elif ext in ("msg", "eml") and self.params.get("convert_msg", True):
                 to_msg.append((idx, zip_sti, ext, mime))
+            elif ext == "extens_dib":
+                to_extens.append((idx, zip_sti, ext, mime))
             elif ext in ("txt", "xml", "bin"):
                 to_rename_only.append((idx, zip_sti, ext, mime))
             elif ext == "pdf" and self.params["skip_existing_pdf"]:
@@ -3669,6 +3684,18 @@ class BlobConvertOperation(BaseOperation):
 
         w(f"  WPTools (wpt): {len(to_wpt):,}", "info")
         w(f"  E-post (msg/eml): {len(to_msg):,}", "info")
+        if to_extens:
+            w(f"  Extens-bilder (DIB) → PNG: {len(to_extens):,}", "info")
+
+        # Formatdiagram/rapport: e-post og Extens-bilder sender ikke file_done
+        # per fil — tell dem her etter innholdstype (som rename-løkken gjør)
+        _own_counts: dict[str, int] = {}
+        for _, _, _e, _ in to_msg:
+            _own_counts[_e] = _own_counts.get(_e, 0) + 1
+        if to_extens:
+            _own_counts["dib"] = len(to_extens)
+        if _own_counts:
+            progress("rename_format_counts", counts=_own_counts)
         w(f"  Rename/behold: {len(to_rename_only):,}", "info")
 
         # Logg hva .txt-filer faktisk ble detektert som
@@ -3726,6 +3753,12 @@ class BlobConvertOperation(BaseOperation):
             self._convert_msgs(
                 to_msg, stats, extract_dir, lo_bin, stop_ev,
                 csv_log, err_log, w, lock, max_w,
+                conversion_registry, creg_lock, _standardize_bin)
+
+        # Steg B4b: Extens-bilder (Windows DIB uten filsignatur) → PNG
+        if to_extens and not stop_ev.is_set():
+            self._convert_extens_images(
+                to_extens, stats, extract_dir, stop_ev, csv_log, err_log, w, lock,
                 conversion_registry, creg_lock, _standardize_bin)
 
         # Steg C: Rename-bare — behandle uten GUI-event per fil (kan vaere 100k+)
@@ -5124,6 +5157,92 @@ class BlobConvertOperation(BaseOperation):
               f"urørt): {stats['msg_signed_zip']:,}", "info")
         w(f"  E-post ferdig: {counter['ok']:,} konvertert, {counter['fail']:,} feilet; "
           f"{counter['att']:,} vedlegg ({counter['listed']:,} kun listet/feilet)", "info")
+
+    def _convert_extens_images(self, to_extens: list, stats: dict, extract_dir: Path,
+                               stop_ev: threading.Event, csv_log, err_log, w,
+                               lock: threading.Lock,
+                               conversion_registry: "dict | None",
+                               creg_lock: "threading.Lock | None",
+                               standardize_bin: bool) -> None:
+        """
+        Extens-bilder (innpakket Windows DIB, se core/extens_image.py) → PNG.
+        Navngivning som de andre konverteringene: <rot>.bin med «Standardiser
+        .bin» (innholdet er PNG, kommentar i konverteringsregisteret), ellers
+        <stamme>.png. Ved feil beholdes originalen som .bin.
+        """
+        from siard_workflow.core import extens_image as _extens
+        w(f"  Konverterer {len(to_extens):,} Extens-bilder (Windows DIB) til PNG ...",
+          "info")
+        n_ok = n_fail = 0
+        for idx, zip_sti, ext, mime in to_extens:
+            if stop_ev.is_set():
+                break
+            src = extract_dir / zip_sti
+            if not src.exists():
+                continue
+            fra_sz = src.stat().st_size
+            p = PurePosixPath(zip_sti)
+            orig_basename = p.name
+            root_stem = orig_basename.split(".")[0]
+            src_ext = p.suffix.lstrip(".").lower()
+            if standardize_bin:
+                new_sti = str(p.parent / f"{root_stem}.bin")
+                comment = (f"Filinnhold konvertert : {_extens.LABEL} til .png"
+                           + (" - Filendelse (.bin) beholdt" if src_ext == "bin"
+                              else f" - Filendelse endret fra .{src_ext} til .bin"))
+            else:
+                new_sti = str(p.parent / f"{p.stem}.png")
+                comment = None
+            target = extract_dir / new_sti
+            try:
+                info = _extens.analyse(src)
+                png = _extens.to_png(src, info)
+                if target != src and _target_taken(target, src):
+                    raise _NameConflict(target.name)
+                tmp = target.with_name(target.name + ".extens_tmp")
+                tmp.write_bytes(png)
+                if src.exists() and src.resolve() != target.resolve():
+                    src.unlink()
+                tmp.replace(target)
+                self._remember_digest(target)
+                if comment and conversion_registry is not None and creg_lock is not None:
+                    with creg_lock:
+                        conversion_registry[orig_basename] = (target, comment)
+                with lock:
+                    stats["converted"] += 1
+                    stats["extens_png"] = stats.get("extens_png", 0) + 1
+                n_ok += 1
+                if n_ok <= 20:
+                    w(f"  Extens-bilde: {orig_basename} → {target.name} "
+                      f"({info['width']}×{info['height']}, {info['bpp']} bit"
+                      + (f", header forskjøvet {info['shift']} byte" if info["shift"] else "")
+                      + ")", "ok")
+                if csv_log:
+                    csv_log.write(zip_sti, fra_sz, "bin", target.name, len(png),
+                                  "bin" if standardize_bin else "png",
+                                  f"{_extens.LABEL} → PNG ({info['width']}×{info['height']}, "
+                                  f"{info['bpp']} bit)")
+            except Exception as exc:
+                n_fail += 1
+                with lock:
+                    stats["failed"] += 1
+                for leftover in (target.with_name(target.name + ".extens_tmp"),):
+                    leftover.unlink(missing_ok=True)
+                if src.exists() and not standardize_bin:
+                    self._rename_file(extract_dir, zip_sti, "bin")
+                kind = "navnekonflikt" if isinstance(exc, _NameConflict) else "konverteringsfeil"
+                if isinstance(exc, _NameConflict):
+                    with lock:
+                        stats["name_conflicts"] = stats.get("name_conflicts", 0) + 1
+                w(f"  Extens-bilde ikke konvertert: {orig_basename} — beholdes som .bin "
+                  f"({exc})", "warn")
+                if err_log:
+                    err_log.write(zip_sti, "bin", f"{_extens.LABEL} → PNG feilet: {exc} "
+                                  f"— original beholdt", kind)
+        if n_ok > 20:
+            w(f"  ... og {n_ok - 20:,} Extens-bilder til (ikke listet)", "info")
+        w(f"  Extens-bilder ferdig: {n_ok:,} konvertert til PNG, {n_fail:,} feilet",
+          "ok" if not n_fail else "warn")
 
     def _process_archives(self,
                           to_archive:     list,

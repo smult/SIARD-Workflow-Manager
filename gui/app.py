@@ -2270,6 +2270,45 @@ class App(ctk.CTk):
         self._pf("avbrutt av operatør")
         return False
 
+    def _ask_dias_config(self, op) -> "dict | None":
+        """
+        Kalles fra DIAS-pakkingen (arbeidstråd) når steget starter: vis
+        konfigurasjonsvinduet med operasjonens gjeldende innstillinger (perioden
+        er allerede hentet fra metadata.xml / estimatet). Returnerer de
+        godkjente parameterne, eller None hvis brukeren avbryter.
+        """
+        import threading as _threading
+        done = _threading.Event()
+        out: list = [None]
+
+        def _show():
+            try:
+                from gui.operations_panel import OP_DEFS, set_upstream_op_ids
+                from gui.dias_dialog import DiasParamDialog
+                op_def = next(d for d in OP_DEFS if d["cls"] is type(op))
+                live_def = {**op_def, "params": [
+                    {**p, "default": op.params.get(p["key"], p["default"])}
+                    for p in op_def["params"]],
+                    "initial_extra_files": op.params.get("extra_files", "[]")}
+                ids = [o.operation_id for o in self.workflow_panel.get_operations()]
+                set_upstream_op_ids(ids[:ids.index("dias_package")]
+                                    if "dias_package" in ids else ids)
+
+                def _confirm(new_op):
+                    out[0] = dict(new_op.params) if new_op is not None else None
+                dlg = DiasParamDialog(self, live_def, on_confirm=_confirm, runtime=True)
+                self.wait_window(dlg)
+            except Exception as exc:
+                self._log(f"  DIAS-kontrollvinduet kunne ikke vises: {exc} — pakker med "
+                          "lagrede innstillinger", "warn")
+                out[0] = dict(op.params)
+            finally:
+                done.set()
+
+        self.after(0, _show)
+        done.wait()
+        return out[0]
+
     def _ask_date_span(self, res: dict) -> bool:
         """
         Kalles fra «Estimer datospenn» (arbeidstråd) når et datospenn er
@@ -2890,6 +2929,9 @@ class App(ctk.CTk):
 
             # Callback: skal et estimert datospenn skrives til metadata.xml og brukes?
             ctx.metadata["ask_date_span_cb"] = self._ask_date_span
+
+            # Callback: DIAS-konfigurasjonen vises når pakkesteget starter
+            ctx.metadata["ask_dias_config_cb"] = self._ask_dias_config
 
             # Callback for forhåndsvisning/bekreftelse av SIARD-anonymisering
             ctx.metadata["anonymize_preview_cb"] = self._anonymize_preview_cb

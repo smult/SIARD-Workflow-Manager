@@ -28,6 +28,17 @@ from settings import save_op_params, _SETTINGS_FILE
 
 # ── Konstanter ────────────────────────────────────────────────────────────────
 
+def _no_flush(scrollbar) -> None:
+    """Slå av CTkScrollbar sin update_idletasks() ved hver omtegning (treg resize)."""
+    canvas = getattr(scrollbar, "_canvas", None)
+    if canvas is not None:
+        canvas.update_idletasks = lambda *a, **k: None
+
+
+# Fast bredde på skjemafeltene (se _build — rask størrelsesendring); skjemaets
+# bredde regnes ut fra innholdet i _build_form
+FIELD_W = 400
+
 _FOLDERS = {
     "root":     "",
     "content":  "content",
@@ -157,13 +168,27 @@ class DiasParamDialog(ctk.CTkToplevel):
     Viser param-skjema til venstre og interaktiv filtrestruktur til høyre.
     """
 
-    def __init__(self, parent, op_def: dict, on_confirm, on_saved=None):
+    def __init__(self, parent, op_def: dict, on_confirm, on_saved=None,
+                 runtime: bool = False):
+        """
+        runtime=True: vist når DIAS-steget starter under kjøringen — perioden er
+        allerede hentet fra metadata.xml / estimatet (ingen ny forhåndsutfylling),
+        og knappene er «Avbryt pakking» / «Fortsett pakking». on_confirm(None)
+        kalles ved avbryt.
+        """
         super().__init__(parent)
-        self.title("DIAS-pakking: Konfigurer og velg filer")
+        self._runtime = runtime
+        self.title("DIAS-pakking: kontroller innstillingene før pakking" if runtime
+                   else "DIAS-pakking: Konfigurer og velg filer")
         self.configure(fg_color=COLORS["surface"])
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
         self.grab_set()
-        self.geometry("1160x780")
-        self.minsize(960, 620)
+        # Startstørrelse etter skjermen (stor nok til at skjemaet og filtreet får
+        # plass uten at vinduet må dras større hver gang)
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        w, h = min(1480, int(sw * 0.9)), min(980, int(sh * 0.88))
+        self.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 3)}")
+        self.minsize(1000, 640)
         self.resizable(True, True)
 
         self._op_def      = op_def
@@ -191,20 +216,106 @@ class DiasParamDialog(ctk.CTkToplevel):
 
         self._build()
         self._populate_tree()
+        # Rask størrelsesendring: frys innholdet mens vinduet dras (se _on_resize)
+        self._frozen = False
+        self._thaw_job = None
+        self._last_size = (0, 0)
+        self._resize_ready = False
+        self.bind("<Configure>", self._on_resize, add="+")
+        self._arm_job = self.after(600, self._arm_resize)
+        self._restore_extra_files(op_def.get("initial_extra_files") or "[]")
+
+    # ── Rask størrelsesendring ────────────────────────────────────────────────
+    #
+    # Windows tegner hvert underelement på nytt for hvert steg i en resize — med
+    # ~130 elementer (hvert CustomTkinter-element er flere vinduer med eget
+    # tegnelerret) tok ett steg 0,3–0,6 s, selv med fast layout. Mens vinduet
+    # dras, skjules derfor innholdet (tomt vindu: ~15 ms per steg); når draget
+    # har stoppet i THAW_MS, vises det igjen og legges ut én gang.
+    THAW_MS = 180
+
+    def destroy(self):
+        for job in (getattr(self, "_thaw_job", None), getattr(self, "_arm_job", None)):
+            if job:
+                try:
+                    self.after_cancel(job)
+                except Exception:
+                    pass
+        super().destroy()
+
+    def _arm_resize(self) -> None:
+        self._arm_job = None
+        try:
+            self._last_size = (self.winfo_width(), self.winfo_height())
+        except tk.TclError:
+            return
+        self._resize_ready = True
+
+    def _on_resize(self, event) -> None:
+        if event.widget is not self or not self._resize_ready:
+            return
+        size = (event.width, event.height)
+        if size == self._last_size:
+            return
+        if not self._frozen:
+            self._body.place_forget()
+            self._frozen = True
+        self._last_size = size
+        if self._thaw_job is not None:
+            self.after_cancel(self._thaw_job)
+        self._thaw_job = self.after(self.THAW_MS, self._thaw)
+
+    def _thaw(self) -> None:
+        self._thaw_job = None
+        if self._frozen:
+            self._body.place(x=0, y=0, relwidth=1, relheight=1)
+            self._frozen = False
+
+    def _restore_extra_files(self, raw: str) -> None:
+        """
+        Legg tidligere valgte ekstra filer (operasjonens extra_files) inn i treet
+        igjen — ellers ville filer brukeren selv la til, forsvinne når vinduet
+        åpnes på nytt (fra arbeidsflyten eller når pakkesteget starter).
+        """
+        try:
+            items = json.loads(raw) if isinstance(raw, str) else list(raw or [])
+        except Exception:
+            return
+        have = {e["src"] for e in self._file_entries.values()}
+        by_dir = {v: k for k, v in _FOLDERS.items()}
+        for ef in items:
+            src, dest = str(ef.get("src", "")), str(ef.get("dest", ""))
+            if not src or src in have or src.startswith("[[pending:"):
+                continue
+            folder = dest.rsplit("/", 1)[0] if "/" in dest else ""
+            fid = by_dir.get(folder)
+            if fid is None:
+                continue
+            self._insert_file(src=src, dest=dest, folder_id=fid,
+                              name=Path(src).name, tag="user")
+            have.add(src)
 
     # ── Bygg hoveddialog ──────────────────────────────────────────────────────
 
     def _build(self):
-        # Kolonne 0 (metadata): 2/3, kolonne 1 (tre): 1/3, minimum 300px
-        self.grid_columnconfigure(0, weight=2, minsize=500)
-        self.grid_columnconfigure(1, weight=1, minsize=300)
+        # Alt innhold ligger i én ramme (body) som fryses under størrelsesendring
+        # (se _on_resize): da tegnes bare vindusrammen på nytt for hvert steg.
+        body = tk.Frame(self, bg=COLORS["surface"], bd=0, highlightthickness=0)
+        body.place(x=0, y=0, relwidth=1, relheight=1)
+        self._body = body
+        # Kolonne 0 (metadata): fast bredde — skjemafeltene endrer ikke størrelse
+        # når vinduet dras (hver CustomTkinter-widget er et lerret som må tegnes
+        # på nytt; ~20 strekkbare felt gjorde hver størrelsesendring ~0,6 s).
+        # Kolonne 1 (filtreet, vanlig ttk.Treeview) tar all ekstra plass.
+        body.grid_columnconfigure(0, weight=0)
+        body.grid_columnconfigure(1, weight=1, minsize=320)
         # Rad 0: kompakt tittel, rad 1: innhold, rad 2: knapper
-        self.grid_rowconfigure(0, weight=0)
-        self.grid_rowconfigure(1, weight=1)
-        self.grid_rowconfigure(2, weight=0)
+        body.grid_rowconfigure(0, weight=0)
+        body.grid_rowconfigure(1, weight=1)
+        body.grid_rowconfigure(2, weight=0)
 
         # ── Tittellinje (kompakt) ──────────────────────────────────────────
-        ctk.CTkLabel(self,
+        ctk.CTkLabel(body,
                      text="DIAS-pakking (SIP/AIC)",
                      font=ctk.CTkFont(family=FONTS["mono"], size=14, weight="bold"),
                      text_color=COLORS["accent"]
@@ -212,7 +323,7 @@ class DiasParamDialog(ctk.CTkToplevel):
                             padx=20, pady=(12, 6), sticky="w")
 
         # ── Venstre: metadata-skjema ───────────────────────────────────────
-        left = ctk.CTkFrame(self, fg_color=COLORS["panel"], corner_radius=8)
+        left = ctk.CTkFrame(body, fg_color=COLORS["panel"], corner_radius=8)
         left.grid(row=1, column=0, padx=(16, 6), pady=(0, 8), sticky="nsew")
         # Rad 0 = liten tittel, rad 1 = skjema (vokser)
         left.grid_rowconfigure(0, weight=0)
@@ -227,7 +338,7 @@ class DiasParamDialog(ctk.CTkToplevel):
         self._build_form(left)   # plasserer skjema i rad 1
 
         # ── Høyre: filtrestruktur ──────────────────────────────────────────
-        right = ctk.CTkFrame(self, fg_color=COLORS["panel"], corner_radius=8)
+        right = ctk.CTkFrame(body, fg_color=COLORS["panel"], corner_radius=8)
         right.grid(row=1, column=1, padx=(6, 16), pady=(0, 8), sticky="nsew")
         # Rad 0 = liten tittel, rad 1 = tre (vokser), rad 2 = knapper, rad 3 = legende
         right.grid_rowconfigure(0, weight=0)
@@ -244,14 +355,16 @@ class DiasParamDialog(ctk.CTkToplevel):
         self._build_tree_panel(right)  # plasserer tre i rad 1-3
 
         # ── Knapper ────────────────────────────────────────────────────────
-        btns = ctk.CTkFrame(self, fg_color="transparent")
+        btns = ctk.CTkFrame(body, fg_color="transparent")
         btns.grid(row=2, column=0, columnspan=2,
                   padx=16, pady=(0, 14), sticky="e")
-        ctk.CTkButton(btns, text="Avbryt", width=100,
+        ctk.CTkButton(btns, text="Avbryt pakking" if self._runtime else "Avbryt",
+                      width=140 if self._runtime else 100,
                       fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
                       font=ctk.CTkFont(family=FONTS["mono"], size=13),
-                      command=self.destroy).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(btns, text="Legg til i workflow", width=170,
+                      command=self._cancel).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(btns, text="Fortsett pakking" if self._runtime else "Legg til i workflow",
+                      width=170,
                       fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"], text_color=COLORS["on_accent"],
                       font=ctk.CTkFont(family=FONTS["mono"], size=13, weight="bold"),
                       command=self._confirm).pack(side="left")
@@ -264,16 +377,18 @@ class DiasParamDialog(ctk.CTkToplevel):
             parent, fg_color="transparent",
             scrollbar_button_color=COLORS["border"])
         frm.grid(row=1, column=0, padx=10, pady=(2, 10), sticky="nsew")
-        # Kolonne 0: felt-titler — styres av lengste label, ingen fast bredde
-        # Kolonne 1: input-bokser — fyller 2/3 av resterende bredde
-        # Kolonne 2: tom spacer  — fyller 1/3 (gir smalere input-felt)
+        # CTkScrollbar._draw kaller update_idletasks() hver gang den tegnes — også
+        # midt i en størrelsesendring — og tvinger hele vinduet til å tegnes på
+        # nytt synkront. Unødvendig: Tk tegner uansett når køen er tom.
+        _no_flush(getattr(frm, "_scrollbar", None))
+        # Kolonne 0: felt-titler (lengste label), kolonne 1: felt med FAST bredde
+        # (FIELD_W) — ingen strekking ved størrelsesendring
         frm.grid_columnconfigure(0, weight=0)
-        frm.grid_columnconfigure(1, weight=2)
-        frm.grid_columnconfigure(2, weight=1)
+        frm.grid_columnconfigure(1, weight=0)
 
         from gui.operations_panel import _get_autocomplete_list, _AutocompleteEntry
 
-        _inp = dict(padx=(6, 12), sticky="ew")   # felles plasseringsargumenter
+        _inp = dict(padx=(6, 12), sticky="w")    # felles plasseringsargumenter
 
         # Rad 0: knapp for å lese inn metadata fra METS-fil
         mets_row = ctk.CTkFrame(frm, fg_color="transparent")
@@ -285,11 +400,15 @@ class DiasParamDialog(ctk.CTkToplevel):
         self._mets_row = mets_row
 
         # Params starter på rad 1 (rad 0 er METS-importknappen)
+        # Feltnavn som vanlige tk.Label: en CTkLabel er tre vinduer med eget
+        # tegnelerret, og alle tegnes på nytt ved hver størrelsesendring.
+        # Samme skrift (CTkFont følger skriftjusteringen) og farger.
+        _lbl_font = ctk.CTkFont(family=FONTS["mono"],
+                                size=round(12 * ctk.ScalingTracker.get_widget_scaling(self)))
         for i, p in enumerate(self._op_def.get("params", [])):
-            ctk.CTkLabel(frm, text=p["label"],
-                         font=ctk.CTkFont(family=FONTS["mono"], size=12),
-                         text_color=COLORS["text"]
-                         ).grid(row=i+1, column=0, padx=(10, 4), pady=5, sticky="w")
+            tk.Label(frm, text=p["label"], font=_lbl_font, anchor="w",
+                     fg=COLORS["text"], bg=COLORS["panel"], bd=0, highlightthickness=0
+                     ).grid(row=i+1, column=0, padx=(10, 4), pady=5, sticky="w")
 
             if p["type"] == "bool":
                 var = ctk.BooleanVar(value=p["default"])
@@ -312,7 +431,7 @@ class DiasParamDialog(ctk.CTkToplevel):
                     dropdown_fg_color=COLORS["panel"],
                     dropdown_text_color=COLORS["text"],
                     font=ctk.CTkFont(family=FONTS["mono"], size=12),
-                    width=1,
+                    width=FIELD_W,
                     dynamic_resizing=False,
                 ).grid(row=i+1, column=1, **_inp)
                 self._vars[p["key"]] = (var, "choice")
@@ -324,14 +443,14 @@ class DiasParamDialog(ctk.CTkToplevel):
                     full_list=_get_autocomplete_list(p.get("source", "")),
                     variable=var,
                     siard_source=p.get("source", ""),
-                    width=1)
+                    width=FIELD_W)
                 ac.grid(row=i+1, column=1, **_inp)
                 self._vars[p["key"]] = (var, "str")
                 continue
 
             elif p["type"] == "int":
                 var = ctk.StringVar(value=str(p["default"]))
-                ctk.CTkEntry(frm, textvariable=var, width=1,
+                ctk.CTkEntry(frm, textvariable=var, width=FIELD_W,
                              fg_color=COLORS["bg"],
                              font=ctk.CTkFont(family=FONTS["mono"], size=12),
                              justify="left",
@@ -345,8 +464,9 @@ class DiasParamDialog(ctk.CTkToplevel):
                     hf.grid(row=i+1, column=1, **_inp)
                     hf.grid_columnconfigure(0, weight=1)
                     ctk.CTkEntry(hf, textvariable=var, fg_color=COLORS["bg"],
+                                 width=FIELD_W - 36,
                                  font=ctk.CTkFont(family=FONTS["mono"], size=12),
-                                 justify="left").grid(row=0, column=0, sticky="ew")
+                                 justify="left").grid(row=0, column=0, sticky="w")
                     def _pick_dir(v=var):
                         d = filedialog.askdirectory(title="Velg utdatamappe")
                         if d:
@@ -357,7 +477,7 @@ class DiasParamDialog(ctk.CTkToplevel):
                                   command=_pick_dir).grid(row=0, column=1, padx=(4, 0))
                     self._vars[p["key"]] = (var, p["type"])
                     continue
-                _entry = ctk.CTkEntry(frm, textvariable=var, width=1,
+                _entry = ctk.CTkEntry(frm, textvariable=var, width=FIELD_W,
                                       fg_color=COLORS["bg"],
                                       font=ctk.CTkFont(family=FONTS["mono"], size=12),
                                       justify="left")
@@ -387,7 +507,18 @@ class DiasParamDialog(ctk.CTkToplevel):
                     _entry.bind("<FocusOut>", lambda _, f=_fn: f())
 
             self._vars[p["key"]] = (var, p["type"])
-        self._prefill_period()
+        # Rullbar ramme er 200 bred som standard: gi den innholdets bredde (feltnavn +
+        # felt, inkl. skjermskalering) så ingenting kuttes
+        frm.update_idletasks()
+        scale = ctk.ScalingTracker.get_widget_scaling(self) or 1.0
+        frm.configure(width=frm.winfo_reqwidth() / scale + 8)
+        if not self._runtime:            # under kjøring er perioden allerede hentet
+            self._prefill_period()
+
+    def _cancel(self):
+        if self._runtime:
+            self._on_confirm(None)
+        self.destroy()
 
     def _prefill_period(self):
         """Periode fra <dataOriginTimespan> i den valgte SIARD-filen, når den finnes."""

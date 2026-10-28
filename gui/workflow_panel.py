@@ -354,7 +354,8 @@ class WorkflowPanel(ctk.CTkFrame):
             current_val = op.params.get(p["key"], p["default"])
             prefilled.append({**p, "default": current_val})
 
-        live_def = {**op_def, "params": prefilled}
+        live_def = {**op_def, "params": prefilled,
+                    "initial_extra_files": op.params.get("extra_files", "[]")}
 
         def _on_confirm(new_op):
             row.op = new_op

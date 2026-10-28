@@ -293,7 +293,9 @@ class DiasPackageOperation(BaseOperation):
     produces_siard  = False
     requires_unpack = False
 
-    default_params = _load_dias_json()
+    # confirm_before_packing: vis konfigurasjonsvinduet når steget starter (kontroll
+    # av periode m.m. etter at den er hentet fra metadata.xml / estimatet)
+    default_params = {**_load_dias_json(), "confirm_before_packing": True}
 
     _REQUIRED_META = [
         "label", "system", "system_version", "submission_agreement",
@@ -333,12 +335,48 @@ class DiasPackageOperation(BaseOperation):
         if any(old) and old != (start, end):
             _w(f"    Erstatter verdiene fra innstillingene ({old[0]} – {old[1]})", "warn")
 
+    def _confirm_settings(self, ctx: WorkflowContext) -> bool:
+        """
+        Vis konfigurasjonsvinduet når pakkingen starter (bryteren
+        «confirm_before_packing», standard på) — med perioden slik den nå er
+        hentet fra metadata.xml / estimatet — så innstillingene kan kontrolleres
+        og rettes. Uten GUI-callback, eller med bryteren av: pakk med lagrede
+        innstillinger. Returnerer False hvis brukeren avbryter.
+        """
+        on = str(self.params.get("confirm_before_packing", True)).strip().lower() \
+            not in ("false", "0", "nei", "")
+        ask = (ctx.metadata or {}).get("ask_dias_config_cb")
+        fl = (ctx.metadata or {}).get("file_logger")
+
+        def _w(msg: str, lvl: str = "info") -> None:
+            logger.info(msg)
+            if fl:
+                fl.log(msg, lvl)
+
+        if not on or ask is None:
+            return True
+        _w("  Viser DIAS-konfigurasjonen for kontroll før pakking …")
+        new = ask(self)
+        if new is None:
+            _w("  Avbrutt i kontrollvinduet — DIAS-pakken lages ikke", "warn")
+            return False
+        changed = [k for k, v in new.items()
+                   if k != "extra_files" and str(v) != str(self.params.get(k, ""))]
+        for k in changed:
+            _w(f"    Endret i kontrollvinduet: {k}: «{self.params.get(k, '')}» → «{new[k]}»")
+        if not changed:
+            _w("    Innstillingene godkjent uendret")
+        self.params.update(new)
+        return True
+
     def run(self, ctx: WorkflowContext) -> OperationResult:
         siard_path = ctx.siard_path
         if not siard_path or not siard_path.exists():
             return self._fail("Ingen SIARD-fil i kontekst.")
 
         self._apply_period(ctx, siard_path)
+        if not self._confirm_settings(ctx):
+            return self._fail("DIAS-pakking avbrutt av bruker i kontrollvinduet")
         missing = [k for k in self._REQUIRED_META if not str(self.params.get(k, "")).strip()]
         if missing:
             return self._fail(f"Manglende obligatoriske parametere: {', '.join(missing)}")
