@@ -73,6 +73,29 @@ def _sync_checkpoints_to_ops(old_checkpoints: list, ops: list) -> list:
     return new_list
 
 
+def _apply_checkpoint_params(ops: list, checkpoints: list) -> int:
+    """Gi workflow-panelets operasjoner parameterne fra en prosjektfil.
+
+    Brukes når en prosjektfil lastes automatisk (samme navn som SIARD-filen):
+    panelet beholder stegene, men verdiene (f.eks. DIAS «Submission Agreement»)
+    skal være prosjektets — ellers overskrev neste kjøring prosjektfila med
+    panelets verdier. Steg matches på operation_id, posisjonelt ved duplikater.
+    Returnerer antall operasjoner som fikk parametere.
+    """
+    pool: dict = {}
+    for cp in checkpoints:
+        pool.setdefault(cp.operation_id, []).append(cp)
+    n = 0
+    for op in ops:
+        bucket = pool.get(op.operation_id)
+        if bucket:
+            cp = bucket.pop(0)
+            if cp.params:
+                op.params = {**op.params, **cp.params}
+                n += 1
+    return n
+
+
 class _PipelineSuggestionDialog(ctk.CTkToplevel):
     """
     Dialog som foreslår å legge til 'Pakk ut SIARD' og 'Pakk sammen SIARD'
@@ -313,6 +336,9 @@ class App(ctk.CTk):
         self._stop_event        = threading.Event()
         self._pause_event       = threading.Event()
         self._step_resume_event = threading.Event()
+        # Mobilvarsling (core/remote_notify) — satt bare mens en kjøring pågår
+        self._remote_hub = None
+        self._remote_rep = None
         self._step_stopped      = False
         # Prosjektfil-tilstand
         self._project_file: "ProjectFile | None" = None   # type: ignore[name-defined]
@@ -989,6 +1015,9 @@ class App(ctk.CTk):
                     self._project_path = auto_path
                     self.workflow_panel.set_project_label(
                         f"Prosjekt: {auto_path.name}")
+                    # Prosjektets lagrede verdier gjelder (ikke panelets)
+                    _apply_checkpoint_params(
+                        list(self.workflow_panel.get_operations()), pf.operations)
                     # Oppdater statusikoner for eksisterende operasjoner
                     for i, op in enumerate(
                             self.workflow_panel.get_operations()):
@@ -2270,6 +2299,105 @@ class App(ctk.CTk):
         self._pf("avbrutt av operatør")
         return False
 
+    # ── Mobilvarsling (core/remote_notify) ──────────────────────────────────
+
+    def _remote_start(self, n_files: int) -> None:
+        """Start varsling til mobil for en kjøring (når slått på og satt opp)."""
+        self._remote_hub = self._remote_rep = None
+        try:
+            from settings import get_config
+            from siard_workflow.core.remote_notify import build_hub, RunReporter
+            hub = build_hub(get_config,
+                            log=lambda m, lvl="warn": self._log_queue.put(("log", m, lvl)))
+            if hub is None:
+                return
+            hub.start()
+            self._remote_rep = RunReporter(
+                hub,
+                hide_filenames=bool(get_config("notify_hide_filenames", False)),
+                each_step=bool(get_config("notify_each_step", False)),
+                heartbeat=bool(get_config("notify_heartbeat", True)))
+            self._remote_rep.queue_start(n_files)
+            self._remote_hub = hub
+            names = {"ntfy": "ntfy-appen", "teams": "Teams"}
+            self._log_queue.put(("log", "Mobilvarsling på: " + ", ".join(
+                names.get(c.name, c.name) for c in hub.channels), "muted"))
+        except Exception as exc:
+            self._remote_hub = self._remote_rep = None
+            self._log_queue.put(("log", f"Mobilvarsling kunne ikke startes: {exc}", "warn"))
+
+    def _remote_finish(self) -> None:
+        rep, hub = self._remote_rep, self._remote_hub
+        self._remote_rep = self._remote_hub = None
+        try:
+            if rep:
+                rep.queue_done(stopped=self._stop_event.is_set())
+            if hub:
+                hub.stop()
+        except Exception:
+            pass
+
+    def _remote_wait(self, done, title: str, text: str, choices: list,
+                     on_remote, timeout: "float | None" = None) -> "str | None":
+        """
+        Vent på svar i et lokalt vindu (done settes når det lukkes) — og, når
+        mobilvarsling er på, på svar fra mobilen. Første svar gjelder:
+        on_remote(key) kjøres på hovedtråden og lukker vinduet med tilsvarende
+        valg (returnerer False hvis det ikke går, f.eks. skjemafeil). Uten
+        mobilvarsling: som done.wait(). Returnerer mobilens valg eller None.
+        """
+        import time as _time
+        hub = self._remote_hub
+        if hub is None:
+            done.wait(timeout)
+            return None
+        if not hub.can_ask:                      # bare Teams: si fra at det ventes
+            hub.notify(f"Venter på svar: {title}", f"{text}\n\nSvar på PC-en.",
+                       priority=4, tags=("question",), status_button=False)
+            done.wait(timeout)
+            return None
+        labels = dict(choices)
+        ticket = hub.ask(title, text, choices)
+        remote = None
+        deadline = None if timeout is None else _time.monotonic() + timeout
+        try:
+            while not done.wait(1.0):
+                if remote is None and ticket.poll() is not None:
+                    remote = ticket.poll()
+                    self._log_queue.put(("log", f"  Svar fra mobil: «{labels.get(remote)}» "
+                                                f"({title})", "info"))
+                    self.after(0, lambda k=remote: self._apply_remote(on_remote, k, title))
+                if deadline is not None and _time.monotonic() > deadline:
+                    break
+        finally:
+            ticket.close("på mobil" if remote else "på PC-en",
+                         labels.get(remote, "") if remote else "")
+        return remote
+
+    @staticmethod
+    def _answer_suggestion(dlg, key: str) -> bool:
+        """Svar i et _PipelineSuggestionDialog: «ja» / «nei» / «avbryt»."""
+        if dlg is None or not dlg.winfo_exists():
+            return False
+        {"ja": dlg._on_ja, "nei": dlg._on_nei}.get(key, dlg._on_avbryt)()
+        return True
+
+    def _apply_remote(self, on_remote, key: str, title: str) -> None:
+        """Hovedtråden: bruk mobilsvaret i vinduet, eller si fra hvis det ikke går."""
+        try:
+            ok = on_remote(key)
+        except Exception as exc:
+            ok = False
+            self._log(f"  Mobilsvaret kunne ikke brukes: {exc}", "warn")
+        if ok is False:
+            self._log(f"  Mobilsvaret kunne ikke brukes for «{title}» — svar på PC-en", "warn")
+            hub = self._remote_hub
+            if hub:
+                hub.notify(f"Må svares på PC-en: {title}",
+                           "Svaret fra mobilen kunne ikke brukes (f.eks. felt som må "
+                           "fylles ut). Vinduet står åpent på PC-en.",
+                           priority=4, tags=("warning",), status_button=False)
+
     def _ask_dias_config(self, op) -> "dict | None":
         """
         Kalles fra DIAS-pakkingen (arbeidstråd) når steget starter: vis
@@ -2297,6 +2425,7 @@ class App(ctk.CTk):
                 def _confirm(new_op):
                     out[0] = dict(new_op.params) if new_op is not None else None
                 dlg = DiasParamDialog(self, live_def, on_confirm=_confirm, runtime=True)
+                box["dlg"] = dlg
                 self.wait_window(dlg)
             except Exception as exc:
                 self._log(f"  DIAS-kontrollvinduet kunne ikke vises: {exc} — pakker med "
@@ -2305,8 +2434,34 @@ class App(ctk.CTk):
             finally:
                 done.set()
 
+        box: dict = {}
+
+        def _remote(key: str) -> bool:
+            dlg = box.get("dlg")
+            if dlg is None or not dlg.winfo_exists():
+                return False
+            if key == "avbryt":
+                dlg._cancel()
+                return True
+            if not all(fn() for fn in dlg._validators):
+                return False                 # feil i skjemaet — må rettes på PC-en
+            dlg._confirm()
+            return True
+
+        p = op.params
+        text = "\n".join([
+            "DIAS-pakken er klar til å lages med disse innstillingene:",
+            f"Pakke: {p.get('label', '')}",
+            f"System: {p.get('system', '')} {p.get('system_version', '')}".rstrip(),
+            f"Submission Agreement: {p.get('submission_agreement', '')}",
+            f"Periode: {p.get('period_start', '')} – {p.get('period_end', '')}",
+            f"Mappe: {p.get('output_dir', '') or '(standard)'}",
+            "",
+            "Fortsett = pakk med innstillingene som vises på PC-en.",
+            "Endringer i skjemaet må gjøres på PC-en."])
         self.after(0, _show)
-        done.wait()
+        self._remote_wait(done, "DIAS-pakking: kontroller innstillingene", text,
+                          [("fortsett", "Fortsett"), ("avbryt", "Avbryt pakking")], _remote)
         return out[0]
 
     def _ask_date_span(self, res: dict) -> bool:
@@ -2352,16 +2507,26 @@ class App(ctk.CTk):
                 "rapportene og som periode i DIAS-pakken.",
                 "Nei: forkast estimatet og fortsett uten.",
             ]
+            box["text"] = "\n".join(lines)
             dlg = _PipelineSuggestionDialog(
-                self, "\n".join(lines), heading="Datospenn funnet",
+                self, box["text"], heading="Datospenn funnet",
                 yes_text="Ja, skriv og bruk", no_text="Nei, fortsett uten", cancel=False)
             dlg.title("Estimert datospenn")
+            box["dlg"] = dlg
             self.wait_window(dlg)
             answer[0] = dlg.result == "ja"
             done.set()
 
+        box: dict = {}
         self.after(0, _show)
-        done.wait()
+        _txt = (f"Estimert datospenn: {res.get('from_year')}–{res.get('to_year')}\n"
+                f"Grunnlag: {res.get('basis_text', '')}\n"
+                f"Sikkerhet: {res.get('confidence', '')}\n\n"
+                "Ja = skriv til metadata.xml og bruk videre (rapporter, DIAS).\n"
+                "Nei = forkast estimatet og fortsett uten.")
+        self._remote_wait(done, "Datospenn funnet", _txt,
+                          [("ja", "Ja, skriv og bruk"), ("nei", "Nei")],
+                          lambda k: self._answer_suggestion(box.get("dlg"), k))
         return answer[0]
 
     def _dependency_preflight(self, ops: list) -> bool:
@@ -2810,6 +2975,9 @@ class App(ctk.CTk):
         from siard_workflow.core.workflow import WorkflowRun
         from siard_workflow.core.project_file import ProjectFile
 
+        self._remote_start(len(filer))
+        _rep = self._remote_rep
+
         for q_idx, path in enumerate(filer):
             if self._stop_event.is_set():
                 break
@@ -2819,6 +2987,8 @@ class App(ctk.CTk):
             wf = Workflow(name=path.stem)
             for op in ops:
                 wf.add(op)
+            if _rep:
+                _rep.file_start(q_idx, len(filer), path.name, len(ops))
 
             # ── Prosjektfil-checkpoint ─────────────────────────────────────────
             # Bruk lastet prosjektfil hvis den gjelder denne kildefilen,
@@ -2880,6 +3050,8 @@ class App(ctk.CTk):
 
             def _progress_cb(event, **kw):
                 self._log_queue.put(("conv_" + event, kw))
+                if _rep and event in ("log", "phase_progress"):
+                    _rep.progress(event, kw)       # for «Status nå» på mobilen
                 # Akkumuler filtype-data i bakgrunnstråden — tilgjengelig for rapport-operasjonen
                 if event == "file_done":
                     ext = kw.get("detected_ext", "")
@@ -2933,6 +3105,9 @@ class App(ctk.CTk):
             # Callback: DIAS-konfigurasjonen vises når pakkesteget starter
             ctx.metadata["ask_dias_config_cb"] = self._ask_dias_config
 
+            # Callback: ukjent filformat i BLOB-konverteringen (konverter/behold/hopp over)
+            ctx.metadata["ask_unknown_format_cb"] = self._ask_unknown_format
+
             # Callback for forhåndsvisning/bekreftelse av SIARD-anonymisering
             ctx.metadata["anonymize_preview_cb"] = self._anonymize_preview_cb
 
@@ -2951,7 +3126,8 @@ class App(ctk.CTk):
                 # Livstegn hver halvtime — også i GUI-loggen
                 file_logger = WorkflowFileLogger(
                     log_dir, path.stem,
-                    on_heartbeat=lambda m: self._log_queue.put(("log", m, "muted")))
+                    on_heartbeat=lambda m: (self._log_queue.put(("log", m, "muted")),
+                                            _rep and _rep.heartbeat(m)))
                 file_logger.__enter__()
                 ctx.metadata["file_logger"] = file_logger
                 # Preflight kjørte på hovedtråden før fil-loggen fantes —
@@ -2998,6 +3174,8 @@ class App(ctk.CTk):
                     self._log_queue.put(("workflow_step_resumed",))
 
                 self._log_queue.put(("step_start", i, op.label))
+                if _rep:
+                    _rep.step_start(i, len(list(wf)), op.label)
                 if file_logger:
                     file_logger.set_step(f"[{i+1}] {op.label}")
                     file_logger.log(f"[{i+1}] {op.label}", "step")
@@ -3134,6 +3312,8 @@ class App(ctk.CTk):
                 elapsed = time.time() - t0
                 run.results.append(result)
                 self._log_queue.put(("result", result))
+                if _rep:
+                    _rep.step_done(i, op.label, result.success, result.message, elapsed)
                 if file_logger:
                     lvl = "ok" if result.success else "feil"
                     file_logger.log(f"  {lvl.upper()}: {result.message}", lvl)
@@ -3177,6 +3357,10 @@ class App(ctk.CTk):
                                                ctx_data=_ctx_data)
                         else:
                             _pf.mark_failed(op.operation_id, result.message)
+                        # Parametere kan ha endret seg under kjøringen (DIAS-
+                        # kontrollvinduet, periode fra metadata.xml) — lagre
+                        # de gjeldende, ikke kopien fra da kjøringen startet
+                        _pf.operations = _sync_checkpoints_to_ops(_pf.operations, list(wf))
                         _pf.save(_pf_path)
                         self._log_queue.put(("project_step_saved", i,
                                              "completed" if result.success else "failed"))
@@ -3190,6 +3374,8 @@ class App(ctk.CTk):
                         op.label,
                         result.message,
                     ))
+                    if _rep:
+                        _rep.halted(op.label, result.message)
                     break
 
             run.end_time = time.time()
@@ -3209,7 +3395,10 @@ class App(ctk.CTk):
                 self._log_queue.put(("log_saved", str(file_logger.log_path)))
 
             self._log_queue.put(("done_one", run, q_idx, len(filer), path))
+            if _rep:
+                _rep.file_done(q_idx, len(filer), run.success)
 
+        self._remote_finish()
         self._log_queue.put(("queue_done", None))
 
     def _poll_log_queue(self):
@@ -3315,7 +3504,7 @@ class App(ctk.CTk):
                 elif kind == "siardmapper_dialog":
                     (_, matches, siard_path, extracted_path,
                      json_path, suggestion_map,
-                     done_event, result_holder) = item
+                     done_event, result_holder, remote_box) = item
                     from gui.siardmapper_dialog import SiardMapperDialog, build_dialog_tables
                     tables = build_dialog_tables(matches)
                     dlg = SiardMapperDialog(
@@ -3323,6 +3512,7 @@ class App(ctk.CTk):
                         json_path=json_path,
                         suggestion_map=suggestion_map or {},
                     )
+                    remote_box["dlg"] = dlg          # svar fra mobil (_siardmapper_dialog_cb)
                     self.wait_window(dlg)
                     result_holder[0] = dlg.get_result()
                     done_event.set()
@@ -3497,48 +3687,49 @@ class App(ctk.CTk):
         Kalles fra bakgrunnstråden (UnpackSiardOperation) når ikke-standard
         LOB-filer oppdages. Poster spørsmål til hoved-tråden og blokkerer til svar.
         """
-        result_event  = __import__("threading").Event()
-        result_holder = [False]
-
-        def _show_dialog():
-            from tkinter import messagebox
-            ans = messagebox.askyesno(
-                "Ikke-standard LOB-filer funnet",
-                f"{count} LOB-fil(er) har ikke .bin/.txt-endelse eller "
+        text = (f"{count} LOB-fil(er) har ikke .bin/.txt-endelse eller "
                 f"heter ikke recordN.\n\n"
                 "Ikke-standard endelser kan gi utfordringer i KDRS Søk & Vis; "
                 "andre filnavn enn recordN underkjennes av DBPTK-validatoren.\n\n"
-                "Vil du legge til «Standardiser filendelser» i arbeidsflyten?",
-                parent=self)
-            result_holder[0] = bool(ans)
-            result_event.set()
+                "Vil du legge til «Standardiser filendelser» i arbeidsflyten?")
+        return self._ask_yes_no("Ikke-standard LOB-filer funnet", text,
+                                "Ja, legg til", "Nei")
 
-        self.after(0, _show_dialog)
-        result_event.wait()
-        return result_holder[0]
+    def _ask_yes_no(self, title: str, text: str, yes_text: str = "Ja",
+                    no_text: str = "Nei") -> bool:
+        """
+        Ja/nei-spørsmål fra arbeidstråden i et vindu som også kan besvares fra
+        mobilen (erstatter messagebox.askyesno, som ikke kan lukkes utenfra).
+        """
+        import threading as _threading
+        done = _threading.Event()
+        box: dict = {"result": False}
+
+        def _show():
+            dlg = _PipelineSuggestionDialog(self, text, heading=title, yes_text=yes_text,
+                                            no_text=no_text, cancel=False)
+            dlg.title(title)
+            box["dlg"] = dlg
+            self.wait_window(dlg)
+            box["result"] = dlg.result == "ja"
+            done.set()
+
+        self.after(0, _show)
+        self._remote_wait(done, title, text, [("ja", yes_text), ("nei", no_text)],
+                          lambda k: self._answer_suggestion(box.get("dlg"), k))
+        return box["result"]
 
     def _ask_add_schema_selector(self, schema_count: int) -> bool:
         """
         Kalles fra UnpackSiardOperation når > 1 schema oppdages.
         Spør om Schema-velger skal legges til arbeidsflyten.
         """
-        result_event  = __import__("threading").Event()
-        result_holder = [False]
-
-        def _show_dialog():
-            from tkinter import messagebox
-            ans = messagebox.askyesno(
-                "Flere schemas funnet",
-                f"SIARD-arkivet inneholder {schema_count} schemas.\n\n"
-                "Vil du legge til «Schema-velger» i arbeidsflyten slik at du "
-                "kan velge hvilke schemas som skal være med i resultatet?",
-                parent=self)
-            result_holder[0] = bool(ans)
-            result_event.set()
-
-        self.after(0, _show_dialog)
-        result_event.wait()
-        return result_holder[0]
+        return self._ask_yes_no(
+            "Flere schemas funnet",
+            f"SIARD-arkivet inneholder {schema_count} schemas.\n\n"
+            "Vil du legge til «Schema-velger» i arbeidsflyten slik at du "
+            "kan velge hvilke schemas som skal være med i resultatet?",
+            "Ja, legg til", "Nei")
 
     def _schema_select_dialog_cb(self, schemas: list) -> "list[str] | None":
         """
@@ -3546,8 +3737,37 @@ class App(ctk.CTk):
         velger schemas. Returnerer liste av navn å beholde, eller None ved
         avbryt.
         """
-        from gui.schema_selector_dialog import ask_select_schemas_modal
-        return ask_select_schemas_modal(self.after, self, schemas)
+        import threading as _threading
+        from gui.schema_selector_dialog import SchemaSelectorDialog
+        done = _threading.Event()
+        box: dict = {"result": None}
+
+        def _cb(selected):
+            box["result"] = selected
+            done.set()
+
+        def _show():
+            box["dlg"] = SchemaSelectorDialog(self, schemas, on_confirm=_cb)
+
+        def _remote(key: str) -> bool:
+            dlg = box.get("dlg")
+            if dlg is None or not dlg.winfo_exists():
+                return False
+            if key == "alle":
+                dlg._select_all()
+                dlg._on_ok()
+            else:
+                dlg._on_cancel()
+            return True
+
+        names = [str(s.get("name", "")) for s in schemas]
+        text = (f"SIARD-arkivet har {len(names)} schemas: " + ", ".join(names[:20])
+                + (" …" if len(names) > 20 else "")
+                + "\n\nBehold alle = alle schemas tas med. Et utvalg må gjøres på PC-en.")
+        self.after(0, _show)
+        self._remote_wait(done, "Velg schemas", text,
+                          [("alle", "Behold alle"), ("avbryt", "Avbryt")], _remote)
+        return box["result"]
 
     def _anonymize_preview_cb(self, summary: dict) -> bool:
         """
@@ -3555,8 +3775,32 @@ class App(ctk.CTk):
         identifiserte PII-felter og LOB-bytte. Returnerer True (anonymiser)
         eller False (avbryt).
         """
-        from gui.anonymize_preview_dialog import ask_anonymize_confirm_modal
-        return ask_anonymize_confirm_modal(self.after, self, summary)
+        import threading as _threading
+        from gui.anonymize_preview_dialog import AnonymizePreviewDialog
+        done = _threading.Event()
+        box: dict = {"result": False}
+
+        def _cb(confirmed):
+            box["result"] = bool(confirmed)
+            done.set()
+
+        def _show():
+            box["dlg"] = AnonymizePreviewDialog(self, summary, on_confirm=_cb)
+
+        def _remote(key: str) -> bool:
+            dlg = box.get("dlg")
+            if dlg is None or not dlg.winfo_exists():
+                return False
+            (dlg._confirm if key == "ja" else dlg._cancel)()
+            return True
+
+        self.after(0, _show)
+        self._remote_wait(done, "Anonymisering: bekreft",
+                          "Forhåndsvisningen av anonymiseringen er klar på PC-en "
+                          "(felt som endres og LOB-bytte).\n\nAnonymiser = gjennomfør "
+                          "som vist. Avbryt = ingen endringer.",
+                          [("ja", "Anonymiser"), ("nei", "Avbryt")], _remote)
+        return box["result"]
 
     def _ask_gs_postprocess(self, est: dict) -> bool:
         """
@@ -3564,50 +3808,84 @@ class App(ctk.CTk):
         vis målt besparelse for utvalget og beregnet besparelse for alle
         PDF/A-filene, og la brukeren velge. True = etterbehandle alle.
         """
-        import threading as _threading
-        from tkinter import messagebox
         from siard_workflow.operations.blob_convert_operation import _fmt_size
+
+        skipped = "".join(f"\n   • {n} beholdt: {r}"
+                          for r, n in est.get("skipped", {}).items())
+        mins = max(1, round(est.get("est_seconds", 0) / 60))
+        pct = f"{est['sample_saving_pct']:.1f}".replace(".", ",")   # norsk desimalkomma
+        n_total = f"{est['n_total']:,}".replace(",", " ")           # 48 210
+        labels = est.get("origin_labels", {})
+        groups = "".join(
+            f"\n   • {f'{n:,}'.replace(',', ' ')} {labels.get(o, o)}"
+            for o, n in est.get("origins", {}).items())
+        msg = (
+            "Dokumentkonverteringen er ferdig. PDF-filene kan etterbehandles med "
+            f"Ghostscript {est.get('gs_version', '')} for å spare lagringsplass:"
+            f"{groups}\n\n"
+            + ("MERK: «Tillat JPEG-omkoding av bilder» er slått på — bilder kan "
+               "kodes om til JPEG (tapsbeheftet). Tekst, "
+               if est.get("allow_jpeg") else
+               "Innholdet endres ikke: bilder komprimeres ikke med tap, og tekst, ")
+            + "sidetall og utseende kontrolleres for hver fil. Filer som ikke blir "
+            "mindre — eller er signert, krypterte, har vedlegg eller skjemafelt — "
+            "beholdes. PDF-er som ikke var PDF/A, blir PDF/A.\n\n"
+            f"Test på {est['n_sample']} filer:\n"
+            f"   {_fmt_size(est['sample_before'])} → {_fmt_size(est['sample_after'])}  "
+            f"({pct} % mindre, {est['n_ok']} av {est['n_sample']} filer "
+            f"forbedret){skipped}\n\n"
+            f"Beregnet for alle {n_total} filer:\n"
+            f"   {_fmt_size(est['total_before'])} → ca. {_fmt_size(est['est_after'])}  "
+            f"(spart ca. {_fmt_size(est['est_saved'])})\n"
+            f"   Tidsbruk: ca. {mins} min\n\n"
+            "Vil du etterbehandle alle PDF-filene?\n"
+            "(Nei = ingen filer endres.)")
+        return self._ask_yes_no("Ghostscript-etterbehandling", msg,
+                                "Ja, etterbehandle alle", "Nei, ingen endres")
+
+    def _ask_unknown_format(self, ext: str, antall: int, eksempler: str,
+                            mime: str) -> str:
+        """
+        Kalles fra BLOB-konverteringen (arbeidstråd) for hvert ukjent, gyldig
+        filformat. Returnerer «konverter», «behold» eller «hopp_over». Uten svar
+        innen fristen (5 min, eller 30 min med mobilvarsling) beholdes filene.
+        """
+        import threading as _threading
         done = _threading.Event()
-        answer = [False]
+        box: dict = {"result": "behold"}
+        timeout = 1800 if self._remote_hub is not None else 300
+        e = ext.upper()
+        text = (f"Ukjent filformat funnet: .{e}\n"
+                f"MIME: {mime or 'ukjent'}\n"
+                f"Antall filer: {antall}\n"
+                f"Eksempler: {eksempler}\n\n"
+                f"Hva skal gjøres med .{e}-filer?\n\n"
+                f"Konverter: forsøk konvertering til PDF/A (formatet legges til i "
+                f"listen over formater som konverteres).\n"
+                f"Behold: behold originalformatet (legges til i listen over formater "
+                f"som beholdes).\n"
+                f"Avbryt: hopp over filene i denne kjøringen.\n\n"
+                f"Uten svar innen {timeout // 60} minutter beholdes filene.")
 
         def _show():
-            skipped = "".join(f"\n   • {n} beholdt: {r}"
-                              for r, n in est.get("skipped", {}).items())
-            mins = max(1, round(est.get("est_seconds", 0) / 60))
-            pct = f"{est['sample_saving_pct']:.1f}".replace(".", ",")   # norsk desimalkomma
-            n_total = f"{est['n_total']:,}".replace(",", " ")           # 48 210
-            labels = est.get("origin_labels", {})
-            groups = "".join(
-                f"\n   • {f'{n:,}'.replace(',', ' ')} {labels.get(o, o)}"
-                for o, n in est.get("origins", {}).items())
-            msg = (
-                "Dokumentkonverteringen er ferdig. PDF-filene kan etterbehandles med "
-                f"Ghostscript {est.get('gs_version', '')} for å spare lagringsplass:"
-                f"{groups}\n\n"
-                + ("MERK: «Tillat JPEG-omkoding av bilder» er slått på — bilder kan "
-                   "kodes om til JPEG (tapsbeheftet). Tekst, "
-                   if est.get("allow_jpeg") else
-                   "Innholdet endres ikke: bilder komprimeres ikke med tap, og tekst, ")
-                + "sidetall og utseende kontrolleres for hver fil. Filer som ikke blir "
-                "mindre — eller er signert, krypterte, har vedlegg eller skjemafelt — "
-                "beholdes. PDF-er som ikke var PDF/A, blir PDF/A.\n\n"
-                f"Test på {est['n_sample']} filer:\n"
-                f"   {_fmt_size(est['sample_before'])} → {_fmt_size(est['sample_after'])}  "
-                f"({pct} % mindre, {est['n_ok']} av {est['n_sample']} filer "
-                f"forbedret){skipped}\n\n"
-                f"Beregnet for alle {n_total} filer:\n"
-                f"   {_fmt_size(est['total_before'])} → ca. {_fmt_size(est['est_after'])}  "
-                f"(spart ca. {_fmt_size(est['est_saved'])})\n"
-                f"   Tidsbruk: ca. {mins} min\n\n"
-                "Vil du etterbehandle alle PDF-filene?\n"
-                "(Nei = ingen filer endres.)")
-            answer[0] = bool(messagebox.askyesno(
-                "Ghostscript-etterbehandling", msg, parent=self))
+            dlg = _PipelineSuggestionDialog(self, text, heading=f"Ukjent format: .{e}",
+                                            yes_text="Konverter", no_text="Behold",
+                                            cancel=True)
+            dlg.title(f"Ukjent format: .{e}")
+            box["dlg"] = dlg
+            self.wait_window(dlg)
+            box["result"] = {"ja": "konverter", "nei": "behold"}.get(dlg.result, "hopp_over")
             done.set()
 
         self.after(0, _show)
-        done.wait()
-        return answer[0]
+        self._remote_wait(done, f"Ukjent format: .{e}", text,
+                          [("ja", "Konverter"), ("nei", "Behold"), ("avbryt", "Hopp over")],
+                          lambda k: self._answer_suggestion(box.get("dlg"), k),
+                          timeout=timeout)
+        if not done.is_set():                        # fristen gikk ut
+            self.after(0, lambda: self._answer_suggestion(box.get("dlg"), "nei"))
+            return "behold"
+        return box["result"]
 
     def _ask_dias_output_dir(self, current_dir, needed_bytes: int,
                               free_bytes: int) -> "str | None":
@@ -3631,20 +3909,26 @@ class App(ctk.CTk):
                     return f"{n / factor:.1f} {unit}"
             return f"{n} B"
 
+        msg = (
+            f"Ikke nok plass på mål-disk for DIAS-pakke.\n\n"
+            f"Mål-mappe:    {current_dir}\n"
+            f"Estimert størrelse: {_fmt(needed_bytes)}\n"
+            f"Ledig plass:        {_fmt(free_bytes)}\n\n"
+            "Vil du velge en annen lagringsmappe?\n"
+            "(Avbryt vil stoppe DIAS-pakking.)"
+        )
+        box: dict = {}
+
         def _show_dialog():
-            # 1. Vis advarsel-modal med info om plass
-            msg = (
-                f"Ikke nok plass på mål-disk for DIAS-pakke.\n\n"
-                f"Mål-mappe:    {current_dir}\n"
-                f"Estimert størrelse: {_fmt(needed_bytes)}\n"
-                f"Ledig plass:        {_fmt(free_bytes)}\n\n"
-                "Vil du velge en annen lagringsmappe?\n"
-                "(Avbryt vil stoppe DIAS-pakking.)"
-            )
-            ok = messagebox.askyesno(
-                "Ikke nok diskplass for DIAS-pakke",
-                msg, icon="warning", parent=self)
-            if not ok:
+            # 1. Vis advarsel med info om plass (kan besvares «Avbryt» fra mobilen)
+            dlg = _PipelineSuggestionDialog(
+                self, msg, heading="Ikke nok diskplass for DIAS-pakke",
+                yes_text="Velg annen mappe …", no_text="Avbryt pakking", cancel=False)
+            dlg.title("Ikke nok diskplass for DIAS-pakke")
+            box["dlg"] = dlg
+            self.wait_window(dlg)
+            box.pop("dlg", None)
+            if dlg.result != "ja":
                 result_event.set()
                 return
 
@@ -3677,7 +3961,12 @@ class App(ctk.CTk):
                 return
 
         self.after(0, _show_dialog)
-        result_event.wait()
+        # Fra mobilen kan pakkingen bare avbrytes — ny mappe velges på PC-en
+        self._remote_wait(result_event, "Ikke nok diskplass for DIAS-pakke",
+                          msg.replace("Vil du velge en annen lagringsmappe?\n",
+                                      "En annen lagringsmappe må velges på PC-en.\n"),
+                          [("nei", "Avbryt pakking")],
+                          lambda k: self._answer_suggestion(box.get("dlg"), k))
         return result_holder[0]
 
     def _ask_fill_empty_schema_names(self, empties: list,
@@ -3692,9 +3981,35 @@ class App(ctk.CTk):
 
         Returnerer {schema_index: new_name} eller None ved Avbryt.
         """
-        from gui.empty_schema_name_dialog import ask_fill_empty_schema_names
-        return ask_fill_empty_schema_names(
-            self.after, self, empties, existing_names=existing_names)
+        import threading as _threading
+        from gui.empty_schema_name_dialog import EmptySchemaNameDialog
+        done = _threading.Event()
+        box: dict = {"result": None}
+
+        def _cb(fixes):
+            box["result"] = fixes
+            done.set()
+
+        def _show():
+            box["dlg"] = EmptySchemaNameDialog(self, empties, existing_names=existing_names,
+                                               on_confirm=_cb)
+
+        def _remote(key: str) -> bool:
+            dlg = box.get("dlg")
+            if dlg is None or not dlg.winfo_exists():
+                return False
+            dlg._cancel()                 # None → operasjonen bruker mappenavnene
+            return True
+
+        folders = [str(e.get("folder", "")) for e in empties]
+        self.after(0, _show)
+        self._remote_wait(done, "Schema uten navn",
+                          f"{len(folders)} schema(s) mangler navn i metadata.xml "
+                          f"(mappe: {', '.join(folders[:10])}).\n\n"
+                          "Bruk mappenavn = schemaet får mappenavnet. Andre navn må "
+                          "skrives inn på PC-en.",
+                          [("mappenavn", "Bruk mappenavn")], _remote)
+        return box["result"]
 
     def _siardmapper_dialog_cb(self, matches, siard_path, extracted_path,
                                json_path=None, suggestion_map=None):
@@ -3705,13 +4020,27 @@ class App(ctk.CTk):
         """
         result_event  = threading.Event()
         result_holder = [None]
+        box: dict = {}
         self._log_queue.put((
             "siardmapper_dialog",
             matches, siard_path, extracted_path,
             json_path, suggestion_map,
-            result_event, result_holder,
+            result_event, result_holder, box,
         ))
-        result_event.wait()
+
+        def _remote(key: str) -> bool:
+            dlg = box.get("dlg")
+            if dlg is None or not dlg.winfo_exists():
+                return False
+            (dlg._save if key == "lagre" else dlg._cancel)()
+            return True
+
+        self._remote_wait(result_event, "Metadata-berikelse (SIARDMapper)",
+                          "JSON-malen passet bare delvis. Beskrivelsene som ble funnet, "
+                          "vises på PC-en.\n\nLagre og fortsett = bruk det som er funnet. "
+                          "Avbryt kjøring = stopp berikelsen.",
+                          [("lagre", "Lagre og fortsett"), ("avbryt", "Avbryt kjøring")],
+                          _remote)
         return result_holder[0]
 
     def _toggle_theme(self) -> None:

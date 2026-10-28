@@ -86,6 +86,16 @@ _CONFIG_DEFAULTS: dict = {
     "ollama_port":            11434,       # Ollama standardport
     "ollama_model":           "",          # tom = auto (foretrekker Gemma)
     "ollama_timeout":         30,          # sekunder per kall
+    # Varsling til mobil (siard_workflow/core/remote_notify.py)
+    "notify_enabled":         False,       # send status/spørsmål til mobil
+    "ntfy_enabled":           True,        # ntfy-appen (varsler + svar)
+    "ntfy_server":            "https://ntfy.sh",
+    "ntfy_topic":             "",          # tom = lages ved første aktivering
+    "ntfy_token":             "",          # valgfri tilgangsnøkkel (reservert emne / egen server)
+    "teams_webhook_url":      "",          # Teams Workflows-webhook (bare varsler)
+    "notify_hide_filenames":  False,       # «fil 2 av 5» i stedet for filnavn
+    "notify_each_step":       False,       # varsle for hvert fullførte steg
+    "notify_heartbeat":       True,        # livstegn hver halvtime
 }
 
 

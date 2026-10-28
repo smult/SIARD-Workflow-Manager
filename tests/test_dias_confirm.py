@@ -119,6 +119,8 @@ def test_dialog(tmp: Path) -> None:
     root.geometry("1200x800+0+0")
     root.workflow_panel = _WP()
     root._log = lambda m, lvl="info": None
+    root._remote_hub = None                              # uten mobilvarsling
+    root._remote_wait = App._remote_wait.__get__(root)
     results: list = []
     seen: dict = {}
 

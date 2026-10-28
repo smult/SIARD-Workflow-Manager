@@ -136,6 +136,8 @@ class SettingsDialog(ctk.CTkToplevel):
                          row=r, column=0, columnspan=2,
                          padx=14, pady=(0, 4), sticky="w"); r += 1
 
+        r = self._build_notify_section(frm, cfg, _seksjon, _rad, r)
+
         _seksjon("SIARDMapper", r);        r += 1
         _rad("JSON-mal-mappe", "json_template_dir", "str", r,
              default="", browse_dir=True);  r += 1
@@ -617,6 +619,63 @@ class SettingsDialog(ctk.CTkToplevel):
                       font=ctk.CTkFont(family=FONTS["mono"], size=11,
                                        weight="bold"),
                       command=self._save).pack(side="left")
+
+    def _build_notify_section(self, frm, cfg: dict, _seksjon, _rad, r: int) -> int:
+        """Varsling til mobil (ntfy-appen og/eller Teams) — se core/remote_notify."""
+        from siard_workflow.core.remote_notify import new_topic
+        _muted = dict(font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                      text_color=COLORS["muted"])
+
+        def _hint(text: str) -> None:
+            nonlocal r
+            ctk.CTkLabel(frm, text=text, justify="left", wraplength=700, **_muted).grid(
+                row=r, column=0, columnspan=2, padx=14, pady=(0, 4), sticky="w")
+            r += 1
+
+        def _entry(label: str, key: str, value: str, width: int = 420, show: str = "") -> None:
+            nonlocal r
+            ctk.CTkLabel(frm, text=label, font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                         text_color=COLORS["text"], anchor="w").grid(
+                row=r, column=0, padx=(12, 8), pady=6, sticky="w")
+            var = ctk.StringVar(value=value)
+            ctk.CTkEntry(frm, textvariable=var, width=width, show=show,
+                         fg_color=COLORS["bg"],
+                         font=ctk.CTkFont(family=FONTS["mono"], size=12)).grid(
+                row=r, column=1, padx=12, pady=6, sticky="ew")
+            self._vars[key] = var
+            r += 1
+
+        _seksjon("Varsling til mobil", r); r += 1
+        _hint("Få beskjed på mobilen om hvordan en jobb går, og svar på spørsmål "
+              "(f.eks. DIAS-kontroll) uten å være ved PC-en. Meldingene inneholder "
+              "bare tekniske opplysninger: filnavn, steg og spørsmålstekst.")
+        _rad("Send varsler til mobil", "notify_enabled", "bool", r, default=False); r += 1
+        _rad("ntfy-appen (varsler og svar)", "ntfy_enabled", "bool", r, default=True); r += 1
+        _entry("ntfy-emne", "ntfy_topic", str(cfg.get("ntfy_topic") or new_topic()))
+        _entry("ntfy-server", "ntfy_server", str(cfg.get("ntfy_server") or "https://ntfy.sh"))
+        _entry("Tilgangsnøkkel (valgfri)", "ntfy_token", str(cfg.get("ntfy_token") or ""),
+               show="•")
+        _entry("Teams-lenke (Workflows)", "teams_webhook_url",
+               str(cfg.get("teams_webhook_url") or ""))
+        _rad("Skjul filnavn i meldingene", "notify_hide_filenames", "bool", r,
+             default=False); r += 1
+        _rad("Varsle for hvert ferdige steg", "notify_each_step", "bool", r,
+             default=False); r += 1
+        _rad("Livstegn hver halvtime", "notify_heartbeat", "bool", r, default=True); r += 1
+        ctk.CTkButton(frm, text="Koble til mobil og test …",
+                      fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"],
+                      text_color=COLORS["on_accent"],
+                      font=ctk.CTkFont(family=FONTS["mono"], size=11, weight="bold"),
+                      command=self._open_remote_setup).grid(
+            row=r, column=0, columnspan=2, padx=12, pady=(6, 4), sticky="w")
+        r += 1
+        _hint("Emnet virker som et passord: alle som kjenner det, kan lese "
+              "meldingene og svare. Del det ikke.")
+        return r
+
+    def _open_remote_setup(self) -> None:
+        from gui.remote_setup_dialog import RemoteSetupDialog
+        RemoteSetupDialog(self, self._vars)
 
     def _save(self):
         cfg: dict = {}

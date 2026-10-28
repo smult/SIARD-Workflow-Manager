@@ -2101,6 +2101,8 @@ class BlobConvertOperation(BaseOperation):
         stop_ev  = ctx.metadata.get("stop_event",  threading.Event())
         # Dialog for Ghostscript-etterbehandling (gui/app.py) — None uten GUI
         self._gs_ask_cb = ctx.metadata.get("ask_gs_postprocess_cb")
+        # Ukjent filformat: spørsmål via GUI-callback (kan besvares fra mobilen)
+        self._unknown_ask_cb = ctx.metadata.get("ask_unknown_format_cb")
         pause_ev = ctx.metadata.get("pause_event", threading.Event())
 
         # CSV-detaljlogg og feilogg per kjøring
@@ -5687,8 +5689,16 @@ class BlobConvertOperation(BaseOperation):
         """
         Spør bruker via GUI-dialog hva som skal gjøres med ukjent filformat.
         Returnerer: 'konverter', 'behold', eller 'hopp_over'.
-        Kjøres i hoved-tråden via tkinter-kall.
+        Med GUI-callback (ask_unknown_format_cb, gui/app.py) kan spørsmålet også
+        besvares fra mobilen; ellers egen messagebox i hoved-tråden.
         """
+        cb = getattr(self, "_unknown_ask_cb", None)
+        if cb is not None:
+            try:
+                svar = cb(ext, antall, eksempler, mime)
+                return svar if svar in ("konverter", "behold", "hopp_over") else "behold"
+            except Exception:
+                return "behold"
         try:
             import tkinter as tk
             from tkinter import messagebox
