@@ -165,6 +165,11 @@ def _markup_from_header(head: bytes) -> "tuple[str, str] | None":
     return None
 
 
+def _clean(value) -> str:
+    """Én TSV-celle: ingen tabulatorer eller linjeskift."""
+    return str(value).replace("\t", " ").replace("\r", " ").replace("\n", " ")
+
+
 class SiegfriedIdentifier:
     """Siegfried/PRONOM-backend."""
 
@@ -174,6 +179,14 @@ class SiegfriedIdentifier:
         from settings import get_config
         self.sf_exe: str = str(get_config("sf_executable", "") or "")
         self._cache: dict[str, tuple[str, str, bool]] = {}
+        # Størrelse og endringstid da filen ble identifisert — et resultat
+        # gjenbrukes bare når filen er uendret (se pre_scan / cache_file)
+        self._stat: dict[str, tuple[int, int]] = {}
+        # Til identifikasjonsloggen for filer hentet fra varig cache:
+        # (opprinnelig sti, PUID, formatnavn, grunnlag, advarsel)
+        self._match_info: dict[str, tuple] = {}
+        self.prescan_reused = 0           # filer hentet fra cache i siste pre_scan
+        self.prescan_scanned = 0          # filer sendt til sf i siste pre_scan
         # Valgfri logger — settes utenfra (SiegfriedIdLogger). Hver
         # identifikasjon skrives som én rad: filnavn, ext, mime, PUID, ...
         self.logger = None
@@ -184,6 +197,7 @@ class SiegfriedIdentifier:
     def set_logger(self, logger) -> None:
         """Sett logger som mottar én rad per identifisert fil."""
         self.logger = logger
+        self._logged_paths = set()        # ny logg (ny kjøring): logg alle filer igjen
 
     # ── Tilgjengelighet ──────────────────────────────────────────────────────
 
@@ -204,7 +218,9 @@ class SiegfriedIdentifier:
     def pre_scan(self, root: Path,
                  files: Optional[list] = None,
                  max_workers: Optional[int] = None,
-                 progress_cb: Optional[Callable[[int, int], None]] = None
+                 progress_cb: Optional[Callable[[int, int], None]] = None,
+                 cache_file: "Optional[Path]" = None,
+                 source_key: str = "",
                  ) -> None:
         """
         Fyll cache med Siegfried-resultater.
@@ -216,18 +232,142 @@ class SiegfriedIdentifier:
         max_workers: antall parallelle sf-prosesser (kun ved file-list-modus).
             None betyr at backenden velger selv (os.cpu_count()).
         progress_cb(done, total): kalles etter hver fullført batch.
+        cache_file: varig cache (TSV) — resultater skrives fortløpende etter
+            hver batch, og leses inn igjen ved neste kjøring (f.eks. etter et
+            avbrudd). Bare filer som er uendret (størrelse + endringstid), med
+            samme Siegfried-versjon og samme kilde-SIARD (`source_key`),
+            gjenbrukes; resten skannes.
         """
+        self.prescan_reused = self.prescan_scanned = 0
         if not self.is_available():
             return
-        if files is not None:
-            self._scan_file_list(files, max_workers=max_workers,
-                                 progress_cb=progress_cb)
-        else:
+        if files is None:
             self._scan_directory(Path(root))
+            return
+        stats = self._stat_map(files)
+        writer = None
+        if cache_file is not None:
+            writer = self._open_cache_file(Path(cache_file), stats, source_key)
+        todo = []
+        for f in files:
+            k = self._cache_key(f)
+            if k in self._cache and k in stats and self._stat.get(k) == stats[k]:
+                self.prescan_reused += 1
+                self._log_cached(k)
+            else:
+                todo.append(f)
+        self.prescan_scanned = len(todo)
+        try:
+            self._scan_file_list(todo, max_workers=max_workers,
+                                 progress_cb=progress_cb, stats=stats, writer=writer)
+        finally:
+            if writer is not None:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+
+    # ── Varig cache ──────────────────────────────────────────────────────────
+
+    _CACHE_MAGIC = "#siard-sf-cache"
+    _CACHE_VERSION = "1"
+
+    def _signature(self) -> str:
+        """Siegfried-programmet (størrelse:endringstid) — ny versjon ⇒ ny skann."""
+        try:
+            st = os.stat(self.sf_exe)
+            return f"{st.st_size}:{st.st_mtime_ns}"
+        except OSError:
+            return ""
+
+    @classmethod
+    def _stat_map(cls, paths) -> dict:
+        """
+        {cache-nøkkel: (størrelse, endringstid_ns)} med én scandir per mappe —
+        på Windows leveres stat-data av katalogoppslaget (ingen ekstra kall
+        per fil, viktig ved hundretusener av LOB-filer).
+        """
+        by_dir: dict = {}
+        for p in paths:
+            d, n = os.path.split(str(p))
+            by_dir.setdefault(d, set()).add(os.path.normcase(n))
+        out: dict = {}
+        for d, names in by_dir.items():
+            try:
+                with os.scandir(d) as it:
+                    for e in it:
+                        if os.path.normcase(e.name) in names:
+                            try:
+                                st = e.stat(follow_symlinks=False)
+                            except OSError:
+                                continue
+                            out[cls._cache_key(os.path.join(d, e.name))] = (
+                                st.st_size, st.st_mtime_ns)
+            except OSError:
+                continue
+        return out
+
+    def _open_cache_file(self, path: Path, stats: dict, source_key: str):
+        """
+        Les gyldige resultater fra en tidligere kjøring inn i minnet, og åpne
+        filen for videre skriving. Annen Siegfried-versjon eller annen kilde
+        ⇒ filen startes på nytt.
+        """
+        header = "\t".join((self._CACHE_MAGIC, self._CACHE_VERSION,
+                            self._signature(), _clean(source_key)))
+        valid_header = False
+        try:
+            if path.exists():
+                with open(path, encoding="utf-8") as fh:      # tåler både LF og CRLF
+                    first = fh.readline().rstrip("\r\n")
+                    valid_header = first == header
+                    if valid_header:
+                        for line in fh:
+                            parts = line.rstrip("\r\n").split("\t")
+                            if len(parts) != 10:
+                                continue
+                            path0, size, mtime, ext, mime, enc = parts[:6]
+                            key = self._cache_key(path0)
+                            try:
+                                snap = (int(size), int(mtime))
+                            except ValueError:
+                                continue
+                            if stats.get(key) != snap:
+                                continue          # endret eller borte — skannes på nytt
+                            self._cache[key] = (ext, mime, enc == "1")
+                            self._stat[key] = snap
+                            self._match_info[key] = (path0, *parts[6:10])
+        except Exception:
+            logger.exception("Siegfried-cache %s kunne ikke leses", path)
+            valid_header = False
+        try:
+            if valid_header:
+                return open(path, "a", encoding="utf-8", newline="\n")
+            fh = open(path, "w", encoding="utf-8", newline="\n")
+            fh.write(header + "\n")
+            fh.flush()
+            return fh
+        except Exception:
+            logger.exception("Siegfried-cache %s kunne ikke skrives", path)
+            return None
+
+    def _log_cached(self, key: str) -> None:
+        """Identifikasjonsloggen skal også vise filer som ble hentet fra cache."""
+        if self.logger is None:
+            return
+        info = self._match_info.get(key)
+        ext, mime, _enc = self._cache[key]
+        if not info:
+            self._log_match(key, ext, mime, [])
+            return
+        m = dict(zip(("id", "format", "basis", "warning"), info[1:]))
+        self._log_match(info[0], ext, mime, [m] if any(m.values()) else [])
 
     def _scan_file_list(self, files: list,
                         max_workers: Optional[int] = None,
-                        progress_cb: Optional[Callable[[int, int], None]] = None
+                        progress_cb: Optional[Callable[[int, int], None]] = None,
+                        stats: "Optional[dict]" = None,
+                        writer=None,
                         ) -> None:
         """Batch-kall til sf med eksplisitt fil-liste.
 
@@ -280,7 +420,12 @@ class SiegfriedIdentifier:
                     result = None
                 if result:
                     with cache_lock:
-                        self._ingest_sf_json(result)
+                        self._ingest_sf_json(result, stats=stats, writer=writer)
+                        if writer is not None:
+                            try:
+                                writer.flush()      # overlever et avbrudd
+                            except Exception:
+                                pass
                 if progress_cb:
                     try:
                         progress_cb(n_done, n_total)
@@ -313,8 +458,9 @@ class SiegfriedIdentifier:
         """
         return os.path.normcase(os.path.normpath(str(path)))
 
-    def _ingest_sf_json(self, result: dict) -> None:
-        """Felles parser av sf-JSON-output — fyller cache og logger."""
+    def _ingest_sf_json(self, result: dict, stats: "Optional[dict]" = None,
+                        writer=None) -> None:
+        """Felles parser av sf-JSON-output — fyller cache og logger (og varig cache)."""
         for f in result.get("files", []):
             path = f.get("filename", "")
             if not path:
@@ -335,6 +481,19 @@ class SiegfriedIdentifier:
             key = self._cache_key(path)
             self._cache[key] = (ext, mime, enc)
             self._log_match(path, ext, mime, matches)
+            snap = (stats or {}).get(key)
+            if snap is not None:
+                self._stat[key] = snap
+                if writer is not None:
+                    m = matches[0] if matches else {}
+                    try:
+                        writer.write("\t".join((
+                            _clean(path), str(snap[0]), str(snap[1]), _clean(ext),
+                            _clean(mime), "1" if enc else "0",
+                            *(_clean(m.get(k, "") or "") for k in
+                              ("id", "format", "basis", "warning")))) + "\n")
+                    except Exception:
+                        pass
 
     # ── Hovedfunksjon ────────────────────────────────────────────────────────
 

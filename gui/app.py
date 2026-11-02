@@ -1066,17 +1066,19 @@ class App(ctk.CTk):
         # Slett blob-resume-sjekkpunkt slik at neste kjøring starter fra steg 1
         src = Path(self._project_file.source_siard) if self._project_file.source_siard else None
         if src:
-            from siard_workflow.operations.blob_convert_operation import _resume_json_path
+            from siard_workflow.operations.blob_convert_operation import (
+                _resume_json_path, _sf_cache_path)
             log_dir = src.parent
             if self._auto_log_dir:
                 log_dir = self._auto_log_dir
-            rjp = _resume_json_path(log_dir, src.stem)
-            if rjp.exists():
-                try:
-                    rjp.unlink()
-                    self._log(f"  Blob-resume-sjekkpunkt slettet: {rjp.name}", "muted")
-                except Exception:
-                    pass
+            for rjp in (_resume_json_path(log_dir, src.stem),
+                        _sf_cache_path(log_dir, src.stem)):
+                if rjp.exists():
+                    try:
+                        rjp.unlink()
+                        self._log(f"  Blob-sjekkpunkt slettet: {rjp.name}", "muted")
+                    except Exception:
+                        pass
         self._log(f"Prosjekt nullstilt: {self._project_path.name} — alle steg kjøres på nytt", "info")
 
     def _clear_project_state(self) -> None:

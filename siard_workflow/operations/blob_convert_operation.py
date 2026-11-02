@@ -1657,6 +1657,23 @@ def _resume_json_path(log_dir, siard_stem: str) -> Path:
     return Path(log_dir) / f"{siard_stem}{_RESUME_SUFFIX}"
 
 
+# Siegfried-resultater fra en avbrutt kjøring (se SiegfriedIdentifier.pre_scan)
+_SF_CACHE_SUFFIX = "_siegfried_cache.tsv"
+
+
+def _sf_cache_path(log_dir, siard_stem: str) -> Path:
+    return Path(log_dir) / f"{siard_stem}{_SF_CACHE_SUFFIX}"
+
+
+def _siard_source_key(siard_path) -> str:
+    """Kilde-SIARD (sti, størrelse, endringstid) — annen fil ⇒ cachen gjelder ikke."""
+    try:
+        st = Path(siard_path).stat()
+        return f"{Path(siard_path).resolve()}|{st.st_size}|{st.st_mtime_ns}"
+    except Exception:
+        return str(siard_path or "")
+
+
 def _load_resume_done_set(resume_json: Path) -> set[str]:
     """
     Les ..._blob_resume.json og returner settet av zip_sti-er som er
@@ -2163,6 +2180,13 @@ class BlobConvertOperation(BaseOperation):
                 except Exception:
                     _resume_json = None   # lagring feilet — fortsett uten
         ctx.metadata["_blob_resume_done"] = _done_set
+        # Siegfried-resultater lagres fortløpende her, så en ny kjøring etter et
+        # avbrudd slipper å skanne uendrede filer på nytt (slettes når steget
+        # fullfører)
+        self._sf_cache_file = (_sf_cache_path(log_dir, ctx.siard_path.stem
+                                              if ctx.siard_path else "blob")
+                               if log_dir else None)
+        self._sf_source_key = _siard_source_key(ctx.siard_path)
 
         # Pipeline-modus: ikke produser ny SIARD — RepackSiard tar seg av det
         pipeline_mode = bool(
@@ -2332,12 +2356,13 @@ class BlobConvertOperation(BaseOperation):
 
         progress("finish", stats=stats)
 
-        # Slett resume-sjekkpunkt — kjøringen fullførte vellykket
-        if _resume_json and _resume_json.exists():
-            try:
-                _resume_json.unlink()
-            except Exception:
-                pass
+        # Slett resume-sjekkpunkt og Siegfried-cache — kjøringen fullførte vellykket
+        for _cp in (_resume_json, getattr(self, "_sf_cache_file", None)):
+            if _cp and _cp.exists():
+                try:
+                    _cp.unlink()
+                except Exception:
+                    pass
 
         return self._ok(
             data={**stats, "output_path": str(dst_path)},
@@ -3121,9 +3146,17 @@ class BlobConvertOperation(BaseOperation):
                     _state["last_log_t"] = now
 
             try:
+                _sf_cache = getattr(self, "_sf_cache_file", None)
                 _id.pre_scan(extract_dir, files=_blob_paths,
-                             max_workers=max_w, progress_cb=_scan_progress)
+                             max_workers=max_w, progress_cb=_scan_progress,
+                             cache_file=_sf_cache,
+                             source_key=getattr(self, "_sf_source_key", ""))
                 _total = _time.monotonic() - _state["t0"]
+                _reused = getattr(_id, "prescan_reused", 0)
+                if _reused:
+                    w(f"  Siegfried: {_reused:,} filer hentet fra forrige (avbrutte) "
+                      f"kjøring ({_sf_cache.name if _sf_cache else 'minne'}), "
+                      f"{getattr(_id, 'prescan_scanned', 0):,} skannet nå", "info")
                 w(f"  Forhåndsskann ferdig på {_total:.0f}s", "ok")
             except Exception as _exc:
                 w(f"  Forhåndsskann feilet: {_exc} — "
