@@ -89,7 +89,7 @@ def venv_python(use_current: bool) -> Path:
         log(f"Lager byggemiljø {venv}")
         run([sys.executable, "-m", "venv", venv])
     run([py, "-m", "pip", "install", "--disable-pip-version-check", "-q", "-U", "pip",
-         "pyinstaller==6.19.0"])
+         "pyinstaller==6.22.3"])
     # constraints.txt låser versjonene programmet er testet med (reproduserbart bygg)
     cons = ["-c", ROOT / "packaging" / "constraints.txt"]
     run([py, "-m", "pip", "install", "--disable-pip-version-check", "-q",
