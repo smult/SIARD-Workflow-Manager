@@ -61,19 +61,43 @@ CHECKED_FORMATS = frozenset(_OLE2_FORMATS) | frozenset(_ZIP_FORMATS)
 _BYTERANGE = re.compile(rb"/ByteRange\s*\[\s*\d+\s+\d+\s+\d+\s+\d+\s*\]")
 
 
+_SIG_CHUNK = 8 << 20       # filer leses i blokker — ikke hele PDF-en i minnet
+_SIG_OVERLAP = 1024        # /ByteRange [...] som deles av en blokkgrense
+
+
+def _has_byterange(buf: bytes) -> bool:
+    """Rask søk (bytes.find) etter «/ByteRange», regex bare der den finnes."""
+    i = buf.find(b"/ByteRange")
+    while i != -1:
+        if _BYTERANGE.match(buf, i):
+            return True
+        i = buf.find(b"/ByteRange", i + 10)
+    return False
+
+
 def is_signed_pdf(source: "Path | bytes") -> bool:
-    """True hvis PDF-en (fil eller bytes) har minst én digital signatur."""
+    """
+    True hvis PDF-en (fil eller bytes) har minst én digital signatur
+    (/ByteRange [a b c d]). Hele filen søkes — signaturen kan ligge hvor som
+    helst — men en fil leses i blokker på 8 MB med overlapp.
+    """
+    if isinstance(source, (bytes, bytearray, memoryview)):
+        data = bytes(source)
+        return b"%PDF" in data[:1024] and _has_byterange(data)
     try:
-        if isinstance(source, (bytes, bytearray, memoryview)):
-            data = bytes(source)
-        else:
-            data = Path(source).read_bytes()
+        with open(source, "rb") as f:
+            buf = f.read(_SIG_CHUNK)
+            if b"%PDF" not in buf[:1024]:
+                return False
+            while True:
+                if _has_byterange(buf):
+                    return True
+                chunk = f.read(_SIG_CHUNK)
+                if not chunk:
+                    return False
+                buf = buf[-_SIG_OVERLAP:] + chunk
     except OSError:
         return False
-    head = data[:1024]
-    if b"%PDF" not in head:
-        return False
-    return _BYTERANGE.search(data) is not None
 
 
 _CLSID_EXCEL = "00020820-0000-0000-C000-000000000046"

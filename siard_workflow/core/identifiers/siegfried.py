@@ -16,8 +16,11 @@ Strategi:
 from __future__ import annotations
 
 import concurrent.futures
+import csv
+import datetime
 import json
 import os
+import re
 import subprocess
 import tempfile
 import threading
@@ -187,6 +190,7 @@ class SiegfriedIdentifier:
         self._match_info: dict[str, tuple] = {}
         self.prescan_reused = 0           # filer hentet fra cache i siste pre_scan
         self.prescan_scanned = 0          # filer sendt til sf i siste pre_scan
+        self.prescan_from_logs = 0        # herav fra identifikasjonslogger (eldre kjøringer)
         # Valgfri logger — settes utenfra (SiegfriedIdLogger). Hver
         # identifikasjon skrives som én rad: filnavn, ext, mime, PUID, ...
         self.logger = None
@@ -221,6 +225,7 @@ class SiegfriedIdentifier:
                  progress_cb: Optional[Callable[[int, int], None]] = None,
                  cache_file: "Optional[Path]" = None,
                  source_key: str = "",
+                 id_logs: "Optional[list]" = None,
                  ) -> None:
         """
         Fyll cache med Siegfried-resultater.
@@ -237,8 +242,12 @@ class SiegfriedIdentifier:
             avbrudd). Bare filer som er uendret (størrelse + endringstid), med
             samme Siegfried-versjon og samme kilde-SIARD (`source_key`),
             gjenbrukes; resten skannes.
+        id_logs: identifikasjonslogger fra tidligere kjøringer
+            ({siard}_{ts}_siegfried_identifikasjon.log) — brukes for filer som
+            ikke er i cachen, når filen ikke er endret etter at loggen ble
+            startet (se _seed_from_id_logs).
         """
-        self.prescan_reused = self.prescan_scanned = 0
+        self.prescan_reused = self.prescan_scanned = self.prescan_from_logs = 0
         if not self.is_available():
             return
         if files is None:
@@ -248,6 +257,9 @@ class SiegfriedIdentifier:
         writer = None
         if cache_file is not None:
             writer = self._open_cache_file(Path(cache_file), stats, source_key)
+        self.prescan_from_logs = 0
+        if id_logs:
+            self.prescan_from_logs = self._seed_from_id_logs(id_logs, stats, writer)
         todo = []
         for f in files:
             k = self._cache_key(f)
@@ -350,6 +362,73 @@ class SiegfriedIdentifier:
         except Exception:
             logger.exception("Siegfried-cache %s kunne ikke skrives", path)
             return None
+
+    _ID_LOG_TS = re.compile(r"_(\d{8}_\d{6})_siegfried_identifikasjon\.log$")
+
+    @classmethod
+    def id_log_start_ns(cls, path) -> "Optional[int]":
+        """Starttidspunktet (fra filnavnet) til en identifikasjonslogg, i ns."""
+        m = cls._ID_LOG_TS.search(Path(path).name)
+        if not m:
+            return None
+        try:
+            t = datetime.datetime.strptime(m.group(1), "%Y%m%d_%H%M%S")
+            return int(t.timestamp()) * 1_000_000_000
+        except ValueError:
+            return None
+
+    def _seed_from_id_logs(self, logs: list, stats: dict, writer=None) -> int:
+        """
+        Hent resultater fra identifikasjonslogger skrevet av tidligere kjøringer
+        (før den varige cachen fantes, eller når den mangler). Loggen har
+        filsti, ext, mime, PUID, format, grunnlag og advarsel, men ikke filens
+        størrelse/tid: et resultat brukes bare når filen sist ble endret FØR
+        loggen ble startet — filer som ble dekodet, pakket ut eller konvertert
+        i den avbrutte kjøringen, skannes på nytt. Nyeste logg vinner.
+        Brukte resultater skrives til den varige cachen.
+        """
+        n = 0
+        dated = sorted(((self.id_log_start_ns(p), Path(p)) for p in logs),
+                       key=lambda x: x[0] or 0)
+        for start_ns, path in dated:
+            if not start_ns or not path.exists():
+                continue
+            try:
+                with open(path, encoding="utf-8-sig", newline="") as fh:
+                    reader = csv.reader(fh, delimiter=";")
+                    next(reader, None)                         # overskrift
+                    for row in reader:
+                        if len(row) < 7:
+                            continue
+                        fname, ext, mime, puid, fmt, basis, warn = row[:7]
+                        key = self._cache_key(fname)
+                        snap = stats.get(key)
+                        if snap is None or snap[1] >= start_ns:
+                            continue        # finnes ikke, eller endret etter loggstart
+                        if key not in self._cache or self._stat.get(key) != snap:
+                            n += 1
+                        w = warn.lower()
+                        enc = "encrypt" in w or "password" in w
+                        self._cache[key] = (ext or "bin", mime or "application/octet-stream",
+                                            enc)
+                        self._stat[key] = snap
+                        self._match_info[key] = (fname, puid, fmt, basis, warn)
+                        if writer is not None:
+                            try:
+                                writer.write("\t".join((
+                                    _clean(fname), str(snap[0]), str(snap[1]), _clean(ext),
+                                    _clean(mime), "1" if enc else "0", _clean(puid),
+                                    _clean(fmt), _clean(basis), _clean(warn))) + "\n")
+                            except Exception:
+                                pass
+            except Exception:
+                logger.exception("Identifikasjonslogg %s kunne ikke leses", path)
+        if writer is not None and n:
+            try:
+                writer.flush()
+            except Exception:
+                pass
+        return n
 
     def _log_cached(self, key: str) -> None:
         """Identifikasjonsloggen skal også vise filer som ble hentet fra cache."""

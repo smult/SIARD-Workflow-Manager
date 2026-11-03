@@ -31,6 +31,7 @@ import concurrent.futures
 import struct
 import csv
 import datetime
+import glob
 import hashlib
 import base64
 import io
@@ -504,6 +505,21 @@ def _strip_rtf_ole_objects(data: bytes) -> bytes:
         return data     # sikker fallback: returner original
 
     return bytes(out)
+
+
+def _utf8_candidate(head: bytes) -> bool:
+    """
+    Billig forsjekk for _try_decode_utf8_binary på filens første 64 kB: minst
+    10 ikke-ASCII-bytes i de første 512, og starten er gyldig UTF-8 (et tegn
+    som kuttes av vindusgrensen godtas). Usant ⇒ hele filen kan ikke være det.
+    """
+    if sum(1 for b in head[:512] if b > 127) < 10:
+        return False
+    try:
+        head.decode("utf-8")
+        return True
+    except UnicodeDecodeError as exc:
+        return exc.reason == "unexpected end of data" and exc.start >= len(head) - 3
 
 
 def _try_decode_utf8_binary(data: bytes) -> bytes | None:
@@ -2187,6 +2203,21 @@ class BlobConvertOperation(BaseOperation):
                                               if ctx.siard_path else "blob")
                                if log_dir else None)
         self._sf_source_key = _siard_source_key(ctx.siard_path)
+        # Identifikasjonslogger fra tidligere kjøringer av samme uttrekk (også fra
+        # før den varige cachen fantes) — gjenbrukes for uendrede filer
+        self._sf_id_logs = []
+        if log_dir:
+            _stem = ctx.siard_path.stem if ctx.siard_path else "blob"
+            _current = sf_log.log_path if sf_log else None
+            try:
+                self._sf_id_logs = [
+                    p for p in Path(log_dir).glob(
+                        f"{glob.escape(_stem)}_*_siegfried_identifikasjon.log")
+                    if p != _current and re.fullmatch(
+                        re.escape(_stem) + r"_\d{8}_\d{6}_siegfried_identifikasjon\.log",
+                        p.name)]
+            except Exception:
+                self._sf_id_logs = []
 
         # Pipeline-modus: ikke produser ny SIARD — RepackSiard tar seg av det
         pipeline_mode = bool(
@@ -3150,13 +3181,18 @@ class BlobConvertOperation(BaseOperation):
                 _id.pre_scan(extract_dir, files=_blob_paths,
                              max_workers=max_w, progress_cb=_scan_progress,
                              cache_file=_sf_cache,
-                             source_key=getattr(self, "_sf_source_key", ""))
+                             source_key=getattr(self, "_sf_source_key", ""),
+                             id_logs=getattr(self, "_sf_id_logs", None))
                 _total = _time.monotonic() - _state["t0"]
                 _reused = getattr(_id, "prescan_reused", 0)
                 if _reused:
+                    _from_logs = getattr(_id, "prescan_from_logs", 0)
                     w(f"  Siegfried: {_reused:,} filer hentet fra forrige (avbrutte) "
-                      f"kjøring ({_sf_cache.name if _sf_cache else 'minne'}), "
-                      f"{getattr(_id, 'prescan_scanned', 0):,} skannet nå", "info")
+                      f"kjøring"
+                      + (f" — herav {_from_logs:,} fra identifikasjonslogg(er) "
+                         f"({', '.join(p.name for p in self._sf_id_logs[-3:])})"
+                         if _from_logs else "")
+                      + f"; {getattr(_id, 'prescan_scanned', 0):,} skannet nå", "info")
                 w(f"  Forhåndsskann ferdig på {_total:.0f}s", "ok")
             except Exception as _exc:
                 w(f"  Forhåndsskann feilet: {_exc} — "
@@ -3204,6 +3240,9 @@ class BlobConvertOperation(BaseOperation):
         # Typekolonne-hint (se _detect_one_raw): tekstbaserte formater som
         # lesbar tekst kan hintes til, og statistikk for loggen
         _TEXT_HINT_EXTS = {"csv", "html", "htm", "xml"}
+        from siard_workflow.core.file_integrity import is_signed_pdf as _is_signed_pdf
+        _signed_pdfs: set = set()             # fylles i _detect_one
+        _signed_lock = threading.Lock()
         _hint_ignored: dict[str, int] = {}
         _hinted: set = set()
         _hint_lock = threading.Lock()
@@ -3211,6 +3250,12 @@ class BlobConvertOperation(BaseOperation):
         def _detect_one(zip_sti: str) -> tuple[str, tuple[str, str, bool]]:
             res = _detect_one_raw(zip_sti)
             ext, _mime, enc = res[1]
+            # Signert PDF? Sjekkes her (parallelt) — ikke én og én i
+            # kategoriseringen etterpå, som leste hele PDF-mengden i én tråd
+            # uten fremdrift (timer ved millioner av filer).
+            if ext == "pdf" and _is_signed_pdf(extract_dir / zip_sti):
+                with _signed_lock:
+                    _signed_pdfs.add(zip_sti)
             if not enc and ext in _CHECKED_FORMATS:
                 reason = _check_structure(extract_dir / zip_sti, ext)
                 if reason:
@@ -3233,7 +3278,8 @@ class BlobConvertOperation(BaseOperation):
         def _detect_one_raw(zip_sti: str) -> tuple[str, tuple[str, str, bool]]:
             p = extract_dir / zip_sti
             try:
-                data = p.read_bytes()[:65536]
+                with open(p, "rb") as _fh:          # bare starten — ikke hele filen
+                    data = _fh.read(65536)
             except Exception as exc:
                 if err_log:
                     err_log.write(zip_sti, PurePosixPath(zip_sti).suffix.lstrip(".").lower(),
@@ -3442,7 +3488,10 @@ class BlobConvertOperation(BaseOperation):
             # Ekte binære PDF-er er ikke gyldig UTF-8 (standard binær-marker
             # %âãÏÓ = \xe2\xe3... er ugyldig UTF-8), så risiko for falsk positiv er
             # minimal.  Kjøres for txt/bin (ingen ASCII-magic) og pdf (ASCII-magic).
-            if ext in ("txt", "bin", "pdf"):
+            # Hele filen leses bare når starten faktisk er gyldig UTF-8 med nok
+            # ikke-ASCII — ellers feiler dekodingen uansett (før ble HELE filen
+            # lest for hver PDF over 64 kB).
+            if ext in ("txt", "bin", "pdf") and _utf8_candidate(data):
                 full_data = _get_full()
                 recovered = _try_decode_utf8_binary(full_data)
                 if recovered is not None:
@@ -3500,13 +3549,51 @@ class BlobConvertOperation(BaseOperation):
         w(f"  Starter parallell deteksjon på {max_w} worker-tråder ...",
           "info")
         import time as _time
-        _last_log_t = _time.monotonic()
+        import queue as _queue
+        _t0 = _last_log_t = _time.monotonic()
+
+        def _num(v: float) -> str:
+            return f"{v:,.0f}".replace(",", " ")
+
+        def _detect_status(_now: float) -> str:
+            pct = 100.0 * n_detected / max(1, n_total)
+            rate = n_detected / max(0.001, _now - _t0)
+            return (f"{_num(n_detected)}/{_num(n_total)} filer ({pct:.0f} %, "
+                    f"{_num(rate)} filer/s{_eta_text(_t0, _now, pct)})")
+
+        # Begrenset antall oppgaver i køen om gangen: millioner av Future-
+        # objekter på én gang kostet flere GB minne og lang stillhet før
+        # første fremdriftsmelding.
+        _done_q: "_queue.SimpleQueue" = _queue.SimpleQueue()
+        _blob_iter = iter(all_blobs)
+        _inflight = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_w) as pool:
-            futs = {pool.submit(_detect_one, z): z for z in all_blobs}
-            for fut in concurrent.futures.as_completed(futs):
+            def _submit_next() -> bool:
+                z = next(_blob_iter, None)
+                if z is None:
+                    return False
+                pool.submit(_detect_one, z).add_done_callback(_done_q.put)
+                return True
+
+            for _ in range(max_w * 256):
+                if not _submit_next():
+                    break
+                _inflight += 1
+            while _inflight:
+                try:
+                    fut = _done_q.get(timeout=MAX_LOG_INTERVAL)
+                except _queue.Empty:
+                    # Ingen fil ferdig på 10 s (store filer) — si fra likevel
+                    _now = _time.monotonic()
+                    w(f"  Deteksjon pågår: {_detect_status(_now)} …", "info")
+                    _last_log_t = _now
+                    continue
+                _inflight -= 1
                 zip_sti, result = fut.result()
                 det_results[zip_sti] = result
                 n_detected += 1
+                if _submit_next():
+                    _inflight += 1
                 _now = _time.monotonic()
                 _gap = _now - _last_log_t
                 # Alltid logg siste; ellers krev både fremgangsterskel og
@@ -3518,10 +3605,13 @@ class BlobConvertOperation(BaseOperation):
                              or _gap >= MAX_LOG_INTERVAL))
                 )
                 if should_log:
-                    w(f"  Detektert: {n_detected:,}/{n_total:,} filer ...", "info")
-                    progress("phase_progress",
-                             done=n_detected, total=n_total)
+                    _st = _detect_status(_now)
+                    w(f"  Detektert: {_st}", "info")
+                    progress("phase_progress", done=n_detected, total=n_total,
+                             text=f"Identifiserer filer: {_st}")
                     _last_log_t = _now
+        if _signed_pdfs:
+            w(f"  Digitalt signerte PDF-er (røres ikke): {len(_signed_pdfs):,}", "info")
 
         if _utf8_bin_count[0]:
             w(f"  UTF-8-kodet binærdata: {_utf8_bin_count[0]:,} filer gjenopprettet", "info")
@@ -3548,9 +3638,14 @@ class BlobConvertOperation(BaseOperation):
         # Last live versjon av upgrade-mappingen
         _upgrade_live = _get_lo_upgrade()
 
+        w(f"  Sorterer {n_total:,} filer etter behandling …".replace(",", " "), "info")
+        _sort_t0 = _sort_log_t = _time.monotonic()
         for idx, zip_sti in enumerate(all_blobs):
             ext, mime, is_encrypted = det_results[zip_sti]
             file_ext  = PurePosixPath(zip_sti).suffix.lstrip(".").lower()
+            if idx & 0x3FFF == 0 and _time.monotonic() - _sort_log_t >= MAX_LOG_INTERVAL:
+                _sort_log_t = _time.monotonic()
+                w(f"    Sortert {idx:,}/{n_total:,} …".replace(",", " "), "info")
 
             # Bevar CSV-ekstensjon: innhold er alltid ren tekst → detektert som "txt",
             # men hvis blob er lagret med .csv-ekstensjon skal den forbli .csv
@@ -3583,8 +3678,7 @@ class BlobConvertOperation(BaseOperation):
 
             # Signert PDF: røres ALDRI (konvertering gjør signaturen ugyldig)
             if ext == "pdf":
-                from siard_workflow.core.file_integrity import is_signed_pdf
-                if is_signed_pdf(extract_dir / zip_sti):
+                if zip_sti in _signed_pdfs:          # sjekket i deteksjonen
                     to_rename_only.append((idx, zip_sti, ext, mime))
                     if err_log:
                         err_log.write(zip_sti, ext, "Digitalt signert PDF — beholdt "
@@ -3625,6 +3719,7 @@ class BlobConvertOperation(BaseOperation):
                 to_convert.append((idx, zip_sti, ext, mime))
             else:
                 unknown_items.setdefault(ext, []).append((idx, zip_sti, ext, mime))
+        w(f"  Sortert på {_time.monotonic() - _sort_t0:.0f} s", "info")
 
         # ── Spør bruker om ukjente, gyldige filtyper ─────────────────────────
         # Samle opp alle ukjente, gruppert per ext, og still ett spørsmål per ext
@@ -3801,6 +3896,7 @@ class BlobConvertOperation(BaseOperation):
         REPORT_INTERVAL = 200   # oppdater GUI hver N fil
         rename_ext_counts: dict[str, int] = {}   # teller per detektert ext
         _standardize_bin = _get_standardize_bin_ext()
+        _rn_t0 = _rn_log_t = _time.monotonic()   # loggmelding hvert 30. s (store uttrekk)
         for i, (idx, zip_sti, ext, mime) in enumerate(to_rename_only):
             if stop_ev.is_set():
                 break
@@ -3897,6 +3993,12 @@ class BlobConvertOperation(BaseOperation):
                 with lock:
                     s = dict(stats)
                 progress("stats_update", stats=s, done=idx + 1)
+                _rn_now = _time.monotonic()
+                if _rn_now - _rn_log_t >= 30 or i == len(to_rename_only) - 1:
+                    _rn_log_t = _rn_now
+                    _pct = 100.0 * (i + 1) / len(to_rename_only)
+                    w(f"  Beholdes/omdøpes: {_num(i + 1)}/{_num(len(to_rename_only))} filer "
+                      f"({_pct:.0f} %{_eta_text(_rn_t0, _rn_now, _pct)})", "info")
 
         # Advarsel for arkivformater som beholdes ubehandlet
         _ARCHIVE_WARN = {"7z", "rar"}
@@ -6184,7 +6286,12 @@ class BlobConvertOperation(BaseOperation):
             return None
 
         file_bytes, detected_as = _decode_inline_lob_text(text)
-        ext, mime, _ = get_identifier().identify(data=file_bytes)
+        # Filendelsen til den utskrevne fila: magic-bytes i prosessen, ikke den
+        # aktive identifikatoren — med Siegfried ble det én sf-prosess per celle
+        # (~0,4 s), timer for uttrekk med titusener av inline-celler. Den fulle
+        # identifiseringen skjer uansett i forhåndsskanningen etterpå.
+        from siard_workflow.core.identifiers.magic_bytes import MagicIdentifier
+        ext, mime, _ = MagicIdentifier().identify(data=file_bytes[:65536])
 
         counter[0] += 1
         lob_counter = counter[0]

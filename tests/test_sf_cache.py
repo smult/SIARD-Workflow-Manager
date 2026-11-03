@@ -150,6 +150,71 @@ def main() -> int:
                                     source_key="C:/annen.siard|1|2")
             _ok(len(f7.scanned) == 250, "ny Siegfried-versjon → alt skannes på nytt")
 
+            print("test_id_logs")
+            import csv as _csv
+            import datetime as _dt
+            from siard_workflow.core.identifiers.siegfried import SiegfriedIdentifier as _SI
+            start = _dt.datetime.now() + _dt.timedelta(seconds=5)   # loggen startet etter filene
+            idlog = tmp / f"uttrekk_{start:%Y%m%d_%H%M%S}_siegfried_identifikasjon.log"
+            _ok(_SI.id_log_start_ns(idlog) == int(start.replace(microsecond=0).timestamp()) * 10**9,
+                "starttid leses fra loggens filnavn")
+            with open(idlog, "w", encoding="utf-8-sig", newline="") as fh:
+                wr = _csv.writer(fh, delimiter=";")
+                wr.writerow(["filnavn", "ext", "mime", "puid", "format", "basis", "warning"])
+                for p in files[:200]:                       # 50 filer mangler i loggen
+                    wr.writerow([str(p), "docx", "application/x-test", "fmt/412",
+                                 "Microsoft Word for Windows", "container", ""])
+                wr.writerow([str(files[0]) + "x", "pdf", "", "", "", "", ""])   # finnes ikke
+            later = (start + _dt.timedelta(seconds=30)).timestamp()
+            os.utime(files[5], (later, later))              # endret etter loggstart
+            cache2 = tmp / "uttrekk2_siegfried_cache.tsv"
+            f8 = _FakeRun()
+            i8 = _ident(sf, f8)
+            log8 = _Log()
+            i8.set_logger(log8)
+            i8.pre_scan(tmp, files=files, max_workers=2, cache_file=cache2, source_key=src,
+                        id_logs=[idlog])
+            _ok(i8.prescan_from_logs == 199 and len(f8.scanned) == 51,
+                "identifikasjonslogg: 199 uendrede filer gjenbrukes; 50 som mangler i "
+                "loggen + 1 endret etter loggstart skannes")
+            _ok(i8.identify(path=files[10])[0] == "docx"
+                and any(r["puid"] == "fmt/412" for r in log8.rows),
+                "resultatet fra loggen brukes (og føres i ny identifikasjonslogg)")
+            f9 = _FakeRun()
+            i9 = _ident(sf, f9)
+            i9.pre_scan(tmp, files=files, max_workers=2, cache_file=cache2, source_key=src)
+            _ok(f9.scanned == [] and i9.prescan_reused == 250,
+                "etterpå ligger alt i den varige cachen")
+
+            print("test_inline_no_siegfried")
+            # Inline-LOB-er får filendelse fra magic-bytes — aldri én sf-prosess
+            # per celle (målt 0,4 s per celle → test på 4 000 rader > 15 min)
+            import siard_workflow.core.file_identifier as FI
+            sys.path.insert(0, str(_ROOT / "tests"))
+            import test_blob_inline_streaming as TS
+            from siard_workflow.operations.blob_convert_operation import BlobConvertOperation
+
+            class _Spy:
+                name = "siegfried"
+                calls = 0
+
+                def identify(self, data=None, path=None):
+                    _Spy.calls += 1
+                    return ("bin", "application/octet-stream", False)
+
+                def pre_scan(self, *a, **k):
+                    pass
+            saved = FI._active
+            FI._active = _Spy()
+            try:
+                _p, _f, n_inl = BlobConvertOperation()._extract_inline(
+                    TS._make_inline_xml(20), TS._XML_STI, TS._TABLE_KEY,
+                    {"inline_extracted": 0}, TS._noop, lob_cols=TS._LOB_COLS)
+            finally:
+                FI._active = saved
+            _ok(n_inl == 20 and _Spy.calls == 0,
+                "inline-utskriving bruker ikke den aktive identifikatoren (Siegfried)")
+
             print("test_blob_paths")
             from siard_workflow.operations.blob_convert_operation import (
                 _resume_json_path, _sf_cache_path)
