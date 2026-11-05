@@ -33,6 +33,7 @@ class FakeOfficeFile:
 
     attempts: list[tuple[str, str]] = []
     non_key_error_for: str = ""
+    probe_error_for: str = ""
     force_reject_for: str = ""
     reject_after_partial_write: bool = False
 
@@ -42,6 +43,8 @@ class FakeOfficeFile:
         self.password = None
 
     def is_encrypted(self):
+        if Path(self.ref).name == FakeOfficeFile.probe_error_for:
+            raise RuntimeError('Simulated Office encryption probe failure')
         return self.handle.read(64).startswith(CFB + b"SECRET-FIXTURE-ENCRYPTED")
 
     def load_key(self, password):
@@ -129,6 +132,7 @@ class GenericDecryptTests(unittest.TestCase):
         self._old_crypto = sys.modules.get("msoffcrypto")
         FakeOfficeFile.attempts = []
         FakeOfficeFile.non_key_error_for = ""
+        FakeOfficeFile.probe_error_for = ""
         FakeOfficeFile.force_reject_for = ""
         FakeOfficeFile.reject_after_partial_write = False
         sys.modules["msoffcrypto"] = types.SimpleNamespace(
@@ -143,6 +147,136 @@ class GenericDecryptTests(unittest.TestCase):
             sys.modules.pop("msoffcrypto", None)
         else:
             sys.modules["msoffcrypto"] = self._old_crypto
+
+    def _add_document(self, docid: str, name: str, blob: str, payload: bytes):
+        """Add one original SIARD row to exercise missing-password cases."""
+        blob_path = self.root / 'content/schema0/table186/lob7' / blob
+        blob_path.write_bytes(payload)
+        table = self.root / 'content/schema0/table186/table186.xml'
+        xml = table.read_text(encoding='utf-8')
+        row = (f"<row><c1>{docid}</c1><c2>1</c2><c3>P</c3><c4>1</c4>"
+               f"<c5>{name}</c5><c6>{len(payload)}</c6>"
+               f"<c7 file='{blob}' length='{len(payload)}' /></row>")
+        table.write_text(xml.replace('</table>', row + '</table>'), encoding='utf-8')
+        return blob_path
+
+    def test_plain_doc_without_password_is_retained_without_error(self):
+        """The 1,935 *_P.doc files must not be rejected solely for no password."""
+        blob = self._add_document('8', '4331_1_P.doc', 'rec200.bin',
+                                  CFB + b'PLAIN-WORD-DOCUMENT')
+        original = blob.read_bytes()
+        rows = []
+        stats = execute_rule(self.root, self.rule, only_ref='rec200.bin',
+                             dry_run=False, record_sink=rows.extend)
+        self.assertEqual(1, stats['selected'])
+        self.assertEqual(1, stats['not_encrypted'])
+        self.assertEqual(0, stats['password_missing'])
+        self.assertEqual(0, stats['decrypt_failed'])
+        self.assertEqual(0, stats['decrypted_saved'])
+        self.assertEqual('beholdt', rows[0]['status'])
+        self.assertEqual('Ikke kryptert', rows[0]['kategori'])
+        self.assertTrue(rows[0]['fil'].startswith('content/'))
+        self.assertEqual(original, blob.read_bytes())
+        from siard_workflow.core.generic_decrypt_reporting import write_decrypt_reports
+        import csv
+        reports = write_decrypt_reports(Path(self.temp.name), 'demo', rows, stats,
+                                         'test rules', dry_run=False)
+        with open(reports['csv'], encoding='utf-8-sig', newline='') as fh:
+            line = next(csv.DictReader(fh, delimiter=';'))
+        self.assertEqual('beholdt', line['status'])
+        self.assertIn('tilgjengelig uten passord', line['kommentar'])
+        with open(reports['errors_csv'], encoding='utf-8-sig', newline='') as fh:
+            self.assertEqual([], list(csv.DictReader(fh, delimiter=';')))
+        self.assertTrue(Path(reports['pdf']).read_bytes().startswith(b'%PDF-'))
+
+    def test_plain_doc_with_missing_lookup_still_retained(self):
+        blob = self._add_document('9999', '9001_1_P.doc', 'rec201.bin',
+                                  CFB + b'PLAIN-DOC')
+        rows = []
+        stats = execute_rule(self.root, self.rule, only_ref='rec201.bin',
+                             record_sink=rows.extend)
+        self.assertEqual(1, stats['not_encrypted'])
+        self.assertEqual(0, stats['lookup_missing'])
+        self.assertEqual('beholdt', rows[0]['status'])
+        self.assertEqual(blob.read_bytes(), CFB + b'PLAIN-DOC')
+
+    def test_plain_doc_with_ambiguous_lookup_still_retained(self):
+        self._add_document('6', '9002_1_P.doc', 'rec202.bin', CFB + b'PLAIN-DOC')
+        pw_xml = self.root / 'content/schema0/table180/table180.xml'
+        data = pw_xml.read_text(encoding='utf-8')
+        pw_xml.write_text(data.replace('</table>',
+                           '<row><c1>6</c1><c2>1</c2><c3>P</c3><c15>bad</c15></row></table>'),
+                           encoding='utf-8')
+        rows = []
+        stats = execute_rule(self.root, self.rule, only_ref='rec202.bin',
+                             record_sink=rows.extend)
+        self.assertEqual(1, stats['not_encrypted'])
+        self.assertEqual(0, stats['lookup_ambiguous'])
+        self.assertEqual('beholdt', rows[0]['status'])
+
+    def test_plain_ooxml_without_password_is_retained(self):
+        self._add_document('8', '4331_1_P.docx', 'rec203.bin',
+                           b'PK\x03\x04' + b'PLAIN-OFFICE-ZIP')
+        rows = []
+        stats = execute_rule(self.root, self.rule, only_ref='rec203.bin',
+                             record_sink=rows.extend)
+        self.assertEqual(1, stats['not_encrypted'])
+        self.assertEqual(0, stats['password_missing'])
+        self.assertEqual('beholdt', rows[0]['status'])
+
+    def test_encrypted_doc_without_password_is_a_real_error(self):
+        original = CFB + b'SECRET-FIXTURE-ENCRYPTED'
+        blob = self._add_document('8', '4331_1_P.doc', 'rec204.bin', original)
+        rows = []
+        stats = execute_rule(self.root, self.rule, only_ref='rec204.bin',
+                             dry_run=False, record_sink=rows.extend)
+        self.assertEqual(1, stats['selected'])
+        self.assertEqual(0, stats['not_encrypted'])
+        self.assertEqual(1, stats['password_missing'])
+        self.assertEqual(0, stats['decrypted_saved'])
+        self.assertEqual('feil', rows[0]['status'])
+        self.assertEqual('Passord mangler', rows[0]['kategori'])
+        self.assertIn('Kryptert Office-dokument', rows[0]['arsak'])
+        self.assertTrue(rows[0]['fil'].startswith('content/'))
+        self.assertEqual(original, blob.read_bytes())
+
+    def test_encrypted_doc_missing_lookup_is_a_real_error(self):
+        self._add_document('9999', '4332_1_P.doc', 'rec205.bin',
+                           CFB + b'SECRET-FIXTURE-ENCRYPTED')
+        rows = []
+        stats = execute_rule(self.root, self.rule, only_ref='rec205.bin',
+                             record_sink=rows.extend)
+        self.assertEqual(1, stats['lookup_missing'])
+        self.assertEqual(0, stats['not_encrypted'])
+        self.assertEqual('feil', rows[0]['status'])
+        self.assertEqual('Passordoppslag mangler', rows[0]['kategori'])
+
+    def test_failed_encryption_probe_is_not_misclassified_as_plain(self):
+        self._add_document('8', '4333_1_P.doc', 'rec206.bin', CFB + b'PLAIN')
+        FakeOfficeFile.probe_error_for = 'rec206.bin'
+        rows = []
+        stats = execute_rule(self.root, self.rule, only_ref='rec206.bin',
+                             record_sink=rows.extend)
+        self.assertEqual(1, stats['decrypt_failed'])
+        self.assertEqual(0, stats['not_encrypted'])
+        self.assertEqual('feil', rows[0]['status'])
+        self.assertEqual('Krypteringskontroll feilet', rows[0]['kategori'])
+
+    def test_mixed_batch_reports_encrypted_and_plain_separately(self):
+        self._add_document('8', '4334_1_P.doc', 'rec207.bin', CFB + b'PLAIN-DOC')
+        rows = []
+        stats = execute_rule(self.root, self.rule, max_files=0,
+                             dry_run=False, record_sink=rows.extend)
+        self.assertEqual(6, stats['selected'])
+        self.assertEqual(1, stats['not_encrypted'])
+        self.assertEqual(3, stats['decrypted_saved'])
+        self.assertEqual(1, stats['decrypt_failed'])  # existing encrypted rec90
+        self.assertEqual(0, stats['password_missing'])
+        self.assertEqual(6, len(rows))
+        self.assertEqual(3, sum(r['status'] == 'dekryptert' for r in rows))
+        self.assertEqual(1, sum(r['status'] == 'beholdt' and r['kategori'] == 'Ikke kryptert'
+                                for r in rows))
+        self.assertEqual(1, sum(r['status'] == 'feil' for r in rows))
 
     def test_formula_and_exception(self):
         formula = self.rule["formula"]

@@ -131,15 +131,18 @@ class GenericDocumentDecryptOperation(BaseOperation):
                 return self._fail('Operasjonen ble avbrutt; dokumentlogg skrevet', data)
             if not dry_run and count:
                 write('  Arbeidskopi oppdatert: bruk Pakk sammen SIARD for ny SIARD-fil', 'ok')
-            return self._ok(
-                data,
-                f'{"Testet" if dry_run else "Dekryptert i SIARD-arbeidskopien"}: '
-                f'{count} dokument(er), {failed} feil; CSV + PDF lagret',
-            )
+            summary = (f'{"Testet" if dry_run else "Dekryptert i SIARD-arbeidskopien"}: '
+                       f'{count} dokument(er), {failed} feil; CSV + PDF lagret')
+            if failed:
+                # The run may continue to repack/report because
+                # halt_on_failure=False. The overall status must still show
+                # genuine decryption failures (unlike retained plain files).
+                return self._fail(summary, data)
+            return self._ok(data, summary)
         except (RuleError, OSError, ValueError, ImportError) as exc:
             write(f'  Generisk dokumentopplåsing: {exc}', 'warn')
             return self._fail(str(exc))
 
     def premis_should_record(self, result: OperationResult, ctx: WorkflowContext) -> bool:
-        return (result.success and not bool(self.params.get('dry_run', False))
+        return (not bool(self.params.get('dry_run', False))
                 and bool(result.data.get('decrypted_saved', 0)))

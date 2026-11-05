@@ -529,40 +529,10 @@ def execute_rule(
                 rec['kategori'] = category
                 rec['arsak'] = reason
 
-            join_key = tuple(values.get(i, '') for i, _ in joins)
-            candidates = lookup_index.get(join_key, [])
-            if not candidates:
-                stats['lookup_missing'] += 1
-                done('feil', 'Passordoppslag mangler', 'Ingen samsvarende rad i oppslagstabell')
-                continue
-            if len(candidates) != 1:
-                stats['lookup_ambiguous'] += 1
-                done('feil', 'Tvetydig passordoppslag', f'{len(candidates)} samsvarende oppslagsrader')
-                continue
-            stored_pw = candidates[0].strip()
-            calculated = formula_password(values.get(formula_i, ''), formula_rule)
-            if stored_pw:
-                stats['password_stored'] += 1
-                if compare_formula and calculated:
-                    is_match = stored_pw == calculated
-                    stats['formula_match' if is_match else 'formula_mismatch'] += 1
-                    rec['formelavvik'] = 'nei' if is_match else 'ja'
-            elif calculated:
-                stats['password_formula_only'] += 1
-            else:
-                stats['password_missing'] += 1
-                done('feil', 'Passord mangler', 'Ingen lagret eller beregnet passordverdi')
-                continue
-            pw_options = []
-            if stored_pw:
-                pw_options.append(('lagret', stored_pw))
-            if calculated and (not stored_pw or (fallback_policy == 'fallback_if_stored_rejected'
-                                                and calculated != stored_pw)):
-                pw_options.append(('beregnet', calculated))
-            if not pw_options:
-                stats['password_missing'] += 1
-                done('feil', 'Passord mangler', 'Ingen brukbar passordkandidat')
-                continue
+            # Check the LOB before querying credentials. Missing passwords
+            # are an error only when the document is actually encrypted.
+            # A plain Office file must be retained unchanged, even when its
+            # filename does not match the password formula or lookup is empty.
             try:
                 lob_file = resolve_lob(root, source, lob_i, ref)
             except RuleError as exc:
@@ -593,6 +563,62 @@ def execute_rule(
             if ref in changes:
                 stats['already_exists'] += 1
                 done('beholdt', 'Duplikat referanse', 'LOB er allerede behandlet via en annen rad')
+                continue
+
+            # Probe encryption independently of password availability.
+            # Do not assume that a missing password means an encrypted file.
+            # If probing fails we cannot safely call the file unencrypted.
+            try:
+                with lob_file.open('rb') as probe:
+                    is_encrypted = bool(msoffcrypto.OfficeFile(probe).is_encrypted())
+            except Exception as exc:
+                stats['decrypt_failed'] += 1
+                done('feil', 'Krypteringskontroll feilet',
+                     f'{type(exc).__name__}: {exc}')
+                writer(f'  {ref}: krypteringskontroll feilet '
+                       f'({type(exc).__name__}: {exc})', 'warn')
+                continue
+            if not is_encrypted:
+                stats['not_encrypted'] += 1
+                done('beholdt', 'Ikke kryptert',
+                     'Dokumentet er tilgjengelig uten passord; ingen endring')
+                continue
+
+            # Only encrypted Office documents need the stored or calculated
+            # password. Preserve the established password/fallback behavior.
+            join_key = tuple(values.get(i, '') for i, _ in joins)
+            candidates = lookup_index.get(join_key, [])
+            if not candidates:
+                stats['lookup_missing'] += 1
+                done('feil', 'Passordoppslag mangler', 'Ingen samsvarende rad i oppslagstabell')
+                continue
+            if len(candidates) != 1:
+                stats['lookup_ambiguous'] += 1
+                done('feil', 'Tvetydig passordoppslag', f'{len(candidates)} samsvarende oppslagsrader')
+                continue
+            stored_pw = candidates[0].strip()
+            calculated = formula_password(values.get(formula_i, ''), formula_rule)
+            if stored_pw:
+                stats['password_stored'] += 1
+                if compare_formula and calculated:
+                    is_match = stored_pw == calculated
+                    stats['formula_match' if is_match else 'formula_mismatch'] += 1
+                    rec['formelavvik'] = 'nei' if is_match else 'ja'
+            elif calculated:
+                stats['password_formula_only'] += 1
+            else:
+                stats['password_missing'] += 1
+                done('feil', 'Passord mangler', 'Kryptert Office-dokument uten lagret eller beregnet passord')
+                continue
+            pw_options = []
+            if stored_pw:
+                pw_options.append(('lagret', stored_pw))
+            if calculated and (not stored_pw or (fallback_policy == 'fallback_if_stored_rejected'
+                                                and calculated != stored_pw)):
+                pw_options.append(('beregnet', calculated))
+            if not pw_options:
+                stats['password_missing'] += 1
+                done('feil', 'Passord mangler', 'Kryptert Office-dokument uten brukbar passordkandidat')
                 continue
             try:
                 with tempfile.TemporaryFile(mode='w+b') as scratch:
