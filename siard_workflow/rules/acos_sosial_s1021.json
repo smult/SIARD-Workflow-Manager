@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "name": "S1021 Acos Sosial - document password lookup (example for 1567_005)",
+  "source": {
+    "table": "NEF_ELFILER",
+    "lob_column": "Nef_ElFil",
+    "filename_column": "Nef_Filnavn",
+    "where_equals": {
+      "Nef_SeqNr": "1"
+    },
+    "extensions": [".doc", ".docx"]
+  },
+  "lookup": {
+    "table": "NVE_DOKVERSJON",
+    "join": [
+      {"source": "Nef_DokID", "target": "Nve_DokID"},
+      {"source": "Nef_Versjon", "target": "Nve_Versjon"},
+      {"source": "Nef_Variant", "target": "Nve_Variant"}
+    ],
+    "value_column": "nve_passord"
+  },
+  "formula": {
+    "input_column": "Nef_Filnavn",
+    "when_regex": "^[0-9]+\\.doc$",
+    "operators": ["basename", "stem", "reverse", {"prepend": "R"}],
+    "use": "fallback_if_stored_rejected",
+    "check_against_stored": true
+  }
+}

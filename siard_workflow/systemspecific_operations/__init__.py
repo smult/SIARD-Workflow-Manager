@@ -1,3 +1,5 @@
 from .cosdoc_operation import CosDocMailMergeOperation
 
-__all__ = ["CosDocMailMergeOperation"]
+from .generic_decrypt_operation import GenericDocumentDecryptOperation
+
+__all__ = ["CosDocMailMergeOperation", "GenericDocumentDecryptOperation"]

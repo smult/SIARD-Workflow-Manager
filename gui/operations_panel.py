@@ -25,7 +25,9 @@ from siard_workflow.operations import (
     StandardizeExtOperation, DepotReportsOperation,
     MetadataQualityOperation, XsdTypeFixOperation, DateSpanOperation,
 )
-from siard_workflow.systemspecific_operations import CosDocMailMergeOperation
+from siard_workflow.systemspecific_operations import (
+    CosDocMailMergeOperation, GenericDocumentDecryptOperation,
+)
 from settings import save_op_params, save_config, get_config, _SETTINGS_FILE
 
 
@@ -649,6 +651,27 @@ OP_DEFS = [
             {"key": "dry_run",        "label": "Tørkjøring (ikke skriv)",   "type": "bool", "default": False},
         ],
     },
+    {
+        "cls": GenericDocumentDecryptOperation,
+        "label": "Generisk: L\u00e5s opp dokumenter (JSON-regler)",
+        "category": "Systemspesifikt",
+        "desc": (
+            "Regelstyrt oppslag av dokumentpassord fra SIARD-tabeller. "
+            "Testkj\u00f8ring kontrollerer reell dekryptering uten varig lagring. "
+            "Vanlig kj\u00f8ring lagrer dekrypterte kopier i egen mappe; "
+            "original SIARD og utpakket arbeidsmappe endres ikke. "
+            "Tom regelsti bruker medf\u00f8lgende Acos Sosial-eksempel."
+        ),
+        "status": GenericDocumentDecryptOperation.status,
+        "params": [
+            {"key": "rule_file", "label": "Regel-JSON (tom = Acos Sosial)", "type": "file", "default": ""},
+            {"key": "unpacked_dir", "label": "Utpakket SIARD-mappe (gjenbruk)", "type": "folder", "default": ""},
+            {"key": "lob_ref", "label": "LOB-fil (tom = alle, f.eks. rec10.bin)", "type": "str", "default": ""},
+            {"key": "max_files", "label": "Maks dokumenter (0 = alle)", "type": "int", "default": 10},
+            {"key": "dry_run", "label": "Testkj\u00f8ring (ikke skriv)", "type": "bool", "default": True},
+            {"key": "output_dir", "label": "Utdatamappe for oppl\u00e5ste kopier", "type": "folder", "default": ""},
+        ],
+    },
     # ── Kompatibilitet ───────────────────────────────────────────────────────
     {
         "cls": LobFolderFixOperation,
@@ -911,7 +934,7 @@ class ParamDialog(ctk.CTkToplevel):
         row_h    = 52
         header_h = 120
         footer_h = 70
-        has_wide = any(p.get("type") in ("hw_int", "autocomplete") or p.get("key") == "temp_dir"
+        has_wide = any(p.get("type") in ("hw_int", "autocomplete", "file", "folder") or p.get("key") == "temp_dir"
                        for p in op_def.get("params", []))
         width    = 640 if has_wide else 520
         height   = min(header_h + n_params * row_h + footer_h, 720)
@@ -1060,6 +1083,35 @@ class ParamDialog(ctk.CTkToplevel):
                                   fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"], text_color=COLORS["on_accent"],
                                   font=ctk.CTkFont(family=FONTS["mono"], size=10),
                                   command=_auto_temp).pack(side="left")
+                elif p["type"] in ("file", "folder"):
+                    var = ctk.StringVar(value=str(p["default"]))
+                    cell = ctk.CTkFrame(frm, fg_color="transparent")
+                    cell.grid(row=i, column=1, padx=12, sticky="e")
+                    ctk.CTkEntry(cell, textvariable=var, width=260,
+                                 fg_color=COLORS["bg"],
+                                 font=ctk.CTkFont(family=FONTS["mono"], size=10)
+                                 ).pack(side="left", padx=(0, 5))
+
+                    def _browse(v=var, kind=p["type"]):
+                        from tkinter import filedialog
+                        if kind == "file":
+                            selected = filedialog.askopenfilename(
+                                parent=self, title="Velg regelsett (JSON)",
+                                filetypes=[("JSON", "*.json"), ("Alle filer", "*.*")])
+                        else:
+                            selected = filedialog.askdirectory(
+                                parent=self, title="Velg mappe")
+                        if selected:
+                            v.set(selected)
+
+                    ctk.CTkButton(
+                        cell, text="Bla...", width=60,
+                        fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+                        text_color=COLORS["btn_text"],
+                        border_color=COLORS["btn_border"], border_width=1,
+                        font=ctk.CTkFont(family=FONTS["mono"], size=10),
+                        command=_browse,
+                    ).pack(side="left")
                 elif p["type"] == "autocomplete":
                     var = ctk.StringVar(value=str(p["default"]))
                     ac = _AutocompleteEntry(
