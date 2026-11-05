@@ -1,8 +1,8 @@
-"""Generic, JSON-driven SIARD document-password lookup and safe decryption.
+"""Generic, JSON-driven SIARD decryption of LOBs in the extracted workspace.
 
-No product-specific table, column or formula is hard-coded in this module.
-Original SIARD/LOB/XML files are never modified. In test mode, decrypted
-bytes are discarded when their temporary file is closed.
+Normal runs replace encrypted LOBs in the unpacked *working copy* and update
+SIARD table XML references for subsequent RepackSiardOperation. Dry runs
+never modify the workspace. No product-specific table/formula is hard-coded.
 """
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import html
 import tempfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -135,6 +136,8 @@ def read_rule(path: Path) -> dict:
     for field in ("table", "value_column"):
         if not isinstance(lookup.get(field), str) or not lookup[field]:
             raise RuleError(f"Regelsett krever lookup.{field}")
+    if source.get("size_column") is not None and not isinstance(source["size_column"], str):
+        raise RuleError("source.size_column maa vaere et kolonnenavn")
     joins = lookup.get("join")
     if not isinstance(joins, list) or not joins or any(
         not isinstance(item, dict) or not isinstance(item.get("source"), str)
@@ -279,198 +282,403 @@ def _decrypt_to_file(source: Path, password: str, target) -> str:
 
 
 def _new_stats() -> dict[str, int]:
+    # The common WorkflowReportOperation displays the first 12 result values.
+    # Put the same operational facts first as CosDoc: outcomes, failures,
+    # and document counts. Lookup/formula diagnostics remain in the log.
     return {key: 0 for key in (
-        "source_rows", "selected", "password_stored", "password_formula_only",
-        "formula_match", "formula_mismatch", "password_missing", "lookup_missing",
-        "lookup_ambiguous", "blob_missing", "pdf_skipped", "format_skipped",
-        "not_encrypted", "decrypted_tested", "decrypted_saved", "decrypt_failed",
-        "formula_fallback_attempted", "formula_fallback_success",
+        "selected", "decrypted_saved", "decrypted_tested", "decrypt_failed",
+        "not_encrypted", "blob_missing", "lookup_missing", "lookup_ambiguous",
+        "password_missing", "formula_fallback_success", "formula_mismatch",
+        "source_rows", "password_stored", "password_formula_only", "formula_match",
+        "pdf_skipped", "format_skipped", "formula_fallback_attempted",
         "already_exists", "stopped",
     )}
+
+def _patch_lob_metadata(
+    xml_data: bytes,
+    *,
+    lob_index: int,
+    changes: dict[str, dict],
+    size_index: int | None = None,
+) -> bytes:
+    """Patch only changed row/cell bytes, retaining namespaces and formatting.
+
+    The LOB *file* reference is unchanged; its length/digest refer to the
+    decrypted bytes in the unpacked SIARD working directory. This is the same
+    metadata convention used by the existing CosDoc operation (MD5).
+    """
+    row_pattern = re.compile(
+        rb"<(?P<prefix>[A-Za-z_][\w.-]*:)?row(?=[\s>])[^>]*>.*?</(?:[A-Za-z_][\w.-]*:)?row\s*>",
+        re.DOTALL,
+    )
+    cell_pattern = re.compile(
+        rb"<(?P<prefix>[A-Za-z_][\w.-]*:)?c" + str(lob_index).encode('ascii')
+        + rb"(?=[\s/>])(?P<attrs>[^<>]*?)(?P<close>/?)>",
+        re.DOTALL,
+    )
+    file_pattern = re.compile(rb"(?<![\w:-])file\s*=\s*([\"'])(.*?)\1", re.DOTALL)
+    updated_refs: set[str] = set()
+
+    def update_cell(cell_match: re.Match[bytes]) -> bytes:
+        attrs = cell_match.group('attrs')
+        file_match = file_pattern.search(attrs)
+        if not file_match:
+            return cell_match.group(0)
+        ref = html.unescape(file_match.group(2).decode('utf-8'))
+        change = changes.get(ref)
+        if change is None:
+            return cell_match.group(0)
+        updated_refs.add(ref)
+        length = str(change['length']).encode('ascii')
+        digest = change['digest'].encode('ascii')
+        # SIARD length/digest/digestType refer to the new actual bytes.
+        for key, value in ((b'length', length), (b'digestType', b'MD5'), (b'digest', digest)):
+            pattern = re.compile(rb"(?<![\w:-])" + key + rb"\s*=\s*([\"']).*?\1", re.DOTALL)
+            if pattern.search(attrs):
+                attrs = pattern.sub(lambda m, k=key, v=value: k + b'=' + m.group(1) + v + m.group(1), attrs, count=1)
+            else:
+                attrs += b' ' + key + b'="' + value + b'"'
+        return b'<' + (cell_match.group('prefix') or b'') + b'c' + str(lob_index).encode('ascii') + attrs + cell_match.group('close') + b'>'
+
+    def update_row(match: re.Match[bytes]) -> bytes:
+        row = match.group(0)
+        refs_before = len(updated_refs)
+        cell_ref_match = cell_pattern.search(row)
+        if cell_ref_match is None:
+            return row
+        file_match = file_pattern.search(cell_ref_match.group('attrs'))
+        if not file_match:
+            return row
+        ref = html.unescape(file_match.group(2).decode('utf-8'))
+        if ref not in changes:
+            return row
+        row = cell_pattern.sub(update_cell, row, count=1)
+        if size_index is not None:
+            # Optional DB size field specified by name in the JSON rules.
+            # Do not touch other rows or columns.
+            tag = str(size_index).encode('ascii')
+            size_pattern = re.compile(
+                rb'(<(?:[A-Za-z_][\w.-]*:)?c' + tag + rb'(?=[\s>])[^>]*>)'
+                rb'[^<]*(</(?:[A-Za-z_][\w.-]*:)?c' + tag + rb'\s*>)',
+                re.DOTALL,
+            )
+            if size_pattern.search(row):
+                row = size_pattern.sub(
+                    lambda m: m.group(1) + str(changes[ref]['length']).encode('ascii') + m.group(2),
+                    row, count=1,
+                )
+        return row
+
+    new_xml = row_pattern.sub(update_row, xml_data)
+    missing = set(changes) - updated_refs
+    if missing:
+        raise RuleError('Kunne ikke oppdatere LOB-referanser i table XML: ' + ', '.join(sorted(missing)[:5]))
+    try:
+        ET.fromstring(new_xml)
+    except ET.ParseError as exc:
+        raise RuleError('Oppdatert tabell-XML ble ugyldig: ' + str(exc)) from exc
+    return new_xml
+
+
+def _commit_decryption(
+    extracted_dir: Path,
+    table_xml: Path,
+    changes: dict[str, dict],
+    *,
+    lob_index: int,
+    size_index: int | None,
+    stage_dir: Path,
+) -> None:
+    """Install LOB + metadata updates with rollback if a filesystem step fails.
+
+    Staged files and backups are on the same volume as the extracted SIARD;
+    os.replace is atomic per file on supported local filesystems.
+    """
+    xml_bytes = table_xml.read_bytes()
+    xml_changed = _patch_lob_metadata(
+        xml_bytes, lob_index=lob_index, changes=changes, size_index=size_index)
+    staged_xml = stage_dir / 'table-updated.xml'
+    staged_xml.write_bytes(xml_changed)
+    backups: list[tuple[Path, Path]] = []
+    xml_backup = stage_dir / 'table-original.xml'
+    try:
+        for index, change in enumerate(changes.values()):
+            src = change['path']
+            decrypted = change['staged']
+            original = stage_dir / f'original-blob-{index:08d}.bak'
+            os.replace(src, original)
+            backups.append((src, original))
+            os.replace(decrypted, src)
+        os.replace(table_xml, xml_backup)
+        try:
+            os.replace(staged_xml, table_xml)
+        except Exception:
+            os.replace(xml_backup, table_xml)
+            raise
+    except Exception:
+        # Restore source blobs and XML even when one replacement failed.
+        for dest, backup in reversed(backups):
+            if backup.exists():
+                os.replace(backup, dest)
+        if xml_backup.exists():
+            os.replace(xml_backup, table_xml)
+        raise
 
 
 def execute_rule(
     extracted_dir: Path,
     rule: dict,
     *,
-    only_ref: str = "",
+    only_ref: str = '',
     max_files: int = 0,
     dry_run: bool = True,
     output_dir: Path | None = None,
     log: Callable[[str, str], None] | None = None,
     stop: Callable[[], bool] | None = None,
+    record_sink: Callable[[list[dict]], None] | None = None,
 ) -> dict[str, int]:
+    """Decrypt SIARD LOBs by JSON rule. Commit only after all candidates are staged.
+
+    A following RepackSiardOperation creates the new SIARD. When requested,
+    record_sink receives a per-source-row audit trail *after* the commit has
+    finished, so the log never reports a staged file as a committed result.
+    output_dir is retained only for backward compatibility with old profiles.
+    """
     root = Path(extracted_dir).expanduser().resolve()
     if not root.is_dir():
-        raise RuleError(f"Utpakket SIARD-mappe finnes ikke: {root}")
-    if not dry_run:
-        if output_dir is None:
-            raise RuleError("Velg egen utdatamappe for dekrypterte kopier")
-        dest_root = Path(output_dir).expanduser().resolve()
-        if dest_root == root or dest_root.is_relative_to(root):
-            raise RuleError("Utdatamappen maa ligge UTENFOR den utpakkede SIARD-mappen")
-        if any((parent / ".git").exists() for parent in (dest_root, *dest_root.parents)):
-            raise RuleError("Utdatamappen maa ikke ligge i et Git-repository")
-    else:
-        dest_root = None
+        raise RuleError(f'Utpakket SIARD-mappe finnes ikke: {root}')
     if max_files < 0:
-        raise RuleError("Maks filer maa vaere 0 eller positiv")
-    if not dry_run:
-        try:
-            import msoffcrypto  # noqa: F401
-        except ImportError as exc:
-            raise RuleError("Mangler msoffcrypto-tool: python -m pip install msoffcrypto-tool") from exc
+        raise RuleError('Maks filer maa vaere 0 eller positiv')
+    try:
+        import msoffcrypto
+    except ImportError as exc:
+        raise RuleError('Mangler msoffcrypto-tool: python -m pip install msoffcrypto-tool') from exc
+
     info = read_metadata_tables(root)
-    source_rule, lookup_rule, formula_rule = (rule[key] for key in ("source", "lookup", "formula"))
-    source = info.get(source_rule["table"].casefold())
-    lookup = info.get(lookup_rule["table"].casefold())
+    source_rule, lookup_rule, formula_rule = (rule[k] for k in ('source', 'lookup', 'formula'))
+    source = info.get(source_rule['table'].casefold())
+    lookup = info.get(lookup_rule['table'].casefold())
     if source is None or lookup is None:
-        raise RuleError("Kildetabell eller oppslagstabell finnes ikke i metadata.xml")
-    filename_i = source.column_index(source_rule["filename_column"])
-    lob_i = source.column_index(source_rule["lob_column"])
-    pw_i = lookup.column_index(lookup_rule["value_column"])
-    formula_i = source.column_index(formula_rule.get("input_column") or source_rule["filename_column"])
-    joins = [(source.column_index(p["source"]), lookup.column_index(p["target"]))
-             for p in lookup_rule["join"]]
-    filters = [(source.column_index(k), str(v))
-               for k, v in source_rule.get("where_equals", {}).items()]
-    allowed_exts = {str(ext).casefold() for ext in source_rule.get("extensions", [".doc", ".docx"])}
-    from_formula = formula_rule.get("check_against_stored", True)
-    # The original policy remains supported for existing external JSON rules.
-    fallback_policy = formula_rule.get("use", "fallback_if_stored_empty")
-    if fallback_policy not in ("fallback_if_stored_empty", "fallback_if_stored_rejected"):
-        raise RuleError(f"Ukjent formula.use: {fallback_policy!r}")
-    target_ref = only_ref.strip().replace("\\", "/")
+        raise RuleError('Kildetabell eller oppslagstabell finnes ikke i metadata.xml')
+    filename_i = source.column_index(source_rule['filename_column'])
+    lob_i = source.column_index(source_rule['lob_column'])
+    pw_i = lookup.column_index(lookup_rule['value_column'])
+    formula_i = source.column_index(formula_rule.get('input_column') or source_rule['filename_column'])
+    size_i = source.column_index(source_rule['size_column']) if source_rule.get('size_column') else None
+    joins = [(source.column_index(p['source']), lookup.column_index(p['target']))
+             for p in lookup_rule['join']]
+    filters = [(source.column_index(k), str(v)) for k, v in source_rule.get('where_equals', {}).items()]
+    allowed_exts = {str(ext).casefold() for ext in source_rule.get('extensions', ['.doc', '.docx'])}
+    compare_formula = formula_rule.get('check_against_stored', True)
+    fallback_policy = formula_rule.get('use', 'fallback_if_stored_empty')
+    if fallback_policy not in ('fallback_if_stored_empty', 'fallback_if_stored_rejected'):
+        raise RuleError(f'Ukjent formula.use: {fallback_policy!r}')
+    target_ref = only_ref.strip().replace('\\', '/')
+    writer = log or (lambda _msg, _level='info': None)
+
     lookup_index: dict[tuple[str, ...], list[str]] = {}
     for cells, _ in iter_table_rows(root / lookup.xml_path_rel):
-        key = tuple(cells.get(k, "") for _, k in joins)
+        key = tuple(cells.get(k, '') for _, k in joins)
         if all(key):
-            lookup_index.setdefault(key, []).append(cells.get(pw_i, ""))
+            lookup_index.setdefault(key, []).append(cells.get(pw_i, ''))
     if not lookup_index:
-        raise RuleError(f"Ingen oppslagsrader i {lookup.name}; kontroller regelsett")
+        raise RuleError(f'Ingen oppslagsrader i {lookup.name}; kontroller regelsett')
+
     stats = _new_stats()
-    writer = log or (lambda _message, _level="info": None)
-    if dry_run:
-        try:
-            import msoffcrypto  # noqa: F401
-        except ImportError as exc:
-            raise RuleError("Mangler msoffcrypto-tool for testdekryptering") from exc
-    elif dest_root is not None:
-        dest_root.mkdir(parents=True, exist_ok=True)
-    for values, refs in iter_table_rows(root / source.xml_path_rel):
-        stats["source_rows"] += 1
-        fname = values.get(filename_i, "")
-        ref = refs.get(lob_i, "")
-        if not ref:
-            continue
-        if target_ref and ref != target_ref and PurePosixPath(ref.replace("\\", "/")).name != PurePosixPath(target_ref).name:
-            continue
-        if filters and any(values.get(i, "") != value for i, value in filters):
-            continue
-        if allowed_exts and Path(fname).suffix.casefold() not in allowed_exts:
-            continue
-        if max_files and stats["selected"] >= max_files:
-            break
-        if stop and stop():
-            stats["stopped"] += 1
-            break
-        stats["selected"] += 1
-        join_key = tuple(values.get(source_i, "") for source_i, _ in joins)
-        candidates = lookup_index.get(join_key, [])
-        if not candidates:
-            stats["lookup_missing"] += 1
-            continue
-        if len(candidates) != 1:
-            stats["lookup_ambiguous"] += 1
-            continue
-        stored_pw = candidates[0].strip()
-        calculated = formula_password(values.get(formula_i, ""), formula_rule)
-        if stored_pw:
-            stats["password_stored"] += 1
-            if from_formula and calculated:
-                stats["formula_match" if stored_pw == calculated else "formula_mismatch"] += 1
-        elif calculated:
-            stats["password_formula_only"] += 1
-        else:
-            stats["password_missing"] += 1
-        # Always try the database value first. A rule may opt in to retrying
-        # the calculated value only after an explicit InvalidKeyError.
-        password_candidates: list[tuple[str, str]] = []
-        if stored_pw:
-            password_candidates.append(("stored", stored_pw))
-        if calculated and (
-            not stored_pw or (
-                fallback_policy == "fallback_if_stored_rejected"
-                and calculated != stored_pw
-            )
-        ):
-            password_candidates.append(("formula", calculated))
-        if not password_candidates:
-            continue
-        try:
-            lob_file = resolve_lob(root, source, lob_i, ref)
-        except RuleError:
-            stats["blob_missing"] += 1
-            continue
-        if not lob_file.is_file():
-            stats["blob_missing"] += 1
-            continue
-        file_type = _format_class(lob_file)
-        if file_type == "pdf":
-            stats["pdf_skipped"] += 1
-            continue
-        if file_type not in ("office", "zip"):
-            stats["format_skipped"] += 1
-            continue
-        try:
-            with tempfile.TemporaryFile(mode="w+b") as scratch:
-                fallback_attempted = False
-                for method, candidate in password_candidates:
-                    # A failed attempt may have written partial data; never
-                    # append a successful retry to the failed first attempt.
-                    scratch.seek(0)
-                    scratch.truncate(0)
-                    try:
-                        result = _decrypt_to_file(lob_file, candidate, scratch)
-                        break
-                    except msoffcrypto.exceptions.InvalidKeyError:
-                        if method == "stored" and len(password_candidates) > 1:
-                            fallback_attempted = True
-                            stats["formula_fallback_attempted"] += 1
-                            writer(f"  {ref}: lagret passord avvist; prover beregnet passord", "warn")
-                            continue
-                        raise
-                if result == "not_encrypted":
-                    stats["not_encrypted"] += 1
-                    continue
-                if fallback_attempted:
-                    stats["formula_fallback_success"] += 1
-                    writer(f"  {ref}: beregnet passord fungerte etter avvist lagret passord", "info")
-                if dry_run:
-                    stats["decrypted_tested"] += 1
-                else:
-                    # Safe name; no original title or password in output path.
-                    relative = lob_file.relative_to(root).as_posix()
-                    tag = hashlib.sha256(relative.encode("utf-8")).hexdigest()[:12]
-                    ext = Path(fname).suffix.lower()
-                    outfile = dest_root / f"{lob_file.stem}_{tag}{ext}"
-                    try:
-                        with outfile.open("xb") as output:
-                            scratch.seek(0)
-                            shutil.copyfileobj(scratch, output, length=1024 * 1024)
-                    except FileExistsError:
-                        stats["already_exists"] += 1
+    records: list[dict] = []
+    # A separate staging area is used for both the decrypted bytes and the
+    # original blobs during commit; neither goes inside the SIARD ZIP.
+    with tempfile.TemporaryDirectory(prefix='siard_decrypt_stage_', dir=root.parent) as stage_name:
+        stage_dir = Path(stage_name)
+        changes: dict[str, dict] = {}
+        for values, refs in iter_table_rows(root / source.xml_path_rel):
+            stats['source_rows'] += 1
+            fname = values.get(filename_i, '')
+            ref = refs.get(lob_i, '')
+            if not ref:
+                continue
+            if target_ref and ref != target_ref and PurePosixPath(ref.replace('\\', '/')).name != PurePosixPath(target_ref).name:
+                continue
+            if filters and any(values.get(i, '') != val for i, val in filters):
+                continue
+            if allowed_exts and Path(fname).suffix.casefold() not in allowed_exts:
+                continue
+            if max_files and stats['selected'] >= max_files:
+                break
+            if stop and stop():
+                stats['stopped'] += 1
+                break
+            stats['selected'] += 1
+            rec = {
+                'fil': ref,
+                'opprinnelig_filnavn': fname,
+                'plassering': f'{source.name}.{source_rule["lob_column"]}',
+                'format': Path(fname).suffix.lstrip('.').lower(),
+                'fra_storrelse': '',
+                'til_storrelse': '',
+                'status': '',
+                'kategori': '',
+                'arsak': '',
+                'passordkilde': '',
+                'formelavvik': '',
+            }
+            records.append(rec)
+
+            def done(status: str, category: str = '', reason: str = '') -> None:
+                rec['status'] = status
+                rec['kategori'] = category
+                rec['arsak'] = reason
+
+            join_key = tuple(values.get(i, '') for i, _ in joins)
+            candidates = lookup_index.get(join_key, [])
+            if not candidates:
+                stats['lookup_missing'] += 1
+                done('feil', 'Passordoppslag mangler', 'Ingen samsvarende rad i oppslagstabell')
+                continue
+            if len(candidates) != 1:
+                stats['lookup_ambiguous'] += 1
+                done('feil', 'Tvetydig passordoppslag', f'{len(candidates)} samsvarende oppslagsrader')
+                continue
+            stored_pw = candidates[0].strip()
+            calculated = formula_password(values.get(formula_i, ''), formula_rule)
+            if stored_pw:
+                stats['password_stored'] += 1
+                if compare_formula and calculated:
+                    is_match = stored_pw == calculated
+                    stats['formula_match' if is_match else 'formula_mismatch'] += 1
+                    rec['formelavvik'] = 'nei' if is_match else 'ja'
+            elif calculated:
+                stats['password_formula_only'] += 1
+            else:
+                stats['password_missing'] += 1
+                done('feil', 'Passord mangler', 'Ingen lagret eller beregnet passordverdi')
+                continue
+            pw_options = []
+            if stored_pw:
+                pw_options.append(('lagret', stored_pw))
+            if calculated and (not stored_pw or (fallback_policy == 'fallback_if_stored_rejected'
+                                                and calculated != stored_pw)):
+                pw_options.append(('beregnet', calculated))
+            if not pw_options:
+                stats['password_missing'] += 1
+                done('feil', 'Passord mangler', 'Ingen brukbar passordkandidat')
+                continue
+            try:
+                lob_file = resolve_lob(root, source, lob_i, ref)
+            except RuleError as exc:
+                stats['blob_missing'] += 1
+                done('feil', 'Ugyldig LOB-referanse', str(exc))
+                continue
+            rec['fil'] = lob_file.relative_to(root).as_posix()
+            if not lob_file.is_file():
+                stats['blob_missing'] += 1
+                done('feil', 'LOB-fil mangler', 'LOB-filen finnes ikke')
+                continue
+            try:
+                rec['fra_storrelse'] = lob_file.stat().st_size
+                rec['til_storrelse'] = rec['fra_storrelse']
+                file_type = _format_class(lob_file)
+            except OSError as exc:
+                stats['decrypt_failed'] += 1
+                done('feil', 'LOB kan ikke leses', f'{type(exc).__name__}: {exc}')
+                continue
+            if file_type == 'pdf':
+                stats['pdf_skipped'] += 1
+                done('beholdt', 'PDF', 'Allerede PDF – ingen dekryptering')
+                continue
+            if file_type not in ('office', 'zip'):
+                stats['format_skipped'] += 1
+                done('beholdt', 'Ukjent format', 'Ingen støttet Office-signatur')
+                continue
+            if ref in changes:
+                stats['already_exists'] += 1
+                done('beholdt', 'Duplikat referanse', 'LOB er allerede behandlet via en annen rad')
+                continue
+            try:
+                with tempfile.TemporaryFile(mode='w+b') as scratch:
+                    fallback_attempted = False
+                    used_method = ''
+                    result = ''
+                    for method, candidate in pw_options:
+                        scratch.seek(0)
+                        scratch.truncate(0)
+                        try:
+                            result = _decrypt_to_file(lob_file, candidate, scratch)
+                            used_method = method
+                            break
+                        except msoffcrypto.exceptions.InvalidKeyError:
+                            if method == 'lagret' and len(pw_options) > 1:
+                                fallback_attempted = True
+                                stats['formula_fallback_attempted'] += 1
+                                writer(f'  {ref}: lagret passord avvist; prøver beregnet passord', 'warn')
+                                continue
+                            raise
+                    if result == 'not_encrypted':
+                        stats['not_encrypted'] += 1
+                        done('beholdt', 'Ikke kryptert', 'Dokumentet er allerede tilgjengelig uten passord')
                         continue
-                    except Exception:
-                        outfile.unlink(missing_ok=True)
-                        raise
-                    stats["decrypted_saved"] += 1
-        except Exception as exc:
-            stats["decrypt_failed"] += 1
-            if stats["decrypt_failed"] <= 15:
-                writer(f"  {ref}: dekryptering feilet ({type(exc).__name__}: {exc})", "warn")
-        if stats["selected"] <= 15 or stats["selected"] % 250 == 0:
-            writer(f"  Behandlet {stats['selected']} utvalgte filer (OK test={stats['decrypted_tested']}, lagret={stats['decrypted_saved']})", "info")
-    if target_ref and not stats["selected"]:
-        raise RuleError(f"Ingen treff paa LOB-referansen '{target_ref}' og aktive filtre")
+                    rec['passordkilde'] = 'beregnet (fallback)' if fallback_attempted else used_method
+                    if fallback_attempted:
+                        stats['formula_fallback_success'] += 1
+                        writer(f'  {ref}: beregnet passord fungerte etter avvist lagret passord', 'info')
+                    if dry_run:
+                        stats['decrypted_tested'] += 1
+                        done('testet', '', 'Dekryptering verifisert uten skriving')
+                        writer(f'  Testet dekryptering: {ref}', 'info')
+                    else:
+                        staged = stage_dir / f'blob-{len(changes):08d}.dec'
+                        md5 = hashlib.md5()
+                        size = 0
+                        scratch.seek(0)
+                        with staged.open('wb') as out:
+                            while True:
+                                chunk = scratch.read(1024 * 1024)
+                                if not chunk:
+                                    break
+                                out.write(chunk)
+                                md5.update(chunk)
+                                size += len(chunk)
+                        rec['til_storrelse'] = size
+                        done('klargjort', '', 'Venter på oppdatering av LOB og tabell-XML')
+                        changes[ref] = {
+                            'path': lob_file, 'staged': staged,
+                            'length': size, 'digest': md5.hexdigest().upper(),
+                        }
+                        writer(f'  Dekryptert: {ref} ({size} byte)', 'ok')
+            except msoffcrypto.exceptions.InvalidKeyError as exc:
+                stats['decrypt_failed'] += 1
+                done('feil', 'Passord avvist', f'{type(exc).__name__}: {exc}')
+                writer(f'  {ref}: passord avvist ({type(exc).__name__}: {exc})', 'warn')
+            except Exception as exc:
+                stats['decrypt_failed'] += 1
+                done('feil', 'Dekryptering feilet', f'{type(exc).__name__}: {exc}')
+                writer(f'  {ref}: dekryptering feilet ({type(exc).__name__}: {exc})', 'warn')
+            if stats['selected'] <= 15 or stats['selected'] % 250 == 0:
+                writer(f'  Behandlet {stats["selected"]} utvalgte filer '
+                       f'(test={stats["decrypted_tested"]}, klargjort={len(changes)})', 'info')
+
+        if target_ref and not stats['selected']:
+            raise RuleError(f'Ingen treff paa LOB-referansen {target_ref!r} og aktive filtre')
+        if not dry_run and changes:
+            if stats['stopped']:
+                writer('  Avbrutt: ingen klargjorte dokumenter ble skrevet', 'warn')
+                for rec in records:
+                    if rec['status'] == 'klargjort':
+                        done_rec = rec
+                        done_rec['status'] = 'avbrutt'
+                        done_rec['kategori'] = 'Avbrutt av bruker'
+                        done_rec['arsak'] = 'Ingen endring skrevet til SIARD'
+            else:
+                _commit_decryption(
+                    root, root / source.xml_path_rel, changes,
+                    lob_index=lob_i, size_index=size_i, stage_dir=stage_dir,
+                )
+                stats['decrypted_saved'] = len(changes)
+                for rec in records:
+                    if rec['status'] == 'klargjort':
+                        rec['status'] = 'dekryptert'
+                        rec['arsak'] = 'Passord fjernet; LOB og tabell-XML oppdatert'
+                writer(f'  Oppdaterte {len(changes)} LOB-filer og tabell-XML i arbeidskopien', 'ok')
+    if record_sink is not None:
+        record_sink(records)
     return stats

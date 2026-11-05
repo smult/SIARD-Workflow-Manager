@@ -1,8 +1,9 @@
-"""Experimental SIARD operation: password lookup and safe Office decryption.
+"""Generic, JSON-driven SIARD document decryption.
 
-Integrates with the existing pipeline extracted_path, or takes an explicit
-existing unpacked folder to support reruns without extracting the SIARD again.
-No file inside the unpacked SIARD is changed by this pilot operation.
+Follows the same unpack -> process LOBs / update table XML -> repack workflow
+as CosDoc/Barnevern. The only system-specific information comes from rules.
+Uses the existing WorkflowFileLogger, PREMIS and report pipeline, and emits
+per-document CSV / error CSV / error log / PDF reports alongside the run log.
 """
 from __future__ import annotations
 
@@ -13,103 +14,132 @@ from siard_workflow.core.context import WorkflowContext
 from siard_workflow.core.document_password_rules import (
     RuleError, execute_rule, read_rule,
 )
+from siard_workflow.core.generic_decrypt_reporting import write_decrypt_reports
 
 
 class GenericDocumentDecryptOperation(BaseOperation):
-    operation_id = "generic_document_decrypt"
-    label = "Generisk dokumentopplaasning (JSON-regler)"
+    operation_id = 'generic_document_decrypt'
+    label = 'Generisk dokumentopplåsing (JSON-regler)'
     description = (
-        "Generisk oppslag av dokumentpassord via SIARD-tabeller og konfigurert "
-        "formel. Testkjoering dekrypterer bare til en midlertidig fil. "
-        "Vanlig kjoering lagrer opplaaste KOPIER utenfor SIARD. "
-        "Eksisterende utpakket mappe kan gjenbrukes mellom kjoeringer."
+        'Dekrypterer passordbeskyttede dokumenter etter JSON-regler. '
+        'Samme pipeline som Acos/CosDoc: skriver LOB-er og oppdatert table XML '
+        'i SIARD-arbeidskopien, deretter Pakk sammen SIARD. '
+        'Loggfører resultat per dokument i CSV, egen feilliste og PDF-rapport.'
     )
-    category = "Systemspesifikt"
-    status = 2  # Visible with the default status filter; experimental by label/docs.
-    halt_on_failure = True
+    category = 'Systemspesifikt'
+    status = 2
     produces_siard = False
-    modifies_content = False
-    requires_unpack = False  # Either pipeline ctx or explicit reused folder is valid.
+    requires_unpack = True
+    modifies_content = True
+    halt_on_failure = False
 
     default_params = {
-        "rule_file": "",        # empty = sample Acos Sosial rule bundled with source
-        "unpacked_dir": "",     # empty = ctx.extracted_path (current pipeline)
-        "lob_ref": "",          # e.g. rec10.bin; empty = all matching rows
-        "max_files": 10,       # 0 = all
-        "dry_run": True,
-        "output_dir": "",       # mandatory when dry_run=False
+        'rule_file': '',
+        'unpacked_dir': '',
+        'lob_ref': '',
+        'max_files': 0,
+        'dry_run': False,
     }
 
     def run(self, ctx: WorkflowContext) -> OperationResult:
-        log = ctx.metadata.get("file_logger")
-        pcb = ctx.metadata.get("progress_cb")
+        log = ctx.metadata.get('file_logger')
+        progress_cb = ctx.metadata.get('progress_cb')
 
-        def write(message: str, level: str = "info") -> None:
+        def write(message: str, level: str = 'info') -> None:
             if log:
-                log.log(message, level)
-            if pcb:
-                pcb("log", msg=message, level=level)
+                log.log(message, 'success' if level == 'ok' else level)
+            if progress_cb:
+                progress_cb('log', msg=message, level=level)
 
         try:
-            explicit_dir = str(self.params.get("unpacked_dir", "") or "").strip()
-            reused = Path(explicit_dir).expanduser() if explicit_dir else None
-            from_pipeline = getattr(ctx, "extracted_path", None)
-            if reused:
+            existing = str(self.params.get('unpacked_dir', '') or '').strip()
+            reused = Path(existing).expanduser() if existing else None
+            pipeline = getattr(ctx, 'extracted_path', None)
+            if pipeline is not None and pipeline.is_dir():
+                directory = pipeline
+                if reused and reused.resolve() != directory.resolve():
+                    write('  Bruker aktiv pipeline-mappe; gjenbruksmappe er ignorert', 'warn')
+            elif reused and reused.is_dir():
                 directory = reused
-                write(f"  Gjenbruker oppgitt utpakket SIARD-mappe: {directory}")
-            elif from_pipeline is not None and from_pipeline.is_dir():
-                directory = from_pipeline
-                write(f"  Bruker allerede utpakket pipeline-mappe: {directory}")
+                ctx.extracted_path = reused
             else:
                 return self._fail(
-                    "Ingen utpakket SIARD-mappe. Bruk Pakk ut SIARD foerst, "
-                    "eller oppgi en BEHOLDT mappe i feltet 'Utpakket SIARD-mappe'."
+                    'Ingen utpakket SIARD-mappe. Legg Pakk ut SIARD før '
+                    'dokumentopplåsingen i arbeidsflyten.'
                 )
+            write(f'  Arbeidsmappe: {directory}', 'info')
 
             default_rule = (Path(__file__).resolve().parents[1]
-                            / "rules" / "acos_sosial_s1021.json")
-            rule_file = str(self.params.get("rule_file", "") or "").strip()
-            rule_path = Path(rule_file).expanduser() if rule_file else default_rule
+                            / 'rules' / 'acos_sosial_s1021.json')
+            selected_rule = str(self.params.get('rule_file', '') or '').strip()
+            rule_path = Path(selected_rule).expanduser() if selected_rule else default_rule
             rule = read_rule(rule_path)
-            dry_run = bool(self.params.get("dry_run", True))
-            max_files = int(self.params.get("max_files", 10) or 0)
-            lob_ref = str(self.params.get("lob_ref", "") or "").strip()
-            target_str = str(self.params.get("output_dir", "") or "").strip()
-            target = Path(target_str).expanduser() if target_str else None
-            stop_event = ctx.metadata.get("stop_event")
+            name = str(rule.get('name', rule_path.name))
+            dry_run = bool(self.params.get('dry_run', False))
+            max_files = int(self.params.get('max_files', 0) or 0)
+            ref = str(self.params.get('lob_ref', '') or '').strip()
+            stop_event = ctx.metadata.get('stop_event')
+            write(f'  Regelsett: {name}', 'info')
+            write(f'  Modus: {"Testkjøring (ingen endring)" if dry_run else "Oppdater utpakket SIARD + sammenpakking"}', 'info')
+            write(f'  Omfang: {ref or "alle"}; maks filer: {max_files or "alle"}', 'info')
 
-            write(f"  Regelsett: {rule.get('name', rule_path.name)}")
-            write(f"  Modus: {'TEST (ingen varig lagring)' if dry_run else 'LAGRE DEKRYPTERTE KOPIER'}")
-            write(f"  Omfang: {lob_ref or 'alle'}; maks filer: {max_files or 'alle'}")
+            records: list[dict] = []
             data = execute_rule(
                 directory, rule,
-                only_ref=lob_ref, max_files=max_files, dry_run=dry_run,
-                output_dir=target, log=write,
-                stop=(stop_event.is_set if stop_event else None),
+                only_ref=ref, max_files=max_files, dry_run=dry_run,
+                log=write, stop=(stop_event.is_set if stop_event else None),
+                record_sink=lambda items: records.extend(items),
             )
-            data["dry_run"] = dry_run
-            data["rule_file"] = str(rule_path)
-            data["unpacked_dir"] = str(directory)
-            if not dry_run and target is not None:
-                data["output_dir"] = str(target)
-            ctx.set_result(self.operation_id, data)
+            data['dry_run'] = dry_run
+            data['rule_file'] = str(rule_path)
+            data['unpacked_dir'] = str(directory)
+            data['rule_name'] = name
+            if not records and data.get('selected'):
+                # An unexpected missing audit trail must never be silently
+                # presented as a completed run.
+                return self._fail('Manglende dokumentlogg fra dekryptering', data=data)
 
-            write("  OPPSUMMERING: " + ", ".join(
-                f"{key}={data[key]}" for key in (
-                    "selected", "password_stored", "password_formula_only",
-                    "formula_match", "formula_mismatch", "decrypted_tested",
-                    "decrypted_saved", "formula_fallback_attempted",
-                    "formula_fallback_success", "pdf_skipped", "not_encrypted",
-                    "blob_missing", "decrypt_failed", "lookup_ambiguous",
-                )))
-            if data.get("stopped"):
-                return self._fail("Test/steg avbrutt av bruker", data=data)
-            if not data.get("selected"):
-                return self._fail("Ingen dokumenter passet til regel og filtre", data=data)
-            if data.get("decrypt_failed") or data.get("lookup_ambiguous"):
-                return self._fail("Noen dokumenter kunne ikke behandles (se logg)", data=data)
-            n = data["decrypted_tested"] if dry_run else data["decrypted_saved"]
-            return self._ok(data, f"{'Testet' if dry_run else 'Lagret'}: {n} dokumenter")
-        except (RuleError, OSError, ValueError) as exc:
-            write(f"  Generisk dokumentopplaasning: {exc}", "warn")
+            log_dir = Path(ctx.metadata.get('log_dir') or ctx.siard_path.parent)
+            file_log_path = getattr(log, 'log_path', None)
+            reports = write_decrypt_reports(
+                log_dir, ctx.siard_path.stem, records, data, name,
+                dry_run=dry_run, log_file=file_log_path,
+            )
+            data['document_log_csv'] = reports['csv']
+            data['error_log_csv'] = reports['errors_csv']
+            data['error_log_path'] = reports['errors_log']
+            data['document_report_pdf'] = reports['pdf']
+            ctx.set_result(self.operation_id, data)
+            write(f'  Dokumentlogg (CSV): {Path(reports["csv"]).name}', 'ok')
+            write(f'  Dekrypteringsfeil (CSV): {Path(reports["errors_csv"]).name}', 'ok')
+            write(f'  Feillogg: {Path(reports["errors_log"]).name}', 'ok')
+            write(f'  Dokumentrapport (PDF): {Path(reports["pdf"]).name}', 'ok')
+
+            count = data['decrypted_tested'] if dry_run else data['decrypted_saved']
+            failed = sum(int(data.get(key, 0)) for key in (
+                'decrypt_failed', 'lookup_ambiguous', 'lookup_missing',
+                'blob_missing', 'password_missing',
+            ))
+            write('  OPPSUMMERING: '
+                  f'valgt={data["selected"]}, '
+                  f'passordfunnet={data["password_stored"]}, '
+                  f'dekryptert={count}, '
+                  f'beholdt_ukryptert={data["not_encrypted"]}, '
+                  f'passord_fallback={data["formula_fallback_success"]}, '
+                  f'feil={failed}', 'info')
+            if data.get('stopped'):
+                return self._fail('Operasjonen ble avbrutt; dokumentlogg skrevet', data)
+            if not dry_run and count:
+                write('  Arbeidskopi oppdatert: bruk Pakk sammen SIARD for ny SIARD-fil', 'ok')
+            return self._ok(
+                data,
+                f'{"Testet" if dry_run else "Dekryptert i SIARD-arbeidskopien"}: '
+                f'{count} dokument(er), {failed} feil; CSV + PDF lagret',
+            )
+        except (RuleError, OSError, ValueError, ImportError) as exc:
+            write(f'  Generisk dokumentopplåsing: {exc}', 'warn')
             return self._fail(str(exc))
+
+    def premis_should_record(self, result: OperationResult, ctx: WorkflowContext) -> bool:
+        return (result.success and not bool(self.params.get('dry_run', False))
+                and bool(result.data.get('decrypted_saved', 0)))

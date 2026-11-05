@@ -2,6 +2,11 @@
 from __future__ import annotations
 
 import json
+import os
+from unittest.mock import patch
+import hashlib
+import zipfile
+import xml.etree.ElementTree as ET
 import sys
 import tempfile
 import types
@@ -37,7 +42,7 @@ class FakeOfficeFile:
         self.password = None
 
     def is_encrypted(self):
-        return self.handle.read(8) == CFB
+        return self.handle.read(64).startswith(CFB + b"SECRET-FIXTURE-ENCRYPTED")
 
     def load_key(self, password):
         name = Path(self.ref).name
@@ -180,20 +185,22 @@ class GenericDecryptTests(unittest.TestCase):
         self.assertNotIn("DEMO_OVERRIDE", " ".join(messages))
         self.assertNotIn("R2111", " ".join(messages))
 
-    def test_fallback_after_failed_decrypt_clears_partial_output(self):
+    def test_fallback_after_failed_decrypt_replaces_lob_and_metadata(self):
         FakeOfficeFile.reject_after_partial_write = True
-        output = Path(self.temp.name) / "formula_output"
-        result = execute_rule(
-            self.root, self.rule, only_ref="rec1520.bin",
-            dry_run=False, output_dir=output,
-        )
-        self.assertEqual(1, result["formula_fallback_attempted"])
-        self.assertEqual(1, result["formula_fallback_success"])
-        self.assertEqual(1, result["decrypted_saved"])
-        self.assertEqual(0, result["decrypt_failed"])
-        copied = list(output.glob("rec1520_*.doc"))
-        self.assertEqual(1, len(copied))
-        self.assertEqual(CFB + b"PLAIN-TEST-ONLY", copied[0].read_bytes())
+        blob = self.root / 'content/schema0/table186/lob7/rec1520.bin'
+        original = blob.read_bytes()
+        result = execute_rule(self.root, self.rule, only_ref='rec1520.bin', dry_run=False)
+        self.assertEqual(1, result['formula_fallback_attempted'])
+        self.assertEqual(1, result['formula_fallback_success'])
+        self.assertEqual(1, result['decrypted_saved'])
+        self.assertEqual(0, result['decrypt_failed'])
+        self.assertNotEqual(original, blob.read_bytes())
+        self.assertEqual(CFB + b'PLAIN-TEST-ONLY', blob.read_bytes())
+        self.assertEqual([], list(Path(self.temp.name).rglob('*.tmp')))
+        xml = (self.root / 'content/schema0/table186/table186.xml').read_text()
+        self.assertIn('file="rec1520.bin"', xml.replace("'", '"'))
+        self.assertIn('digestType="MD5"', xml)
+        self.assertIn('digest="' + hashlib.md5(blob.read_bytes()).hexdigest().upper() + '"', xml)
 
     def test_two_rejected_passwords_count_as_one_document_failure(self):
         FakeOfficeFile.force_reject_for = "rec1520.bin"
@@ -244,29 +251,143 @@ class GenericDecryptTests(unittest.TestCase):
         self.assertEqual(1, results["decrypt_failed"])
         self.assertEqual(0, results["formula_mismatch"] - 1)
 
-    def test_live_writes_copies_not_source(self):
-        output = Path(self.temp.name) / "unlocked"
-        original = (self.root / "content/schema0/table186/lob7/rec10.bin").read_bytes()
-        result = execute_rule(self.root, self.rule, only_ref="rec10.bin", dry_run=False, output_dir=output)
-        self.assertEqual(1, result["decrypted_saved"])
-        copied = list(output.glob("rec10_*.doc"))
-        self.assertEqual(1, len(copied))
-        self.assertEqual(CFB + b"PLAIN-TEST-ONLY", copied[0].read_bytes())
-        self.assertEqual(original, (self.root / "content/schema0/table186/lob7/rec10.bin").read_bytes())
-        again = execute_rule(self.root, self.rule, only_ref="rec10.bin", dry_run=False, output_dir=output)
-        self.assertEqual(1, again["already_exists"])
-        self.assertEqual(0, again["decrypted_saved"])
+    def test_live_replaces_lob_and_updates_size_and_digest(self):
+        blob = self.root / 'content/schema0/table186/lob7/rec10.bin'
+        original = blob.read_bytes()
+        table_xml = self.root / 'content/schema0/table186/table186.xml'
+        source_xml = table_xml.read_bytes()
+        self.assertIn(b"length='100'", source_xml)
+        result = execute_rule(self.root, self.rule, only_ref='rec10.bin', dry_run=False)
+        self.assertEqual(1, result['decrypted_saved'])
+        self.assertEqual(0, result['decrypt_failed'])
+        self.assertEqual(CFB + b'PLAIN-TEST-ONLY', blob.read_bytes())
+        self.assertNotEqual(original, blob.read_bytes())
+        doc = ET.parse(table_xml).getroot()
+        rows = list(doc)
+        cell = rows[0].find('c7')
+        self.assertEqual('rec10.bin', cell.get('file'))
+        self.assertEqual(str(len(blob.read_bytes())), cell.get('length'))
+        self.assertEqual('MD5', cell.get('digestType'))
+        self.assertEqual(hashlib.md5(blob.read_bytes()).hexdigest().upper(), cell.get('digest'))
+        self.assertEqual(str(len(blob.read_bytes())), rows[0].find('c6').text)
+        self.assertEqual('100', rows[1].find('c6').text)
+        # Re-running after a successful in-place update does not decrypt again.
+        second = execute_rule(self.root, self.rule, only_ref='rec10.bin', dry_run=False)
+        self.assertEqual(1, second['not_encrypted'])
+        self.assertEqual(0, second['decrypted_saved'])
 
-    def test_reject_output_inside_source(self):
-        with self.assertRaises(RuleError):
-            execute_rule(self.root, self.rule, only_ref="rec10.bin", dry_run=False, output_dir=self.root / "myfiles")
+    def test_repacked_archive_contains_decrypted_lob_and_consistent_xml(self):
+        # Synthetic ZIP round-trip of the same files used by the SIARD repacker.
+        original = Path(self.temp.name) / 'original.siard'
+        with zipfile.ZipFile(original, 'w', zipfile.ZIP_DEFLATED) as z:
+            for p in self.root.rglob('*'):
+                if p.is_file():
+                    z.write(p, p.relative_to(self.root).as_posix())
+        with zipfile.ZipFile(original) as z:
+            encrypted = z.read('content/schema0/table186/lob7/rec10.bin')
+        execute_rule(self.root, self.rule, only_ref='rec10.bin', dry_run=False)
+        repacked = Path(self.temp.name) / 'result.siard'
+        with zipfile.ZipFile(repacked, 'w', zipfile.ZIP_DEFLATED) as z:
+            for p in self.root.rglob('*'):
+                if p.is_file():
+                    z.write(p, p.relative_to(self.root).as_posix())
+        with zipfile.ZipFile(repacked) as z:
+            decrypted = z.read('content/schema0/table186/lob7/rec10.bin')
+            xml = ET.fromstring(z.read('content/schema0/table186/table186.xml'))
+        self.assertNotEqual(encrypted, decrypted)
+        self.assertEqual(CFB + b'PLAIN-TEST-ONLY', decrypted)
+        self.assertEqual(str(len(decrypted)), list(xml)[0].find('c7').get('length'))
+        self.assertEqual('MD5', list(xml)[0].find('c7').get('digestType'))
+        with zipfile.ZipFile(original) as z:
+            self.assertEqual(encrypted, z.read('content/schema0/table186/lob7/rec10.bin'))
 
-    def test_reject_output_inside_git_repo(self):
-        target = Path(self.temp.name) / "repo"
-        (target / ".git").mkdir(parents=True)
-        with self.assertRaises(RuleError):
-            execute_rule(self.root, self.rule, only_ref="rec10.bin", dry_run=False,
-                         output_dir=target / "decrypted")
+    def test_batch_commits_valid_and_keeps_failed_documents(self):
+        successful = self.root / 'content/schema0/table186/lob7/rec10.bin'
+        failed = self.root / 'content/schema0/table186/lob7/rec90.bin'
+        original_successful = successful.read_bytes()
+        original_failed = failed.read_bytes()
+        table_xml = self.root / 'content/schema0/table186/table186.xml'
+        result = execute_rule(self.root, self.rule, max_files=0, dry_run=False)
+        self.assertEqual(1, result['decrypt_failed'])
+        self.assertEqual(3, result['decrypted_saved'])
+        self.assertEqual(5, result['selected'])
+        self.assertNotEqual(original_successful, successful.read_bytes())
+        self.assertEqual(original_failed, failed.read_bytes())
+        doc = ET.parse(table_xml).getroot()
+        rows = list(doc)
+        self.assertEqual(str(len(successful.read_bytes())), rows[0].find('c7').get('length'))
+        self.assertEqual('100', rows[4].find('c7').get('length'))
+
+    def test_report_first_twelve_fields_include_outcomes(self):
+        from siard_workflow.core.document_password_rules import _new_stats
+        keys = list(_new_stats())[:12]
+        for name in ('decrypted_saved', 'decrypted_tested', 'decrypt_failed',
+                     'selected', 'formula_mismatch', 'formula_fallback_success'):
+            self.assertIn(name, keys)
+
+    def test_per_document_audit_matches_committed_batch(self):
+        records = []
+        result = execute_rule(
+            self.root, self.rule, max_files=0, dry_run=False,
+            record_sink=records.extend,
+        )
+        self.assertEqual(result['selected'], len(records))
+        self.assertEqual(result['decrypted_saved'],
+                         sum(1 for row in records if row['status'] == 'dekryptert'))
+        self.assertEqual(result['decrypt_failed'],
+                         sum(1 for row in records if row['status'] == 'feil'))
+        self.assertEqual(result['pdf_skipped'],
+                         sum(1 for row in records if row['kategori'] == 'PDF'))
+        paths = [row['fil'] for row in records]
+        self.assertTrue(all(path.startswith('content/') for path in paths))
+        by_name = {Path(row['fil']).name: row for row in records}
+        self.assertEqual('beregnet (fallback)', by_name['rec1520.bin']['passordkilde'])
+        self.assertEqual('ja', by_name['rec1520.bin']['formelavvik'])
+        self.assertEqual('R4321' in repr(records), False)
+        self.assertNotIn('DEMO_OVERRIDE', repr(records))
+
+    def test_per_document_audit_dry_run_reports_tested_not_written(self):
+        records = []
+        blob = self.root / 'content/schema0/table186/lob7/rec10.bin'
+        before = blob.read_bytes()
+        result = execute_rule(self.root, self.rule, only_ref='rec10.bin',
+                              dry_run=True, record_sink=records.extend)
+        self.assertEqual(1, result['decrypted_tested'])
+        self.assertEqual('testet', records[0]['status'])
+        self.assertEqual(before, blob.read_bytes())
+
+    def test_commit_xml_failure_rolls_back_lob(self):
+        blob = self.root / 'content/schema0/table186/lob7/rec10.bin'
+        table_xml = self.root / 'content/schema0/table186/table186.xml'
+        original_blob, original_xml = blob.read_bytes(), table_xml.read_bytes()
+        real_replace = os.replace
+        failure_injections = []
+        def fail_xml_commit(src, dst):
+            # execute_rule() normalizes the workspace with Path.resolve().
+            # On Windows the resulting destination may be canonically spelled
+            # differently from the test's original path, even when identical.
+            # Match the unique staged XML file and the destination filename.
+            if (Path(src).name == 'table-updated.xml'
+                    and Path(dst).name == table_xml.name):
+                failure_injections.append(Path(dst).name)
+                raise OSError('Simulated XML commit failure')
+            return real_replace(src, dst)
+        with patch('siard_workflow.core.document_password_rules.os.replace', side_effect=fail_xml_commit):
+            with self.assertRaisesRegex(OSError, 'Simulated XML commit failure'):
+                execute_rule(self.root, self.rule, only_ref='rec10.bin', dry_run=False)
+        self.assertEqual(['table186.xml'], failure_injections)
+        self.assertEqual(original_blob, blob.read_bytes())
+        self.assertEqual(original_xml, table_xml.read_bytes())
+
+    def test_dry_run_does_not_change_lob_or_xml(self):
+        blob = self.root / 'content/schema0/table186/lob7/rec1520.bin'
+        table_xml = self.root / 'content/schema0/table186/table186.xml'
+        before_blob, before_xml = blob.read_bytes(), table_xml.read_bytes()
+        result = execute_rule(self.root, self.rule, only_ref='rec1520.bin', dry_run=True)
+        self.assertEqual(1, result['formula_fallback_success'])
+        self.assertEqual(1, result['decrypted_tested'])
+        self.assertEqual(before_blob, blob.read_bytes())
+        self.assertEqual(before_xml, table_xml.read_bytes())
 
     def test_reject_missing_reference(self):
         with self.assertRaises(RuleError):

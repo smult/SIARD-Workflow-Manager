@@ -658,8 +658,8 @@ OP_DEFS = [
         "desc": (
             "Regelstyrt oppslag av dokumentpassord fra SIARD-tabeller. "
             "Testkj\u00f8ring kontrollerer reell dekryptering uten varig lagring. "
-            "Vanlig kj\u00f8ring lagrer dekrypterte kopier i egen mappe; "
-            "original SIARD og utpakket arbeidsmappe endres ikke. "
+            "Vanlig kj\u00f8ring oppdaterer LOB-filer og tabell-XML i utpakket "
+            "SIARD-arbeidskopi. Legg Pakk sammen SIARD etter operasjonen. "
             "Tom regelsti bruker medf\u00f8lgende Acos Sosial-eksempel."
         ),
         "status": GenericDocumentDecryptOperation.status,
@@ -667,9 +667,8 @@ OP_DEFS = [
             {"key": "rule_file", "label": "Regel-JSON (tom = Acos Sosial)", "type": "file", "default": ""},
             {"key": "unpacked_dir", "label": "Utpakket SIARD-mappe (gjenbruk)", "type": "folder", "default": ""},
             {"key": "lob_ref", "label": "LOB-fil (tom = alle, f.eks. rec10.bin)", "type": "str", "default": ""},
-            {"key": "max_files", "label": "Maks dokumenter (0 = alle)", "type": "int", "default": 10},
-            {"key": "dry_run", "label": "Testkj\u00f8ring (ikke skriv)", "type": "bool", "default": True},
-            {"key": "output_dir", "label": "Utdatamappe for oppl\u00e5ste kopier", "type": "folder", "default": ""},
+            {"key": "max_files", "label": "Maks dokumenter (0 = alle)", "type": "int", "default": 0},
+            {"key": "dry_run", "label": "Testkj\u00f8ring (ikke skriv)", "type": "bool", "default": False},
         ],
     },
     # ── Kompatibilitet ───────────────────────────────────────────────────────

@@ -74,7 +74,6 @@ if __name__ == "__main__" and len(sys.argv) >= 2 and sys.argv[1] == "--selftest"
 
 _TITLE = "SIARD Workflow Manager"
 
-
 def _fatal(msg: str) -> None:
     """Vis feilmelding uten tkinter (Windows-meldingsboks) og avslutt."""
     print(f"FEIL: {msg}")
@@ -165,6 +164,9 @@ from gui.app import App
 def main():
     try:
         app = App()
+        # Vis utviklingssuffiks fra version.py, uten å endre App.VERSION.
+        from version import DISPLAY_VERSION
+        app.title(f"{app.TITLE}  v{DISPLAY_VERSION}")
         app.mainloop()
     except Exception:
         # Uten konsoll (pythonw) er en uhåndtert feil usynlig — logg traceback
