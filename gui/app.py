@@ -20,6 +20,7 @@ except ImportError:
 from gui.workflow_panel import WorkflowPanel
 from gui.operations_panel import OperationsPanel, set_current_siard_path
 from gui.log_panel import LogPanel
+from gui.header_panel import HeaderDock
 from gui.styles import COLORS, FONTS
 from gui.settings_dialog import SettingsDialog
 
@@ -422,9 +423,20 @@ class App(ctk.CTk):
             stop_cb=self._conv_stop,
             resume_cb=self._conv_resume)
 
-        self.log_panel = LogPanel(right)
+        # Kjøreloggen med SIARD-header-panelet til høyre (skjult til en
+        # workflow starter; bredde dras i skillelinja, » minimerer til en stripe)
+        log_area = ctk.CTkFrame(right, fg_color="transparent")
+        log_area.grid(row=2, column=0, sticky="nsew")
+        log_area.grid_rowconfigure(0, weight=1)
+        log_area.grid_columnconfigure(0, weight=1)
+
+        self.log_panel = LogPanel(log_area)
         self.log_panel.set_show_all_callback(self._on_log_show_all)
-        self.log_panel.grid(row=2, column=0, sticky="nsew")
+        self.log_panel.grid(row=0, column=0, sticky="nsew")
+
+        self.header_dock = HeaderDock(log_area)
+        self.header_dock.grid(row=0, column=1, sticky="ns")
+        self.header_dock.grid_remove()
 
     def _build_topbar(self):
         bar = ctk.CTkFrame(self, fg_color=COLORS["surface"], corner_radius=0, height=48)
@@ -3158,6 +3170,13 @@ class App(ctk.CTk):
 
             ctx.metadata["step_results"] = []
 
+            # SIARD-header-panelet: vis headeren nå; endringer i panelet skrives
+            # inn mellom stegene og tas med ved «Pakk sammen SIARD»
+            _hdr_ids = {op.operation_id for op in wf}
+            _hdr = {"can_edit": {"unpack_siard", "repack_siard"} <= _hdr_ids,
+                    "repacked": False}
+            self._header_publish(ctx, _hdr, first=True)
+
             # Prosjektfil: fullførte steg hoppes bare over så lenge ALLE steg
             # før dem også ble hoppet over. Når ett steg må kjøres (ikke
             # fullført, eller «Pakk ut» må gjentas fordi temp-mappa er borte),
@@ -3270,6 +3289,12 @@ class App(ctk.CTk):
                     })
                     continue
 
+                if (_hdr["can_edit"] and not _hdr["repacked"]
+                        and self._header_apply_pending(
+                            ctx, file_logger, premis_logger,
+                            before_repack=op.operation_id == "repack_siard")):
+                    self._header_publish(ctx, _hdr)
+
                 t0 = time.time()
                 try:
                     result = op.run(ctx)
@@ -3329,6 +3354,11 @@ class App(ctk.CTk):
                     "elapsed":  elapsed,
                 })
 
+                # Steget kan ha endret headeren — vis gjeldende verdier
+                if op.operation_id == "repack_siard" and result.success:
+                    _hdr["repacked"] = True
+                self._header_publish(ctx, _hdr)
+
                 # ── Prosjektfil: lagre status etter steget ────────────────────
                 if _pf and _pf_path:
                     try:
@@ -3380,6 +3410,12 @@ class App(ctk.CTk):
                         _rep.halted(op.label, result.message)
                     break
 
+            # Stoppet før sammenpakking: skriv ventende header-endringer inn i
+            # den utpakkede mappa, så de er med når prosjektet kjøres videre
+            if _hdr["can_edit"] and not _hdr["repacked"]:
+                self._header_apply_pending(ctx, file_logger, premis_logger)
+            self._header_publish(ctx, _hdr, done=True)
+
             run.end_time = time.time()
             # Skriv PREMIS-proveniensfil før loggen avsluttes (slik at en
             # eventuell speiling rekker å nå kjøreloggen).
@@ -3402,6 +3438,87 @@ class App(ctk.CTk):
 
         self._remote_finish()
         self._log_queue.put(("queue_done", None))
+
+    # ── SIARD-header-panelet (kalles fra kjøretråden) ─────────────────────────
+
+    @staticmethod
+    def _header_meta(ctx) -> "Path | None":
+        """header/metadata.xml i den utpakkede mappa (None før utpakking/etter opprydding)."""
+        from siard_workflow.core.siard_header import metadata_path
+        ext = getattr(ctx, "extracted_path", None)
+        return metadata_path(Path(ext)) if ext and Path(ext).is_dir() else None
+
+    def _header_publish(self, ctx, hdr: dict, first: bool = False,
+                        done: bool = False) -> None:
+        """Les headeren (utpakket metadata.xml, ellers SIARD-fila) og vis den i panelet."""
+        from siard_workflow.core.siard_header import read_header
+        meta = None if hdr["repacked"] else self._header_meta(ctx)
+        info = read_header(meta) if meta else read_header(ctx.siard_path)
+        editable = hdr["can_edit"] and not hdr["repacked"] and not done and info is not None
+        if info is None:
+            note = "Fant ikke header/metadata.xml."
+        elif not hdr["can_edit"]:
+            note = ("Skrivebeskyttet: endringer krever «Pakk ut SIARD» og "
+                    "«Pakk sammen SIARD» i arbeidsflyten.")
+        elif hdr["repacked"]:
+            note = f"Pakket inn som header i {ctx.siard_path.name}."
+        elif done and meta:
+            note = ("Kjøringen stoppet før sammenpakking. Endringene ligger i den "
+                    "utpakkede mappa og tas med når prosjektet kjøres videre.")
+        elif done:
+            note = "Kjøringen er ferdig."
+        elif meta is None:
+            note = ("Endringer skrives inn etter utpakkingen og tas med ved "
+                    "sammenpakking.")
+        else:
+            note = ("Endringer skrives inn i metadata.xml før neste steg og tas "
+                    "med ved sammenpakking.")
+        self._log_queue.put(("header_show", first, info, ctx.siard_path.name,
+                             editable, note))
+
+    def _header_apply_pending(self, ctx, file_logger, premis_logger,
+                              before_repack: bool = False) -> bool:
+        """Skriv endringer fra header-panelet inn i den utpakkede metadata.xml.
+        True når noe ble skrevet."""
+        meta = self._header_meta(ctx)
+        if meta is None:
+            return False                  # ikke utpakket ennå — endringene venter
+        panel = self.header_dock.panel
+
+        def _w(msg: str, lvl: str = "info") -> None:
+            self._log_queue.put(("log", msg, lvl))
+            if file_logger:
+                file_logger.log(msg, lvl)
+
+        if before_repack:
+            for tag, err in panel.invalid_fields().items():
+                _w(f"  SIARD-header: <{tag}> har ugyldig verdi i panelet og tas "
+                   f"ikke med ({err})", "warn")
+        pending = panel.take_pending()
+        if not pending:
+            return False
+        from siard_workflow.core.siard_header import apply_header_file
+        try:
+            changes = apply_header_file(meta, pending)
+        except Exception as exc:
+            _w(f"  SIARD-header kunne ikke skrives: {exc}", "error")
+            return False
+        done = [c for c in changes if not c.startswith("IKKE")]
+        if done:
+            _w("  SIARD-header endret i panelet:", "info")
+        for c in changes:
+            _w(f"    {c}", "warn" if c.startswith("IKKE") else "info")
+        if done and premis_logger:
+            from types import SimpleNamespace
+            detail = ("Manuell endring av SIARD-header (header/metadata.xml): "
+                      + "; ".join(done))
+            premis_logger.record(
+                SimpleNamespace(operation_id="header_edit",
+                                premis_event_type="Adjustment",
+                                premis_event_label="metadataendring (manuell)",
+                                premis_detail=lambda _r, _c: detail),
+                SimpleNamespace(success=True, message=detail), ctx)
+        return bool(done)
 
     def _poll_log_queue(self):
         # Behandle maks 50 meldinger per runde.
@@ -3478,6 +3595,13 @@ class App(ctk.CTk):
                     self.format_chart.reset()
                     self._update_status_right(
                         f"Kjører [{q_idx+1}/{q_tot}]: {path.name}")
+                    needs_redraw = True
+                elif kind == "header_show":
+                    _, first, info, name, editable, note = item
+                    if first:
+                        self.header_dock.load(info or {"values": {}}, name, editable, note)
+                    elif info is not None:
+                        self.header_dock.refresh(info, editable, note)
                     needs_redraw = True
                 elif kind == "done_one":
                     _, run, q_idx, q_tot, path = item

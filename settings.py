@@ -96,6 +96,9 @@ _CONFIG_DEFAULTS: dict = {
     "notify_hide_filenames":  False,       # «fil 2 av 5» i stedet for filnavn
     "notify_each_step":       False,       # varsle for hvert fullførte steg
     "notify_heartbeat":       True,        # livstegn hver halvtime
+    # ── SIARD-header-panelet til høyre for kjøreloggen ──
+    "header_panel_width":     380,         # bredde (px) — dras i skillelinja
+    "header_panel_collapsed": False,       # minimert til en stripe ytterst til høyre
 }
 
 
