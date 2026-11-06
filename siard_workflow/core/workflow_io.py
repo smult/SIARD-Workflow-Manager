@@ -23,6 +23,7 @@ def _op_map() -> dict:
     from siard_workflow.operations.segfolder_fix_operation import SegFolderFixOperation
     from siard_workflow.operations.xsd_type_fix_operation import XsdTypeFixOperation
     from siard_workflow.operations.siardmapper_operation import SiardMapperOperation
+    from siard_workflow.operations.content_qa_operation import ContentQAOperation
     from siard_workflow.systemspecific_operations.generic_decrypt_operation import (
         GenericDocumentDecryptOperation,
     )
@@ -40,6 +41,7 @@ def _op_map() -> dict:
         "repack_siard":       RepackSiardOperation,
         "workflow_report":    WorkflowReportOperation,
         "generic_document_decrypt": GenericDocumentDecryptOperation,
+        "content_qa":         ContentQAOperation,
         "cosdoc_mailmerge":   CosDocMailMergeOperation,
         "dias_package":       DiasPackageOperation,
         "lobfolder_fix":      LobFolderFixOperation,

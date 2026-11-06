@@ -1,9 +1,9 @@
-"""Versjon for Generic Decrypt-utviklingsgrenen.
+"""Versjon for utviklingsgrenen innholdskontroll.
 
 VERSION er ordinær applikasjonsversjon for oppdatering/PREMIS.
 DEVELOPMENT_SUFFIX styrer bare synlig utviklingsmerking.
 """
 
 VERSION = "1.4.22"
-DEVELOPMENT_SUFFIX = "ikamr-03"
+DEVELOPMENT_SUFFIX = "ikamr-04-a2"
 DISPLAY_VERSION = f"{VERSION}-{DEVELOPMENT_SUFFIX}" if DEVELOPMENT_SUFFIX else VERSION

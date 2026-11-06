@@ -25,6 +25,7 @@ from siard_workflow.operations import (
     StandardizeExtOperation, DepotReportsOperation,
     MetadataQualityOperation, XsdTypeFixOperation, DateSpanOperation,
 )
+from siard_workflow.operations.content_qa_operation import ContentQAOperation
 from siard_workflow.systemspecific_operations import (
     CosDocMailMergeOperation, GenericDocumentDecryptOperation,
 )
@@ -669,6 +670,29 @@ OP_DEFS = [
             {"key": "lob_ref", "label": "LOB-fil (tom = alle, f.eks. rec10.bin)", "type": "str", "default": ""},
             {"key": "max_files", "label": "Maks dokumenter (0 = alle)", "type": "int", "default": 0},
             {"key": "dry_run", "label": "Testkj\u00f8ring (ikke skriv)", "type": "bool", "default": False},
+        ],
+    },
+    # ── Generisk kvalitetssikring av faglig innhold ───────────────────────────────
+    {
+        "cls": ContentQAOperation,
+        "label": "Innholdskontroll (QA - informasjonsbærere)",
+        "category": "Innhold",
+        "desc": (
+            "Kontrollerer antall SIARD-tabellrader mot metadata og teller faglige "
+            "informasjonsbærere med JSON-kartlegging. Kontrollerer nøkler, "
+            "relasjoner og status-/årsfordelinger der malsettet er kartlagt. "
+            "Skrivebeskyttet: endrer aldri SIARD. Lager PDF, CSV og JSON. "
+            "Tom malfil bruker ePhorte-kartleggingsmalen (ikke automatisk godkjent). "
+            "Legges etter Pakk sammen SIARD og før Kjørerapport."
+        ),
+        "status": ContentQAOperation.status,
+        "params": [
+            {"key": "profile_file", "label": "QA-mal (JSON, tom = ePhorte-kartlegging)",
+             "type": "file", "default": ""},
+            {"key": "scan_rows", "label": "Tell og kontroller alle tabellrader",
+             "type": "bool", "default": True},
+            {"key": "check_metadata_pk", "label": "Kontroller primærnøkler fra SIARD-metadata",
+             "type": "bool", "default": True},
         ],
     },
     # ── Kompatibilitet ───────────────────────────────────────────────────────

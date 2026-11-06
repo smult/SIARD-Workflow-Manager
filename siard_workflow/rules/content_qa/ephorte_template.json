@@ -1,0 +1,152 @@
+{
+  "format_version": 1,
+  "id": "ephorte-informasjonsbaerere-a2",
+  "label": "ePhorte - innholdskontroll (kartleggingsmal)",
+  "system_hint": "ePhorte / Noark 4 og Noark 5",
+  "description": "Konseptuelle informasjonsbaerere og navnealiaser for automatisk KARTLEGGINGSFORSLAG. Fysiske tabeller og nockelfelt er ikke verifisert eller automatisk kartlagt. Alle source er fortsatt null til operatorkontroll.",
+  "carriers": [
+    {
+      "id": "arkiv",
+      "label": "Arkiv",
+      "source": null,
+      "key": [],
+      "aliases": [
+        "arkiv",
+        "arkivenhet"
+      ]
+    },
+    {
+      "id": "arkivdel",
+      "label": "Arkivdeler",
+      "source": null,
+      "key": [],
+      "aliases": [
+        "arkivdel",
+        "arkivdeler"
+      ]
+    },
+    {
+      "id": "klassifikasjonssystem",
+      "label": "Klassifikasjonssystemer",
+      "source": null,
+      "key": [],
+      "aliases": [
+        "klassifikasjonssystem",
+        "ordningsprinsipp"
+      ]
+    },
+    {
+      "id": "klasse",
+      "label": "Klasser",
+      "source": null,
+      "key": [],
+      "aliases": [
+        "klasse",
+        "arkivkode",
+        "ordningsverdi"
+      ]
+    },
+    {
+      "id": "mappe",
+      "label": "Mapper / saker",
+      "source": null,
+      "key": [],
+      "aliases": [
+        "mappe",
+        "saksmappe",
+        "sak",
+        "sakshode"
+      ]
+    },
+    {
+      "id": "registrering",
+      "label": "Registreringer / journalposter",
+      "source": null,
+      "key": [],
+      "aliases": [
+        "registrering",
+        "journalpost",
+        "journalposter",
+        "jp"
+      ]
+    },
+    {
+      "id": "dokumentbeskrivelse",
+      "label": "Dokumentbeskrivelser",
+      "source": null,
+      "key": [],
+      "aliases": [
+        "dokumentbeskrivelse",
+        "dokument",
+        "dokumenttittel"
+      ]
+    },
+    {
+      "id": "dokumentobjekt",
+      "label": "Dokumentobjekter / dokumentversjoner",
+      "source": null,
+      "key": [],
+      "aliases": [
+        "dokumentobjekt",
+        "dokumentversjon",
+        "dokumentfil",
+        "dokumentvariant"
+      ]
+    },
+    {
+      "id": "korrespondansepart",
+      "label": "Korrespondanseparter",
+      "source": null,
+      "key": [],
+      "aliases": [
+        "korrespondansepart",
+        "avsender",
+        "mottaker",
+        "adressat"
+      ]
+    },
+    {
+      "id": "sakspart",
+      "label": "Saksparter",
+      "source": null,
+      "key": [],
+      "aliases": [
+        "sakspart",
+        "saksparter",
+        "part"
+      ]
+    },
+    {
+      "id": "merknad",
+      "label": "Merknader",
+      "source": null,
+      "key": [],
+      "aliases": [
+        "merknad",
+        "merknader"
+      ]
+    },
+    {
+      "id": "skjerming",
+      "label": "Skjerming / gradering",
+      "source": null,
+      "key": [],
+      "aliases": [
+        "skjerming",
+        "gradering",
+        "tilgangskode"
+      ]
+    },
+    {
+      "id": "avskrivning",
+      "label": "Avskrivninger",
+      "source": null,
+      "key": [],
+      "aliases": [
+        "avskrivning",
+        "avskrivninger"
+      ]
+    }
+  ],
+  "relations": []
+}
