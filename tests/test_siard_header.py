@@ -142,17 +142,53 @@ def test_panel() -> None:
     _ok(p.get_value("dbname") == "KRS", "panelet viser verdiene")
     p.set_value("dataOwner", "Ny eier")
     p.set_value("archivalDate", "1.5.2020")
-    pend = p.take_pending()
-    _ok(pend == {"dataOwner": "Ny eier"}, f"endring ventende, ugyldig dato ikke ({pend})")
+    _ok(p.unconfirmed() == {"dataOwner": "Ny eier"} and p.take_confirmed() == {},
+        "endring er ubekreftet og skrives ikke automatisk; ugyldig dato ikke med")
     _ok("archivalDate" in p.invalid_fields(), "ugyldig felt meldes")
+    _ok(p._confirm_btn.cget("state") == "normal"
+        and "(1)" in p._confirm_btn.cget("text"), "«Bekreft endringer (1)» er aktiv")
+    seen: list = []
+    p.on_confirm = seen.append
+    p.confirm()
+    _ok(seen == [{"dataOwner": "Ny eier"}] and p.unconfirmed() == {}
+        and p._confirm_btn.cget("state") == "disabled", "bekreftet; knappen inaktiv")
     p.set_value("dbname", "Skrives")
-    info2 = H.read_header_bytes(META.replace("Kommune", "Ny eier")
-                                .replace("<databaseUser>sa", "<databaseUser>dba").encode())
+    info2 = H.read_header_bytes(META.replace("<databaseUser>sa", "<databaseUser>dba")
+                                .encode())
     dock.refresh(info2, editable=True, note="")
     root.update()
-    _ok(p.get_value("dbname") == "Skrives", "felt under redigering overskrives ikke")
+    _ok(p.get_value("dbname") == "Skrives" and p.get_value("dataOwner") == "Ny eier",
+        "ubekreftet og bekreftet (ikke skrevet) felt overskrives ikke")
     _ok(p.get_value("databaseUser") == "dba", "andre felt oppdateres fra fila")
-    _ok(p.take_pending() == {"dbname": "Skrives"}, "ventende endring står fortsatt")
+    _ok(p.take_confirmed() == {"dataOwner": "Ny eier"}
+        and p.unconfirmed() == {"dbname": "Skrives"}, "bekreftet/ubekreftet holdes adskilt")
+    p.set_value("dataOwner", "Ny eier 2")
+    p.confirm()
+    p.set_value("dataOwner", "Ny eier 3")
+    _ok("dataOwner" not in p.take_confirmed()
+        and p.unconfirmed().get("dataOwner") == "Ny eier 3",
+        "endret etter bekreftelse → må bekreftes på nytt")
+    p.undo()
+    _ok(p.unconfirmed() == {} and p.get_value("dataOwner") == "Kommune", "Angre")
+
+    class _Ev:
+        def __init__(self, x):
+            self.x_root = x
+    sc = ctk.ScalingTracker.get_widget_scaling(p)
+    w0 = dock._width
+    dock._drag_start(_Ev(1000))
+    dock._drag(_Ev(900))
+    root.update()
+    _ok(not p.winfo_ismapped() and dock._ghost.winfo_ismapped(),
+        "under draing er panelinnholdet skjult")
+    _ok(dock._width == w0, "panelet får ikke ny bredde før knappen slippes")
+    dock._drag(_Ev(880))
+    root.after(60)
+    root.update()
+    dock._drag_end(_Ev(880))
+    root.update()
+    _ok(p.winfo_ismapped() and not dock._ghost.winfo_ismapped()
+        and abs(dock._width - (w0 + 120 / sc)) <= 1, f"ny bredde etter slipp ({dock._width})")
     dock.set_collapsed(True)
     root.update()
     _ok(not p.winfo_ismapped() and dock.strip.winfo_ismapped(), "minimert til stripe")
@@ -212,25 +248,46 @@ def test_run_chain(tmp: Path) -> None:
     it = shown()[-1]
     _ok(it[1] is True and it[2]["values"]["dbname"] == "KRS" and it[4] is True
         and "etter utpakkingen" in it[5], "før utpakking: header fra .siard, redigerbar")
+    panel = fake.header_dock.panel
     fake.header_dock.load(it[2], it[3], it[4], it[5])
-    fake.header_dock.panel.set_value("dataOwner", "Arkivverket test")
+    panel.set_value("dataOwner", "Arkivverket test")
+    panel.confirm()
     _ok(fake._header_apply_pending(ctx, None, None) is False
-        and fake.header_dock.panel.take_pending() == {"dataOwner": "Arkivverket test"},
-        "ikke utpakket ennå → endringen venter")
-    fake.header_dock.panel.set_value("dataOwner", "Arkivverket test")
+        and panel._confirmed == {"dataOwner": "Arkivverket test"},
+        "ikke utpakket ennå → den bekreftede endringen venter")
 
     r = UnpackSiardOperation().run(ctx)
     ctx.set_result("unpack_siard", r.data)
     _ok(r.success and ctx.extracted_path, "pakket ut")
+    meta_p = ctx.extracted_path / "header/metadata.xml"
     premis = PremisProvenanceLogger(tmp, siard)
-    fake.header_dock.panel.set_value("archiver", "Kari")
-    _ok(fake._header_apply_pending(ctx, None, premis, before_repack=True),
-        "endringene skrives før sammenpakking")
-    meta = (ctx.extracted_path / "header/metadata.xml").read_text("utf-8")
-    _ok("<dataOwner>Arkivverket test</dataOwner>" in meta and "<archiver>Kari</archiver>" in meta,
-        "utpakket metadata.xml oppdatert")
+    panel.set_value("dbname", "Ubekreftet")
+    _ok(fake._header_apply_pending(ctx, None, premis), "bekreftet endring skrives før steget")
+    meta = meta_p.read_text("utf-8")
+    _ok("<dataOwner>Arkivverket test</dataOwner>" in meta and "Ubekreftet" not in meta,
+        "bare den bekreftede endringen er skrevet")
     _ok(premis.has_events(), "PREMIS-hendelse for manuell header-endring")
-    _ok(fake.header_dock.panel.take_pending() == {}, "ingen ventende etter skriving")
+
+    # Før «Pakk sammen»: ubekreftede endringer → spørsmål (vindu + ntfy via _ask_yes_no)
+    asked: list = []
+    answer = {"v": False}
+    fake._ask_yes_no = lambda title, text, yes, no: (asked.append((title, text, yes, no)),
+                                                    answer["v"])[1]
+    fake._ask_header_unconfirmed = App._ask_header_unconfirmed.__get__(fake)
+    fake._header_apply_pending(ctx, None, None, before_repack=True)
+    _ok(len(asked) == 1 and "Lagre endringer i SIARD-header ved pakking av ny siard?"
+        in asked[0][1] and "«Ubekreftet»" in asked[0][1],
+        "spørsmålet stilles med endringene listet")
+    _ok("Ubekreftet" not in meta_p.read_text("utf-8") and panel.unconfirmed() == {},
+        "«Nei» → ubekreftet endring forkastes")
+    panel.set_value("archiver", "Kari")
+    answer["v"] = True
+    _ok(fake._header_apply_pending(ctx, None, None, before_repack=True)
+        and "<archiver>Kari</archiver>" in meta_p.read_text("utf-8"),
+        "«Ja» → ubekreftet endring skrives før sammenpakking")
+    asked.clear()
+    fake._header_apply_pending(ctx, None, None, before_repack=True)
+    _ok(not asked, "ingen ubekreftede endringer → ingen spørsmål")
 
     r = RepackSiardOperation(keep_temp=False).run(ctx)
     _ok(r.success, f"pakket sammen ({r.message})")

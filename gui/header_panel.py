@@ -1,10 +1,11 @@
 """
 gui/header_panel.py
 SIARD-header (feltene øverst i header/metadata.xml) i et panel til høyre for
-kjøreloggen. Feltene kan endres mens workflowen går; endringene samles som
-«ventende» og skrives inn i den utpakkede metadata.xml mellom stegene (av
-kjøretråden i app.py) — senest rett før «Pakk sammen SIARD». Steg som endrer
-headeren oppdaterer panelet etter at de er ferdige.
+kjøreloggen. Feltene kan endres mens workflowen går. Endringene må bekreftes
+(«Bekreft endringer»); bekreftede skrives inn i den utpakkede metadata.xml
+mellom stegene (av kjøretråden i app.py) — senest rett før «Pakk sammen
+SIARD». Ubekreftede endringer gir et spørsmål før sammenpakkingen. Steg som
+endrer headeren oppdaterer panelet etter at de er ferdige.
 
   HeaderDock   skillelinje (dra for bredde) + HeaderPanel (» minimerer), eller en smal
                stripe ytterst til høyre når panelet er minimert
@@ -36,9 +37,11 @@ class HeaderPanel(ctk.CTkFrame):
         self.grid_rowconfigure(2, weight=1)
         self._on_collapse = on_collapse
         self._lock = threading.Lock()
-        self._base: dict[str, str] = {}
-        self._pending: dict[str, str] = {}
-        self._invalid: dict[str, str] = {}
+        self._base: dict[str, str] = {}       # verdiene i fila
+        self._pending: dict[str, str] = {}    # endret, gyldig, ikke bekreftet
+        self._confirmed: dict[str, str] = {}  # bekreftet, ikke skrevet ennå
+        self._invalid: dict[str, str] = {}    # {tag: feiltekst}
+        self.on_confirm = None                # kalles med {tag: verdi} ved «Bekreft»
         self._editable = False
         self._loading = False
         self._vars: dict[str, tk.StringVar] = {}
@@ -137,9 +140,17 @@ class HeaderPanel(ctk.CTkFrame):
             self._ro_labels[tag] = (lbl, label)
             r += 1
 
+        self._confirm_btn = ctk.CTkButton(
+            self, text="Bekreft endringer", height=30,
+            fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"],
+            text_color=COLORS["on_accent"],
+            font=ctk.CTkFont(family=FONTS["ui"], size=12, weight="bold"),
+            command=self.confirm, state="disabled")
+        self._confirm_btn.grid(row=3, column=0, sticky="ew", padx=12, pady=(8, 0))
+
         self._note = ctk.CTkLabel(self, text="", font=small, text_color=COLORS["muted"],
                                   anchor="w", justify="left", wraplength=300)
-        self._note.grid(row=3, column=0, sticky="ew", padx=12, pady=(4, 10))
+        self._note.grid(row=4, column=0, sticky="ew", padx=12, pady=(4, 10))
         self.bind("<Configure>", self._on_resize, add="+")
         self._set_inputs_state(False)
 
@@ -181,10 +192,12 @@ class HeaderPanel(ctk.CTkFrame):
             self._loading = False
 
     def _on_change(self, tag: str) -> None:
+        """Brukeren endret feltet: ny (ubekreftet) endring, eller tilbake til fila."""
         if self._loading or not self._editable:
             return
         v = self.get_value(tag)
         with self._lock:
+            self._confirmed.pop(tag, None)    # endret igjen → må bekreftes på nytt
             if _norm(v) == _norm(self._base.get(tag, "")):
                 self._pending.pop(tag, None)
                 self._invalid.pop(tag, None)
@@ -201,19 +214,46 @@ class HeaderPanel(ctk.CTkFrame):
     def _show_state(self, tag: str) -> None:
         with self._lock:
             pending = tag in self._pending
+            confirmed = tag in self._confirmed
             err = self._invalid.get(tag)
-            any_change = bool(self._pending or self._invalid)
-        self._marks[tag].configure(
-            text="● endret" if pending else ("● ugyldig" if err else ""),
-            text_color=COLORS["red"] if err else COLORS["accent"])
+        if err:
+            mark, color = "● ugyldig", COLORS["red"]
+        elif pending:
+            mark, color = "● ikke bekreftet", COLORS["yellow"]
+        elif confirmed:
+            mark, color = "✓ bekreftet", COLORS["green"]
+        else:
+            mark, color = "", COLORS["accent"]
+        self._marks[tag].configure(text=mark, text_color=color)
         lbl = self._errors[tag]
         if err:
             lbl.configure(text=err + " — skrives ikke")
             lbl.grid()
         else:
             lbl.grid_remove()
-        self._undo_btn.configure(state="normal" if any_change and self._editable
-                                 else "disabled")
+        self._update_buttons()
+
+    def _update_buttons(self) -> None:
+        with self._lock:
+            n_pending = len(self._pending)
+            any_change = bool(self._pending or self._invalid or self._confirmed)
+        on = self._editable
+        self._undo_btn.configure(state="normal" if any_change and on else "disabled")
+        self._confirm_btn.configure(
+            state="normal" if n_pending and on else "disabled",
+            text=f"Bekreft endringer ({n_pending})" if n_pending else "Bekreft endringer")
+
+    def confirm(self) -> None:
+        """«Bekreft endringer»: endringene skrives inn og tas med ved sammenpakking."""
+        with self._lock:
+            done = dict(self._pending)
+            self._confirmed.update(done)
+            self._pending.clear()
+        for tag in done:
+            self._show_state(tag)
+        self._update_buttons()
+        if done and self.on_confirm:
+            self.on_confirm(done)
 
     def _set_inputs_state(self, editable: bool) -> None:
         for w in self._inputs.values():
@@ -226,14 +266,15 @@ class HeaderPanel(ctk.CTkFrame):
         """Vis headeren for en ny fil (forkaster ventende endringer)."""
         with self._lock:
             self._pending.clear()
+            self._confirmed.clear()
             self._invalid.clear()
         self.refresh(info, editable, note, source=source)
 
     def refresh(self, info: "dict | None", editable: bool, note: str,
                 source: "str | None" = None) -> None:
         """
-        Oppdater fra fila etter et steg. Felt brukeren holder på å endre
-        (ventende eller ugyldige) overskrives ikke.
+        Oppdater fra fila etter et steg. Felt med endringer som ikke er
+        skrevet ennå (ubekreftede, bekreftede eller ugyldige) overskrives ikke.
         """
         values = (info or {}).get("values", {})
         if source is not None:
@@ -244,6 +285,7 @@ class HeaderPanel(ctk.CTkFrame):
         if not editable:
             with self._lock:
                 self._pending.clear()
+                self._confirmed.clear()
                 self._invalid.clear()
         self._editable = False          # _put skal ikke registrere endringer
         self._set_inputs_state(True)
@@ -251,17 +293,21 @@ class HeaderPanel(ctk.CTkFrame):
             if not f.editable:
                 continue
             fv = values.get(f.tag, "")
-            with self._lock:
-                keep = f.tag in self._pending or f.tag in self._invalid
             self._base[f.tag] = fv
+            with self._lock:
+                keep = (f.tag in self._pending or f.tag in self._confirmed
+                        or f.tag in self._invalid)
+                if keep and _norm(self.get_value(f.tag)) == _norm(fv):
+                    # fila har nå samme verdi → ikke lenger en endring
+                    for d in (self._pending, self._confirmed, self._invalid):
+                        d.pop(f.tag, None)
+                    keep = False
             if not keep:
                 self._put(f.tag, fv)
         self._editable = editable
         self._set_inputs_state(editable)
         for f in FIELDS:
             if f.editable:
-                if editable and (f.tag in self._pending or f.tag in self._invalid):
-                    self._on_change(f.tag)    # ny base kan gjøre feltet uendret
                 self._show_state(f.tag)
         for tag, (lbl, label) in self._ro_labels.items():
             v = ver if tag == "version" else values.get(tag, "")
@@ -271,18 +317,32 @@ class HeaderPanel(ctk.CTkFrame):
     def undo(self) -> None:
         """Tilbakestill alle felt til verdiene i fila."""
         with self._lock:
-            tags = set(self._pending) | set(self._invalid)
+            tags = set(self._pending) | set(self._confirmed) | set(self._invalid)
             self._pending.clear()
+            self._confirmed.clear()
             self._invalid.clear()
         for tag in tags:
             self._put(tag, self._base.get(tag, ""))
             self._show_state(tag)
+        self._update_buttons()
 
     def is_editable(self) -> bool:
         return self._editable
 
-    def take_pending(self) -> dict:
-        """Ventende, gyldige endringer (tømmes). Trådsikker."""
+    def take_confirmed(self) -> dict:
+        """Bekreftede endringer som skal skrives (tømmes). Trådsikker."""
+        with self._lock:
+            d = dict(self._confirmed)
+            self._confirmed.clear()
+            return d
+
+    def unconfirmed(self) -> dict:
+        """Gyldige endringer som ikke er bekreftet (uten å tømme). Trådsikker."""
+        with self._lock:
+            return dict(self._pending)
+
+    def take_unconfirmed(self) -> dict:
+        """Ubekreftede endringer (tømmes). Trådsikker."""
         with self._lock:
             d = dict(self._pending)
             self._pending.clear()
@@ -310,6 +370,8 @@ class HeaderDock(ctk.CTkFrame):
             except Exception:
                 pass
         self._width = max(MIN_WIDTH, width)
+        self._ghost: "tk.Frame | None" = None
+        self._drag_x = None
 
         self.sash = ctk.CTkFrame(self, width=8, fg_color="transparent",
                                  corner_radius=0, cursor="sb_h_double_arrow")
@@ -373,19 +435,55 @@ class HeaderDock(ctk.CTkFrame):
         if save:
             self._save("header_panel_width", self._width)
 
+    # Under draing vises en tom flate i stedet for panelet: å tegne om alle
+    # CTk-feltene for hver musebevegelse var svært tregt. Panelet får den nye
+    # bredden først når knappen slippes, og flaten oppdateres høyst hvert 30. ms.
+
     def _drag_start(self, ev) -> None:
         self._drag_x = ev.x_root
         self._drag_w = self._width
+        self._drag_target = self._width
+        self._drag_job = None
 
     def _drag(self, ev) -> None:
         if getattr(self, "_drag_x", None) is None:
             return
-        self.set_width(self._drag_w - (ev.x_root - self._drag_x) / self._scaling())
+        if self._ghost is None or not self._ghost.winfo_ismapped():
+            self._show_ghost()
+        w = self._drag_w - (ev.x_root - self._drag_x) / self._scaling()
+        self._drag_target = int(max(MIN_WIDTH, min(w, self._max_width())))
+        if self._drag_job is None:
+            self._drag_job = self.after(30, self._drag_apply)
+
+    def _drag_apply(self) -> None:
+        self._drag_job = None
+        if self._ghost is not None:
+            self._ghost.configure(width=round(self._drag_target * self._scaling()))
 
     def _drag_end(self, _ev) -> None:
-        if getattr(self, "_drag_x", None) is not None:
-            self._drag_x = None
+        if getattr(self, "_drag_x", None) is None:
+            return
+        self._drag_x = None
+        if self._drag_job is not None:
+            self.after_cancel(self._drag_job)
+            self._drag_job = None
+        if self._ghost is not None and self._ghost.winfo_ismapped():
+            self._ghost.grid_remove()
+            self.set_width(self._drag_target)
+            if not self._collapsed:
+                self.panel.grid()
             self._save("header_panel_width", self._width)
+
+    def _show_ghost(self) -> None:
+        if self._ghost is None:
+            self._ghost = tk.Frame(self, bg=COLORS["surface"], highlightthickness=1,
+                                   highlightbackground=COLORS["border"])
+            tk.Label(self._ghost, text="SIARD-header\nslipp for å endre bredde",
+                     bg=COLORS["surface"], fg=COLORS["muted"],
+                     font=(FONTS["ui"], 10)).place(relx=0.5, rely=0.5, anchor="center")
+        self._ghost.configure(width=max(1, self.panel.winfo_width()))
+        self.panel.grid_remove()
+        self._ghost.grid(row=0, column=1, sticky="ns")
 
     def set_collapsed(self, collapsed: bool, save: bool = True) -> None:
         self._collapsed = collapsed

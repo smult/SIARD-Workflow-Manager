@@ -437,6 +437,7 @@ class App(ctk.CTk):
         self.header_dock = HeaderDock(log_area)
         self.header_dock.grid(row=0, column=1, sticky="ns")
         self.header_dock.grid_remove()
+        self.header_dock.panel.on_confirm = self._on_header_confirm
 
     def _build_topbar(self):
         bar = ctk.CTkFrame(self, fg_color=COLORS["surface"], corner_radius=0, height=48)
@@ -3289,11 +3290,13 @@ class App(ctk.CTk):
                     })
                     continue
 
-                if (_hdr["can_edit"] and not _hdr["repacked"]
-                        and self._header_apply_pending(
-                            ctx, file_logger, premis_logger,
-                            before_repack=op.operation_id == "repack_siard")):
-                    self._header_publish(ctx, _hdr)
+                if _hdr["can_edit"] and not _hdr["repacked"]:
+                    _is_repack = op.operation_id == "repack_siard"
+                    _hdr_written = self._header_apply_pending(
+                        ctx, file_logger, premis_logger, before_repack=_is_repack)
+                    _hdr["packing"] = _is_repack      # låst mens det pakkes
+                    if _hdr_written or _is_repack:
+                        self._header_publish(ctx, _hdr)
 
                 t0 = time.time()
                 try:
@@ -3355,8 +3358,9 @@ class App(ctk.CTk):
                 })
 
                 # Steget kan ha endret headeren — vis gjeldende verdier
-                if op.operation_id == "repack_siard" and result.success:
-                    _hdr["repacked"] = True
+                if op.operation_id == "repack_siard":
+                    _hdr["packing"] = False
+                    _hdr["repacked"] = bool(result.success)
                 self._header_publish(ctx, _hdr)
 
                 # ── Prosjektfil: lagre status etter steget ────────────────────
@@ -3413,7 +3417,8 @@ class App(ctk.CTk):
             # Stoppet før sammenpakking: skriv ventende header-endringer inn i
             # den utpakkede mappa, så de er med når prosjektet kjøres videre
             if _hdr["can_edit"] and not _hdr["repacked"]:
-                self._header_apply_pending(ctx, file_logger, premis_logger)
+                self._header_apply_pending(ctx, file_logger, premis_logger,
+                                           finishing=True)
             self._header_publish(ctx, _hdr, done=True)
 
             run.end_time = time.time()
@@ -3454,7 +3459,9 @@ class App(ctk.CTk):
         from siard_workflow.core.siard_header import read_header
         meta = None if hdr["repacked"] else self._header_meta(ctx)
         info = read_header(meta) if meta else read_header(ctx.siard_path)
-        editable = hdr["can_edit"] and not hdr["repacked"] and not done and info is not None
+        packing = hdr.get("packing", False)
+        editable = (hdr["can_edit"] and not hdr["repacked"] and not packing
+                    and not done and info is not None)
         if info is None:
             note = "Fant ikke header/metadata.xml."
         elif not hdr["can_edit"]:
@@ -3463,21 +3470,46 @@ class App(ctk.CTk):
         elif hdr["repacked"]:
             note = f"Pakket inn som header i {ctx.siard_path.name}."
         elif done and meta:
-            note = ("Kjøringen stoppet før sammenpakking. Endringene ligger i den "
-                    "utpakkede mappa og tas med når prosjektet kjøres videre.")
+            note = ("Kjøringen stoppet før sammenpakking. Bekreftede endringer "
+                    "ligger i den utpakkede mappa og tas med når prosjektet "
+                    "kjøres videre.")
         elif done:
             note = "Kjøringen er ferdig."
-        elif meta is None:
-            note = ("Endringer skrives inn etter utpakkingen og tas med ved "
-                    "sammenpakking.")
+        elif packing:
+            note = "Pakker sammen SIARD — headeren er låst."
         else:
-            note = ("Endringer skrives inn i metadata.xml før neste steg og tas "
-                    "med ved sammenpakking.")
+            note = ("Trykk «Bekreft endringer» for å ta endringene med. De skrives "
+                    "inn " + ("etter utpakkingen" if meta is None else
+                              "i metadata.xml før neste steg")
+                    + " og pakkes med i den nye SIARD-fila.")
         self._log_queue.put(("header_show", first, info, ctx.siard_path.name,
                              editable, note))
 
+    def _ask_header_unconfirmed(self, unconf: dict) -> bool:
+        """Arbeidstråden, før «Pakk sammen SIARD»: ta med ubekreftede header-endringer?"""
+        from siard_workflow.core.siard_header import FIELD_BY_TAG
+
+        def _short(v: str) -> str:
+            v = " ".join(v.split())
+            return v if len(v) <= 120 else v[:117] + "…"
+        lines = "\n".join(
+            f"   • {FIELD_BY_TAG[t].label if t in FIELD_BY_TAG else t}: «{_short(v)}»"
+            for t, v in unconf.items())
+        return self._ask_yes_no(
+            "Ubekreftede endringer i SIARD-header",
+            "Det er gjort endringer i SIARD-headeren som ikke er bekreftet med "
+            f"«Bekreft endringer»:\n\n{lines}\n\n"
+            "Lagre endringer i SIARD-header ved pakking av ny siard?",
+            "Ja, lagre endringene", "Nei, forkast")
+
+    def _on_header_confirm(self, values: dict) -> None:
+        """Hovedtråden: «Bekreft endringer» i header-panelet."""
+        self._log(f"  SIARD-header: {len(values)} endring(er) bekreftet "
+                  f"({', '.join(values)}) — skrives inn før neste steg", "info")
+
     def _header_apply_pending(self, ctx, file_logger, premis_logger,
-                              before_repack: bool = False) -> bool:
+                              before_repack: bool = False,
+                              finishing: bool = False) -> bool:
         """Skriv endringer fra header-panelet inn i den utpakkede metadata.xml.
         True når noe ble skrevet."""
         meta = self._header_meta(ctx)
@@ -3490,16 +3522,34 @@ class App(ctk.CTk):
             if file_logger:
                 file_logger.log(msg, lvl)
 
+        # Bare bekreftede endringer («Bekreft endringer») skrives automatisk.
+        # Ubekreftede: spør før sammenpakkingen (også på mobil); ved avbrudd
+        # lagres de ikke.
+        values = panel.take_confirmed()
         if before_repack:
             for tag, err in panel.invalid_fields().items():
                 _w(f"  SIARD-header: <{tag}> har ugyldig verdi i panelet og tas "
                    f"ikke med ({err})", "warn")
-        pending = panel.take_pending()
-        if not pending:
+            unconf = panel.unconfirmed()
+            if unconf:
+                if self._ask_header_unconfirmed(unconf):
+                    values.update(panel.take_unconfirmed())
+                    _w("  SIARD-header: ubekreftede endringer lagres (valgt før "
+                       "sammenpakking)", "info")
+                else:
+                    panel.take_unconfirmed()
+                    _w("  SIARD-header: ubekreftede endringer forkastet (valgt før "
+                       f"sammenpakking): {', '.join(unconf)}", "warn")
+        elif finishing:
+            unconf = panel.unconfirmed()
+            if unconf:
+                _w("  SIARD-header: endringer som ikke var bekreftet, er ikke "
+                   f"lagret: {', '.join(unconf)}", "warn")
+        if not values:
             return False
         from siard_workflow.core.siard_header import apply_header_file
         try:
-            changes = apply_header_file(meta, pending)
+            changes = apply_header_file(meta, values)
         except Exception as exc:
             _w(f"  SIARD-header kunne ikke skrives: {exc}", "error")
             return False
