@@ -184,6 +184,9 @@ class PremisProvenanceLogger:
         ET.SubElement(chars, _p("compositionLevel")).text = "0"
 
         sha = (ctx.results.get("sha256") if (ctx and ctx.results) else None)
+        # Etter fullført SHA-256-steg ligger resultat-dataene der, ikke strengen
+        if isinstance(sha, dict):
+            sha = sha.get("sha256")
         if sha:
             fixity = ET.SubElement(chars, _p("fixity"))
             ET.SubElement(fixity, _p("messageDigestAlgorithm")).text = "SHA-256"

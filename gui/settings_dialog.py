@@ -136,6 +136,17 @@ class SettingsDialog(ctk.CTkToplevel):
                          row=r, column=0, columnspan=2,
                          padx=14, pady=(0, 4), sticky="w"); r += 1
 
+        _seksjon("Logg-mappe", r);         r += 1
+        _rad("Logg-mappe", "log_dir", "str", r,
+             default="", browse_dir=True);  r += 1
+        ctk.CTkLabel(frm,
+                     text="Kjørelogg, konverterings-CSV, feillogg, Siegfried-logg og PREMIS.\n"
+                          "Tom = samme mappe som SIARD-fila",
+                     font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                     text_color=COLORS["muted"], justify="left").grid(
+                         row=r, column=0, columnspan=2,
+                         padx=14, pady=(0, 4), sticky="w"); r += 1
+
         r = self._build_notify_section(frm, cfg, _seksjon, _rad, r)
 
         _seksjon("SIARDMapper", r);        r += 1

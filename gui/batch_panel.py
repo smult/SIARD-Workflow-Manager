@@ -210,7 +210,7 @@ class BatchWindow(ctk.CTkToplevel):
         from siard_workflow.core.workflow import Workflow
         from siard_workflow.core.context import WorkflowContext
         from siard_workflow.core.workflow import WorkflowRun
-        from siard_workflow.core.file_logger import WorkflowFileLogger
+        from siard_workflow.core.file_logger import WorkflowFileLogger, resolve_log_dir
 
         total = len(self._rows)
         for idx, row in enumerate(self._rows):
@@ -221,7 +221,7 @@ class BatchWindow(ctk.CTkToplevel):
             for op in ops:
                 wf.add(op)
 
-            log_dir = row.path.parent / "siard_logs"
+            log_dir = resolve_log_dir(row.path, row.path.parent / "siard_logs")
             with WorkflowFileLogger(log_dir, row.path.stem) as wfl:
                 ctx = WorkflowContext(siard_path=row.path)
                 ctx.metadata["file_logger"] = wfl

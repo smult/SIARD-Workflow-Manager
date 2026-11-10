@@ -396,6 +396,28 @@ def _find_clob_tables(zf: zipfile.ZipFile) -> list[dict]:
     return _parse_clob_tables_from_xml(xml_bytes)
 
 
+def _count_lob_files(extract_dir: Path, w=None, label: str = "") -> int:
+    """
+    Antall filer i lob-mapper (mappenavn med «lob») under extract_dir.
+
+    os.walk henter filnavnene fra mappelistingen — ingen stat per fil. Med
+    1,6 millioner LOB-filer tok rglob + is_file 27 minutter uten loggmeldinger;
+    nå logges fremdrift hvert minutt.
+    """
+    import time as _time
+    t0 = last = _time.monotonic()
+    n = 0
+    for dirpath, _dirs, files in os.walk(extract_dir):
+        if "lob" in os.path.basename(dirpath).lower():
+            n += len(files)
+        now = _time.monotonic()
+        if w and now - last >= 60:
+            last = now
+            w(f"    {label}: {n:,} LOB-filer telt så langt "
+              f"({int(now - t0) // 60} min) …", "info")
+    return n
+
+
 def _find_clob_tables_fs(extract_dir: Path) -> list[dict]:
     """
     Les metadata.xml fra filsystemet (utpakket SIARD) og returner
@@ -918,9 +940,8 @@ class HexExtractOperation(BaseOperation):
         progress("phase_done")
 
         phase(2, "Prosesserer tabeller (filesystem)")
-        lob_before = sum(
-            1 for f in extract_dir.rglob("*")
-            if f.is_file() and "lob" in f.parent.name.lower())
+        w("  Teller LOB-filer før uttrekket (for kontroll etterpå) …", "info")
+        lob_before = _count_lob_files(extract_dir, w, "Før")
         retypes: list[dict] = []
         for table_info in tables:
             _process_table_fs(extract_dir, table_info, w, stats,
@@ -934,9 +955,7 @@ class HexExtractOperation(BaseOperation):
         progress("phase_done")
 
         phase(3, "Validering")
-        lob_after = sum(
-            1 for f in extract_dir.rglob("*")
-            if f.is_file() and "lob" in f.parent.name.lower())
+        lob_after = _count_lob_files(extract_dir, w, "Etter")
         stats["lob_before"] = lob_before
         stats["lob_after"]  = lob_after
         stats["lob_diff"]   = lob_after - lob_before

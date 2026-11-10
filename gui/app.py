@@ -29,7 +29,7 @@ from siard_workflow import create_manager
 from siard_workflow.core.workflow import Workflow
 from siard_workflow.core.report import save_html, save_pdf
 from siard_workflow.core.workflow_io import workflow_to_json, workflow_from_json
-from siard_workflow.core.file_logger import WorkflowFileLogger
+from siard_workflow.core.file_logger import WorkflowFileLogger, resolve_log_dir
 from siard_workflow.core.premis_logger import PremisProvenanceLogger
 from gui.progress_panel import ProgressPanel
 from gui.format_chart_panel import FormatChartPanel
@@ -327,7 +327,6 @@ class App(ctk.CTk):
         self._running        = False
         self._log_entries: list[tuple[str,str]] = []
         self._current_run: "WorkflowRun | None" = None
-        self._auto_log_dir: Path | None = None
         self._global_temp_dir: Path | None = None
         self._output_dir_override: str = ""   # satt av preflight hvis output-disk har lite plass
         self._preflight_active: bool = False
@@ -998,7 +997,6 @@ class App(ctk.CTk):
     def _set_active_file(self, path: Path):
         """Sett aktiv SIARD-fil (brukes av workflow og logging)."""
         self.siard_path = path
-        self._auto_log_dir = path.parent
         set_current_siard_path(path)
         if self._global_temp_dir is None:
             self._auto_select_temp(path)
@@ -1081,9 +1079,7 @@ class App(ctk.CTk):
         if src:
             from siard_workflow.operations.blob_convert_operation import (
                 _resume_json_path, _sf_cache_path)
-            log_dir = src.parent
-            if self._auto_log_dir:
-                log_dir = self._auto_log_dir
+            log_dir = resolve_log_dir(src)
             for rjp in (_resume_json_path(log_dir, src.stem),
                         _sf_cache_path(log_dir, src.stem)):
                 if rjp.exists():
@@ -1532,18 +1528,6 @@ class App(ctk.CTk):
         except Exception as e:
             messagebox.showerror("Feil", str(e))
 
-    # ─── Auto-logg til fil ────────────────────────────────────────────────────
-
-    def _toggle_auto_log(self):
-        from tkinter import filedialog
-        start = str(self._auto_log_dir) if self._auto_log_dir else "."
-        d = filedialog.askdirectory(
-            title="Velg logg-mappe",
-            initialdir=start)
-        if d:
-            self._auto_log_dir = Path(d)
-            self._log(f"Logg-mappe endret til: {d}", "success")
-
     # ─── Batch ────────────────────────────────────────────────────────────────
 
     def _open_settings(self):
@@ -1604,8 +1588,41 @@ class App(ctk.CTk):
             from siard_workflow.core.workflow import Workflow as _WF
             self.workflow = _WF(name="workflow")
         self.workflow.add(op)
+        if op.operation_id == "siardmapper" and self._place_before_blob_convert(op):
+            return
         self.workflow_panel.add_operation(op)
         self._log(f"Lagt til: {op.label}", "info")
+
+    def _place_before_blob_convert(self, op) -> bool:
+        """
+        SIARDMapper venter på operatøren (redigeringsdialog). Står den etter en
+        BLOB-konvertering som går over natta eller helga, står hele kjøringen
+        stille til noen svarer. Foreslå å legge den før BLOB-konverteringen.
+        True = plassert (før BLOB-konverteringen), False = legg sist som vanlig.
+        """
+        ops = list(self.workflow_panel.get_operations())
+        blob = next((o for o in ops if o.operation_id == "blob_convert"), None)
+        if blob is None:
+            return False
+        dialog = _PipelineSuggestionDialog(
+            self,
+            f"«{op.label}» venter på deg i en dialog for beskrivelser som mangler.\n\n"
+            f"Står den etter «{blob.label}», som kan ta mange timer (for eksempel "
+            "over helga), blir kjøringen stående og vente til noen svarer.\n\n"
+            f"Anbefalt: legg den før «{blob.label}», så er spørsmålet besvart før "
+            "den lange konverteringen starter.",
+            heading="Plassering av SIARDMapper",
+            yes_text="Før BLOB-konvertering (anbefalt)",
+            no_text="Sist i arbeidsflyten",
+            cancel=False)
+        dialog.title("SIARDMapper")
+        self.wait_window(dialog)
+        if dialog.result != "ja":
+            return False
+        self.workflow_panel.insert_operation_before(op, "blob_convert")
+        self._log(f"Lagt til: {op.label} — før «{blob.label}» "
+                  f"(så kjøringen ikke venter på svar etter konverteringen)", "info")
+        return True
 
     # ─── Kjoring ──────────────────────────────────────────────────────────────
 
@@ -2360,34 +2377,47 @@ class App(ctk.CTk):
         on_remote(key) kjøres på hovedtråden og lukker vinduet med tilsvarende
         valg (returnerer False hvis det ikke går, f.eks. skjemafeil). Uten
         mobilvarsling: som done.wait(). Returnerer mobilens valg eller None.
+
+        Ventingen står i kjøreloggen — ellers ser et ubesvart spørsmål ut som
+        timer uten fremdrift (livstegnet viser siste loggmelding).
         """
         import time as _time
-        hub = self._remote_hub
-        if hub is None:
-            done.wait(timeout)
-            return None
-        if not hub.can_ask:                      # bare Teams: si fra at det ventes
-            hub.notify(f"Venter på svar: {title}", f"{text}\n\nSvar på PC-en.",
-                       priority=4, tags=("question",), status_button=False)
-            done.wait(timeout)
-            return None
-        labels = dict(choices)
-        ticket = hub.ask(title, text, choices)
+        from siard_workflow.core.zip_progress import fmt_duration
+        logq = self.__dict__.get("_log_queue")
+        t_wait = _time.monotonic()
+        if logq is not None:
+            logq.put(("log", f"  Venter på svar: {title} …", "info"))
         remote = None
-        deadline = None if timeout is None else _time.monotonic() + timeout
         try:
-            while not done.wait(1.0):
-                if remote is None and ticket.poll() is not None:
-                    remote = ticket.poll()
-                    self._log_queue.put(("log", f"  Svar fra mobil: «{labels.get(remote)}» "
-                                                f"({title})", "info"))
-                    self.after(0, lambda k=remote: self._apply_remote(on_remote, k, title))
-                if deadline is not None and _time.monotonic() > deadline:
-                    break
+            hub = self._remote_hub
+            if hub is None:
+                done.wait(timeout)
+                return None
+            if not hub.can_ask:                      # bare Teams: si fra at det ventes
+                hub.notify(f"Venter på svar: {title}", f"{text}\n\nSvar på PC-en.",
+                           priority=4, tags=("question",), status_button=False)
+                done.wait(timeout)
+                return None
+            labels = dict(choices)
+            ticket = hub.ask(title, text, choices)
+            deadline = None if timeout is None else _time.monotonic() + timeout
+            try:
+                while not done.wait(1.0):
+                    if remote is None and ticket.poll() is not None:
+                        remote = ticket.poll()
+                        self._log_queue.put(("log", f"  Svar fra mobil: «{labels.get(remote)}» "
+                                                    f"({title})", "info"))
+                        self.after(0, lambda k=remote: self._apply_remote(on_remote, k, title))
+                    if deadline is not None and _time.monotonic() > deadline:
+                        break
+            finally:
+                ticket.close("på mobil" if remote else "på PC-en",
+                             labels.get(remote, "") if remote else "")
+            return remote
         finally:
-            ticket.close("på mobil" if remote else "på PC-en",
-                         labels.get(remote, "") if remote else "")
-        return remote
+            waited = _time.monotonic() - t_wait
+            if logq is not None and waited >= 60:
+                logq.put(("log", f"  Svar på «{title}» etter {fmt_duration(waited)}", "info"))
 
     @staticmethod
     def _answer_suggestion(dlg, key: str) -> bool:
@@ -2724,6 +2754,80 @@ class App(ctk.CTk):
                  f"fortsetter med ny profil per kall (tregere)")
         return True
 
+    def _filename_preflight(self, ops: list) -> bool:
+        """
+        Ødelagte filnavn i køen («1504_Ã…lesund» for «1504_Ålesund»): navnet
+        arves av alt som lages (ny SIARD, PREMIS, CSV-er, rapporter), og
+        kontrolltegnet i det kan ikke skrives med Windows-tegnsettet. Tilby å
+        gi fila riktig navn før kjøringen.
+
+        Returnerer True = fortsett, False = avbryt.
+        """
+        from siard_workflow.core.filename_check import has_control_chars, repair_mojibake
+
+        fixes = []          # (sti, nytt navn)
+        unfixable = []
+        for path in self.siard_queue:
+            fixed = repair_mojibake(path.name)
+            if fixed:
+                fixes.append((path, fixed))
+            elif has_control_chars(path.name):
+                unfixable.append(path)
+        if not fixes and not unfixable:
+            return True
+
+        def _show(name: str) -> str:
+            return "".join(f"\\x{ord(c):02x}" if has_control_chars(c) else c for c in name)
+
+        for path in unfixable:
+            self._log(f"    ADVARSEL: {_show(path.name)} har kontrolltegn i navnet — "
+                      f"gi fila nytt navn før arkivering", "warn")
+        if not fixes:
+            self._pf(f"{len(unfixable)} fil(er) med kontrolltegn i navnet (se over)")
+            return True
+
+        lines = "\n".join(f"  {_show(p.name)}\n    → {n}" for p, n in fixes[:8])
+        if len(fixes) > 8:
+            lines += f"\n  … og {len(fixes) - 8} til"
+        msg = (
+            f"{len(fixes)} SIARD-fil(er) har et ødelagt filnavn — «Å», «Æ» eller «Ø» er "
+            f"lagret feil (typisk etter utpakking av en zip-fil eller en overføring):\n\n"
+            f"{lines}\n\n"
+            "Navnet arves av alt som lages: ny SIARD, PREMIS, CSV-er og rapporter.\n\n"
+            "Vil du gi fila riktig navn før kjøringen?"
+        )
+        dialog = _PipelineSuggestionDialog(self, msg, heading="Ødelagt filnavn",
+                                           yes_text="Ja, gi riktig navn",
+                                           no_text="Nei, behold navnet")
+        dialog.title("Filnavn")
+        self.wait_window(dialog)
+
+        if dialog.result == "ja":
+            renamed = 0
+            for path, fixed in fixes:
+                target = path.with_name(fixed)
+                try:
+                    if target.exists():
+                        raise FileExistsError(f"{fixed} finnes fra før")
+                    path.rename(target)
+                except OSError as exc:
+                    self._log(f"    Kunne ikke gi nytt navn til {_show(path.name)}: {exc}",
+                              "warn")
+                    continue
+                self.siard_queue[self.siard_queue.index(path)] = target
+                if self.siard_path == path:
+                    self.siard_path = target
+                self._log(f"    Nytt navn: {fixed}", "ok")
+                renamed += 1
+            self._queue_render()
+            self._pf(f"{renamed} av {len(fixes)} fil(er) fikk riktig navn")
+            return True
+        if dialog.result == "nei":
+            self._pf("ødelagt filnavn beholdt — utdatafilene arver det")
+            return True
+        self._pf("avbrutt av operatør")
+        return False
+
     def _report_preflight(self, ops: list) -> bool:
         """
         Spør om brukeren vil legge til 'Kjørerapport (PDF)' dersom den ikke
@@ -2928,6 +3032,7 @@ class App(ctk.CTk):
         self._status_spinner.configure(text="⏳")
         t_pf = time.monotonic()
         steps = [
+            ("Filnavn (tegnkoding)",                       self._filename_preflight),
             ("Pipeline-modus (Pakk ut / Pakk sammen)",     self._pipeline_preflight),
             ("lobFolder (SCFC→DBPTK)",                     self._lobfolder_preflight),
             ("LOB-referanser (DBPTK A_M_5.6-1-2)",         self._lob_fullpath_preflight),
@@ -3130,9 +3235,14 @@ class App(ctk.CTk):
                 ctx.metadata["temp_dir"] = str(self._global_temp_dir)
             if self._output_dir_override:
                 ctx.metadata["output_dir_override"] = self._output_dir_override
-            log_dir = path.parent
-            if self._auto_log_dir:
-                log_dir = self._auto_log_dir
+            # «Logg-mappe» i Innstillinger; tom = mappa SIARD-fila ligger i
+            log_dir = resolve_log_dir(path)
+            try:
+                log_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                self._log_queue.put(("log", f"  Logg-mappa {log_dir} kan ikke brukes ({exc}) "
+                                            f"— loggene skrives ved SIARD-fila", "warn"))
+                log_dir = path.parent
             ctx.metadata["log_dir"] = str(log_dir)
 
             run.start_time = time.time()

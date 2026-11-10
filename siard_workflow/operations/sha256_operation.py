@@ -41,11 +41,17 @@ class SHA256Operation(BaseOperation):
         digest = sha.hexdigest()
         ctx.set_result("sha256", digest)
 
+        message = digest[:16] + "…"
         if self.params["save_to_file"]:
             checksum_path = path.with_suffix(".sha256")
-            checksum_path.write_text(f"{digest}  {path.name}\n")
+            # UTF-8: filnavnet kan ha tegn som Windows-tegnsettet ikke har
+            # (f.eks. ødelagt «Å» = «Ã» + U+0085) — sjekksummen skal ikke gå tapt
+            try:
+                checksum_path.write_text(f"{digest}  {path.name}\n", encoding="utf-8")
+            except OSError as exc:
+                message += f" (sjekksumfil ikke skrevet: {exc})"
 
         return self._ok(
             data={"sha256": digest, "file": str(path)},
-            message=digest[:16] + "…",
+            message=message,
         )

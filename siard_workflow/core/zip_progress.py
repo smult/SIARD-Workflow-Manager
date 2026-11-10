@@ -354,3 +354,87 @@ def read_small(item: "tuple[Path, int]", limit: int = 1 << 20) -> "bytes | None"
     if size >= limit:
         return None
     return path.read_bytes()
+
+
+# ── Opprydding ───────────────────────────────────────────────────────────────
+
+RMTREE_LOG_INTERVAL_S = 5 * 60
+
+
+def rmtree_progress(root: Path, w: "Optional[Callable[[str, str], None]]" = None,
+                    label: str = "Rydder", total: "int | None" = None,
+                    pcb: "Optional[Callable]" = None) -> int:
+    """
+    shutil.rmtree med fremdrift: å slette millioner av filer tar over en time
+    (antivirus), og uten meldinger ser det ut som om programmet har hengt.
+
+    Kjørelogg: en startlinje, så én linje per LOG_STEP_PCT % (når `total` er
+    kjent) og uansett minst hvert RMTREE_LOG_INTERVAL_S. Skrivebeskyttede
+    filer slettes også. Returnerer antall slettede filer.
+    """
+    import stat as _stat
+    root = Path(root)
+    if not root.exists():
+        return 0
+    if w:
+        w(f"  {label}: {root} …", "info")
+    t0 = last_log = last_gui = time.monotonic()
+    next_pct = LOG_STEP_PCT
+    n = 0
+
+    def _unlink(p: str) -> None:
+        try:
+            os.unlink(p)
+        except PermissionError:
+            try:
+                os.chmod(p, _stat.S_IWRITE)
+                os.unlink(p)
+            except OSError:
+                pass
+        except OSError:
+            pass
+
+    for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+        for name in filenames:
+            _unlink(os.path.join(dirpath, name))
+            n += 1
+        for name in dirnames:
+            p = os.path.join(dirpath, name)
+            try:
+                if os.path.islink(p):
+                    os.unlink(p)
+                else:
+                    os.rmdir(p)
+            except OSError:
+                pass
+        now = time.monotonic()
+        pct = int(n * 100 / total) if total else 0
+        if w and (now - last_log >= RMTREE_LOG_INTERVAL_S
+                  or (total and pct >= next_pct and pct < 100)):
+            last_log = now
+            el = now - t0
+            if total:
+                while next_pct <= pct:
+                    next_pct += LOG_STEP_PCT
+                eta = el * (total - n) / n if n else 0
+                w(f"    {pct} % — {_n(n)}/{_n(total)} filer slettet, "
+                  f"{fmt_duration(el)} brukt, ca. {fmt_duration(eta)} igjen", "info")
+            else:
+                w(f"    {_n(n)} filer slettet ({fmt_duration(el)} brukt)", "info")
+        if pcb and now - last_gui >= GUI_INTERVAL_S:
+            last_gui = now
+            try:
+                pcb("phase_progress", done=min(n, total or 0), total=total or 0,
+                    text=f"{label}: {_n(n)} filer slettet", eta="")
+            except Exception:
+                pass
+    try:
+        os.rmdir(root)
+    except OSError:
+        pass
+    if root.exists():
+        import shutil
+        shutil.rmtree(root, ignore_errors=True)
+    if w and time.monotonic() - t0 >= 60:
+        w(f"    {_n(n)} filer slettet på {fmt_duration(time.monotonic() - t0)}", "info")
+    return n

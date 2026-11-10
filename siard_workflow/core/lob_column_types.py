@@ -196,6 +196,23 @@ def _folder_of(block: bytes) -> bytes:
     return fm.group(1).strip() if fm else b""
 
 
+# tableX.xml fra denne størrelsen meldes i loggen før den leses (kan ta minutter)
+_BIG_TABLE_XML = 100 << 20
+
+
+def _note_big_table(w, what: str, txml: Path, sfolder: str, tfolder: str) -> None:
+    """Loggmelding før en stor tableX.xml leses — ellers står loggen stille."""
+    if not w:
+        return
+    try:
+        size = txml.stat().st_size
+    except OSError:
+        return
+    if size >= _BIG_TABLE_XML:
+        from siard_workflow.core.zip_progress import fmt_bytes
+        w(f"    {what}: {sfolder}/{tfolder} ({fmt_bytes(size)}) …", "info")
+
+
 def set_column_type(meta: bytes, schema_folder: str, table_folder: str,
                     col_index: int, new_type: str) -> tuple[bytes, bool]:
     """
@@ -241,7 +258,7 @@ def set_column_type(meta: bytes, schema_folder: str, table_folder: str,
     return out, hit[0]
 
 
-def find_inconsistent_lob_columns(extract_dir: Path) -> list[dict]:
+def find_inconsistent_lob_columns(extract_dir: Path, w=None) -> list[dict]:
     """
     Finn tegn-LOB-kolonner som har minst én .bin-referanse.
 
@@ -280,6 +297,7 @@ def find_inconsistent_lob_columns(extract_dir: Path) -> list[dict]:
             cols = table.findall("n:columns/n:column", ns)
             if not any(is_lob_type(_txt(c, "type")) for c in cols):
                 continue
+            _note_big_table(w, "Kontrollerer kolonnetyper", txml, sfolder, tfolder)
             per_col = scan_table_lob_extensions(txml)
             if not per_col:
                 continue
@@ -385,6 +403,7 @@ def repair_dangling_lob_refs(extract_dir: Path, w=None) -> dict:
                 col_dirs[idx] = lob_dir
             if not col_files:
                 continue
+            _note_big_table(w, "Kontrollerer LOB-referanser", txml, sfolder, tfolder)
 
             fixes: dict[int, dict[str, str]] = {}
             for idx, by_stem in col_files.items():
@@ -493,7 +512,11 @@ def reconcile_lob_column_types(extract_dir: Path, w=None) -> dict:
     Returnerer {"columns_retyped": n, "files_renamed": n, "refs_rewritten": n,
                 "details": [...]}.
     """
+    import time as _time
     extract_dir = Path(extract_dir)
+    t0 = _time.monotonic()
+    if w:
+        w("  Kontrollerer LOB-referanser og LOB-kolonnetyper …", "info")
     stats = {"columns_retyped": 0, "files_renamed": 0,
              "refs_rewritten": 0, "refs_repaired": 0,
              "unresolved_refs": 0, "details": [],
@@ -508,8 +531,10 @@ def reconcile_lob_column_types(extract_dir: Path, w=None) -> dict:
     stats["details"].extend(repair["details"])
     stats["repair_details"] = list(repair["details"])
 
-    inconsistent = find_inconsistent_lob_columns(extract_dir)
+    inconsistent = find_inconsistent_lob_columns(extract_dir, w)
     if not inconsistent:
+        if w and _time.monotonic() - t0 >= 60:
+            w(f"    LOB-kontroll ferdig ({int(_time.monotonic() - t0) // 60} min)", "info")
         return stats
 
     meta_path = extract_dir / "header" / "metadata.xml"

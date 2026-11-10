@@ -607,6 +607,11 @@ def _generate_pdf(
             skipped = step.get("skipped", False)
             message = step.get("message", "")
             op_data = ctx_results.get(op_id) or {}
+            # Operasjoner kan legge en enkeltverdi under sin egen id (SHA-256
+            # legger sjekksummen der før resultatet er klart) — tål det
+            if not isinstance(op_data, dict):
+                op_data = {"sha256": op_data} if op_id == "sha256" \
+                    and isinstance(op_data, str) else {}
 
             story.append(Spacer(1, 0.35 * cm))
             story.append(_step_header(idx, step))

@@ -32,7 +32,7 @@ from siard_workflow.core.siard_format import (
 from siard_workflow.core import external_lob
 from siard_workflow.core.zip_progress import (
     BIG_FILE, CHUNK, ByteProgress, extract_all, fmt_bytes, fmt_duration,
-    read_small, scan_files,
+    read_small, rmtree_progress, scan_files,
 )
 
 
@@ -714,7 +714,7 @@ class RepackSiardOperation(BaseOperation):
             w(f"  Temp-mappe beholdt: {extract_dir}", "info")
         else:
             try:
-                shutil.rmtree(extract_dir, ignore_errors=True)
+                rmtree_progress(extract_dir, w, "Rydder temp-mappe", total=n_total, pcb=pcb)
                 if not extract_dir.exists():
                     w(f"  Temp-mappe ryddet: {extract_dir}", "info")
                 else:

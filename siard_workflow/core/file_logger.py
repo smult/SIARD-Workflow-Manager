@@ -21,6 +21,21 @@ HEARTBEAT_S = 30 * 60
 _WEEKDAYS = ("mandag", "tirsdag", "onsdag", "torsdag", "fredag", "lørdag", "søndag")
 
 
+def resolve_log_dir(siard_path: Path, fallback: "Path | None" = None) -> Path:
+    """
+    Mappa kjøringens loggfiler skrives til: «Logg-mappe» fra Innstillinger
+    (config «log_dir»), ellers `fallback`, ellers mappa SIARD-fila ligger i.
+    """
+    try:
+        from settings import get_config
+        cfg = str(get_config("log_dir", "") or "").strip()
+    except Exception:
+        cfg = ""
+    if cfg:
+        return Path(cfg)
+    return Path(fallback) if fallback else Path(siard_path).parent
+
+
 def _fmt_duration(sec: float) -> str:
     d, rest = divmod(int(sec), 86400)
     h, rest = divmod(rest, 3600)

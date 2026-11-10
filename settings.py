@@ -31,6 +31,7 @@ _CONFIG_DEFAULTS: dict = {
     "siardmapper_show_data": True,   # vis eksempeldata i SIARDMapper-dialogen
     "siardmapper_rows":      5,      # antall eksempelrader i SIARDMapper-dialogen
     "global_temp_dir":  "",          # tom = auto-velg ved filvalg
+    "log_dir":          "",          # loggfiler for kjøringen; tom = mappa SIARD-fila ligger i
     "av_executable":    "",          # sti til antivirus-program
     "av_warning_dismissed": False,   # preflight: ikke varsle om antivirus ved mange filer
     "lo_executable":    "",          # sti til LibreOffice soffice (auto-detektert ved oppstart)

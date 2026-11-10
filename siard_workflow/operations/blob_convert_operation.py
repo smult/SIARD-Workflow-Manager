@@ -3110,7 +3110,8 @@ class BlobConvertOperation(BaseOperation):
             self._gs_postprocess_collect(stats, w, int(self.params.get("max_workers", 4) or 4),
                                          lo_run_root / "gs_post", stop_ev)
         finally:
-            shutil.rmtree(lo_run_root, ignore_errors=True)
+            from siard_workflow.core.zip_progress import rmtree_progress
+            rmtree_progress(lo_run_root, w, "Rydder LibreOffice-arbeidsmappe")
 
     def _convert_all_run(self, all_blobs: list[str], extract_dir: Path,
                          stats: dict, w, progress,
@@ -4163,10 +4164,12 @@ class BlobConvertOperation(BaseOperation):
 
         def _run_lo_chunk(items: list, batch_tag: str,
                           profile_dir: Path, timeout: int,
-                          work_root: Path) -> tuple[bool, str, list[tuple[Path,str,str,str]]]:
+                          work_root: Path,
+                          activity_timeout: int = 30) -> tuple[bool, str, list[tuple[Path,str,str,str]]]:
             """
             Kjør LO på en liste filer. Returnerer (lo_ok, lo_err, input_map).
             input_map = [(batch_file, zip_sti, ext, mime), ...]
+            activity_timeout: sekunder uten ny PDF før LO stoppes (vaktposten).
             """
             out_dir = work_root / "out"
             work_root.mkdir(exist_ok=True)
@@ -4231,7 +4234,7 @@ class BlobConvertOperation(BaseOperation):
                 """
                 import time as _time
 
-                ACTIVITY_TIMEOUT = 30   # sekunder uten ny PDF → kill
+                ACTIVITY_TIMEOUT = activity_timeout   # sekunder uten ny PDF → kill
                 STARTUP_GRACE    = 15   # sekunder før watchdog aktiveres
 
                 stdout_buf: list[str] = []
@@ -4666,6 +4669,8 @@ class BlobConvertOperation(BaseOperation):
         # Kun i siste runde (størrelse 1) markeres gjenværende filer som feilet.
         if retry_list and not stop_ev.is_set():
             retry_timeout = min(60, self.params["lo_timeout"])
+            # Siste runde: inntil 180 s per fil (eller lo_timeout om den er kortere)
+            final_timeout = max(retry_timeout, min(180, self.params["lo_timeout"]))
             converted_before = stats.get("converted", 0)
             total_retry = len(retry_list)
 
@@ -4704,9 +4709,13 @@ class BlobConvertOperation(BaseOperation):
                             continue
                     try:
                         retry_root = lo_run_root / f"retry_s{size}_b{rb_idx}"
+                        # Siste runde (én fil per kjøring): «ingen ny PDF» betyr bare
+                        # at fila ikke er ferdig — store RTF-er kan trenge mer enn
+                        # 30 s. Gi hele fristen før den regnes som feilet.
                         lo_ok, lo_err, input_map = _run_lo_chunk(
                             rb_items, f"retry_s{size}_b{rb_idx}", rb_profile,
-                            retry_timeout, retry_root)
+                            final_timeout if final else retry_timeout, retry_root,
+                            activity_timeout=final_timeout if final else 30)
                         expected = {zip_sti: (ext, mime)
                                     for _, zip_sti, ext, mime in rb_items}
                         processed: set = set()
@@ -4725,8 +4734,8 @@ class BlobConvertOperation(BaseOperation):
                                     batch_file, zip_sti, ext, retry_root / "out",
                                     False, lo_err or "Ingen PDF produsert")
                                 w(f"    Endelig feilet: "
-                                  f"{PurePosixPath(zip_sti).name} — beholdes "
-                                  f"som .{ext}", "warn")
+                                  f"{PurePosixPath(zip_sti).name} — ingen PDF etter "
+                                  f"siste forsøk som enkeltfil", "warn")
                             else:
                                 orig = next((it for it in rb_items
                                              if it[1] == zip_sti), None)
@@ -4780,7 +4789,8 @@ class BlobConvertOperation(BaseOperation):
                 round_no += 1
                 w(f"  Nytt forsøk (runde {round_no}): {len(pending)} filer i "
                   f"batcher à {size}, {max_w} worker(e) "
-                  f"(timeout {retry_timeout}s) ...", "info")
+                  + (f"(siste runde: inntil {final_timeout} s per fil) ..." if final
+                     else f"(timeout {retry_timeout}s, 30 s uten ny PDF) ..."), "info")
                 pending = _run_retry_round(pending, size, final)
                 if final:
                     break
@@ -4988,12 +4998,37 @@ class BlobConvertOperation(BaseOperation):
         """
         if stop_ev.is_set():
             return
+        # Avslått: ikke les noen PDF-er. Signatursjekken leser HELE filen, og
+        # for hundretusenvis av PDF-er tok det timer uten loggmeldinger.
+        mode = str(self.params.get("gs_postprocess", "Av") or "Av").strip().lower()
+        if mode in ("av", "nei"):
+            return
+        from siard_workflow.core import ghostscript as _gs
+        if not _gs.active_ghostscript():
+            w("  Ghostscript-etterbehandling: Ghostscript ikke funnet/aktivert — hoppet over",
+              "info")
+            return
         from siard_workflow.core import pdf_postprocess as _PP
         from siard_workflow.core.file_integrity import is_signed_pdf as _signed
+        from siard_workflow.core.zip_progress import fmt_duration
         items: list = []
         seen: set = set()
+        candidates = (len(getattr(self, "_pp_produced", []))
+                      + len(getattr(self, "_pp_system", []))
+                      + len(getattr(self, "_pp_archive_files", [])))
+        w(f"  Ghostscript-etterbehandling: samler PDF-er ({candidates:,} kandidater, "
+          f"signerte holdes utenfor) …", "info")
+        t0 = last = time.monotonic()
+        n_seen = [0]
 
         def _add(path: Path, origin: str, member: str = "") -> None:
+            nonlocal last
+            n_seen[0] += 1
+            now = time.monotonic()
+            if now - last >= 60:
+                last = now
+                w(f"    {n_seen[0]:,}/{candidates:,} kontrollert "
+                  f"({fmt_duration(now - t0)} brukt)", "info")
             key = (str(path), member)
             if key in seen or not path.exists():
                 return
@@ -5012,6 +5047,7 @@ class BlobConvertOperation(BaseOperation):
                     _add(p, "arkiv", m)
             elif p.exists() and b"%PDF" in p.read_bytes()[:1024]:
                 _add(p, "arkiv")
+        w(f"    {len(items):,} PDF-er funnet ({fmt_duration(time.monotonic() - t0)})", "info")
         if items:
             self._gs_postprocess(items, stats, w, workers, work_root, stop_ev)
 
