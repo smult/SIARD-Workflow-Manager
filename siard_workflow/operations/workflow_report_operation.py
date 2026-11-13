@@ -54,6 +54,19 @@ class WorkflowReportOperation(BaseOperation):
         # Fjern selve rapport-operasjonen fra listen (den er ikke ferdig enda)
         step_results = [s for s in step_results if s.get("id") != self.operation_id]
 
+        # Prosjektet er kjørt før: hele prosessen, ikke bare denne kjøringen.
+        # Steg som ble hoppet over nå, vises med resultatet fra kjøringen der
+        # de kjørte; steg som er kjørt på nytt, merkes med forrige status.
+        history = None
+        pf = ctx.metadata.get("project_file")
+        if pf is not None:
+            try:
+                step_results, history = project_history(
+                    pf, ctx.metadata.get("run_id"), step_results,
+                    report_index=_report_index(pf, self.operation_id, step_results))
+            except Exception:
+                history = None
+
         suffix = (self.params.get("report_suffix") or "_workflow_rapport").strip()
         ts     = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         pdf_path = siard_path.parent / f"{siard_path.stem}{suffix}_{ts}.pdf"
@@ -69,6 +82,7 @@ class WorkflowReportOperation(BaseOperation):
                 format_counts   = format_counts,
                 include_charts  = bool(self.params.get("include_charts", True)),
                 include_details = bool(self.params.get("include_details", True)),
+                history         = history,
             )
         except ImportError:
             return self._fail(
@@ -78,9 +92,136 @@ class WorkflowReportOperation(BaseOperation):
             return self._fail(f"Kunne ikke generere rapport: {exc}")
 
         size_kb = pdf_path.stat().st_size / 1024
+        if history and history.get("preliminary"):
+            return self._ok(
+                data={"report_path": str(pdf_path), "size_kb": round(size_kb, 1),
+                      "preliminary": True},
+                message=f"Foreløpig rapport lagret: {pdf_path.name}  ({size_kb:.0f} KB) "
+                        f"— {history['held']} steg er holdt igjen")
         return self._ok(
             data={"report_path": str(pdf_path), "size_kb": round(size_kb, 1)},
             message=f"Rapport lagret: {pdf_path.name}  ({size_kb:.0f} KB)")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Historikk fra prosjektfila (.siardwf)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fmt_run(iso_or_id: "str | None") -> str:
+    if not iso_or_id:
+        return ""
+    for fmt in ("%Y%m%d_%H%M%S",):
+        try:
+            return datetime.datetime.strptime(str(iso_or_id)[:15], fmt) \
+                .strftime("%d.%m.%Y %H:%M")
+        except Exception:
+            pass
+    try:
+        return datetime.datetime.fromisoformat(str(iso_or_id)).strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return str(iso_or_id)
+
+
+def _report_index(pf, report_id: str, step_results: list) -> int:
+    """Rapportens plass i arbeidsflyten (steg etter den er ikke kjørt ennå)."""
+    n_before = len(step_results)
+    ids = [cp.operation_id for cp in pf.operations]
+    # Rapporten står etter stegene som er registrert i denne kjøringen
+    cands = [i for i, oid in enumerate(ids) if oid == report_id]
+    for i in cands:
+        if i >= n_before:
+            return i
+    return cands[-1] if cands else len(ids)
+
+
+_STATUS_TXT = {
+    "completed":   "OK",
+    "failed":      "FEIL",
+    "interrupted": "Avbrutt",
+    "held":        "Holdt igjen",
+    "skipped":     "Hoppet over",
+    "user_skip":   "Hoppet over (valgt)",
+    "pending":     "Ikke kjørt",
+}
+
+
+def project_history(pf, run_id, step_results: list, report_index: int):
+    """Slå sammen denne kjøringens steg med prosjektets historikk.
+
+    Returnerer (steg, historikk). Hvert steg får:
+      run_label  — «denne kjøringen» eller tidspunktet for kjøringen det er fra
+      data       — stegets resultat (fra prosjektfila for steg fra før)
+      rerun      — kjørt på nytt nå: {"attempt", "prev_status", "prev_message", "prev_when"}
+      held / interrupted
+    """
+    by_index = {}
+    for st in step_results:
+        if st.get("index") is not None:
+            by_index[int(st["index"])] = st
+    merged = []
+    reruns = []
+    for i, cp in enumerate(pf.operations[:report_index]):
+        st = dict(by_index.get(i) or {})
+        ran_now = bool(st) and not st.get("skipped")
+        if ran_now:
+            st["run_label"] = "denne kjøringen"
+            prev = (cp.attempts or [])[-1] if cp.attempts else None
+            if prev:
+                info = {"attempt": cp.attempt_no,
+                        "prev_status": _STATUS_TXT.get(prev.get("status"), prev.get("status")),
+                        "prev_message": prev.get("message") or "",
+                        "prev_when": _fmt_run(prev.get("run_id") or prev.get("ended"))}
+                st["rerun"] = info
+                reruns.append({"label": cp.label, **info,
+                               "now": "OK" if st.get("success") else
+                               ("Avbrutt" if st.get("interrupted") else "FEIL"),
+                               "message": st.get("message", "")})
+        else:
+            status = cp.status
+            st.setdefault("id", cp.operation_id)
+            st.setdefault("label", cp.label)
+            st.setdefault("category", st.get("category", ""))
+            st["index"] = i
+            if status == "completed" and cp.run_id != run_id:
+                st.update({"success": True, "skipped": False,
+                           "elapsed": float(cp.elapsed or 0.0),
+                           "message": cp.message or st.get("message", ""),
+                           "data": cp.ctx_data or {},
+                           "run_label": _fmt_run(cp.run_id or cp.completed_at)
+                           or "tidligere kjøring",
+                           "carried": True})
+            elif status == "held":
+                st.update({"success": None, "skipped": True, "held": True,
+                           "message": cp.message or "Holdt igjen",
+                           "run_label": "denne kjøringen"})
+            else:
+                st.setdefault("success", None)
+                st.setdefault("skipped", True)
+                st.setdefault("message", _STATUS_TXT.get(status, status))
+                st.setdefault("run_label", "")
+        merged.append(st)
+
+    runs = []
+    for r in pf.runs:
+        steps = r.get("steps_run") or []
+        runs.append({
+            "when":   _fmt_run(r.get("run_id") or r.get("started")),
+            "ended":  _fmt_run(r.get("ended")) if r.get("ended") else "",
+            "result": "pågår" if r.get("run_id") == run_id else (r.get("result") or "—"),
+            "steps":  ", ".join(f"{x.get('label')} ({_STATUS_TXT.get(x.get('status'), x.get('status'))})"
+                                for x in steps) or "—",
+            "log":    Path(r["log_file"]).name if r.get("log_file") else "",
+            "current": r.get("run_id") == run_id,
+        })
+    held = sum(1 for st in merged if st.get("held"))
+    history = {
+        "runs": runs,
+        "reruns": reruns,
+        "held": held,
+        "preliminary": held > 0,
+        "carried": sum(1 for st in merged if st.get("carried")),
+    }
+    return merged, history
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -129,8 +270,12 @@ def _generate_pdf(
     format_counts:   dict | None = None,
     include_charts:  bool = True,
     include_details: bool = True,
+    history:         "dict | None" = None,
 ) -> None:
-    """Genererer selve PDF-filen. Krever reportlab."""
+    """Genererer selve PDF-filen. Krever reportlab.
+
+    history: samlet historikk fra prosjektfila (project_history) — da viser
+    rapporten hele prosessen på tvers av kjøringer."""
 
     # ── Lazy-import av reportlab ──────────────────────────────────────────────
     from reportlab.lib import colors
@@ -166,7 +311,9 @@ def _generate_pdf(
     fail_steps   = sum(1 for s in step_results if not s.get("skipped") and not s.get("success"))
     skip_steps   = sum(1 for s in step_results if s.get("skipped"))
     run_steps    = total_steps - skip_steps
+    held_steps   = sum(1 for s in step_results if s.get("held"))
     overall_ok   = (fail_steps == 0 and run_steps > 0)
+    preliminary  = bool(held_steps)
     total_elapsed = sum(s.get("elapsed", 0.0) for s in step_results)
 
     # ── Dokument-oppsett ──────────────────────────────────────────────────────
@@ -226,7 +373,11 @@ def _generate_pdf(
         skipped = step.get("skipped", False)
         success = step.get("success", False)
         elapsed = step.get("elapsed", 0.0)
-        if skipped:
+        if step.get("held"):
+            status_txt = "⏸  Holdt igjen"
+            sc = C_SKIP
+            bg = C_SKIP_BG
+        elif skipped:
             status_txt = "Hoppet over"
             sc = C_SKIP
             bg = C_SKIP_BG
@@ -234,12 +385,20 @@ def _generate_pdf(
             status_txt = "✓  Vellykket"
             sc = C_SUCCESS
             bg = C_SUCCESS_BG
+        elif step.get("interrupted"):
+            status_txt = "⏹  Avbrutt"
+            sc = C_ERROR
+            bg = C_ERROR_BG
         else:
             status_txt = "✗  Feil"
             sc = C_ERROR
             bg = C_ERROR_BG
 
         dur_txt = "" if skipped else f"  ({_fmt_elapsed(elapsed)})"
+        if step.get("carried") and step.get("run_label"):
+            dur_txt += f" — {step['run_label']}"
+        elif step.get("rerun"):
+            dur_txt += f" — kjørt på nytt (forsøk {step['rerun'].get('attempt')})"
         tbl = Table(
             [[f"{idx}. {label}", f"{status_txt}{dur_txt}"]],
             colWidths=[inner_w * 0.68, inner_w * 0.32],
@@ -341,8 +500,13 @@ def _generate_pdf(
         ["Fil:",      siard_path.name],
         ["Mappe:",    str(siard_path.parent)],
         ["Kjørt:",    now.strftime("%d.%m.%Y  kl. %H:%M:%S")],
-        ["Varighet:", _fmt_elapsed(total_elapsed)],
+        ["Varighet:", _fmt_elapsed(total_elapsed)
+                      + ("  (sum for stegene, alle kjøringer)" if history and
+                         len(history.get("runs") or []) > 1 else "")],
     ]
+    if history and len(history.get("runs") or []) > 1:
+        fi_rows.append(["Kjøringer:",
+                        f"{len(history['runs'])}  (første {history['runs'][0]['when']})"])
     fi_tbl = Table(fi_rows, colWidths=[3 * cm, inner_w - 3 * cm])
     fi_tbl.setStyle(TableStyle([
         ("BACKGROUND",    (0, 0), (0, -1), C_LIGHT_BLUE),
@@ -365,8 +529,13 @@ def _generate_pdf(
         stat_sym  = "✓" if overall_ok else "✗"
         stat_col  = C_SUCCESS if overall_ok else C_ERROR
         stat_bg   = C_SUCCESS_BG if overall_ok else C_ERROR_BG
+        if preliminary and overall_ok:
+            stat_txt, stat_sym = "FORELØPIG", "⏸"
+            stat_col, stat_bg = C_SKIP, C_SKIP_BG
         sum_txt   = (f"{ok_steps} av {run_steps} steg OK"
-                     + (f"  •  {skip_steps} hoppet over" if skip_steps else "")
+                     + (f"  •  {held_steps} holdt igjen" if held_steps else "")
+                     + (f"  •  {skip_steps - held_steps} hoppet over"
+                        if skip_steps - held_steps else "")
                      + (f"  •  {fail_steps} FEIL" if fail_steps else ""))
 
         st_tbl = Table(
@@ -403,24 +572,34 @@ def _generate_pdf(
             "Ingen steg ble registrert. Kontroller at operasjoner "
             "er lagt til i workflowen.", s_body))
     else:
-        col_w = [0.9 * cm, 6.2 * cm, 2.9 * cm, 2.8 * cm, 2.4 * cm]
-        tbl_rows = [["#", "Operasjon", "Kategori", "Status", "Varighet"]]
+        if history:
+            col_w = [0.8 * cm, 5.2 * cm, 2.3 * cm, 2.6 * cm, 2.0 * cm, 2.3 * cm]
+            tbl_rows = [["#", "Operasjon", "Kategori", "Status", "Varighet", "Kjøring"]]
+        else:
+            col_w = [0.9 * cm, 6.2 * cm, 2.9 * cm, 2.8 * cm, 2.4 * cm]
+            tbl_rows = [["#", "Operasjon", "Kategori", "Status", "Varighet"]]
         for idx, step in enumerate(step_results, 1):
             skipped = step.get("skipped", False)
             success = step.get("success", False)
             label   = step.get("label", f"Steg {idx}")
             cat     = step.get("category", "")
             elapsed = step.get("elapsed", 0.0)
-            if skipped:
+            if step.get("held"):
+                st = "Holdt igjen"
+            elif skipped:
                 st = "Hoppet over"
             elif success:
-                st = "OK"
+                st = "OK" + (f" (forsøk {step['rerun']['attempt']})"
+                             if step.get("rerun") else "")
+            elif step.get("interrupted"):
+                st = "Avbrutt"
             else:
                 st = "FEIL"
-            tbl_rows.append([
-                str(idx), label, cat, st,
-                _fmt_elapsed(elapsed) if not skipped else "—",
-            ])
+            row = [str(idx), label, cat, st,
+                   _fmt_elapsed(elapsed) if not skipped else "—"]
+            if history:
+                row.append(step.get("run_label") or "—")
+            tbl_rows.append(row)
 
         sum_tbl = Table(tbl_rows, colWidths=col_w)
         style_cmds = [
@@ -463,6 +642,66 @@ def _generate_pdf(
                 ]
         sum_tbl.setStyle(TableStyle(style_cmds))
         story.append(sum_tbl)
+
+    # ══ KJØRINGER (prosjektet er kjørt flere ganger) ══════════════════════════
+    if history and (len(history.get("runs") or []) > 1 or history.get("reruns")):
+        story.append(Spacer(1, 0.6 * cm))
+        story.append(Paragraph("Kjøringer", s_section))
+        story.append(HRFlowable(width="100%", thickness=1.5, color=C_ACCENT,
+                                 spaceAfter=6))
+        story.append(Paragraph(
+            "Prosessen er kjørt i flere omganger. Steg som var fullført, ble "
+            "hoppet over i senere kjøringer; tabellen over viser hvert stegs "
+            "siste resultat og hvilken kjøring det er fra.", s_body))
+        if preliminary:
+            story.append(Paragraph(
+                f"<b>Foreløpig rapport:</b> {held_steps} steg er holdt igjen fordi "
+                f"et steg før dem feilet eller ble avbrutt. Kjør arbeidsflyten "
+                f"igjen når feilen er rettet — da kjøres bare det som gjenstår.",
+                s_body))
+        story.append(Spacer(1, 0.2 * cm))
+        r_rows = [["Startet", "Resultat", "Steg kjørt", "Logg"]]
+        for r in history.get("runs") or []:
+            r_rows.append([
+                r["when"] + ("  (denne)" if r.get("current") else ""),
+                r["result"],
+                Paragraph(r["steps"], s_small),
+                Paragraph(r["log"] or "—", s_small),
+            ])
+        r_tbl = Table(r_rows, colWidths=[3.0 * cm, 2.0 * cm, 6.6 * cm, 3.6 * cm],
+                      repeatRows=1)
+        r_tbl.setStyle(TableStyle([
+            ("BACKGROUND",    (0, 0), (-1, 0), C_PRIMARY),
+            ("TEXTCOLOR",     (0, 0), (-1, 0), C_WHITE),
+            ("FONTNAME",      (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE",      (0, 0), (-1, -1), 8.5),
+            ("VALIGN",        (0, 0), (-1, -1), "TOP"),
+            ("GRID",          (0, 0), (-1, -1), 0.5, C_BORDER),
+            ("TOPPADDING",    (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        story.append(r_tbl)
+        if history.get("reruns"):
+            story.append(Spacer(1, 0.4 * cm))
+            story.append(Paragraph("Kjørt på nytt i denne kjøringen", s_sub))
+            rr_rows = [["Steg", "Forrige forsøk", "Nå"]]
+            for x in history["reruns"]:
+                prev = f"{x['prev_status']} {x['prev_when']}".strip()
+                if x.get("prev_message"):
+                    prev += f" — {x['prev_message'][:160]}"
+                rr_rows.append([Paragraph(x["label"], s_small),
+                                Paragraph(prev, s_small),
+                                Paragraph(f"{x['now']} (forsøk {x['attempt']})", s_small)])
+            rr_tbl = Table(rr_rows, colWidths=[4.0 * cm, 8.0 * cm, 3.2 * cm], repeatRows=1)
+            rr_tbl.setStyle(TableStyle([
+                ("BACKGROUND",    (0, 0), (-1, 0), C_PRIMARY),
+                ("TEXTCOLOR",     (0, 0), (-1, 0), C_WHITE),
+                ("FONTNAME",      (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE",      (0, 0), (-1, -1), 8.5),
+                ("VALIGN",        (0, 0), (-1, -1), "TOP"),
+                ("GRID",          (0, 0), (-1, -1), 0.5, C_BORDER),
+            ]))
+            story.append(rr_tbl)
 
     # ══ FILTYPE-DIAGRAM ═══════════════════════════════════════════════════════
     if format_counts:
@@ -606,7 +845,7 @@ def _generate_pdf(
             op_id   = step.get("id", "")
             skipped = step.get("skipped", False)
             message = step.get("message", "")
-            op_data = ctx_results.get(op_id) or {}
+            op_data = step.get("data") or ctx_results.get(op_id) or {}
             # Operasjoner kan legge en enkeltverdi under sin egen id (SHA-256
             # legger sjekksummen der før resultatet er klart) — tål det
             if not isinstance(op_data, dict):
@@ -616,6 +855,15 @@ def _generate_pdf(
             story.append(Spacer(1, 0.35 * cm))
             story.append(_step_header(idx, step))
 
+            if step.get("rerun"):
+                _rr = step["rerun"]
+                story.append(Paragraph(
+                    f"Kjørt på nytt (forsøk {_rr.get('attempt')}). Forrige forsøk "
+                    f"{_rr.get('prev_when', '')}: {_rr.get('prev_status', '')}"
+                    + (f" — {_rr.get('prev_message')[:200]}" if _rr.get('prev_message') else ""),
+                    _style("rerun_style", fontName="Helvetica-Oblique",
+                           fontSize=9, textColor=colors.HexColor("#7a5a00"),
+                           leftIndent=10, spaceAfter=2)))
             if message:
                 story.append(Paragraph(
                     f"Melding: {message}",

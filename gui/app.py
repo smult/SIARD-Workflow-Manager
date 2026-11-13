@@ -340,6 +340,9 @@ class App(ctk.CTk):
         self._remote_hub = None
         self._remote_rep = None
         self._step_stopped      = False
+        self._abort_requested   = False
+        # Valgt grunnlag per fil når temp-mappa må lages på nytt (kjøreplanen)
+        self._run_plan_bases: dict = {}
         # Prosjektfil-tilstand
         self._project_file: "ProjectFile | None" = None   # type: ignore[name-defined]
         self._project_path: Path | None = None
@@ -394,6 +397,8 @@ class App(ctk.CTk):
             on_save_project=self._save_project,
             on_reset_project=self._reset_project,
         )
+        self.workflow_panel.project_status_fn = self._step_project_status
+        self.workflow_panel.project_action_fn = self._step_project_action
         self.workflow_panel.grid(row=1, column=0, padx=10, pady=(0,6), sticky="nsew")
 
         self.format_chart = FormatChartPanel(left)
@@ -420,7 +425,8 @@ class App(ctk.CTk):
         self.progress_panel.set_callbacks(
             pause_cb=self._conv_pause,
             stop_cb=self._conv_stop,
-            resume_cb=self._conv_resume)
+            resume_cb=self._conv_resume,
+            abort_cb=self._conv_abort)
 
         # Kjøreloggen med SIARD-header-panelet til høyre (skjult til en
         # workflow starter; bredde dras i skillelinja, » minimerer til en stripe)
@@ -1029,12 +1035,9 @@ class App(ctk.CTk):
                     # Prosjektets lagrede verdier gjelder (ikke panelets)
                     _apply_checkpoint_params(
                         list(self.workflow_panel.get_operations()), pf.operations)
-                    # Oppdater statusikoner for eksisterende operasjoner
-                    for i, op in enumerate(
-                            self.workflow_panel.get_operations()):
-                        status = pf.get_status(op.operation_id)
-                        if status != "pending":
-                            self.workflow_panel.set_step_status(i, status)
+                    # Oppdater statusikoner (posisjonelt — samme steg kan
+                    # forekomme flere ganger, f.eks. SHA-256 først og sist)
+                    self._refresh_step_statuses()
                     self._log(
                         f"Prosjektfil lastet: {auto_path.name}  "
                         f"({pf.completed_count}/{len(pf.operations)} steg fullført)",
@@ -1063,11 +1066,20 @@ class App(ctk.CTk):
         if not svar:
             return
         for cp in self._project_file.operations:
-            cp.status       = "pending"
+            self._project_file.reset(cp, "hele arbeidsflyten startes på nytt")
             cp.output_siard = None
-            cp.completed_at = None
-            cp.error_msg    = None
             cp.ctx_data     = {}
+        for cp in self._project_file.operations:
+            cp.attempts = []
+            cp.reset_reason = None
+        self._project_file.answers = {}
+        self._project_file.workdir = {}
+        self._project_file.format_counts = {}
+        self._project_file.runs = []
+        self._project_file.failure_files = []
+        _prog = self._forget_blob_progress(self._project_file)
+        if _prog:
+            self._log(f"  Blob-sjekkpunkt{_prog}", "muted")
         try:
             self._project_file.save(self._project_path)
         except Exception as exc:
@@ -1097,6 +1109,189 @@ class App(ctk.CTk):
             self._project_path = None
             self.workflow_panel.set_project_label("")
             self.workflow_panel.clear_statuses()
+
+    # ─── Kjøreplan og tilbakestilling av enkeltsteg ──────────────────────────
+
+    def _confirm_run_plan(self, ops: list):
+        """Vis kjøreplanen når det aktive prosjektet er kjørt før.
+
+        Returnerer None (avbrutt), False (ny kjøring — ingen plan å vise) eller
+        {"unpack": bool, "blob": bool} (fortsatt kjøring: hvilke tunge steg
+        som skal kjøres, så preflight kan hoppe over det som ikke trengs).
+        """
+        import copy
+        from types import SimpleNamespace
+        from siard_workflow.core.run_plan import (
+            BASE_ORIGINAL, BASE_OUTPUT, build_run_plan)
+        pf = self._project_file
+        if pf is None or not pf.has_history or not self.siard_path \
+                or Path(pf.source_siard) != Path(self.siard_path):
+            return False
+        cps = _sync_checkpoints_to_ops(copy.deepcopy(pf.operations), ops)
+        view = SimpleNamespace(operations=cps, workdir=pf.workdir)
+        workdir = self._project_workdir(view, ops)
+        out = self._project_output(view, ops)
+        plan = build_run_plan(ops, cps, workdir is not None, out)
+        if plan.nothing_to_do:
+            from tkinter import messagebox
+            messagebox.showinfo(
+                "Alt er fullført",
+                "Alle stegene i prosjektet er fullført.\n\n"
+                "Høyreklikk et steg og velg «Kjør dette steget på nytt» for å "
+                "kjøre det igjen, eller bruk ↻ for å starte hele arbeidsflyten "
+                "på nytt.", parent=self)
+            return None
+
+        if (not plan.has_history_skips and not plan.base_choice
+                and not any(s.action == "rerun" for s in plan.steps)):
+            return False          # alt kjøres uansett — ingen plan å vise
+
+        def _count(p):
+            return sum(1 for s in p.steps if s.runs)
+
+        msg = ("Prosjektet er kjørt før. Fullførte steg hoppes over, og bare "
+               "det som gjenstår kjøres:\n\n" + "\n".join(plan.lines()))
+        if plan.base_choice:
+            alt = BASE_OUTPUT if plan.base_suggestion == BASE_ORIGINAL else BASE_ORIGINAL
+            p_alt = build_run_plan(ops, cps, False, out, alt)
+            p_org = plan if plan.base == BASE_ORIGINAL else p_alt
+            p_out = plan if plan.base == BASE_OUTPUT else p_alt
+            msg += ("\n\nTemp-mappa fra forrige kjøring er borte. Hva skal stegene "
+                    "bygge på?\n"
+                    f"  • Original-SIARD: alle innholdssteg kjøres på nytt "
+                    f"({_count(p_org)} steg)\n"
+                    f"  • Siste resultat ({Path(out).name}): bare stegene som må "
+                    f"kjøres ({_count(p_out)} steg)\n\n"
+                    f"Forslag: {'original-SIARD' if plan.base_suggestion == BASE_ORIGINAL else 'siste resultat'}"
+                    f" — {plan.base_reason}.")
+            if plan.base_suggestion == BASE_OUTPUT:
+                msg += "\n\nPlanen over viser forslaget."
+            org_txt = "Original-SIARD" + (" (anbefalt)" if plan.base_suggestion == BASE_ORIGINAL else "")
+            out_txt = "Siste resultat" + (" (anbefalt)" if plan.base_suggestion == BASE_OUTPUT else "")
+            dlg = _PipelineSuggestionDialog(self, msg, heading="Kjøreplan",
+                                            yes_text=org_txt, no_text=out_txt, cancel=True)
+            dlg.title("Kjøreplan")
+            self.wait_window(dlg)
+            if dlg.result == "avbryt":
+                self._log("Kjøringen startes ikke.", "warn")
+                return None
+            chosen = BASE_ORIGINAL if dlg.result == "ja" else BASE_OUTPUT
+            self._run_plan_bases[str(self.siard_path)] = chosen
+            plan = build_run_plan(ops, cps, False, out, chosen)
+        else:
+            dlg = _PipelineSuggestionDialog(self, msg, heading="Kjøreplan",
+                                            yes_text="Kjør", no_text="Avbryt",
+                                            cancel=False)
+            dlg.title("Kjøreplan")
+            self.wait_window(dlg)
+            if dlg.result != "ja":
+                self._log("Kjøringen startes ikke.", "warn")
+                return None
+        runs = {s.op_id for s in plan.steps if s.runs}
+        return {"unpack": "unpack_siard" in runs, "blob": "blob_convert" in runs}
+
+    def _project_checkpoints_for_panel(self) -> list:
+        """Prosjektets checkpoints posisjonelt synket mot panelets steg (kopi)."""
+        import copy
+        if self._project_file is None:
+            return []
+        return _sync_checkpoints_to_ops(copy.deepcopy(self._project_file.operations),
+                                        list(self.workflow_panel.get_operations()))
+
+    def _refresh_step_statuses(self) -> None:
+        self.workflow_panel.clear_statuses()
+        for i, cp in enumerate(self._project_checkpoints_for_panel()):
+            if cp.status != "pending" or cp.reset_reason:
+                self.workflow_panel.set_step_status(
+                    i, "reset" if cp.status == "pending" else cp.status)
+
+    def _step_project_action(self, index: int, action: str) -> None:
+        """Høyreklikk på et steg: «reset» (kjør på nytt), «skip» (hopp over i
+        neste kjøring) eller «unskip» (ta med igjen)."""
+        from tkinter import messagebox
+        if self._running:
+            messagebox.showinfo("Kjøring pågår",
+                                "Vent til kjøringen er ferdig.", parent=self)
+            return
+        if self._project_file is None:
+            messagebox.showinfo(
+                "Ingen prosjektfil",
+                "Arbeidsflyten er ikke kjørt for denne fila ennå — alle steg "
+                "kjøres uansett.", parent=self)
+            return
+        ops = list(self.workflow_panel.get_operations())
+        if not (0 <= index < len(ops)):
+            return
+        pf = self._project_file
+        pf.operations = _sync_checkpoints_to_ops(pf.operations, ops)
+        cp = pf.operations[index]
+        op = ops[index]
+        if action == "reset":
+            pf.reset(cp, "tilbakestilt av bruker")
+            # Stegets lagrede svar gjelder ikke lenger
+            pf.forget_answers(f"{op.operation_id}:")
+            extra = ""
+            if op.operation_id == "blob_convert":
+                extra = self._forget_blob_progress(pf)
+            self._log(f"«{op.label}» kjøres på nytt ved neste kjøring{extra}", "info")
+        elif action == "skip":
+            cp.status = "user_skip"
+            self._log(f"«{op.label}» hoppes over i neste kjøring", "info")
+        elif action == "unskip":
+            pf.reset(cp, "tatt med igjen")
+            self._log(f"«{op.label}» er tatt med igjen", "info")
+        try:
+            pf.save(self._project_path)
+        except Exception as exc:
+            messagebox.showerror("Lagringsfeil", str(exc), parent=self)
+            return
+        self._refresh_step_statuses()
+
+    def _forget_blob_progress(self, pf) -> str:
+        """Slett BLOB-progresjonen, så steget starter fra begynnelsen."""
+        from siard_workflow.core.blob_progress import progress_path
+        src = Path(pf.source_siard) if pf.source_siard else None
+        if src is None:
+            return ""
+        log_dir = resolve_log_dir(src)
+        removed = []
+        stems = {src.stem}
+        for cp in pf.operations:
+            if cp.operation_id == "repack_siard" and cp.output_siard:
+                stems.add(Path(cp.output_siard).stem)
+        for stem in stems:
+            for p in (progress_path(log_dir, stem),):
+                if p.exists():
+                    try:
+                        p.unlink()
+                        removed.append(p.name)
+                    except Exception:
+                        pass
+        return f" (progresjon slettet: {', '.join(removed)})" if removed else ""
+
+    def _rename_project_for(self, old: Path, new: Path) -> None:
+        """SIARD-fila har fått nytt navn: flytt <navn>.siardwf og oppdater kilden."""
+        from siard_workflow.core.project_file import ProjectFile
+        old_pf, new_pf = old.with_suffix(".siardwf"), new.with_suffix(".siardwf")
+        try:
+            if old_pf.exists() and not new_pf.exists():
+                pf = ProjectFile.load(old_pf)
+                pf.source_siard = str(new)
+                pf.save(new_pf)
+                old_pf.unlink()
+                if self._project_path == old_pf:
+                    self._project_file, self._project_path = pf, new_pf
+                    self.workflow_panel.set_project_label(f"Prosjekt: {new_pf.name}")
+        except Exception as exc:
+            self._log(f"    Prosjektfila kunne ikke få nytt navn: {exc}", "warn")
+
+    def _step_project_status(self, index: int) -> str:
+        """Status for steg nr. `index` i prosjektet (til høyreklikkmenyen)."""
+        cps = self._project_checkpoints_for_panel()
+        if 0 <= index < len(cps):
+            cp = cps[index]
+            return "reset" if cp.status == "pending" and cp.reset_reason else cp.status
+        return ""
 
     # ─── Gammel _browse_file beholdt for bakoverkompatibilitet ────────────────
     def _browse_file(self):
@@ -1347,6 +1542,12 @@ class App(ctk.CTk):
         """Kalles når en operasjons parametre er lagret til settings.json."""
         if error:
             self._log(f"  [FEIL] Innstillinger ikke lagret: {error}", "error")
+        elif op_id == "dias_package":
+            # Bare felt krysset av for «Husk» lagres i programmets innstillinger
+            self._log(f"  DIAS: felt som huskes til neste kjøring → {settings_path}",
+                      "success")
+            self._log("    " + (", ".join(f"{k}={v}" for k, v in params.items())
+                                or "(ingen felt er krysset av for «Husk»)"), "info")
         else:
             self._log(
                 f"  Innstillinger lagret → {settings_path}", "success")
@@ -1473,14 +1674,6 @@ class App(ctk.CTk):
                 "Følgende operasjoner i prosjektfilen ble ikke gjenkjent og hoppet over:\n"
                 + "\n".join(f"  • {m}" for m in missing))
 
-        # ── Sett statusikoner for fullførte steg ──────────────────────────────
-        ops_in_panel = list(self.workflow_panel.get_operations())
-        loaded_ids = [op.operation_id for op in ops_in_panel]
-        for i, op_id in enumerate(loaded_ids):
-            status = pf.get_status(op_id)
-            if status != "pending":
-                self.workflow_panel.set_step_status(i, status)
-
         # ── Legg til kilde-SIARD i køen ───────────────────────────────────────
         src = Path(pf.source_siard) if pf.source_siard else None
         if src and src.exists():
@@ -1496,6 +1689,8 @@ class App(ctk.CTk):
         self._project_file = pf
         self._project_path = Path(sp)
         self.workflow_panel.set_project_label(f"Prosjekt: {Path(sp).name}")
+        # Statusikoner (posisjonelt)
+        self._refresh_step_statuses()
 
         done = pf.completed_count
         total = len(pf.operations)
@@ -2305,6 +2500,19 @@ class App(ctk.CTk):
             "metadata.xml (med en XML-kommentar om at verdien er estimert) og brukes "
             "videre, også som periode i DIAS-pakken. Svarer du nei, forkastes det.",
             "",
+        ]
+        from siard_workflow.operations.dias_package_operation import is_period_date
+        if any(op.operation_id == "dias_package"
+               and not (is_period_date(op.params.get("period_start"))
+                        and is_period_date(op.params.get("period_end")))
+               for op in ops):
+            lines += [
+                "DIAS-pakken i arbeidsflyten har ikke periode (fra–til). Uten «Estimer "
+                "datospenn» spør programmet når DIAS-steget starter, og kan da kjøre "
+                "estimeringen for å foreslå datoer.",
+                "",
+            ]
+        lines += [
             "Vil du legge til «Estimer datospenn» "
             + ("rett etter «Pakk ut SIARD»?"
                if any(op.operation_id == "unpack_siard" for op in ops)
@@ -2462,7 +2670,8 @@ class App(ctk.CTk):
                 live_def = {**op_def, "params": [
                     {**p, "default": op.params.get(p["key"], p["default"])}
                     for p in op_def["params"]],
-                    "initial_extra_files": op.params.get("extra_files", "[]")}
+                    "initial_extra_files": op.params.get("extra_files", "[]"),
+                    "period_note": getattr(op, "period_note", "")}
                 ids = [o.operation_id for o in self.workflow_panel.get_operations()]
                 set_upstream_op_ids(ids[:ids.index("dias_package")]
                                     if "dias_package" in ids else ids)
@@ -2508,6 +2717,49 @@ class App(ctk.CTk):
         self._remote_wait(done, "DIAS-pakking: kontroller innstillingene", text,
                           [("fortsett", "Fortsett"), ("avbryt", "Avbryt pakking")], _remote)
         return out[0]
+
+    def _ask_dias_date_span(self, op) -> bool:
+        """
+        Kalles fra DIAS-pakkingen (arbeidstråd) når periode fra–til ikke er fylt
+        ut og uttrekket ikke oppgir datospenn: kjøre «Estimer datospenn» nå, før
+        pakkingen, for å få forslag til periode? True = ja.
+        """
+        import threading as _threading
+        done = _threading.Event()
+        answer = [False]
+        text = "\n".join([
+            "DIAS-pakken mangler periode (fra–til), og metadata.xml oppgir ikke "
+            "datospenn (<dataOriginTimespan>).",
+            "",
+            "«Estimer datospenn (fra–til)» kan finne første og siste dato ut fra "
+            "datoverdiene i uttrekket — sak-/journaltabeller, person-/klienttabeller "
+            "og LOB-tabeller, i den rekkefølgen.",
+            "",
+            "Ja: kjør «Estimer datospenn» nå. Datoene foreslås i DIAS-vinduet, der du "
+            "kan kontrollere og rette dem før pakkingen. Uttrekket endres ikke.",
+            "Nei: fyll inn perioden selv i DIAS-vinduet.",
+        ])
+        box: dict = {}
+
+        def _show():
+            dlg = _PipelineSuggestionDialog(
+                self, text, heading="Periode mangler i DIAS-pakken",
+                yes_text="Ja, estimer datospenn", no_text="Nei, fyll inn selv",
+                cancel=False)
+            dlg.title("Periode mangler")
+            box["dlg"] = dlg
+            self.wait_window(dlg)
+            answer[0] = dlg.result == "ja"
+            done.set()
+
+        self.after(0, _show)
+        self._remote_wait(done, "DIAS: periode mangler",
+                          "DIAS-pakken mangler periode (fra–til), og metadata.xml oppgir "
+                          "ikke datospenn.\n\nJa = kjør «Estimer datospenn» nå og foreslå "
+                          "datoene i DIAS-vinduet.\nNei = fyll inn perioden selv.",
+                          [("ja", "Ja, estimer"), ("nei", "Nei")],
+                          lambda k: self._answer_suggestion(box.get("dlg"), k))
+        return answer[0]
 
     def _ask_date_span(self, res: dict) -> bool:
         """
@@ -2817,6 +3069,8 @@ class App(ctk.CTk):
                 self.siard_queue[self.siard_queue.index(path)] = target
                 if self.siard_path == path:
                     self.siard_path = target
+                # Prosjektfila følger med, så kjøringen kan gjenopptas
+                self._rename_project_for(path, target)
                 self._log(f"    Nytt navn: {fixed}", "ok")
                 renamed += 1
             self._queue_render()
@@ -3015,6 +3269,14 @@ class App(ctk.CTk):
                 parent=self)
             return
 
+        # ── Kjøreplan: prosjektet er kjørt før ───────────────────────────────
+        # Vis hva som hoppes over / kjøres (på nytt) før noe skjer, og la
+        # brukeren velge grunnlag når temp-mappa må lages på nytt.
+        self._run_plan_bases = {}
+        resume = self._confirm_run_plan(ops)
+        if resume is None:
+            return
+
         # ── Preflight: synlig i logg og statuslinje ──────────────────────────
         # Hvert steg logges med navn, resultat og tidsbruk. Steg som endrer
         # arbeidsflyten (eller stopper kjøringen) logger det selv; dialoger
@@ -3046,6 +3308,26 @@ class App(ctk.CTk):
             ("Diskplass (temp/output)",                    self._disk_space_preflight),
             ("Antivirus og temp-disk (mange filer)",       self._antivirus_preflight),
         ]
+        # Prosjektet er kjørt før: forslagene om å legge til steg (og
+        # skanningene bak dem) ble besvart i første kjøring — ikke spør igjen.
+        # Programvare, LibreOffice og antivirus sjekkes fortsatt.
+        _answered = {self._filename_preflight, self._pipeline_preflight,
+                     self._lobfolder_preflight, self._lob_fullpath_preflight,
+                     self._segfolder_preflight, self._xsd_type_preflight,
+                     self._metadata_quality_preflight, self._date_span_preflight,
+                     self._report_preflight}
+        if resume:
+            if not resume.get("unpack"):
+                _answered.add(self._disk_space_preflight)
+            if not resume.get("blob"):
+                _answered.add(self._libreoffice_preflight)
+
+            def _already(_ops, _self=self):
+                _self._pf("hoppet over — prosjektet er kjørt før, svarene fra "
+                          "første kjøring gjelder")
+                return True
+            steps = [(label, _already if fn in _answered else fn)
+                     for label, fn in steps]
         try:
             for label, fn in steps:
                 ops = list(self.workflow_panel.get_operations())
@@ -3093,7 +3375,8 @@ class App(ctk.CTk):
         import time
         from siard_workflow.core.context import WorkflowContext
         from siard_workflow.core.workflow import WorkflowRun
-        from siard_workflow.core.project_file import ProjectFile
+        from siard_workflow.core.project_file import sanitize_result
+        from siard_workflow.core.run_plan import held_after_unpack_failure
 
         self._remote_start(len(filer))
         _rep = self._remote_rep
@@ -3111,58 +3394,15 @@ class App(ctk.CTk):
                 _rep.file_start(q_idx, len(filer), path.name, len(ops))
 
             # ── Prosjektfil-checkpoint ─────────────────────────────────────────
-            # Bruk lastet prosjektfil hvis den gjelder denne kildefilen,
-            # ellers auto-lag checkpoint ved siden av SIARD-filen.
-            _pf: ProjectFile | None = None
-            _pf_path: Path | None   = None
-            if pf_arg and Path(pf_arg.source_siard) == path:
-                _pf      = pf_arg
-                _pf_path = pf_path_arg
-                # Sync operasjonslista mot det som faktisk skal kjøres — slik
-                # at nye steg får en checkpoint og fjernede ikke ligger igjen.
-                _pf.operations = _sync_checkpoints_to_ops(_pf.operations, list(wf))
-            else:
-                _pf_path = path.with_suffix(".siardwf")
-                _pf      = ProjectFile.from_ops(path, list(wf))
-                try:
-                    _pf.save(_pf_path)
-                    self._log_queue.put(("project_checkpoint_path", str(_pf_path)))
-                except Exception:
-                    _pf = _pf_path = None   # checkpoint mislyktes — fortsett uten
-
-            # ── Temp-mappe-sjekk ──────────────────────────────────────────────
-            # I pipeline-modus: hvis unpack_siard er ferdig men temp-mappen er
-            # borte, nullstill alle temp-avhengige operasjoner til "pending" og
-            # vis advarsel. Operasjoner som ikke bruker temp-mappen (sha256,
-            # xml_validation m.fl.) beholdes som fullført og hoppes over.
-            # Unntak: hvis alle operasjoner er fullført er jobben ferdig —
-            # ingen grunn til å gi varsel om manglende temp-mappe.
-            if _pf and not _pf.is_fully_completed:
-                _unpack_cp = _pf._find("unpack_siard")
-                if _unpack_cp and _unpack_cp.status == "completed":
-                    _ext_str = (_unpack_cp.ctx_data or {}).get("extracted_path", "")
-                    _ext_dir = Path(_ext_str) if _ext_str else None
-                    if not _ext_dir or not _ext_dir.is_dir():
-                        _op_map = {op.operation_id: op for op in wf}
-                        _needs_rerun: list[str] = []
-                        for _cp in _pf.operations:
-                            if _cp.status != "completed":
-                                continue
-                            _op = _op_map.get(_cp.operation_id)
-                            _temp_dep = (
-                                _cp.operation_id in ("unpack_siard", "repack_siard")
-                                or (_op is not None
-                                    and getattr(_op, "requires_unpack", False))
-                            )
-                            if _temp_dep:
-                                _cp.status = "pending"
-                                _needs_rerun.append(_cp.label)
-                        if _needs_rerun:
-                            try:
-                                _pf.save(_pf_path)
-                            except Exception:
-                                pass
-                            self._log_queue.put(("project_temp_lost", _needs_rerun))
+            # Lastet prosjekt for denne fila, ellers en eksisterende
+            # <siard>.siardwf ved siden av fila (alle filer i køen — ikke bare
+            # den aktive), ellers en ny. Kjøreplanen (core/run_plan.py)
+            # bestemmer så hvilke steg som hoppes over, kjøres eller må kjøres
+            # på nytt.
+            _pf, _pf_path = self._project_for_run(path, wf, pf_arg, pf_path_arg)
+            _plan, _workdir = self._plan_for_run(_pf, wf, path)
+            if _pf is not None:
+                self._log_queue.put(("project_checkpoint_path", str(_pf_path)))
 
             ctx = WorkflowContext(siard_path=path)
             run = WorkflowRun(path)
@@ -3196,8 +3436,12 @@ class App(ctk.CTk):
             _has_stdext = any(
                 getattr(op, "operation_id", "") == "standardize_ext"
                 for op in wf)
+            # Svar på spørsmål under kjøringen huskes i prosjektfila
+            # (_remembered) — de stilles ikke på nytt når prosjektet kjøres igjen
             if not _has_stdext:
-                ctx.metadata["ask_standardize_cb"] = self._ask_add_standardize_ext
+                ctx.metadata["ask_standardize_cb"] = self._remembered(
+                    _pf, _pf_path, "unpack_siard:standardize_ext",
+                    "Standardiser filendelser", self._ask_add_standardize_ext)
 
             # Schema-velger: callback for å spørre om auto-add når
             # flere schemas oppdages, og dialog-callback for selve valget.
@@ -3205,9 +3449,12 @@ class App(ctk.CTk):
                 getattr(op, "operation_id", "") == "schema_selector"
                 for op in wf)
             if not _has_schemasel:
-                ctx.metadata["ask_schema_selector_cb"] = \
-                    self._ask_add_schema_selector
-            ctx.metadata["ask_schema_select_cb"] = self._schema_select_dialog_cb
+                ctx.metadata["ask_schema_selector_cb"] = self._remembered(
+                    _pf, _pf_path, "unpack_siard:schema_selector",
+                    "Legg til schema-velger", self._ask_add_schema_selector)
+            ctx.metadata["ask_schema_select_cb"] = self._remembered(
+                _pf, _pf_path, "schema_selector:selection",
+                "Valgte schemaer", self._schema_select_dialog_cb)
 
             # Callback for å fylle inn tomme <schema><name>-noder
             ctx.metadata["ask_fill_empty_schema_names_cb"] = \
@@ -3217,13 +3464,22 @@ class App(ctk.CTk):
             ctx.metadata["ask_dias_output_dir_cb"] = self._ask_dias_output_dir
 
             # Callback: Ghostscript-etterbehandling av PDF/A (BLOB-konvertering)
-            ctx.metadata["ask_gs_postprocess_cb"] = self._ask_gs_postprocess
+            ctx.metadata["ask_gs_postprocess_cb"] = self._remembered(
+                _pf, _pf_path, "blob_convert:gs_postprocess",
+                "Ghostscript-etterbehandling", self._ask_gs_postprocess)
 
             # Callback: skal et estimert datospenn skrives til metadata.xml og brukes?
-            ctx.metadata["ask_date_span_cb"] = self._ask_date_span
+            ctx.metadata["ask_date_span_cb"] = self._remembered(
+                _pf, _pf_path, "date_span:use_estimate",
+                "Bruk estimert datospenn", self._ask_date_span)
 
             # Callback: DIAS-konfigurasjonen vises når pakkesteget starter
             ctx.metadata["ask_dias_config_cb"] = self._ask_dias_config
+
+            # Callback: DIAS mangler periode — kjøre «Estimer datospenn» først?
+            ctx.metadata["ask_dias_date_span_cb"] = self._remembered(
+                _pf, _pf_path, "dias_package:date_span",
+                "Estimer datospenn for DIAS-perioden", self._ask_dias_date_span)
 
             # Callback: ukjent filformat i BLOB-konverteringen (konverter/behold/hopp over)
             ctx.metadata["ask_unknown_format_cb"] = self._ask_unknown_format
@@ -3288,107 +3544,148 @@ class App(ctk.CTk):
                     "repacked": False}
             self._header_publish(ctx, _hdr, first=True)
 
-            # Prosjektfil: fullførte steg hoppes bare over så lenge ALLE steg
-            # før dem også ble hoppet over. Når ett steg må kjøres (ikke
-            # fullført, eller «Pakk ut» må gjentas fordi temp-mappa er borte),
-            # kjøres alle påfølgende steg — ellers blir f.eks. en ny, uendret
-            # utpakking pakket sammen uten konvertering, eller et nytt steg
-            # endrer en mappe som aldri pakkes sammen.
-            _pf_rerun_from: "int | None" = None
-            for i, op in enumerate(wf):
-                # Sjekk stop FØR hvert nytt steg — blokker til Fortsett klikkes
+            # ── Kjøring i prosjektfila + kjøreplanen i loggen ──────────────────
+            _run_id = None
+            _log_file = str(file_logger.log_path) if file_logger and file_logger.log_path else None
+            if _pf is not None:
+                _run_id = _pf.start_run(_log_file)
+                ctx.metadata["project_file"] = _pf
+                ctx.metadata["run_id"] = _run_id
+                if premis_logger is not None:
+                    # Proveniens samles opp på tvers av kjøringer
+                    premis_logger.append_existing = len(_pf.runs) > 1
+                self._project_save(_pf, _pf_path)
+            if _plan is not None and _pf is not None and _pf.has_history:
+                _plines = ["Kjøreplan (prosjektet er kjørt før):"] + [
+                    "  " + ln for ln in _plan.lines()]
+                if _plan.base:
+                    _plines.append(
+                        "  Grunnlag: "
+                        + ("original-SIARD" if _plan.base == "original" else "siste resultat")
+                        + (f" — {_plan.base_reason}" if _plan.base_reason else ""))
+                for _ln in _plines:
+                    self._log_queue.put(("log", _ln, "info"))
+                    if file_logger:
+                        file_logger.log(_ln, "info")
+            # Filtyper fra en tidligere BLOB-konvertering (rapporten)
+            if _pf is not None and _pf.format_counts:
+                _blob_steps = [s for s in (_plan.steps if _plan else [])
+                               if s.op_id == "blob_convert"]
+                if _blob_steps and not any(s.runs for s in _blob_steps):
+                    ctx.metadata["format_counts"] = dict(_pf.format_counts)
+
+            _plan_of = {}
+            if _plan is not None:
+                for _sp, _o in zip(_plan.steps, list(wf)):
+                    _plan_of[id(_o)] = _sp
+            _held: dict = {}      # id(op) → hvorfor steget holdes igjen
+            _aborted = False
+
+            i = 0
+            while i < len(wf):
+                op = list(wf)[i]
+                # Stoppet mellom steg — vent på «▶ Fortsett» eller «Avslutt»
                 if self._stop_event.is_set():
-                    self._log_queue.put(("workflow_step_stopped", i, op.label))
-                    self._step_resume_event.clear()
-                    self._step_resume_event.wait()   # blokkerer bakgrunnstråden
-                    if self._stop_event.is_set():
-                        break   # fortsatt stoppet etter venting = hard abort
-                    self._log_queue.put(("workflow_step_resumed",))
+                    if not self._wait_after_stop(i, op.label):
+                        _aborted = True
+                        break
+
+                _sp = _plan_of.get(id(op))
+                _cp = _pf.at(i, op.operation_id) if _pf is not None else None
 
                 self._log_queue.put(("step_start", i, op.label))
                 if _rep:
-                    _rep.step_start(i, len(list(wf)), op.label)
+                    _rep.step_start(i, len(wf), op.label)
                 if file_logger:
                     file_logger.set_step(f"[{i+1}] {op.label}")
                     file_logger.log(f"[{i+1}] {op.label}", "step")
 
-                # ── Prosjektfil: hopp over fullførte steg ─────────────────────
-                if _pf and _pf_rerun_from is None and _pf.is_completed(op.operation_id):
-                    _cp       = _pf._find(op.operation_id)
-                    saved_ctx = _cp.ctx_data if _cp else {}
-                    saved_out = _pf.get_output_siard(op.operation_id)
+                def _skip_record(message, success=True, cp=None, _op=op, _i=i):
+                    ctx.metadata["step_results"].append({
+                        "id":       _op.operation_id,
+                        "label":    _op.label,
+                        "category": getattr(_op, "category", ""),
+                        "success":  success,
+                        "message":  message,
+                        "skipped":  True,
+                        "elapsed":  0.0,
+                        "index":    _i,
+                        "from_run": getattr(cp, "run_id", None) if cp else None,
+                    })
 
-                    # unpack_siard: temp-mappen MÅ fortsatt eksistere for at
-                    # blob_convert (pipeline-modus) og repack_siard skal fungere
-                    if op.operation_id == "unpack_siard":
-                        ext_str  = saved_ctx.get("extracted_path", "")
-                        ext_dir  = Path(ext_str) if ext_str else None
-                        if not ext_dir or not ext_dir.is_dir():
-                            self._log_queue.put((
-                                "log",
-                                "  Temp-mappe fra forrige kjøring er borte — "
-                                "kjører 'Pakk ut SIARD' på nytt",
-                                "warn"))
-                            # Fall gjennom til normal kjøring
-                        else:
-                            ctx.extracted_path = ext_dir
-                            ctx.set_result(op.operation_id, saved_ctx)
-                            out_name = ext_dir.name
-                            self._log_queue.put(("project_skip", i, op.label, out_name))
-                            run.skipped.append(op.operation_id)
-                            if file_logger:
-                                file_logger.log("  Hoppet over (allerede fullført)", "muted")
-                            ctx.metadata["step_results"].append({
-                                "id":       op.operation_id,
-                                "label":    op.label,
-                                "category": getattr(op, "category", ""),
-                                "success":  True,
-                                "message":  "Allerede fullført — hoppet over",
-                                "skipped":  True,
-                                "elapsed":  0.0,
-                            })
-                            continue
-                    elif not op.produces_siard or (saved_out and saved_out.exists()):
-                        if saved_out and saved_out.exists():
-                            ctx.siard_path = saved_out
-                        if saved_ctx:
-                            ctx.set_result(op.operation_id, saved_ctx)
-                        out_name = saved_out.name if saved_out else ""
-                        self._log_queue.put(("project_skip", i, op.label, out_name))
+                # ── Holdt igjen: et innholdssteg før feilet/ble avbrutt ────────
+                if id(op) in _held:
+                    _why = _held[id(op)]
+                    _msg = f"  Holdt igjen — {_why}"
+                    self._log_queue.put(("log", _msg, "warn"))
+                    if file_logger:
+                        file_logger.log(_msg, "warn")
+                    if _pf is not None and _cp is not None:
+                        _pf.mark_held(_cp, _why)
+                        _pf.note_step_run(_run_id, op.label, "held")
+                        self._project_save(_pf, _pf_path)
+                    self._log_queue.put(("project_step_saved", i, "held"))
+                    run.skipped.append(op.operation_id)
+                    _skip_record(f"Holdt igjen — {_why}", success=None)
+                    i += 1
+                    continue
+
+                # ── Kjøreplan: hoppes over ────────────────────────────────────
+                if _sp is not None and _sp.action in ("skip", "user_skip") and _cp is not None:
+                    if _sp.action == "user_skip":
+                        self._log_queue.put(("log", "      [⤼] Hoppet over (valgt)", "muted"))
+                        self._log_queue.put(("project_step_saved", i, "user_skip"))
+                        if file_logger:
+                            file_logger.log("  Hoppet over (valgt: «Hopp over i neste kjøring»)",
+                                            "muted")
                         run.skipped.append(op.operation_id)
-                        if file_logger:
-                            file_logger.log("  Hoppet over (allerede fullført)", "muted")
-                        ctx.metadata["step_results"].append({
-                            "id":       op.operation_id,
-                            "label":    op.label,
-                            "category": getattr(op, "category", ""),
-                            "success":  True,
-                            "message":  "Allerede fullført — hoppet over",
-                            "skipped":  True,
-                            "elapsed":  0.0,
-                        })
+                        _skip_record("Hoppet over (valgt av bruker)", success=None, cp=_cp)
+                        i += 1
                         continue
+                    _out_name = self._restore_skipped_step(ctx, op, _cp, _workdir)
+                    self._log_queue.put(("project_skip", i, op.label, _out_name))
+                    run.skipped.append(op.operation_id)
+                    if file_logger:
+                        file_logger.log(f"  Hoppet over ({_sp.reason or 'allerede fullført'})",
+                                        "muted")
+                    _skip_record(_cp.message or "Allerede fullført — hoppet over", cp=_cp)
+                    i += 1
+                    continue
 
-                if _pf and _pf_rerun_from is None:
-                    _pf_rerun_from = i
-                    _later_done = [o.label for o in list(wf)[i + 1:]
-                                   if _pf.is_completed(o.operation_id)]
-                    if _later_done:
-                        _msg = (f"  Prosjekt: «{op.label}» kjøres — derfor kjøres også "
-                                f"{len(_later_done)} påfølgende steg som var fullført "
-                                f"({', '.join(_later_done[:4])}"
-                                f"{' …' if len(_later_done) > 4 else ''})")
-                        self._log_queue.put(("log", _msg, "warn"))
+                if _sp is not None and _sp.action == "rerun" and _sp.reason:
+                    _msg = f"  Kjøres på nytt: {_sp.reason}"
+                    self._log_queue.put(("log", _msg, "info"))
+                    if file_logger:
+                        file_logger.log(_msg, "info")
+                elif _sp is not None and _sp.reason and file_logger:
+                    file_logger.log(f"  ({_sp.reason})", "muted")
+
+                # «Pakk ut» på nytt: original-SIARD eller siste resultat
+                if op.operation_id == "unpack_siard" and _sp is not None and _sp.runs:
+                    ctx.extracted_path = None
+                    if _plan.base == "output" and _plan.output_siard:
+                        ctx.siard_path = Path(_plan.output_siard)
+                        # «Pakk sammen» navngir etter originalen (…_konvertert_1.siard)
+                        ctx.metadata["repack_name_base"] = str(path)
+                        _msg = (f"  Bygger på siste resultat: pakker ut "
+                                f"{Path(_plan.output_siard).name}")
+                        self._log_queue.put(("log", _msg, "info"))
                         if file_logger:
-                            file_logger.log(_msg, "warn")
+                            file_logger.log(_msg, "info")
+
+                if _pf is not None and _cp is not None:
+                    _pf.mark_started(_cp, _run_id, _log_file)
+                    self._project_save(_pf, _pf_path)
 
                 if not op.should_run(ctx):
                     self._log_queue.put(("skip", op.operation_id, op.label))
                     run.skipped.append(op.operation_id)
                     if file_logger:
                         file_logger.log("  Hoppet over (vilkår ikke oppfylt)", "muted")
-                    if _pf:
-                        _pf.mark_skipped(op.operation_id)
+                    if _pf is not None and _cp is not None:
+                        _pf.mark_skipped(_cp)
+                        _pf.note_step_run(_run_id, op.label, "skipped")
+                        self._project_save(_pf, _pf_path)
                     ctx.metadata["step_results"].append({
                         "id":       op.operation_id,
                         "label":    op.label,
@@ -3397,7 +3694,9 @@ class App(ctk.CTk):
                         "message":  "Hoppet over (vilkår ikke oppfylt)",
                         "skipped":  True,
                         "elapsed":  0.0,
+                        "index":    i,
                     })
+                    i += 1
                     continue
 
                 if _hdr["can_edit"] and not _hdr["repacked"]:
@@ -3407,6 +3706,10 @@ class App(ctk.CTk):
                     _hdr["packing"] = _is_repack      # låst mens det pakkes
                     if _hdr_written or _is_repack:
                         self._header_publish(ctx, _hdr)
+
+                if op.operation_id == "workflow_report":
+                    ctx.metadata["held_steps"] = [o.label for o in list(wf)
+                                                  if id(o) in _held]
 
                 t0 = time.time()
                 try:
@@ -3450,13 +3753,19 @@ class App(ctk.CTk):
                 except Exception as exc:
                     result = op._fail(str(exc))
                 elapsed = time.time() - t0
+                # Stoppet av brukeren midt i steget (og steget ble ikke ferdig):
+                # AVBRUTT — fortsetter ved «▶ Fortsett» eller neste kjøring
+                _interrupted = (not result.success) and (
+                    bool((result.data or {}).get("interrupted"))
+                    or self._stop_event.is_set())
                 run.results.append(result)
                 self._log_queue.put(("result", result))
                 if _rep:
                     _rep.step_done(i, op.label, result.success, result.message, elapsed)
                 if file_logger:
-                    lvl = "ok" if result.success else "feil"
-                    file_logger.log(f"  {lvl.upper()}: {result.message}", lvl)
+                    lvl = "ok" if result.success else ("warn" if _interrupted else "feil")
+                    _tag = "OK" if result.success else ("AVBRUTT" if _interrupted else "FEIL")
+                    file_logger.log(f"  {_tag}: {result.message}", lvl)
                 ctx.metadata["step_results"].append({
                     "id":       op.operation_id,
                     "label":    op.label,
@@ -3465,6 +3774,8 @@ class App(ctk.CTk):
                     "message":  result.message,
                     "skipped":  False,
                     "elapsed":  elapsed,
+                    "index":    i,
+                    "interrupted": _interrupted,
                 })
 
                 # Steget kan ha endret headeren — vis gjeldende verdier
@@ -3473,45 +3784,58 @@ class App(ctk.CTk):
                     _hdr["repacked"] = bool(result.success)
                 self._header_publish(ctx, _hdr)
 
-                # ── Prosjektfil: lagre status etter steget ────────────────────
-                if _pf and _pf_path:
+                # ── Prosjektfil: lagre status og resultat etter steget ────────
+                _status = ("completed" if result.success
+                           else "interrupted" if _interrupted else "failed")
+                if _pf is not None:
                     try:
-                        if result.success:
-                            out_p = result.data.get("output_path")
-                            # Lagre relevant ctx_data: Path-verdier som str,
-                            # skalarer og lister (f.eks. original_namelist for unpack)
-                            _ctx_data = {}
-                            for k, v in result.data.items():
-                                if k == "output_path":
-                                    continue
-                                if isinstance(v, Path):
-                                    _ctx_data[k] = str(v)
-                                elif isinstance(v, (str, int, float, bool)) or v is None:
-                                    _ctx_data[k] = v
-                                elif isinstance(v, list):
-                                    if k == "original_namelist":
-                                        # Behold kun katalogposter (slutter på '/') —
-                                        # det er alt repack_siard trenger, og listen
-                                        # kan ellers inneholde millioner av filnavn
-                                        _ctx_data[k] = [
-                                            e for e in v
-                                            if isinstance(e, str) and e.endswith("/")]
-                                    else:
-                                        _ctx_data[k] = v
-                            _pf.mark_completed(op.operation_id,
-                                               Path(out_p) if out_p else None,
-                                               ctx_data=_ctx_data)
-                        else:
-                            _pf.mark_failed(op.operation_id, result.message)
-                        # Parametere kan ha endret seg under kjøringen (DIAS-
-                        # kontrollvinduet, periode fra metadata.xml) — lagre
-                        # de gjeldende, ikke kopien fra da kjøringen startet
+                        # Steg kan ha blitt satt inn under kjøringen — synk først,
+                        # så checkpoint-posisjonene følger arbeidsflyten
                         _pf.operations = _sync_checkpoints_to_ops(_pf.operations, list(wf))
-                        _pf.save(_pf_path)
-                        self._log_queue.put(("project_step_saved", i,
-                                             "completed" if result.success else "failed"))
-                    except Exception:
-                        pass
+                        _cp = _pf.at(i, op.operation_id)
+                        _data = sanitize_result(result.data or {})
+                        if result.success:
+                            out_p = (result.data or {}).get("output_path")
+                            _pf.mark_completed(_cp, Path(out_p) if out_p else None,
+                                               ctx_data=_data, message=result.message,
+                                               elapsed=elapsed)
+                        else:
+                            _pf.mark_failed(_cp, result.message, elapsed=elapsed,
+                                            ctx_data=_data, interrupted=_interrupted)
+                        _pf.note_step_run(_run_id, op.label, _status)
+                        self._project_after_step(_pf, op, result, ctx, _run_id)
+                        self._project_save(_pf, _pf_path)
+                    except Exception as exc:
+                        self._log_queue.put(("log", f"  Prosjektfila kunne ikke "
+                                                    f"oppdateres: {exc}", "warn"))
+                self._log_queue.put(("project_step_saved", i, _status))
+                if result.success and op.operation_id == "repack_siard":
+                    self._cleanup_after_repack(ctx, path, _pf, _pf_path)
+
+                # ── Feil eller avbrudd i et innholdssteg: hold igjen ──────────
+                if not result.success and _plan is not None and _plan.mode == "pipeline":
+                    _kind = _sp.kind if _sp is not None else ""
+                    _hold_idx: list = []
+                    if op.operation_id == "unpack_siard":
+                        _hold_idx = held_after_unpack_failure(_plan)
+                    elif _kind == "content" or (_sp is None and getattr(
+                            op, "modifies_content", False)):
+                        _hold_idx = list(_plan.held_on_content_failure)
+                    _hold_ops = [o for o in list(wf)[i + 1:]
+                                 if _plan_of.get(id(o)) is not None
+                                 and _plan_of[id(o)].index in _hold_idx
+                                 and id(o) not in _held]
+                    if _hold_ops:
+                        _why = (f"«{op.label}» "
+                                f"{'ble avbrutt' if _interrupted else 'feilet'}")
+                        for _o in _hold_ops:
+                            _held[id(_o)] = _why
+                        _msg = (f"  ⏸ {_why} — {', '.join(o.label for o in _hold_ops)} "
+                                f"holdes igjen. Temp-mappa beholdes, så neste kjøring "
+                                f"tar bare det som gjenstår.")
+                        self._log_queue.put(("log", _msg, "warn"))
+                        if file_logger:
+                            file_logger.log(_msg, "warn")
 
                 # Stopp workflowen umiddelbart ved kritisk feil
                 if not result.success and getattr(op, "halt_on_failure", False):
@@ -3523,6 +3847,25 @@ class App(ctk.CTk):
                     if _rep:
                         _rep.halted(op.label, result.message)
                     break
+
+                # Avbrutt midt i steget: vent på «▶ Fortsett» (steget fortsetter
+                # der det stoppet) eller «Avslutt» (prosjektet er lagret)
+                if _interrupted:
+                    if self._wait_after_stop(i, op.label, interrupted=True):
+                        # Prøv steget igjen — og slipp stegene som ble holdt igjen
+                        for _o in list(wf)[i + 1:]:
+                            _held.pop(id(_o), None)
+                        continue
+                    _aborted = True
+                    break
+                i += 1
+
+            if _aborted:
+                _msg = ("Kjøringen ble avsluttet. Prosjektet er lagret — kjør "
+                        "arbeidsflyten igjen for å fortsette der den stoppet.")
+                self._log_queue.put(("log", _msg, "warn"))
+                if file_logger:
+                    file_logger.log(_msg, "warn")
 
             # Stoppet før sammenpakking: skriv ventende header-endringer inn i
             # den utpakkede mappa, så de er med når prosjektet kjøres videre
@@ -3541,7 +3884,15 @@ class App(ctk.CTk):
                         file_logger.log(f"PREMIS-proveniens skrevet: {_pp.name}", "info")
                 except Exception:
                     pass
+            _outcome = ("avbrutt" if _aborted else "foreløpig" if _held
+                        else "ok" if run.success else "feil")
+            if _pf is not None and _run_id:
+                _pf.end_run(_run_id, _outcome)
+                self._project_save(_pf, _pf_path)
             if file_logger:
+                if _held:
+                    file_logger.log(f"Holdt igjen: {len(_held)} steg — kjør arbeidsflyten "
+                                    f"igjen når feilen er rettet", "warn")
                 file_logger.log(
                     f"Fullført: {'SUKSESS' if run.success else 'FEIL'}  ({run.elapsed:.2f}s)")
                 file_logger.__exit__(None, None, None)
@@ -3550,9 +3901,201 @@ class App(ctk.CTk):
             self._log_queue.put(("done_one", run, q_idx, len(filer), path))
             if _rep:
                 _rep.file_done(q_idx, len(filer), run.success)
+            if _aborted:
+                break
 
         self._remote_finish()
         self._log_queue.put(("queue_done", None))
+
+    # ── Prosjekt og kjøreplan (kalles fra kjøretråden) ────────────────────────
+
+    def _remembered(self, pf, pf_path, key: str, label: str, ask_fn):
+        """Spørsmål under kjøring som huskes i prosjektfila.
+
+        Er spørsmålet besvart i en tidligere kjøring av samme kilde-SIARD,
+        brukes svaret (og det logges) — ellers spørres det, og svaret lagres.
+        «Kjør dette steget på nytt» glemmer stegets svar."""
+        if pf is None:
+            return ask_fn
+        from siard_workflow.core.project_file import source_fingerprint
+        fp = source_fingerprint(pf.source_siard)
+
+        def _wrapped(*args, **kwargs):
+            prev = pf.get_answer(key, fp)
+            if prev is not None:
+                shown = ("ja" if prev is True else "nei" if prev is False
+                         else ", ".join(map(str, prev)) if isinstance(prev, list)
+                         else str(prev))
+                msg = f"  Bruker svaret fra forrige kjøring ({label}): {shown}"
+                self._log_queue.put(("log", msg, "info"))
+                fl = self._conv_ctx.metadata.get("file_logger") if self._conv_ctx else None
+                if fl:
+                    fl.log(msg, "info")
+                return prev
+            ans = ask_fn(*args, **kwargs)
+            if ans is not None and isinstance(ans, (bool, str, int, float, list, tuple)):
+                pf.set_answer(key, list(ans) if isinstance(ans, tuple) else ans, fp)
+                self._project_save(pf, pf_path)
+            return ans
+        return _wrapped
+
+
+    def _project_for_run(self, path: Path, wf, pf_arg=None, pf_path_arg=None):
+        """Prosjektfila for `path`: lastet prosjekt, eksisterende .siardwf ved
+        siden av fila, eller ny. Checkpoints synkes posisjonelt mot `wf`."""
+        from siard_workflow.core.project_file import ProjectFile
+        pf, pf_path = None, None
+        if pf_arg is not None and Path(pf_arg.source_siard) == path:
+            pf, pf_path = pf_arg, pf_path_arg
+        else:
+            pf_path = path.with_suffix(".siardwf")
+            if pf_path.exists():
+                try:
+                    pf = ProjectFile.load(pf_path)
+                    if Path(pf.source_siard) != path:
+                        pf = None
+                except Exception:
+                    pf = None
+            if pf is None:
+                pf = ProjectFile.from_ops(path, list(wf))
+        pf.operations = _sync_checkpoints_to_ops(pf.operations, list(wf))
+        try:
+            pf.save(pf_path)
+        except Exception as exc:
+            self._log_queue.put(("log", f"  Prosjektfila kan ikke lagres ({exc}) — "
+                                        f"kjøringen kan ikke gjenopptas", "warn"))
+            return None, None
+        return pf, pf_path
+
+    @staticmethod
+    def _project_workdir(pf, ops) -> "Path | None":
+        """Temp-mappa fra en fullført «Pakk ut», hvis den fortsatt finnes."""
+        for cp, op in zip(pf.operations, ops):
+            if op.operation_id == "unpack_siard" and cp.status == "completed":
+                ext = (cp.ctx_data or {}).get("extracted_path") or \
+                    (pf.workdir or {}).get("path")
+                if ext and Path(ext).is_dir():
+                    return Path(ext)
+        return None
+
+    @staticmethod
+    def _project_output(pf, ops) -> "str | None":
+        """Siste «Pakk sammen»-resultat på disk."""
+        for cp, op in zip(pf.operations, ops):
+            if (op.operation_id == "repack_siard" and cp.status == "completed"
+                    and cp.output_siard and Path(cp.output_siard).exists()):
+                return cp.output_siard
+        return None
+
+    def _plan_for_run(self, pf, wf, path: Path):
+        """Kjøreplan for fila (None uten prosjekt)."""
+        from siard_workflow.core.run_plan import build_run_plan
+        if pf is None:
+            return None, None
+        ops = list(wf)
+        workdir = self._project_workdir(pf, ops)
+        base = (getattr(self, "_run_plan_bases", None) or {}).get(str(path))
+        plan = build_run_plan(ops, pf.operations, workdir is not None,
+                              self._project_output(pf, ops), base)
+        return plan, workdir
+
+    def _project_save(self, pf, pf_path) -> None:
+        if pf is None or pf_path is None:
+            return
+        try:
+            pf.save(pf_path)
+        except Exception as exc:
+            if not getattr(self, "_pf_save_warned", False):
+                self._pf_save_warned = True
+                self._log_queue.put(("log", f"  Prosjektfila kunne ikke lagres: {exc}",
+                                     "warn"))
+
+    @staticmethod
+    def _restore_skipped_step(ctx, op, cp, workdir) -> str:
+        """Gjenopprett et fullført stegs resultat i ctx (steget hoppes over)."""
+        data = dict(cp.ctx_data or {})
+        if op.operation_id == "unpack_siard":
+            if workdir is not None:
+                ctx.extracted_path = Path(workdir)
+            ctx.set_result("unpack_siard", data)
+            return Path(workdir).name if workdir is not None else ""
+        if data:
+            ctx.set_result(op.operation_id, data)
+        out = Path(cp.output_siard) if cp.output_siard else None
+        # Bare «Pakk sammen» (og steg uten pipeline) gir en ny SIARD som neste
+        # steg skal bruke — i pipeline peker f.eks. BLOB-stegets output_path på
+        # en fil som aldri skrives (eller en gammel)
+        if out is not None and out.exists() and (
+                op.operation_id == "repack_siard" or ctx.extracted_path is None
+                and getattr(type(op), "produces_siard", False)
+                and op.operation_id not in ("blob_convert",)):
+            ctx.siard_path = out
+        return out.name if out is not None else ""
+
+    def _project_after_step(self, pf, op, result, ctx, run_id) -> None:
+        """Prosjektdata utover stegets egen status (temp-mappe, filtyper, feillogger)."""
+        data = result.data or {}
+        if op.operation_id == "unpack_siard" and result.success:
+            pf.workdir = {
+                "path":       str(data.get("extracted_path") or ctx.extracted_path or ""),
+                "base":       "output" if ctx.metadata.get("repack_name_base") else "original",
+                "base_siard": str(ctx.siard_path),
+                "run_id":     run_id,
+            }
+        elif op.operation_id == "repack_siard" and result.success:
+            if not op.params.get("keep_temp"):
+                pf.workdir = {}
+        elif op.operation_id == "blob_convert":
+            run_fc = dict(ctx.metadata.get("format_counts") or {})
+            if data.get("resumed_files"):
+                merged = dict(pf.format_counts or {})
+                for k, v in run_fc.items():
+                    merged[k] = merged.get(k, 0) + v
+                pf.format_counts = merged
+            else:
+                pf.format_counts = run_fc
+            ctx.metadata["format_counts"] = dict(pf.format_counts)
+            fs = data.get("failure_summary") or {}
+            if not data.get("resumed_files"):
+                # Ny konvertering fra start: loggene fra tidligere forsøk gjelder
+                # ikke lenger (DIAS/depotrapporter tar bare med gjeldende)
+                for _e in pf.failure_files:
+                    _e["superseded"] = True
+            pf.add_failure_files(run_id,
+                                 blob_csv=ctx.metadata.get("blob_csv_path"),
+                                 error_log=fs.get("log_path") if isinstance(fs, dict) else None,
+                                 error_csv=fs.get("csv_path") if isinstance(fs, dict) else None)
+
+    def _cleanup_after_repack(self, ctx, path: Path, pf=None, pf_path=None) -> None:
+        """Etter vellykket «Pakk sammen»: BLOB-progresjon og Siegfried-cache
+        trengs ikke lenger (de gjaldt den utpakkede mappa)."""
+        for key in ("blob_progress_file", "blob_sf_cache_file"):
+            p = ctx.metadata.get(key)
+            if not p:
+                continue
+            try:
+                if Path(p).exists():
+                    Path(p).unlink()
+                    self._log_queue.put(("log", f"  Ryddet: {Path(p).name}", "muted"))
+            except Exception:
+                pass
+
+    def _wait_after_stop(self, i: int, label: str, interrupted: bool = False) -> bool:
+        """Blokker kjøretråden etter «⏹ Stopp» til brukeren velger.
+
+        True = «▶ Fortsett» (fortsett med steget / neste steg),
+        False = «⏹ Avslutt» (kjøringen avsluttes; prosjektet er lagret)."""
+        self._log_queue.put(("workflow_step_stopped", i, label, interrupted))
+        self._step_resume_event.clear()
+        self._step_resume_event.wait()          # blokkerer bakgrunnstråden
+        if getattr(self, "_abort_requested", False):
+            self._abort_requested = False
+            return False
+        self._stop_event.clear()
+        if self._conv_ctx is not None:
+            self._conv_ctx.metadata["stopped"] = False
+        self._log_queue.put(("workflow_step_resumed",))
+        return True
 
     # ── SIARD-header-panelet (kalles fra kjøretråden) ─────────────────────────
 
@@ -3805,9 +4348,16 @@ class App(ctk.CTk):
                     needs_redraw = True
                 elif kind == "workflow_step_stopped":
                     step_label = item[2]
-                    self._log(
-                        f"  ⏸ Stoppet — neste steg: {step_label}. "
-                        "Klikk '▶ Fortsett' for å gjenoppta.", "warn")
+                    if len(item) > 3 and item[3]:
+                        self._log(
+                            f"  ⏸ «{step_label}» ble avbrutt. «▶ Fortsett» fortsetter "
+                            "steget der det stoppet; «⏹ Avslutt» lagrer prosjektet "
+                            "så du kan fortsette senere.", "warn")
+                    else:
+                        self._log(
+                            f"  ⏸ Stoppet — neste steg: {step_label}. "
+                            "Klikk '▶ Fortsett' for å gjenoppta, eller "
+                            "'⏹ Avslutt' for å avslutte (prosjektet er lagret).", "warn")
                     self.progress_panel.set_step_stopped(True)
                     needs_redraw = True
                 elif kind == "workflow_step_resumed":
@@ -3962,11 +4512,23 @@ class App(ctk.CTk):
         self._log("Stopper workflow ...", "warn")
 
     def _conv_resume(self):
-        """Gjenoppta workflow fra neste steg etter steg-nivå stopp."""
+        """Gjenoppta workflow etter steg-nivå stopp (et avbrutt steg fortsetter
+        der det stoppet)."""
         self._step_stopped = False
+        self._abort_requested = False
         self._stop_event.clear()
+        if self._conv_ctx is not None:
+            self._conv_ctx.metadata["stopped"] = False
         self._step_resume_event.set()
         self._log("Gjenopptar workflow ...", "info")
+
+    def _conv_abort(self):
+        """Avslutt kjøringen etter stopp. Prosjektet er lagret, så neste kjøring
+        fortsetter der denne stoppet."""
+        self._abort_requested = True
+        self._step_stopped = False
+        self._step_resume_event.set()
+        self._log("Avslutter kjøringen — prosjektet er lagret", "warn")
 
     def _ask_add_standardize_ext(self, count: int) -> bool:
         """

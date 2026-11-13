@@ -528,6 +528,14 @@ class RepackSiardOperation(BaseOperation):
         # Bestem destinasjonsfil
         suffix   = (self.params.get("output_suffix") or "_konvertert").strip()
         src_path = ctx.siard_path
+        # Kjøreplanen kan ha pakket ut siste resultat (…_konvertert.siard) for å
+        # kjøre enkeltsteg på nytt — navngi da etter originalen
+        # (…_konvertert_1.siard), ikke …_konvertert_konvertert.siard
+        _name_base = ctx.metadata.get("repack_name_base")
+        if _name_base:
+            src_path = Path(_name_base).with_name(Path(_name_base).name)
+            if ctx.siard_path is not None:
+                src_path = ctx.siard_path.with_name(Path(_name_base).name)
         # Anonymisert innhold skal alltid være synlig i filnavnet — et uttrekk
         # med fiktive personopplysninger må ikke kunne forveksles med originalen.
         if (ctx.get_result("anonymize") is not None
@@ -700,6 +708,14 @@ class RepackSiardOperation(BaseOperation):
                 prog.finish()
 
         except Exception as exc:
+            # Ikke la en halvskrevet SIARD ligge igjen (den kunne forveksles med
+            # et ferdig resultat). Temp-mappa beholdes — steget kan kjøres igjen.
+            try:
+                if dst_path.exists():
+                    dst_path.unlink()
+                    w(f"  Halvskrevet {dst_path.name} slettet", "warn")
+            except Exception:
+                pass
             return self._fail(f"Kunne ikke pakke sammen SIARD: {exc}")
 
         elapsed = (datetime.datetime.now() - t0).total_seconds()

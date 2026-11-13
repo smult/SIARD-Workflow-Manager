@@ -100,6 +100,10 @@ _CONFIG_DEFAULTS: dict = {
     # ── SIARD-header-panelet til høyre for kjøreloggen ──
     "header_panel_width":     380,         # bredde (px) — dras i skillelinja
     "header_panel_collapsed": False,       # minimert til en stripe ytterst til høyre
+    # ── DIAS-pakking: felt som huskes til neste kjøring (avkrysning i dialogen) ──
+    # None = ikke valgt ennå (standardutvalg, se core/dias_remember.py)
+    "dias_remember_fields":   None,
+    "dias_remembered_values": {},          # {feltnøkkel: verdi} for avkryssede felt
 }
 
 

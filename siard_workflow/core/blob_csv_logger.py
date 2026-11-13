@@ -33,6 +33,9 @@ class BlobCsvLogger:
         self._fh   = None
         self._writer = None
         self._lock   = _threading.Lock()   # beskytt mot parallell skriving
+        # Kalles for hver rad (fra_fil, til_fil, kommentar) — progresjonsfila
+        # for gjenopptakelse (core/blob_progress.py)
+        self.on_write = None
 
     def __enter__(self) -> "BlobCsvLogger":
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -61,6 +64,11 @@ class BlobCsvLogger:
               til_storrelse: int,
               til_ext:       str,
               kommentar:     str = "") -> None:
+        if self.on_write is not None:
+            try:
+                self.on_write(fra_fil, til_fil, kommentar)
+            except Exception:
+                pass
         if not self._writer:
             return
         with self._lock:

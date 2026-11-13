@@ -148,6 +148,10 @@ def test_filename_preflight(tmp: Path) -> None:
         fake._pf = lambda s: setattr(fake, "_pf_status", s)
         fake._queue_render = lambda: None
         fake.wait_window = lambda d: None
+        fake._project_path = None
+        fake._rename_project_for = A.App._rename_project_for.__get__(fake)
+        from siard_workflow.core.project_file import ProjectFile
+        ProjectFile.from_ops(broken, []).save(broken.with_suffix(".siardwf"))
         run = A.App._filename_preflight.__get__(fake)
 
         answers["svar"] = "nei"
@@ -161,6 +165,10 @@ def test_filename_preflight(tmp: Path) -> None:
         _ok(fixed.exists() and not broken.exists()
             and fake.siard_queue == [fixed, ok_file] and fake.siard_path == fixed,
             "fila har fått riktig navn, og køen og aktiv fil er oppdatert")
+        _pfw = fixed.with_suffix(".siardwf")
+        _ok(_pfw.exists() and not broken.with_suffix(".siardwf").exists()
+            and ProjectFile.load(_pfw).source_siard == str(fixed),
+            "prosjektfila følger med og peker på det nye navnet")
         fake._pf_status = None
         _ok(run([]) and fake._pf_status is None, "ingen funn når navnene er riktige")
     finally:

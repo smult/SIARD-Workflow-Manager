@@ -12,11 +12,17 @@ from gui.styles import COLORS, FONTS, cat_color
 
 
 _STATUS_CFG = {
-    "completed": ("✓", "#3a9a5c"),
-    "failed":    ("✗", COLORS["red"]),
-    "skipped":   ("–", COLORS["muted"]),
-    "pending":   ("",  COLORS["muted"]),
+    "completed":   ("✓", "#3a9a5c"),
+    "failed":      ("✗", COLORS["red"]),
+    "skipped":     ("–", COLORS["muted"]),
+    "pending":     ("",  COLORS["muted"]),
+    # Kjøreplan / gjenopptakelse
+    "interrupted": ("⏹", COLORS["yellow"]),
+    "held":        ("⏸", COLORS["muted"]),
+    "reset":       ("↻", COLORS["accent"]),
+    "user_skip":   ("⤼", COLORS["muted"]),
 }
+
 
 
 class OperationRow(ctk.CTkFrame):
@@ -128,6 +134,27 @@ class OperationRow(ctk.CTkFrame):
         if self._on_configure:
             menu.add_command(label="⚙  Konfigurer operasjon",
                              command=lambda: self._on_configure(self))
+        # Prosjekt: kjør steget på nytt / hopp over i neste kjøring
+        panel = getattr(self, "_panel", None)
+        act = getattr(panel, "project_action_fn", None) if panel else None
+        if act is not None:
+            idx = panel._rows.index(self) if self in panel._rows else -1
+            st_fn = getattr(panel, "project_status_fn", None)
+            st = st_fn(idx) if st_fn else ""
+            menu.add_separator()
+            if st in ("completed", "failed", "interrupted", "held", "skipped"):
+                menu.add_command(label="↻  Kjør dette steget på nytt",
+                                 command=lambda: act(idx, "reset"))
+            if st == "interrupted" and self.op.operation_id == "blob_convert":
+                menu.add_command(
+                    label="▶  (Fortsetter der det stoppet ved neste kjøring)",
+                    state="disabled")
+            if st == "user_skip":
+                menu.add_command(label="↺  Ta med i neste kjøring igjen",
+                                 command=lambda: act(idx, "unskip"))
+            else:
+                menu.add_command(label="⤼  Hopp over i neste kjøring",
+                                 command=lambda: act(idx, "skip"))
         menu.add_separator()
         menu.add_command(label="▲  Flytt opp",
                          command=lambda: self._on_move_up(self))
@@ -151,9 +178,10 @@ class OperationRow(ctk.CTkFrame):
         self.idx_label.configure(text=f"{i}.")
 
     def set_status(self, status: str) -> None:
-        """Vis checkpoint-status ved siden av knappene (✓ / ✗ / –)."""
+        """Vis checkpoint-status ved siden av knappene (✓ ✗ – ⏹ ⏸ ↻ ⤼)."""
         sym, color = _STATUS_CFG.get(status, ("", COLORS["muted"]))
         self._status_lbl.configure(text=sym, text_color=color)
+        self.status = status
 
     def show_warning(self, msg: str) -> None:
         self._warn_msg = msg
@@ -207,6 +235,10 @@ class WorkflowPanel(ctk.CTkFrame):
         self._on_save_project   = on_save_project
         self._on_reset_project  = on_reset_project
         self._rows: list[OperationRow] = []
+        # Settes av app.py: status per steg i prosjektet og handling fra
+        # høyreklikkmenyen («reset» / «skip» / «unskip»)
+        self.project_status_fn = None
+        self.project_action_fn = None
         # Drag-reorder tilstand
         self._drag_row: OperationRow | None = None
         self._drag_start_y: int = 0
@@ -331,6 +363,7 @@ class WorkflowPanel(ctk.CTkFrame):
                            on_move_down=self._move_down,
                            on_configure=self._configure_row)
         row.grid(row=len(self._rows), column=0, sticky="ew", pady=3, padx=2)
+        row._panel = self
         self._rows.append(row)
         self._bind_drag(row)
         if not silent:
@@ -398,6 +431,7 @@ class WorkflowPanel(ctk.CTkFrame):
             on_move_down=self._move_down,
             on_configure=self._configure_row,
         )
+        new_row._panel = self
         self._rows.insert(insert_idx, new_row)
         for i, row in enumerate(self._rows):
             row.grid(row=i, column=0, sticky="ew", pady=3, padx=2)

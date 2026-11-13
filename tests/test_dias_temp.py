@@ -64,6 +64,7 @@ def _run(tmp: Path, temp_dir: "str | None") -> "tuple[object, list, list]":
         op = D.DiasPackageOperation()
         for k in op._REQUIRED_META:
             op.params[k] = op.params.get(k) or "x"
+        op.params["period_start"], op.params["period_end"] = "2010-01-01", "2015-12-31"
         op.params["output_dir"] = str(tmp / "ut")
         D.logger.info = lambda msg, *a: logs.append(str(msg))
         r = op.run(ctx)

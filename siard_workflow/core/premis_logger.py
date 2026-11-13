@@ -76,6 +76,9 @@ class PremisProvenanceLogger:
         self.agent_id  = f"SIARD Manager v{agent_version}" if agent_version else "SIARD Manager"
         self._events: list[dict] = []
         self._path: Path | None = None
+        # Prosjektet er kjørt før (gui/app.py): hendelser fra tidligere kjøringer
+        # i {base}_premis.xml beholdes, og denne kjøringens legges til
+        self.append_existing = False
 
     @property
     def out_path(self) -> Path:
@@ -148,6 +151,7 @@ class PremisProvenanceLogger:
             return None
         try:
             self.log_dir.mkdir(parents=True, exist_ok=True)
+            self._prior = self._read_prior() if self.append_existing else []
             root = self._build_tree(Path(siard_path), ctx)
             tree = ET.ElementTree(root)
             try:
@@ -163,6 +167,31 @@ class PremisProvenanceLogger:
         except Exception:
             logger.exception("Kunne ikke skrive PREMIS-proveniensfil")
             return None
+
+    def _read_prior(self) -> list[dict]:
+        """Hendelser fra en tidligere kjøring av samme prosjekt."""
+        out = self.out_path
+        if not out.exists():
+            return []
+        try:
+            root = ET.parse(out).getroot()
+        except Exception:
+            return []
+        prior = []
+        for e in root.findall(_p("event")):
+            def _t(tag, _e=e):
+                el = _e.find(_p(tag))
+                return (el.text or "") if el is not None else ""
+            outcome = e.find(f"{_p('eventOutcomeInformation')}/{_p('eventOutcome')}")
+            prior.append({
+                "type":     _t("eventType") or DEFAULT_EVENT_TYPE,
+                "label":    "",
+                "op_id":    "",
+                "datetime": _t("eventDateTime"),
+                "detail":   _t("eventDetail"),
+                "success":  (outcome is None or (outcome.text or "0").strip() == "0"),
+            })
+        return prior
 
     # ── XML-bygging ───────────────────────────────────────────────────────────
 
@@ -197,7 +226,7 @@ class PremisProvenanceLogger:
         ET.SubElement(fmt_des, _p("formatName")).text = "SIARD"
 
         # ── premis:event (én per endrende operasjon) ──────────────────────────
-        for i, ev in enumerate(self._events, 1):
+        for i, ev in enumerate(list(getattr(self, "_prior", []) or []) + self._events, 1):
             e = ET.SubElement(root, _p("event"))
             eid = ET.SubElement(e, _p("eventIdentifier"))
             ET.SubElement(eid, _p("eventIdentifierType")).text = "SIARD-Manager"

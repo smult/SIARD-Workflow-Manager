@@ -62,9 +62,15 @@ def test_operation(tmp: Path) -> None:
     _ok(op._confirm_settings(ctx) is False, "«Avbryt pakking» → steget stoppes")
     asked.clear()
     ctx.metadata["ask_dias_config_cb"] = lambda op: (asked.append(op), None)[1]
-    op2 = DiasPackageOperation(confirm_before_packing=False)
+    op2 = DiasPackageOperation(confirm_before_packing=False,
+                               period_start="2014-10-01", period_end="2020-06-19")
     _ok(op2._confirm_settings(ctx) is True and not asked,
         "bryter av → ingen spørsmål, lagrede innstillinger brukes")
+    op3 = DiasPackageOperation(confirm_before_packing=False, period_start="ÅÅÅÅ-MM-DD",
+                               period_end="")
+    _ok(op3._confirm_settings(ctx) is False and asked,
+        "bryter av, men periode mangler → vinduet vises likevel")
+    asked.clear()
     del ctx.metadata["ask_dias_config_cb"]
     _ok(op._confirm_settings(ctx) is True, "uten GUI (ingen callback) → pakker uten spørsmål")
 
@@ -93,10 +99,9 @@ def test_dialog(tmp: Path) -> None:
     import gui.operations_panel as OP
     from gui.app import App
     from siard_workflow.operations.dias_package_operation import DiasPackageOperation
-    import settings
-    saved_save = settings.save_op_params
     import gui.dias_dialog as DD
-    DD.save_op_params = lambda *a, **k: None          # ikke skriv brukerens innstillinger
+    saved_save = DD.save_remembered
+    DD.save_remembered = lambda f, v: {}               # ikke skriv brukerens innstillinger
     # Inndatafila oppgir et ANNET spenn — kjøremodus skal ikke overstyre operasjonens
     other = tmp / "annen.siard"
     with zipfile.ZipFile(other, "w") as zf:
@@ -170,7 +175,7 @@ def test_dialog(tmp: Path) -> None:
         run_once("avbryt")
         _ok(results[-1] is None, "«Avbryt pakking» → None")
     finally:
-        DD.save_op_params = saved_save
+        DD.save_remembered = saved_save
         OP._current_siard_path = None
         root.destroy()
 

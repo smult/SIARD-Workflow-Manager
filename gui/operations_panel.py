@@ -1258,7 +1258,9 @@ class OperationCard(ctk.CTkFrame):
             if self._get_workflow_ops:
                 set_upstream_op_ids(
                     [op.operation_id for op in self._get_workflow_ops()])
-            DiasParamDialog(self, op_def, on_confirm=on_add, on_saved=on_saved)
+            # Nytt steg: felt krysset av for «Husk» fylles inn fra innstillingene
+            DiasParamDialog(self, {**op_def, "apply_remembered": True},
+                            on_confirm=on_add, on_saved=on_saved)
         elif op_def.get("custom_dialog") == "SiardMapperParamDialog":
             from gui.siardmapper_param_dialog import SiardMapperParamDialog
             SiardMapperParamDialog(self, op_def, on_confirm=on_add, on_saved=on_saved)

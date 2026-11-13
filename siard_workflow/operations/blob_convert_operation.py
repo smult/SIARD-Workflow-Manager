@@ -53,6 +53,8 @@ from siard_workflow.core.base_operation import BaseOperation, OperationResult
 from siard_workflow.core.context import WorkflowContext
 from siard_workflow.core import external_lob
 from siard_workflow.core.lob_column_types import reconcile_lob_column_types
+from siard_workflow.core.blob_progress import (BlobProgress, PersistentRegistry,
+                                              progress_path)
 from siard_workflow.core.blob_csv_logger import (
     BlobCsvLogger, ConversionErrorLogger, SiegfriedIdLogger,
 )
@@ -2087,6 +2089,11 @@ class BlobConvertOperation(BaseOperation):
         "gs_allow_jpeg":        False,
     }
 
+    @staticmethod
+    def _user_stopped() -> bool:
+        """Overstyres i run() — stoppet brukeren kjøringen?"""
+        return False
+
     def run(self, ctx: WorkflowContext) -> OperationResult:
         log = ctx.metadata.get("file_logger")
         pcb = ctx.metadata.get("progress_cb")
@@ -2132,6 +2139,9 @@ class BlobConvertOperation(BaseOperation):
 
         # Hent pause/stopp Events (trådsikre)
         stop_ev  = ctx.metadata.get("stop_event",  threading.Event())
+        # Brukerstopp (gui/app.py setter ctx.metadata["stopped"]) skilles fra
+        # hjerteslagets stopp av hengende LibreOffice-batcher
+        self._user_stopped = lambda: bool(ctx.metadata.get("stopped"))
         # Dialog for Ghostscript-etterbehandling (gui/app.py) — None uten GUI
         self._gs_ask_cb = ctx.metadata.get("ask_gs_postprocess_cb")
         # Ukjent filformat: spørsmål via GUI-callback (kan besvares fra mobilen)
@@ -2148,6 +2158,7 @@ class BlobConvertOperation(BaseOperation):
             csv_log = BlobCsvLogger(log_dir, siard_name)
             csv_log.__enter__()
             w(f"  CSV-logg: {csv_log.log_path}", "info")
+            ctx.metadata["blob_csv_path"] = str(csv_log.log_path)
             err_log = ConversionErrorLogger(log_dir, siard_name)
             err_log.__enter__()
             # Siegfried-identifikasjonslogg — opprettes alltid, men slettes
@@ -2178,24 +2189,48 @@ class BlobConvertOperation(BaseOperation):
         # det at forrige kjøring ble avbrutt.  Ferdig-settet lastes inn og sendes
         # via ctx.metadata slik at _process_pipeline / _process kan filtrere
         # all_blobs.  Finnes den ikke, opprettes den nå (ny kjøring).
-        _resume_json = None
+        # Progresjonsfila (core/blob_progress.py) gjelder bare i pipeline-modus:
+        # da jobbes det i samme utpakkede mappe, og ferdige filer ligger der
+        # allerede konvertert. Uten pipeline pakkes kilden ut på nytt hver gang.
+        _resume_json = None   # gammel resume-fil (før progresjonsfila) — ryddes
         _done_set: set[str] = set()
+        self._blob_progress = None
+        self._resumed_refs: dict = {}
+        _pipe_dir = getattr(ctx, "extracted_path", None)
         if log_dir:
-            _resume_json = _resume_json_path(log_dir, ctx.siard_path.stem if ctx.siard_path else "blob")
+            _stem_r = ctx.siard_path.stem if ctx.siard_path else "blob"
+            _resume_json = _resume_json_path(log_dir, _stem_r)
             if _resume_json.exists():
-                _done_set = _load_resume_done_set(_resume_json)
-                if _done_set:
-                    w(f"  Resume: finner {_resume_json.name} — "
-                      f"{len(_done_set):,} filer allerede behandlet vil hoppes over", "info")
-            else:
                 try:
-                    _resume_json.write_text(json.dumps({
-                        "csv_path": str(csv_log.log_path) if csv_log and csv_log.log_path else "",
-                        "started":  datetime.datetime.now().isoformat(timespec="seconds"),
-                    }, indent=2), encoding="utf-8")
+                    _resume_json.unlink()
                 except Exception:
-                    _resume_json = None   # lagring feilet — fortsett uten
+                    pass
+        if log_dir and _pipe_dir and Path(_pipe_dir).is_dir():
+            _bp = BlobProgress(
+                progress_path(log_dir, ctx.siard_path.stem if ctx.siard_path else "blob"),
+                Path(_pipe_dir),
+                {"standardize_bin_ext": _get_standardize_bin_ext(),
+                 "dbptk_lob_names": bool(_dbptk_names_enabled())})
+            _n_prev = _bp.load()
+            if _n_prev:
+                _done_set = set(_bp.done)
+                self._resumed_refs = _bp.resumed_refs()
+                w(f"  Fortsetter der forrige kjøring stoppet: {_n_prev:,} filer er "
+                  f"allerede behandlet og hoppes over ({_bp.path.name})", "info")
+            elif _bp.discarded_reason:
+                w(f"  Progresjonsfil fra forrige kjøring brukes ikke "
+                  f"({_bp.discarded_reason}) — starter på nytt", "warn")
+            try:
+                _bp.open(append=bool(_n_prev))
+                self._blob_progress = _bp
+                if csv_log is not None:
+                    csv_log.on_write = _bp.record_done
+            except Exception as exc:
+                w(f"  Advarsel: progresjonsfil kan ikke skrives ({exc}) — "
+                  f"steget kan ikke fortsettes etter et avbrudd", "warn")
         ctx.metadata["_blob_resume_done"] = _done_set
+        if self._blob_progress is not None:
+            ctx.metadata["blob_progress_file"] = str(self._blob_progress.path)
         # Siegfried-resultater lagres fortløpende her, så en ny kjøring etter et
         # avbrudd slipper å skanne uendrede filer på nytt (slettes når steget
         # fullfører)
@@ -2203,6 +2238,9 @@ class BlobConvertOperation(BaseOperation):
                                               if ctx.siard_path else "blob")
                                if log_dir else None)
         self._sf_source_key = _siard_source_key(ctx.siard_path)
+        if self._blob_progress is not None and self._sf_cache_file:
+            # Ryddes av app.py når «Pakk sammen SIARD» har lykkes
+            ctx.metadata["blob_sf_cache_file"] = str(self._sf_cache_file)
         # Identifikasjonslogger fra tidligere kjøringer av samme uttrekk (også fra
         # før den varige cachen fantes) — gjenbrukes for uendrede filer
         self._sf_id_logs = []
@@ -2309,6 +2347,8 @@ class BlobConvertOperation(BaseOperation):
                 err_log.__exit__(None, None, None)
             if sf_log:
                 sf_log.__exit__(None, None, None)
+            if getattr(self, "_blob_progress", None) is not None:
+                self._blob_progress.close()   # beholdes — neste kjøring fortsetter
             return self._fail(str(exc))
         finally:
             if csv_log:
@@ -2387,13 +2427,49 @@ class BlobConvertOperation(BaseOperation):
 
         progress("finish", stats=stats)
 
-        # Slett resume-sjekkpunkt og Siegfried-cache — kjøringen fullførte vellykket
-        for _cp in (_resume_json, getattr(self, "_sf_cache_file", None)):
-            if _cp and _cp.exists():
-                try:
-                    _cp.unlink()
-                except Exception:
-                    pass
+        _bp = getattr(self, "_blob_progress", None)
+        _n_resumed = len(ctx.metadata.get("_blob_resume_done") or ())
+        if _bp is not None:
+            if _n_resumed:
+                # Fortsatt kjøring: tallene for hele konverteringen, ikke bare
+                # restkjøringen, i rapporten
+                stats["this_run"] = {k: v for k, v in stats.items()
+                                     if isinstance(v, int) and not isinstance(v, bool)}
+                _tot = _bp.total_stats(stats["this_run"])
+                _bp.record_stats(stats["this_run"])
+                stats.update(_tot)
+                stats["resumed_files"] = _n_resumed
+                stats["runs_combined"] = len(_bp.prior_stats) + 1
+                w(f"  Samlet over {stats['runs_combined']} kjøringer: "
+                  f"{stats.get('converted', 0):,} konvertert, "
+                  f"{stats.get('kept', 0):,} beholdt, {stats.get('failed', 0):,} feil", "info")
+            else:
+                _bp.record_stats({k: v for k, v in stats.items()
+                                  if isinstance(v, int) and not isinstance(v, bool)})
+            _bp.close()
+
+        # Stoppet av bruker: steget er AVBRUTT, ikke fullført. Progresjonsfila
+        # og Siegfried-cachen beholdes, så neste kjøring fortsetter der det
+        # stoppet.
+        if stop_ev.is_set():
+            w("  BLOB-konverteringen ble avbrutt — kjør arbeidsflyten igjen for å "
+              "fortsette der den stoppet", "warn")
+            return OperationResult(
+                operation_id=self.operation_id, success=False,
+                data={**stats, "interrupted": True},
+                message=(f"Avbrutt — {stats['converted']} konvertert så langt; "
+                         f"fortsetter ved neste kjøring"))
+
+        # Fullført. I pipeline-modus beholdes progresjonsfila og Siegfried-cachen
+        # til «Pakk sammen SIARD» har lykkes (app.py rydder): må steget kjøres på
+        # nytt før det (f.eks. fordi HEX ble kjørt på nytt), tar det bare nye filer.
+        if _bp is None:
+            for _cp in (getattr(self, "_sf_cache_file", None),):
+                if _cp and _cp.exists():
+                    try:
+                        _cp.unlink()
+                    except Exception:
+                        pass
 
         return self._ok(
             data={**stats, "output_path": str(dst_path)},
@@ -2661,7 +2737,9 @@ class BlobConvertOperation(BaseOperation):
 
         # ── Fase 3: Detekter og konverter blob-filer ──────────────────────────
         total = len(all_blobs)
-        _pipeline_creg: dict = {}
+        # Skrives også til progresjonsfila, så XML-en kan rettes for filer
+        # konvertert før et avbrudd
+        _pipeline_creg: dict = PersistentRegistry(getattr(self, "_blob_progress", None))
         _pipeline_creg_lock = threading.Lock()
         if total == 0:
             w("  Ingen blob-filer å behandle", "info")
@@ -4657,8 +4735,10 @@ class BlobConvertOperation(BaseOperation):
         # Stopp heartbeat
         _hb_stop.set()
 
-        # Nullstill stop_ev hvis det var heartbeat som satte den
-        if not pause_ev.is_set():
+        # Nullstill stop_ev hvis det var heartbeat som satte den — IKKE ved stopp
+        # fra brukeren (da skal steget avsluttes som avbrutt, ikke fortsette med
+        # nye forsøk og XML-patching)
+        if not pause_ev.is_set() and not self._user_stopped():
             stop_ev.clear()
 
         # ── Retry: halverende batcher (bisection) ────────────────────────────
@@ -6607,6 +6687,24 @@ class BlobConvertOperation(BaseOperation):
                         # Full-sti-key for entydig oppslag ved full-sti-refs
                         renames[zip_sti_old] = new_path
                         line_comments[orig_name] = comment
+
+            # Filer konvertert i en tidligere (avbrutt) kjøring har allerede
+            # nytt navn på disk, mens XML-en peker på det gamle
+            _resumed = (getattr(self, "_resumed_refs", None) or {}).get(table_key, ())
+            if _resumed:
+                _rn_count: dict[str, int] = {}
+                for _on, _zs, _np, _cm in _resumed:
+                    _rn_count[_on] = _rn_count.get(_on, 0) + 1
+                for _on, _zs, _np, _cm in _resumed:
+                    renames.setdefault(_zs, _np)
+                    _mm = re.match(r'lob(\d+)$', PurePosixPath(_zs).parent.name,
+                                   re.IGNORECASE)
+                    if _rn_count[_on] > 1 and _mm:
+                        col_renames.setdefault(int(_mm.group(1)), {}).setdefault(_on, _np)
+                    else:
+                        renames.setdefault(_on, _np)
+                    if _cm:
+                        line_comments.setdefault(_on, _cm)
 
             # Finn type-kolonne-kobling for denne tabellen
             col_map  = _lob_type_map.get(table_key, {})

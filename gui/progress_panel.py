@@ -106,6 +106,7 @@ class ProgressPanel(ctk.CTkFrame):
         self._pause_cb  = None
         self._stop_cb   = None
         self._resume_cb = None
+        self._abort_cb  = None
         self._step_stopped_state = False
         self._current_phase  = 0
         self._phase_state:    list[str]   = []
@@ -289,10 +290,15 @@ class ProgressPanel(ctk.CTkFrame):
     # Callbacks
     # ─────────────────────────────────────────────────────────────────────────
 
-    def set_callbacks(self, pause_cb, stop_cb, resume_cb=None):
+    def set_callbacks(self, pause_cb, stop_cb, resume_cb=None, abort_cb=None):
         self._pause_cb  = pause_cb
         self._stop_cb   = stop_cb
         self._resume_cb = resume_cb
+        self._abort_cb  = abort_cb
+
+    def _on_abort(self):
+        if self._abort_cb:
+            self._abort_cb()
 
     def _on_pause(self):
         if self._pause_cb:
@@ -386,7 +392,7 @@ class ProgressPanel(ctk.CTkFrame):
             self._counters[key].configure(text="0")
 
         self._step_stopped_state = False
-        self._pause_btn.configure(state="disabled", text="⏸ Pause",
+        self._pause_btn.configure(state="disabled", text="⏸ Pause", command=self._on_pause,
                                    fg_color=COLORS["btn"])
         self._pause_btn.grid()
         self._stop_btn.configure(state="disabled", text="⏹ Stopp",
@@ -431,7 +437,7 @@ class ProgressPanel(ctk.CTkFrame):
 
         # Vis begge knapper i blob-modus
         self._pause_btn.grid()
-        self._pause_btn.configure(state="normal", text="⏸ Pause",
+        self._pause_btn.configure(state="normal", text="⏸ Pause", command=self._on_pause,
                                    fg_color=COLORS["btn"],
                                    hover_color=COLORS["btn_hover"])
         self._stop_btn.configure(state="normal")
@@ -601,7 +607,7 @@ class ProgressPanel(ctk.CTkFrame):
                                        fg_color=COLORS["accent"],
                                        hover_color=COLORS["accent_dim"])
         else:
-            self._pause_btn.configure(text="⏸ Pause",
+            self._pause_btn.configure(text="⏸ Pause", command=self._on_pause,
                                        fg_color=COLORS["btn"],
                                        hover_color=COLORS["btn_hover"])
 
@@ -613,7 +619,19 @@ class ProgressPanel(ctk.CTkFrame):
                 text="▶ Fortsett",
                 fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"], text_color=COLORS["on_accent"],
                 state="normal")
+            # Pause-knappen blir «Avslutt» mens kjøringen står stoppet:
+            # avslutter kjøringen, prosjektet er lagret og kan fortsettes senere
+            if self._abort_cb:
+                self._pause_btn.grid()
+                self._pause_btn.configure(
+                    text="⏹ Avslutt", state="normal", command=self._on_abort,
+                    fg_color=COLORS["danger_bg"], hover_color=COLORS["danger_hover"],
+                    text_color=COLORS["danger_text"])
         else:
+            self._pause_btn.configure(
+                text="⏸ Pause", command=self._on_pause,
+                fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"],
+                text_color=COLORS["btn_text"])
             self._stop_btn.configure(
                 text="⏹ Stopp",
                 fg_color=COLORS["danger_bg"],

@@ -87,10 +87,21 @@ class DepotReportsOperation(BaseOperation):
             from siard_workflow.operations.depot_reports import (
                 _read_conversion_csv, _read_error_log,
             )
-            if csv_path:
-                csv_rows = _read_conversion_csv(csv_path)
-            if err_path:
-                errors = _read_error_log(err_path)
+            # Konverteringen kan være fortsatt over flere kjøringer — les
+            # loggene fra alle (prosjektfila vet hvilke som gjelder)
+            _proj = ctx.metadata.get("project_file")
+            _csvs = _proj.current_failure_files("blob_csv") if _proj is not None else []
+            _errs = _proj.current_failure_files("error_log") if _proj is not None else []
+            if len(_csvs) > 1 or len(_errs) > 1:
+                for _c in _csvs:
+                    csv_rows.extend(_read_conversion_csv(Path(_c)))
+                for _e in _errs:
+                    errors.extend(_read_error_log(Path(_e)))
+            else:
+                if csv_path:
+                    csv_rows = _read_conversion_csv(csv_path)
+                if err_path:
+                    errors = _read_error_log(err_path)
 
         # ── Utdatamappe ──────────────────────────────────────────────────────
         subdir = (p.get("report_subdir") or "").strip()

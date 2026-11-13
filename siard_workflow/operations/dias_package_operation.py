@@ -76,6 +76,23 @@ def _load_dias_json() -> dict[str, str]:
     return base
 
 
+def is_period_date(value) -> bool:
+    """
+    Gyldig periodedato for DIAS (ÅÅÅÅ-MM-DD). Tom verdi og plassholdere som
+    «ÅÅÅÅ-MM-DD» fra dias.json regnes som ikke fylt ut.
+    """
+    import datetime as _dt
+    import re as _re
+    v = str(value or "").strip()
+    if not _re.fullmatch(r"\d{4}-\d{2}-\d{2}", v):
+        return False
+    try:
+        _dt.date.fromisoformat(v)
+        return True
+    except ValueError:
+        return False
+
+
 def read_meta_from_mets(mets_path) -> dict:
     """
     Les metadata fra en eksisterende METS-fil (info.xml, mets.xml eller annet navn).
@@ -297,6 +314,23 @@ class DiasPackageOperation(BaseOperation):
     # av periode m.m. etter at den er hentet fra metadata.xml / estimatet)
     default_params = {**_load_dias_json(), "confirm_before_packing": True}
 
+    # Standardverdier: dias.json, deretter felt krysset av for «Husk» i
+    # DIAS-dialogen (programmets innstillinger, se core/dias_remember.py) —
+    # ikke alle sist brukte verdier (de hører til uttrekket / prosjektfila)
+    use_stored_op_params = False
+
+    def __init__(self, **params):
+        try:
+            from siard_workflow.core.dias_remember import remembered_values
+            remembered = {k: v for k, v in remembered_values().items()
+                          if k in self.default_params}
+        except Exception:
+            remembered = {}
+        super().__init__(**{**remembered, **params})
+        # Periode foreslått fra «Estimer datospenn» under pakkingen (se _suggest_period)
+        self.period_note: str = ""
+        self.period_suggestion: dict = {}
+
     _REQUIRED_META = [
         "label", "system", "system_version", "submission_agreement",
         "archivist_type", "period_start", "period_end",
@@ -335,6 +369,79 @@ class DiasPackageOperation(BaseOperation):
         if any(old) and old != (start, end):
             _w(f"    Erstatter verdiene fra innstillingene ({old[0]} – {old[1]})", "warn")
 
+    def _period_missing(self) -> bool:
+        """Periode fra–til mangler (tom, plassholder som «ÅÅÅÅ-MM-DD» e.l.)."""
+        return not (is_period_date(self.params.get("period_start"))
+                    and is_period_date(self.params.get("period_end")))
+
+    def _suggest_period(self, ctx: WorkflowContext, siard_path: Path) -> None:
+        """
+        Periode mangler (verken i dialogen, metadata.xml eller et godkjent
+        estimat): foreslå datoer fra «Estimer datospenn».
+
+        - Er «Estimer datospenn» kjørt i denne kjøringen (estimatet ble ikke
+          godkjent for metadata.xml), brukes estimatet som forslag.
+        - Ellers spørres brukeren (ask_dias_date_span_cb) om «Estimer datospenn»
+          skal kjøres nå, før pakkingen. Estimatet blir bare et forslag i
+          DIAS-vinduet — det skrives ikke til metadata.xml (uttrekket er
+          normalt allerede pakket sammen her).
+        Forslaget settes i period_start/period_end; self.period_note forklarer
+        hvor det kommer fra (vises i DIAS-vinduet og i resultatet).
+        """
+        from siard_workflow.core.date_span import _full_date
+        fl = (ctx.metadata or {}).get("file_logger")
+
+        def _w(msg: str, lvl: str = "info") -> None:
+            logger.info(msg)
+            if fl:
+                fl.log(msg, lvl)
+
+        def _use(res: dict, origin: str) -> bool:
+            if not (res and res.get("found") and res.get("from_date") and res.get("to_date")):
+                return False
+            start = _full_date(res["from_date"], True)
+            end = _full_date(res["to_date"], False)
+            self.params["period_start"], self.params["period_end"] = start, end
+            self.period_note = f"Periode {origin} — kontroller før pakking"
+            self.period_suggestion = {
+                "from": start, "to": end, "origin": origin,
+                "basis": res.get("basis_text", ""), "confidence": res.get("confidence", ""),
+                "reliable": bool(res.get("reliable", True))}
+            _w(f"  Periode foreslått: {start} – {end} ({origin})", "ok")
+            if not res.get("reliable", True):
+                _w("    Estimatet er bare veiledende — kontroller perioden", "warn")
+            return True
+
+        _w("  Periode (fra–til) er ikke fylt ut, og uttrekket oppgir ikke datospenn",
+           "warn")
+        prior = ctx.get_result("date_span")
+        if isinstance(prior, dict) and _use(
+                prior, "estimert av «Estimer datospenn» i denne kjøringen"):
+            return
+        ask = (ctx.metadata or {}).get("ask_dias_date_span_cb")
+        if ask is None:
+            return
+        try:
+            yes = bool(ask(self))
+        except Exception as exc:
+            _w(f"  [ADVARSEL] Spørsmål om datospenn feilet: {exc}", "warn")
+            yes = False
+        if not yes:
+            _w("    «Estimer datospenn» ikke kjørt — perioden må fylles ut i DIAS-vinduet")
+            return
+        from siard_workflow.operations.date_span_operation import DateSpanOperation
+        _w("  Kjører «Estimer datospenn» for å foreslå periode …")
+        op = DateSpanOperation()
+        op.suggest_only = True
+        try:
+            r = op.run(ctx)
+        except Exception as exc:
+            _w(f"  [ADVARSEL] «Estimer datospenn» feilet: {exc}", "warn")
+            return
+        if not (r.success and _use(r.data or {}, "estimert av «Estimer datospenn»")):
+            _w(f"    Fant ikke datospenn ({r.message}) — perioden må fylles ut i "
+               "DIAS-vinduet", "warn")
+
     def _confirm_settings(self, ctx: WorkflowContext) -> bool:
         """
         Vis konfigurasjonsvinduet når pakkingen starter (bryteren
@@ -353,9 +460,18 @@ class DiasPackageOperation(BaseOperation):
             if fl:
                 fl.log(msg, lvl)
 
-        if not on or ask is None:
+        if ask is None:
             return True
-        _w("  Viser DIAS-konfigurasjonen for kontroll før pakking …")
+        # Foreslått eller manglende periode skal kontrolleres/fylles ut — da
+        # vises vinduet selv om bryteren er av
+        must = bool(self.period_suggestion) or self._period_missing()
+        if not on and not must:
+            return True
+        if not on:
+            _w("  Viser DIAS-konfigurasjonen fordi perioden "
+               + ("er foreslått" if self.period_suggestion else "mangler") + " …")
+        else:
+            _w("  Viser DIAS-konfigurasjonen for kontroll før pakking …")
         new = ask(self)
         if new is None:
             _w("  Avbrutt i kontrollvinduet — DIAS-pakken lages ikke", "warn")
@@ -374,10 +490,18 @@ class DiasPackageOperation(BaseOperation):
         if not siard_path or not siard_path.exists():
             return self._fail("Ingen SIARD-fil i kontekst.")
 
+        self.period_note, self.period_suggestion = "", {}
+        for k in ("period_start", "period_end"):        # plassholder = ikke fylt ut
+            if not is_period_date(self.params.get(k)):
+                self.params[k] = ""
         self._apply_period(ctx, siard_path)
+        if self._period_missing():
+            self._suggest_period(ctx, siard_path)
         if not self._confirm_settings(ctx):
             return self._fail("DIAS-pakking avbrutt av bruker i kontrollvinduet")
         missing = [k for k in self._REQUIRED_META if not str(self.params.get(k, "")).strip()]
+        if self._period_missing() and not any(k.startswith("period_") for k in missing):
+            missing.append("period_start/period_end (ugyldig dato)")
         if missing:
             return self._fail(f"Manglende obligatoriske parametere: {', '.join(missing)}")
 
@@ -465,6 +589,19 @@ class DiasPackageOperation(BaseOperation):
         else:
             _auto_add(_auto_newest(siard_path.parent, _log_dir,
                                    pattern=f"{base}_*.log"), _repo, "kjørelogg")
+
+        # Prosjektet er kjørt i flere omganger: kjøreloggene og BLOB-loggene
+        # fra alle kjøringene hører med (ikke bare den nyeste)
+        _proj = _ctx_meta.get("project_file")
+        if _proj is not None:
+            for _r in getattr(_proj, "runs", []) or []:
+                _lf = _r.get("log_file")
+                if _lf and Path(_lf).exists() and str(Path(_lf)) not in _existing_srcs:
+                    _auto_add(_lf, _repo, "kjørelogg (tidligere kjøring)")
+            for _key, _lbl in (("blob_csv", "blob-konvertering CSV"),
+                               ("error_log", "blob-konvertering feillogg")):
+                for _f in _proj.current_failure_files(_key):
+                    _auto_add(_f, _repo, _lbl)
 
         # Blob-konvertering CSV og feillogg
         _auto_add(_auto_newest(siard_path.parent, _log_dir,
@@ -592,9 +729,12 @@ class DiasPackageOperation(BaseOperation):
             logger.exception("DIAS-pakking feilet")
             return self._fail(f"DIAS-pakking feilet: {exc}")
 
-        return self._ok(
-            data={"aic_path": str(aic_path)},
-            message=f"DIAS-pakke opprettet: {aic_path.name}")
+        data = {"aic_path": str(aic_path),
+                "period": f"{self.params.get('period_start', '')} – "
+                          f"{self.params.get('period_end', '')}"}
+        if self.period_suggestion:
+            data["period_suggestion"] = dict(self.period_suggestion)
+        return self._ok(data=data, message=f"DIAS-pakke opprettet: {aic_path.name}")
 
 
 def _choose_temp_base(ctx_meta: dict, siard_path: Path, needed: int,

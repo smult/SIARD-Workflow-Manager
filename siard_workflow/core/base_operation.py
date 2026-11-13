@@ -78,6 +78,9 @@ class BaseOperation(ABC):
     # <premis:eventDetail>. eventType er begrenset til enumerasjonen over, så
     # denne bevarer den beskrivende betegnelsen for operasjonen.
     premis_event_label: str = ""
+    # False: lagrede op_params (settings.json) brukes ikke som standardverdier —
+    # operasjonen har egen ordning (f.eks. DIAS: bare felt krysset av for «Husk»)
+    use_stored_op_params: bool = True
 
     def __init__(self, **params):
         # Prioritet: 1) eksplisitte params, 2) lagrede op_params, 3) config.json, 4) defaults
@@ -104,7 +107,7 @@ class BaseOperation(ABC):
                         merged[param_key] = val
 
             # Lagrede op_params overstyrer config
-            if self.operation_id:
+            if self.operation_id and self.use_stored_op_params:
                 stored = get_op_params(self.operation_id, {})
                 for k, v in stored.items():
                     if k in merged:

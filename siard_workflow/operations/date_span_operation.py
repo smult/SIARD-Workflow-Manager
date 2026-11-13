@@ -53,6 +53,11 @@ class DateSpanOperation(BaseOperation):
         "use_estimate": "Spør",
     }
 
+    # True: kjørt fra DIAS-pakkingen for å foreslå periode (datoene var ikke
+    # fylt ut) — ingen spørsmål og ingen skriving til metadata.xml; estimatet
+    # vises som forslag i DIAS-vinduet, der brukeren kan rette det
+    suggest_only: bool = False
+
     def use_mode(self) -> str:
         """«spør» | «ja» | «nei» — også eldre lagret write_metadata=False → «nei»."""
         if str(self.params.get("write_metadata", True)).lower() in ("false", "0"):
@@ -147,6 +152,16 @@ class DateSpanOperation(BaseOperation):
             w("    Bare veiledende (fant ingen sak-/journal-, person-/klient- eller "
               "LOB-tabeller med datoer)", "warn")
         w(f"    {DS.NOTE}", "info")
+
+        if self.suggest_only:
+            res["accepted"] = True
+            res["accept_reason"] = "forslag til perioden i DIAS-pakken"
+            w(f"  Brukes som forslag til perioden i DIAS-pakken: "
+              f"{DS._full_date(res['from_date'], True)} – "
+              f"{DS._full_date(res['to_date'], False)} (skrives ikke til metadata.xml)",
+              "ok")
+            return self._ok(res, f"Estimert datospenn {res['from_year']}–{res['to_year']} "
+                                 f"({res['confidence']} sikkerhet) — forslag til DIAS-pakken")
 
         # Skal estimatet brukes? Spør brukeren (GUI), ellers innstillingen
         mode = self.use_mode()
