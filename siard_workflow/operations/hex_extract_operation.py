@@ -27,6 +27,7 @@ BLOB-kolonner (xs:hexBinary i tabell-XSD) forhåndsskannes per kolonne:
      erstatt disse med patchet versjon.
 """
 from __future__ import annotations
+from siard_workflow.core.fmt import num as _fnum
 
 import hashlib
 import io
@@ -413,7 +414,7 @@ def _count_lob_files(extract_dir: Path, w=None, label: str = "") -> int:
         now = _time.monotonic()
         if w and now - last >= 60:
             last = now
-            w(f"    {label}: {n:,} LOB-filer telt så langt "
+            w(f"    {label}: {_fnum(n)} LOB-filer telt så langt "
               f"({int(now - t0) // 60} min) …", "info")
     return n
 
@@ -432,7 +433,7 @@ def _find_clob_tables_fs(extract_dir: Path) -> list[dict]:
 
 
 # Antall eksporterte felt per tabell som listes enkeltvis i loggen
-_LOG_FILES = 50
+_LOG_FILES = 3      # felt som listes enkeltvis per tabell (eksempler)
 
 
 def _process_table_fs(
@@ -459,7 +460,8 @@ def _process_table_fs(
     table_name    = table_info["name"]
 
     xml_path = extract_dir / "content" / schema_folder / folder / f"{folder}.xml"
-    w(f"  Prosesserer {table_name} — CLOB-kol: {clob_columns}", "info")
+    w(f"  Prosesserer {table_name} ({folder}) — LOB-kolonner: "
+      + ", ".join(f"c{c}" for c in clob_columns), "info")
 
     if not xml_path.exists():
         w(f"  [ADVARSEL] {xml_path} ikke funnet", "warn")
@@ -566,7 +568,7 @@ def _process_table_fs(
 
                             if lob_written <= _LOG_FILES:
                                 w(f"    rad {row_counter}/{target_tag} → "
-                                  f"lob{col_index}/{filename} ({length:,} bytes)", "info")
+                                  f"lob{col_index}/{filename} ({_fnum(length)} bytes)", "info")
 
                         except Exception as exc:
                             w(f"  [FEIL] LOB rad {row_counter}/{target_tag}: {exc}",
@@ -590,9 +592,11 @@ def _process_table_fs(
             pass
 
     if lob_written > _LOG_FILES:
-        w(f"    … og {lob_written - _LOG_FILES:,} felt til (ikke listet enkeltvis)", "info")
-    w(f"  {table_name}: {lob_written} felt eksportert ({row_counter} rader)",
-      "ok" if lob_written else "info")
+        w(f"    … og {_fnum(lob_written - _LOG_FILES)} felt til (ikke listet enkeltvis)", "info")
+    if lob_written:
+        w(f"  {table_name}: {lob_written} felt eksportert ({row_counter} rader)", "ok")
+    else:
+        w(f"    ingen HEX-felt ({row_counter} rader)", "info")
     return lob_written
 
 
@@ -625,7 +629,8 @@ def _process_table(
     table_name    = table_info["name"]
     xml_arc_path  = f"content/{schema_folder}/{folder}/{folder}.xml"
 
-    w(f"  Prosesserer {table_name} — CLOB-kol: {clob_columns}", "info")
+    w(f"  Prosesserer {table_name} ({folder}) — LOB-kolonner: "
+      + ", ".join(f"c{c}" for c in clob_columns), "info")
 
     if xml_arc_path not in set(zin.namelist()):
         w(f"    [ADVARSEL] {xml_arc_path} ikke funnet", "warn")
@@ -738,7 +743,7 @@ def _process_table(
 
                             if lob_written <= _LOG_FILES:
                                 w(f"    rad {row_counter}/{target_tag} → "
-                                  f"{zip_path} ({length:,} bytes)", "info")
+                                  f"{zip_path} ({_fnum(length)} bytes)", "info")
 
                         except Exception as exc:
                             w(f"    [FEIL] CLOB rad {row_counter}/{target_tag}:"
@@ -764,9 +769,11 @@ def _process_table(
             pass
 
     if lob_written > _LOG_FILES:
-        w(f"    … og {lob_written - _LOG_FILES:,} felt til (ikke listet enkeltvis)", "info")
-    w(f"  {table_name}: {lob_written} felt eksportert "
-      f"({row_counter} rader)", "ok" if lob_written else "info")
+        w(f"    … og {_fnum(lob_written - _LOG_FILES)} felt til (ikke listet enkeltvis)", "info")
+    if lob_written:
+        w(f"  {table_name}: {lob_written} felt eksportert ({row_counter} rader)", "ok")
+    else:
+        w(f"    ingen HEX-felt ({row_counter} rader)", "info")
     return lob_written
 
 
@@ -933,10 +940,8 @@ class HexExtractOperation(BaseOperation):
                 progress("phase_done")
             return []
 
-        w(f"  Fant {len(tables)} tabell(er) med LOB-kolonner:", "info")
-        for t in tables:
-            w(f"    • {t['schema_folder']}/{t['folder']} "
-              f"— kol {t['clob_columns']}", "info")
+        # Tabellene listes én gang — med navn — når de behandles
+        w(f"  Fant {len(tables)} tabell(er) med LOB-kolonner", "info")
         progress("phase_done")
 
         phase(2, "Prosesserer tabeller (filesystem)")
@@ -1026,10 +1031,7 @@ class HexExtractOperation(BaseOperation):
                     progress("phase_done")
                 return []
 
-            w(f"  Fant {len(tables)} tabell(er) med LOB-kolonner:", "info")
-            for t in tables:
-                w(f"    • {t['schema_folder']}/{t['folder']} "
-                  f"— kol {t['clob_columns']}", "info")
+            w(f"  Fant {len(tables)} tabell(er) med LOB-kolonner", "info")
 
             # Sett med tableX.xml som behandles av _process_table
             table_xml_paths: set[str] = {

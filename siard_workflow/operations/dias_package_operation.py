@@ -294,6 +294,19 @@ def _fmt_bytes(n: int) -> str:
     return f"{n} B"
 
 
+def unique_by_dest(extras: list) -> list:
+    """Ekstra filer uten duplikater: første fil per målsti i pakken beholdes."""
+    seen: set = set()
+    out: list = []
+    for ef in extras:
+        key = str(ef.get("dest", "")).replace("\\", "/").lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(ef)
+    return out
+
+
 class DiasPackageOperation(BaseOperation):
     """Pakker SIARD-fil inn i DIAS/SIP-format (METS + PREMIS) for ESSArch."""
 
@@ -627,6 +640,13 @@ class DiasPackageOperation(BaseOperation):
         _auto_add(_auto_newest(siard_path.parent, _log_dir,
                                pattern=f"{base}_premis.xml"),
                   _repo, "premis-proveniens")
+
+        # Samme fil kan være valgt i dialogen og funnet automatisk (ulik
+        # skrivemåte av stien) — hver målsti skal bare med én gang
+        metadata_extras = unique_by_dest(metadata_extras)
+        if _fl and getattr(_fl, "log_path", None):
+            _wlog("  Kjøreloggen i pakken gjelder fram til pakketidspunktet — den "
+                  "fullstendige loggen ligger i logg-mappa")
 
         _wlog(f"  Totalt {len(metadata_extras)} ekstra filer klar for pakking")
         # ─────────────────────────────────────────────────────────────────────

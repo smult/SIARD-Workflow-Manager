@@ -36,7 +36,7 @@ from pathlib import Path
 from siard_workflow.core.base_operation import BaseOperation, OperationResult
 from siard_workflow.core.context import WorkflowContext
 from siard_workflow.core.column_xsd_types import (
-    apply_xsd_fixes, check_dir, check_zip, fix_dir, format_finding,
+    apply_xsd_fixes, check_dir, check_zip, fix_dir, format_finding, group_lines,
     xsd_arc_path, xsds_with_fixes,
 )
 
@@ -72,7 +72,7 @@ class XsdTypeFixOperation(BaseOperation):
             return "ingen XSD-typeendringer"
         return (f"{len(changes)} retting(er) i tableX.xsd slik DBPTK-validatoren "
                 f"krever (P_4.3-3 kolonnetyper / T_6.3-1 datofasetter), "
-                f"tapsfritt for verdiene: " + "; ".join(changes))
+                f"tapsfritt for verdiene: " + "; ".join(group_lines(changes, 5)))
 
     def run(self, ctx: WorkflowContext) -> OperationResult:
         log = ctx.metadata.get("file_logger")
@@ -157,13 +157,14 @@ class XsdTypeFixOperation(BaseOperation):
         fixable = [f for f in findings if f.get("fix_to")]
         manual  = [f for f in findings if not f.get("fix_to")]
         if fixable:
+            # Like rettinger i mange tabeller vises som én linje med antall
             w(f"  {len(fixable)} avvik rettes (tapsfri utvidelse):", "step")
-            for f in fixable:
-                w(f"    {format_finding(f)}", "info")
+            for line in group_lines(format_finding(f) for f in fixable):
+                w(f"    {line}", "info")
         if manual:
             w(f"  {len(manual)} avvik krever manuell vurdering (rettes ikke):", "warn")
-            for f in manual:
-                w(f"    {format_finding(f)}", "warn")
+            for line in group_lines((format_finding(f) for f in manual), 10):
+                w(f"    {line}", "warn")
 
     def _result(self, findings: list[dict], changes: list[str], w,
                 dst: Path | None) -> OperationResult:

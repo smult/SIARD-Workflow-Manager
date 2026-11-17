@@ -41,6 +41,7 @@ Valg ``ref_target`` — ENTEN KDRS Søk & Vis ELLER DBPTK-validering (default KD
 """
 
 from __future__ import annotations
+from siard_workflow.core.fmt import num as _fnum
 import os
 import re
 import shutil
@@ -228,14 +229,14 @@ def describe_lob_ref_column(c: dict) -> str:
     parts = []
     if c["fixable"]:
         parts.append(
-            f"{c['fixable']:,} av {c['refs']:,} LOB-referanser slås ikke opp av "
+            f"{_fnum(c['fixable'])} av {_fnum(c['refs'])} LOB-referanser slås ikke opp av "
             f"DBPTK-validatoren (basenavn + lobFolder «{c['lob_folder'] or ''}» "
             f"uten '/'), men filene finnes — f.eks. file=\"{c['example_ref']}\" → "
             f"{c['example_full']}. Løses med «Korriger lobFolder» → «DBPTK-validering "
             f"(full sti)» — men da finner KDRS Søk & Vis ikke filene (enten/eller)")
     if c["missing"]:
         ex = ", ".join(c["missing_examples"])
-        parts.append(f"{c['missing']:,} LOB-fil(er) mangler i arkivet, f.eks. {ex}")
+        parts.append(f"{_fnum(c['missing'])} LOB-fil(er) mangler i arkivet, f.eks. {ex}")
     return f"{where}: " + "; ".join(parts)
 
 
@@ -468,10 +469,12 @@ class LobFolderFixOperation(BaseOperation):
                 pcb("log", msg=msg, level=lvl)
 
         full_paths = self.use_full_paths()
-        w("  Filreferanser (file=): " + (REF_DBPTK + " — KDRS Søk & Vis finner ikke "
-                                         "filene" if full_paths else
-                                         REF_KDRS + " — DBPTK-validatoren melder "
-                                         "«not found external lob»"), "info")
+        w("  Filreferanser (file=) skrives for " + (
+            REF_DBPTK + ". Merk: KDRS Søk & Vis finner ikke LOB-filene med denne "
+                        "skrivemåten (velg KDRS-format i innstillingene hvis uttrekket "
+                        "skal åpnes der)" if full_paths else
+            REF_KDRS + ". Merk: DBPTK-validatoren melder «not found external lob» "
+                       "med denne skrivemåten"), "info")
 
         # ── Pipeline-modus ────────────────────────────────────────────────────
         if ctx.extracted_path and ctx.extracted_path.is_dir():
@@ -556,7 +559,7 @@ class LobFolderFixOperation(BaseOperation):
                             zin, zout, item, sf, tf, lob_tables[key],
                             lambda rel: rel in zip_names, stats, w)
                         if n:
-                            w(f"  {item.filename}: {n:,} file=-referanser → "
+                            w(f"  {item.filename}: {_fnum(n)} file=-referanser → "
                               f"full sti", "info")
                         continue
                     if item.is_dir():
@@ -586,10 +589,10 @@ class LobFolderFixOperation(BaseOperation):
     def _path_summary(stats: dict) -> list[str]:
         out = []
         if stats.get("file_paths"):
-            out.append(f"{stats['file_paths']:,} file=-referanser skrevet "
+            out.append(f"{_fnum(stats['file_paths'])} file=-referanser skrevet "
                        f"som full content/-sti")
         if stats.get("file_unresolved"):
-            out.append(f"ADVARSEL: {stats['file_unresolved']:,} file=-referanser "
+            out.append(f"ADVARSEL: {_fnum(stats['file_unresolved'])} file=-referanser "
                        f"kunne ikke gjenfinnes og er urørt")
         return out
 
@@ -618,7 +621,7 @@ class LobFolderFixOperation(BaseOperation):
                 if n:
                     tmp.replace(xml_path)
                     total += n
-                    w(f"  {sf}/{tf}/{tf}.xml: {n:,} file=-referanser → "
+                    w(f"  {sf}/{tf}/{tf}.xml: {_fnum(n)} file=-referanser → "
                       f"full sti", "info")
                 else:
                     tmp.unlink(missing_ok=True)
@@ -627,7 +630,7 @@ class LobFolderFixOperation(BaseOperation):
                 w(f"  FEIL patch {tf}.xml: {exc}", "feil")
         stats["file_paths"] = total
         if stats.get("file_unresolved"):
-            w(f"  ADVARSEL: {stats['file_unresolved']:,} file=-referanser "
+            w(f"  ADVARSEL: {_fnum(stats['file_unresolved'])} file=-referanser "
               f"kunne ikke gjenfinnes — urørt", "warn")
 
     @staticmethod

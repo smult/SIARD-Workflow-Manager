@@ -21,16 +21,105 @@ from pathlib import Path
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _human_size(n: int) -> str:
-    """Returnerer menneskelig lesbar filstørrelse (f.eks. '12.4 MB')."""
+    """Returnerer menneskelig lesbar filstørrelse (f.eks. «12,4 MB»)."""
     if n is None:
         return "–"
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if abs(n) < 1024.0:
-            if unit == "B":
-                return f"{n} {unit}"
-            return f"{n:.1f} {unit}"
-        n /= 1024.0
-    return f"{n:.1f} PB"
+    from siard_workflow.core import fmt
+    return fmt.size(n)
+
+
+def _num(n) -> str:
+    """Antall med (hardt) mellomrom som tusenskille — brytes ikke i en celle."""
+    from siard_workflow.core import fmt
+    return fmt.num(n).replace(" ", " ")
+
+
+def _tbl_key(schema: str, table: str) -> str:
+    """Stabilt ankernavn for lenker fra tabelloversikten til detaljene."""
+    import re as _re
+    return "t_" + _re.sub(r"[^A-Za-z0-9]", "_", f"{schema}__{table}")
+
+
+def short_connection(conn) -> str:
+    """
+    Tilkoblingsstrengen forkortet til server og database. Rapporten følger
+    pakken — brukernavn, passord og tekniske parametre hører ikke hjemme der.
+    """
+    import re as _re
+    s = (conn or "").strip()
+    if not s:
+        return ""
+    if "=" in s and "://" not in s:
+        parts = {}
+        for p in s.split(";"):
+            if "=" in p:
+                k, v = p.split("=", 1)
+                parts[k.strip().lower()] = v.strip()
+        server = (parts.get("data source") or parts.get("server")
+                  or parts.get("host") or parts.get("address"))
+        db = parts.get("initial catalog") or parts.get("database")
+        out = [x for x in (f"server {server}" if server else "",
+                           f"database {db}" if db else "") if x]
+        return ", ".join(out) if out else "(oppgitt — se metadata.xml)"
+    s = _re.sub(r"//[^/@\s]+@", "//", s)          # bruker:passord@
+    return _re.split(r"[?;]", s, maxsplit=1)[0]
+
+
+def referenced_by(schemas: list) -> dict:
+    """{(skjema, tabell) med små bokstaver: [tabeller som har fremmednøkkel dit]}."""
+    out: dict = {}
+    for schema in schemas or []:
+        sname = schema.get("name", "")
+        for tbl in schema.get("tables", []):
+            for fk in tbl.get("foreign_keys", []) or []:
+                rs = (fk.get("ref_schema") or sname).lower()
+                rt = (fk.get("ref_table") or "").lower()
+                if not rt:
+                    continue
+                name = tbl.get("name", "")
+                if rs != sname.lower():
+                    name = f"{sname}.{name}"
+                lst = out.setdefault((rs, rt), [])
+                if name not in lst:
+                    lst.append(name)
+    for lst in out.values():
+        lst.sort(key=str.lower)
+    return out
+
+
+def quality_notes(meta: dict) -> list:
+    """Merknader til metadataene — det en mottaker bør vite eller rette."""
+    notes: list = []
+    span = (meta.get("data_origin_time_span") or "").strip()
+    if span and not meta.get("data_origin_time_span_estimated"):
+        try:
+            from siard_workflow.core.date_span import guess_compact_span, metadata_span
+            if metadata_span(span) is None:
+                g = guess_compact_span(span)
+                notes.append(
+                    f"Tidsperioden «{span}» lar seg ikke tolke som datoer"
+                    + (f" (ligner DDMMÅÅÅÅ: {g[0]} – {g[1]})" if g else "") + ".")
+        except Exception:
+            pass
+    elif not span and not meta.get("data_start"):
+        notes.append("Tidsperiode (dataOriginTimespan) er ikke oppgitt.")
+    desc = (meta.get("description") or "").strip()
+    if not desc or desc.lower() in ("(unspecified)", "unspecified", "-", "n/a"):
+        notes.append("Uttrekket har ingen beskrivelse"
+                     + (f" («{desc}»)." if desc else "."))
+    tables = [(s.get("name", ""), t) for s in meta.get("schemas", [])
+              for t in s.get("tables", [])]
+    no_pk = sorted(t.get("name", "") for _s, t in tables if not t.get("primary_key"))
+    if no_pk:
+        shown = ", ".join(no_pk[:8]) + (f" og {len(no_pk) - 8} til" if len(no_pk) > 8 else "")
+        notes.append(f"{len(no_pk)} tabell(er) har ingen primærnøkkel: {shown}.")
+    n_empty = sum(1 for _s, t in tables if not (t.get("rows", 0) or 0))
+    if n_empty:
+        notes.append(f"{n_empty} av {len(tables)} tabeller er tomme (0 rader).")
+    n_desc = sum(1 for _s, t in tables if (t.get("description") or "").strip())
+    if tables and not n_desc:
+        notes.append("Ingen tabeller har beskrivelse i metadata.xml.")
+    return notes
 
 
 def _trunc_name(s: str, n: int = 15) -> str:
@@ -262,6 +351,23 @@ def generate_metadata_pdf(
         def wrap(self, aw, ah):
             return self.width, self.height
 
+    class Outline(Flowable):
+        """Usynlig: setter et PDF-bokmerke (navigasjonspanelet) og et lenkemål."""
+        def __init__(self, title, key, level=0):
+            super().__init__()
+            self.title, self.key, self.level = str(title), str(key), int(level)
+            self.width = self.height = 0
+
+        def wrap(self, aw, ah):
+            return 0, 0
+
+        def draw(self):
+            self.canv.bookmarkPage(self.key)
+            self.canv.addOutlineEntry(self.title, self.key, level=self.level,
+                                      closed=self.level >= 1)
+
+    _refs_by = referenced_by(meta.get("schemas", []))
+
     # ══════════════════════════════════════════════════════════════════════
     # Side 1: Forsidebygging
     # ══════════════════════════════════════════════════════════════════════
@@ -366,6 +472,7 @@ def generate_metadata_pdf(
 
     def _build_overview() -> list:
         story = []
+        story.append(Outline("Databaseoversikt", "sec_overview", 0))
         story.append(Paragraph("Databaseoversikt", style_h1))
         story.append(HRFlowable(width=CONTENT_W, thickness=1.0,
                                 color=C_NAVY, spaceAfter=4*mm))
@@ -381,7 +488,7 @@ def generate_metadata_pdf(
             ("Databasenavn",         _val(meta.get("db_name"))),
             ("DBMS",                 _val(meta.get("db_product"))),
             ("Opprinnelse",          _val(meta.get("db_origin"))),
-            ("Tilkoblings-URL",      _val(meta.get("connection"))),
+            ("Tilkobling",           _val(short_connection(meta.get("connection")))),
             ("DB-bruker",            _val(meta.get("db_user"))),
             ("Arkiveringsdato",      _val(meta.get("archival_date"))),
             ("Produsert av",         _val(meta.get("producer_app"))),
@@ -393,8 +500,8 @@ def generate_metadata_pdf(
               if _ds_found else []),
             ("SIARD-versjon",        _val(meta.get("siard_version"))),
             ("Meldingssammendrag",   digest_str),
-            ("Antall ZIP-poster",    str(meta.get("zip_entry_count", "–"))),
-            ("LOB-filer totalt",     str(meta.get("lob_file_count", "–"))),
+            ("Antall ZIP-poster",    _num(meta.get("zip_entry_count", 0))),
+            ("LOB-filer totalt",     _num(meta.get("lob_file_count", 0))),
             ("Filstørrelse",         _human_size(meta.get("file_size"))),
         ]
         desc = (meta.get("description") or "").strip()
@@ -462,6 +569,27 @@ def generate_metadata_pdf(
                 + "</i>", style_caption))
             story.append(Spacer(1, 4 * mm))
 
+        # ── Merknader til metadataene ─────────────────────────────────────
+        _notes = quality_notes(meta)
+        if _notes:
+            from xml.sax.saxutils import escape as _esc_n
+            story.append(Paragraph("Merknader til metadataene", style_h2))
+            for _note in _notes:
+                story.append(Paragraph("•  " + _esc_n(_note), style_body))
+            story.append(Spacer(1, 4 * mm))
+
+        # ── Mest refererte tabeller (kjernen i datamodellen) ──────────────
+        _central = sorted(((len(v), k[1]) for k, v in _refs_by.items()), reverse=True)[:8]
+        if _central:
+            _names = {t.get("name", "").lower(): t.get("name", "")
+                      for s in meta.get("schemas", []) for t in s.get("tables", [])}
+            story.append(Paragraph("Mest refererte tabeller", style_h2))
+            story.append(Paragraph(
+                "Tabellene flest andre tabeller peker til med fremmednøkkel: "
+                + ", ".join(f"<b>{_names.get(t, t)}</b> ({n})" for n, t in _central) + ".",
+                style_body))
+            story.append(Spacer(1, 4 * mm))
+
         # ── Horisontalt søylediagram: topp-15 tabeller etter rader ────────
         all_tables = []
         schema_colors = {}
@@ -478,9 +606,11 @@ def generate_metadata_pdf(
             all_tables.sort(reverse=True)
             top15 = all_tables[:15]
 
-            story.append(Paragraph("Topp-15 tabeller etter radantall", style_h2))
-
             chart_h = max(60 * mm, len(top15) * 7 * mm + 20 * mm)
+            # Overskriften skal ikke stå alene nederst på en side
+            from reportlab.platypus import CondPageBreak
+            story.append(CondPageBreak(chart_h + 20 * mm))
+            story.append(Paragraph("Topp-15 tabeller etter radantall", style_h2))
             chart_w = CONTENT_W
             bar_area_w = chart_w - 50 * mm   # venstre reservert til tabellnavn
             max_rows = max(r for r, _, _, _ in top15) if top15 else 1
@@ -540,6 +670,7 @@ def generate_metadata_pdf(
 
     def _build_inventory() -> list:
         story = []
+        story.append(Outline("Tabelloversikt", "sec_inventory", 0))
         story.append(Paragraph("Tabelloversikt", style_h1))
         story.append(HRFlowable(width=CONTENT_W, thickness=1.0,
                                 color=C_NAVY, spaceAfter=4*mm))
@@ -558,13 +689,21 @@ def generate_metadata_pdf(
 
         # Kolonne-bredder:
         #  Skjema(18) | Tabell(36) | Rader(20) | LOB(15) | PK(28) | Beskrivelse(rest)
-        CW_SCHEMA = 18 * mm
-        CW_NAME   = 36 * mm
+        # «Beskrivelse» vises bare når noen tabell har en — ellers får
+        # tabellnavnet plassen (lange navn ble brutt midt i ordet)
+        has_desc = any((t.get("description") or "").strip() for _s, t in all_tables)
+        CW_SCHEMA = 16 * mm
         CW_ROWS   = 20 * mm
-        CW_LOB    = 15 * mm
-        CW_PK     = 28 * mm
-        CW_DESC   = CONTENT_W - CW_SCHEMA - CW_NAME - CW_ROWS - CW_LOB - CW_PK
-        col_widths = [CW_SCHEMA, CW_NAME, CW_ROWS, CW_LOB, CW_PK, CW_DESC]
+        CW_LOB    = 18 * mm
+        if has_desc:
+            CW_NAME = 52 * mm
+            CW_PK   = 30 * mm
+            CW_DESC = CONTENT_W - CW_SCHEMA - CW_NAME - CW_ROWS - CW_LOB - CW_PK
+            col_widths = [CW_SCHEMA, CW_NAME, CW_ROWS, CW_LOB, CW_PK, CW_DESC]
+        else:
+            CW_NAME = 68 * mm
+            CW_PK   = CONTENT_W - CW_SCHEMA - CW_NAME - CW_ROWS - CW_LOB
+            col_widths = [CW_SCHEMA, CW_NAME, CW_ROWS, CW_LOB, CW_PK]
 
         headers = [
             _p("Skjema",       style_cell_bold),
@@ -572,8 +711,13 @@ def generate_metadata_pdf(
             _p("Rader",        style_cell_bold),
             _p("LOB-filer",    style_cell_bold),
             _p("Primærnøkkel", style_cell_bold),
-            _p("Beskrivelse",  style_cell_bold),
         ]
+        if has_desc:
+            headers.append(_p("Beskrivelse", style_cell_bold))
+        story.append(Paragraph(
+            "Klikk på et tabellnavn for å gå til kolonner og nøkler. Tabellene "
+            "finnes også som bokmerker i PDF-leseren.", style_caption))
+        story.append(Spacer(1, 2 * mm))
 
         C_TBL_ROW  = C_LIGHT_BLUE
 
@@ -616,13 +760,14 @@ def generate_metadata_pdf(
             # Tabellnavn-celle: navn (fet) + tableX-mappe
             tbl_name   = tbl.get("name", "")
             tbl_folder = tbl.get("folder", "")
-            name_parts = [Paragraph(f"<b>{tbl_name}</b>", style_cell)]
-            if tbl_folder:
-                name_parts.append(Paragraph(tbl_folder, style_tbl_desc))
-            name_cell = name_parts if len(name_parts) > 1 else name_parts[0]
+            name_cell = Paragraph(
+                f'<a href="#{_tbl_key(sname, tbl_name)}" color="#1a3866">'
+                f"<b>{tbl_name}</b></a>"
+                + (f' &nbsp;<font size="6.5" color="#8c8c8c">{tbl_folder}</font>'
+                   if tbl_folder else ""), style_cell)
 
             # LOB-filer: vis antall (tom hvis ingen)
-            lob_str = str(lob_file_cnt) if lob_file_cnt > 0 else ""
+            lob_str = _num(lob_file_cnt) if lob_file_cnt > 0 else ""
 
             # ── Tabellrad ──────────────────────────────────────────────────
             tbl_row = [
@@ -631,14 +776,15 @@ def generate_metadata_pdf(
                 _p(rows_str, style_cell_bold),
                 _p(lob_str, style_cell_center),
                 _p(pk_str, style_cell),
-                _p(desc, style_cell),
             ]
+            if has_desc:
+                tbl_row.append(_p(desc, style_cell))
             rows.append(tbl_row)
 
             bg = C_LOB_YELLOW if has_lob else C_TBL_ROW
             row_styles.append(("BACKGROUND", (0, ri), (-1, ri), bg))
-            row_styles.append(("TOPPADDING",    (0, ri), (-1, ri), 4))
-            row_styles.append(("BOTTOMPADDING", (0, ri), (-1, ri), 5))
+            row_styles.append(("TOPPADDING",    (0, ri), (-1, ri), 2))
+            row_styles.append(("BOTTOMPADDING", (0, ri), (-1, ri), 2.5))
             row_styles.append(("VALIGN",        (0, ri), (-1, ri), "TOP"))
             ri += 1
 
@@ -668,6 +814,29 @@ def generate_metadata_pdf(
             '<b>LOB-filer</b> = antall binærfiler talt fra content/schema{n}/table{m}/lob*/',
             style_caption,
         ))
+
+        # ── LOB-kolonner: antall filer og størrelse per kolonne ───────────
+        lob_rows = []
+        for sname, tbl in all_tables:
+            for lc in tbl.get("lob_columns") or []:
+                lob_rows.append([
+                    _p(f"<b>{tbl.get('name', '')}</b>", style_cell),
+                    _p(lc.get("column") or lc.get("folder", ""), style_cell),
+                    _p(_abbrev_type(lc.get("type", "")) or "–", style_cell),
+                    _p(lc.get("folder", ""), style_cell),
+                    _p(_num(lc.get("files", 0)), style_cell),
+                    _p(_human_size(lc.get("bytes", 0)), style_cell),
+                ])
+        if lob_rows:
+            story.append(Spacer(1, 6 * mm))
+            story.append(Paragraph("LOB-kolonner (filer i uttrekket)", style_h2))
+            lt = Table([[_p(h, style_cell_bold) for h in
+                         ("Tabell", "Kolonne", "SQL-type", "Mappe", "Filer", "Størrelse")]]
+                       + lob_rows,
+                       colWidths=[52 * mm, 44 * mm, 22 * mm, 16 * mm, 18 * mm,
+                                  CONTENT_W - 152 * mm], repeatRows=1)
+            lt.setStyle(_std_table_style())
+            story.append(lt)
 
         return story
 
@@ -866,7 +1035,9 @@ def generate_metadata_pdf(
     # ══════════════════════════════════════════════════════════════════════
 
     def _build_details() -> list:
+        from xml.sax.saxutils import escape as _esc
         story = []
+        story.append(Outline("Skjema- og tabelldetaljer", "sec_details", 0))
         story.append(Paragraph("Skjema- og tabelldetaljer", style_h1))
         story.append(HRFlowable(width=CONTENT_W, thickness=1.0,
                                 color=C_NAVY, spaceAfter=4*mm))
@@ -876,70 +1047,121 @@ def generate_metadata_pdf(
             story.append(Paragraph("Ingen skjemaer funnet.", style_body))
             return story
 
+        def _keys_block(sname: str, tbl: dict) -> list:
+            """Primærnøkkel, fremmednøkler, unike nøkler og «refereres av»."""
+            out = []
+            pk = tbl.get("primary_key")
+            if pk:
+                out.append(Spacer(1, 1.5 * mm))
+                out.append(Paragraph(
+                    f'<b>Primærnøkkel</b> ({_esc(pk.get("name", ""))}): '
+                    + _esc(", ".join(pk.get("columns", []))), style_body_small))
+            fks = tbl.get("foreign_keys", [])
+            if fks:
+                out.append(Spacer(1, 1 * mm))
+                out.append(Paragraph("<b>Fremmednøkler:</b>", style_body_small))
+                for fk in fks:
+                    ref_pairs = ", ".join(
+                        f'{r.get("column")} → {r.get("referenced")}'
+                        for r in fk.get("references", []))
+                    ref_schema = fk.get("ref_schema", "")
+                    ref_table  = fk.get("ref_table", "")
+                    dest = f"{ref_schema}.{ref_table}" if ref_schema else ref_table
+                    out.append(Paragraph(
+                        f'&nbsp;&nbsp;{_esc(fk.get("name", ""))}: → {_esc(dest)}: '
+                        f'{_esc(ref_pairs)}', style_body_small))
+            uks = tbl.get("unique_keys", [])
+            if uks:
+                out.append(Spacer(1, 1 * mm))
+                out.append(Paragraph("<b>Unike nøkler:</b>", style_body_small))
+                for uk in uks:
+                    out.append(Paragraph(
+                        f'&nbsp;&nbsp;{_esc(uk.get("name", ""))}: '
+                        + _esc(", ".join(uk.get("columns", []))), style_body_small))
+            refs = _refs_by.get((sname.lower(), tbl.get("name", "").lower())) or []
+            if refs:
+                shown = ", ".join(refs[:14])
+                if len(refs) > 14:
+                    shown += f" og {len(refs) - 14} til"
+                out.append(Spacer(1, 1 * mm))
+                out.append(Paragraph(
+                    f"<b>Refereres av</b> ({len(refs)}): {_esc(shown)}", style_body_small))
+            return out
+
         for schema in schemas:
             schema_name = schema.get("name", "Ukjent")
             schema_desc = (schema.get("description") or "").strip()
 
             # ── Skjema-overskrift ────────────────────────────────────────
-            schema_block = []
-            schema_block.append(Spacer(1, 4 * mm))
-            schema_block.append(Paragraph(f"Skjema: {schema_name}", style_h2))
+            story.append(Spacer(1, 4 * mm))
+            story.append(Outline(f"Skjema: {schema_name}", f"sch_{id(schema)}", 1))
+            story.append(Paragraph(f"Skjema: {_esc(schema_name)}", style_h2))
             if schema_desc:
-                schema_block.append(Paragraph(schema_desc, style_caption))
-            schema_block.append(HRFlowable(width=CONTENT_W, thickness=0.6,
-                                           color=C_BLUE, spaceAfter=2*mm))
-            story.extend(schema_block)
+                story.append(Paragraph(_esc(schema_desc), style_caption))
+            story.append(HRFlowable(width=CONTENT_W, thickness=0.6,
+                                    color=C_BLUE, spaceAfter=2*mm))
 
-            tables = schema.get("tables", [])
+            # Alfabetisk — som tabelloversikten. Tabeller med innhold først;
+            # tomme tabeller samles kompakt til slutt.
+            tables = sorted(schema.get("tables", []),
+                            key=lambda t: t.get("name", "").lower())
             if not tables:
                 story.append(Paragraph("Ingen tabeller i dette skjemaet.", style_body))
                 continue
+            filled = [t for t in tables if (t.get("rows", 0) or 0) > 0]
+            empty  = [t for t in tables if (t.get("rows", 0) or 0) <= 0]
 
-            for tbl in tables:
+            for tbl in filled:
                 tname = tbl.get("name", "Ukjent")
-                rows_val = tbl.get("rows", 0) or 0
                 tbl_desc = (tbl.get("description") or "").strip()
                 columns = tbl.get("columns", [])
+                key = _tbl_key(schema_name, tname)
 
                 # ── Tabell-overskrift ────────────────────────────────────
-                tbl_block = []
-                rows_str = f"{rows_val:,}".replace(",", "\u00a0")
-                tbl_block.append(Spacer(1, 3 * mm))
-                tbl_block.append(
-                    Paragraph(
-                        f"{tname} &nbsp;&nbsp;"
-                        f'<font color="grey" size="9">{rows_str} rader</font>',
-                        style_h3,
-                    )
-                )
+                tbl_block = [Spacer(1, 3 * mm), Outline(tname, key, 2)]
+                folder = tbl.get("folder", "")
+                sub = f"{_num(tbl.get('rows', 0) or 0)} rader"
+                if folder:
+                    sub += f" · {folder}"
+                if tbl.get("lob_file_count"):
+                    sub += f" · {_num(tbl['lob_file_count'])} LOB-filer"
+                tbl_block.append(Paragraph(
+                    f'<a name="{key}"/>{_esc(tname)} &nbsp;&nbsp;'
+                    f'<font color="grey" size="9">{_esc(sub)}</font>', style_h3))
                 if tbl_desc:
-                    tbl_block.append(Paragraph(tbl_desc, style_caption))
+                    tbl_block.append(Paragraph(_esc(tbl_desc), style_caption))
 
-                # ── Kolonnetabell ────────────────────────────────────────
-                col_headers = ["Pos", "Kolonne", "SQL-type", "Orig.type",
-                               "LOB", "Beskrivelse"]
-                cw = [10*mm, 44*mm, 22*mm, 22*mm, 10*mm,
-                      CONTENT_W - 108*mm]
+                # ── Kolonnetabell — tomme kolonner («LOB», «Beskrivelse») skjules
+                has_desc = any((c.get("description") or "").strip() for c in columns)
+                has_lob  = any(c.get("is_lob") for c in columns)
+                col_headers = ["Pos", "Kolonne", "SQL-type", "Orig.type"]
+                if has_desc:
+                    cw = [10*mm, 46*mm, 24*mm, 24*mm]
+                else:
+                    cw = [10*mm, 70*mm, 42*mm, 0]
+                if has_lob:
+                    col_headers.append("LOB")
+                    cw.append(10*mm)
+                if has_desc:
+                    col_headers.append("Beskrivelse")
+                    cw.append(CONTENT_W - sum(cw))
+                else:
+                    cw[3] = CONTENT_W - sum(cw)
 
                 col_rows = [col_headers]
                 col_row_styles = []
                 for ci, col_info in enumerate(columns):
                     ri = ci + 1
                     is_lob = col_info.get("is_lob", False)
-                    nullable = "Ja" if col_info.get("nullable", True) else "Nei"
-                    lob_flag = "Ja" if is_lob else ""
-                    mime = (col_info.get("mime_type") or "").strip() or "–"
-                    cdesc = (col_info.get("description") or "").strip()
-                    orig_t = _abbrev_type(col_info.get("type_original", ""))
-
-                    col_rows.append([
-                        str(col_info.get("pos", ci + 1)),
-                        col_info.get("name", ""),
-                        _abbrev_type(col_info.get("type", "")),
-                        orig_t or "–",
-                        lob_flag,
-                        _p(cdesc),
-                    ])
+                    row = [str(col_info.get("pos", ci + 1)),
+                           _p(_esc(col_info.get("name", ""))),
+                           _abbrev_type(col_info.get("type", "")),
+                           _abbrev_type(col_info.get("type_original", "")) or "–"]
+                    if has_lob:
+                        row.append("Ja" if is_lob else "")
+                    if has_desc:
+                        row.append(_p(_esc((col_info.get("description") or "").strip())))
+                    col_rows.append(row)
                     if is_lob:
                         col_row_styles.append(
                             ("BACKGROUND", (0, ri), (-1, ri), C_LOB_YELLOW))
@@ -954,67 +1176,46 @@ def generate_metadata_pdf(
                 col_ts.add("FONTSIZE", (0, 0), (-1, -1), 7.5)
                 col_ts.add("LEADING", (0, 0), (-1, -1), 9)
                 col_ts.add("ALIGN", (0, 1), (0, -1), "CENTER")
-                col_ts.add("ALIGN", (4, 1), (4, -1), "CENTER")
-                col_ts.add("VALIGN", (5, 1), (5, -1), "TOP")
+                if has_lob:
+                    col_ts.add("ALIGN", (4, 1), (4, -1), "CENTER")
                 ct.setStyle(col_ts)
                 tbl_block.append(ct)
-
-                # ── Primærnøkkel ─────────────────────────────────────────
-                pk = tbl.get("primary_key")
-                if pk:
-                    pk_cols = ", ".join(pk.get("columns", []))
-                    tbl_block.append(Spacer(1, 1.5 * mm))
-                    tbl_block.append(
-                        Paragraph(
-                            f'<b>Primærnøkkel</b> ({pk.get("name", "")}):'
-                            f' {pk_cols}',
-                            style_body_small,
-                        )
-                    )
-
-                # ── Fremmednøkler ────────────────────────────────────────
-                fks = tbl.get("foreign_keys", [])
-                if fks:
-                    tbl_block.append(Spacer(1, 1 * mm))
-                    tbl_block.append(Paragraph("<b>Fremmednøkler:</b>",
-                                               style_body_small))
-                    for fk in fks:
-                        refs = fk.get("references", [])
-                        ref_pairs = ", ".join(
-                            f'{r.get("column")} → {r.get("referenced")}'
-                            for r in refs
-                        )
-                        ref_schema = fk.get("ref_schema", "")
-                        ref_table  = fk.get("ref_table", "")
-                        dest = f"{ref_schema}.{ref_table}" if ref_schema else ref_table
-                        tbl_block.append(
-                            Paragraph(
-                                f'&nbsp;&nbsp;{fk.get("name", "")}:'
-                                f' → {dest}: {ref_pairs}',
-                                style_body_small,
-                            )
-                        )
-
-                # ── Unike nøkler ─────────────────────────────────────────
-                uks = tbl.get("unique_keys", [])
-                if uks:
-                    tbl_block.append(Spacer(1, 1 * mm))
-                    tbl_block.append(Paragraph("<b>Unike nøkler:</b>",
-                                               style_body_small))
-                    for uk in uks:
-                        uk_cols = ", ".join(uk.get("columns", []))
-                        tbl_block.append(
-                            Paragraph(
-                                f'&nbsp;&nbsp;{uk.get("name", "")}: {uk_cols}',
-                                style_body_small,
-                            )
-                        )
-
+                tbl_block.extend(_keys_block(schema_name, tbl))
                 tbl_block.append(Spacer(1, 2 * mm))
-                try:
+                # Små tabeller holdes samlet. Større får brytes over sider
+                # (kolonneoverskriften gjentas) — ellers blir halve sider tomme;
+                # overskriften skal likevel ikke stå alene nederst.
+                if len(columns) <= 12:
                     story.append(KeepTogether(tbl_block))
-                except Exception:
+                else:
+                    from reportlab.platypus import CondPageBreak
+                    story.append(CondPageBreak(45 * mm))
                     story.extend(tbl_block)
+
+            if empty:
+                story.append(Spacer(1, 4 * mm))
+                story.append(Outline(f"Tomme tabeller ({len(empty)})",
+                                     f"empty_{id(schema)}", 2))
+                story.append(Paragraph(f"Tomme tabeller ({len(empty)})", style_h3))
+                story.append(Paragraph(
+                    "Tabellene under har ingen rader i uttrekket. Strukturen er "
+                    "vist kompakt: kolonnenavn med SQL-type.", style_caption))
+                story.append(Spacer(1, 1.5 * mm))
+                for tbl in empty:
+                    tname = tbl.get("name", "Ukjent")
+                    key = _tbl_key(schema_name, tname)
+                    cols_txt = ", ".join(
+                        f"{c.get('name', '')} <font color='grey'>"
+                        f"{_esc(_abbrev_type(c.get('type', '')))}</font>"
+                        for c in tbl.get("columns", []))
+                    folder = tbl.get("folder", "")
+                    block = [Paragraph(
+                        f'<a name="{key}"/><b>{_esc(tname)}</b>'
+                        + (f' <font color="grey">({_esc(folder)})</font>' if folder else "")
+                        + f" — {cols_txt}", style_body_small)]
+                    block.extend(_keys_block(schema_name, tbl))
+                    block.append(Spacer(1, 2 * mm))
+                    story.append(KeepTogether(block))
 
         return story
 

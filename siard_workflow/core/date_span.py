@@ -39,6 +39,7 @@ Fremgangsmåte for estimatet
 Et estimat merkes alltid slik i rapportene.
 """
 from __future__ import annotations
+from siard_workflow.core.fmt import num as _fnum
 
 import datetime as _dt
 import re
@@ -238,6 +239,31 @@ def read_metadata(meta_bytes: bytes) -> "tuple[list[dict], dict]":
 _RX_SPAN_DATE = re.compile(
     r"(?<!\d)(?:(\d{4})-(\d{1,2})-(\d{1,2})|(\d{1,2})[./-](\d{1,2})[./-](\d{4}))(?!\d)")
 _RX_YEAR = re.compile(r"(?<!\d)(1[89]\d{2}|20\d{2})(?!\d)")
+
+
+def guess_compact_span(ts: str) -> "tuple[_dt.date, _dt.date] | None":
+    """
+    «01012020 - 01052025» → (2020-01-01, 2025-05-01) når begge delene er åtte
+    sifre som bare gir mening som DDMMÅÅÅÅ (eller ÅÅÅÅMMDD). Bare et hint til
+    brukeren — teksten tolkes ikke automatisk som datospenn.
+    """
+    m = re.fullmatch(r"\s*(\d{8})\s*[-–—/]\s*(\d{8})\s*", ts or "")
+    if not m:
+        return None
+    out = []
+    for tok in m.groups():
+        d = None
+        for y, mo, da in ((tok[4:], tok[2:4], tok[:2]), (tok[:4], tok[4:6], tok[6:])):
+            try:
+                if 1800 <= int(y) <= 2100:
+                    d = _dt.date(int(y), int(mo), int(da))
+                    break
+            except ValueError:
+                continue
+        if d is None:
+            return None
+        out.append(d)
+    return min(out), max(out)
 
 
 def metadata_span(ts: str) -> "tuple[_dt.date, _dt.date] | None":
@@ -680,7 +706,7 @@ def summarize(picks: list, info: dict, max_year: int, trim: float, tier: str,
     for r in used:
         years.update(r["c"].years_lob if r["lob"] else r["c"].years)
     n = sum(years.values())
-    basis_text = (f"{n:,} datoer i {len(used)} {tier_label}"
+    basis_text = (f"{_fnum(n)} datoer i {len(used)} {tier_label}"
                   + (" (rader med LOB-fil)" if tier == "lob" else "")
                   + (f"; {off_n} avvikende tabell(er) holdt utenfor" if off_n else ""))
     if tier == "alle":

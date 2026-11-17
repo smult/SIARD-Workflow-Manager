@@ -19,6 +19,7 @@ Kjøremoduser (som schema_selector / blob_convert):
   - Standalone: pakker ut → anonymiserer → pakker ny SIARD (_anonymisert).
 """
 from __future__ import annotations
+from siard_workflow.core.fmt import num as _fnum
 
 import re
 import os
@@ -584,8 +585,8 @@ class AnonymizeOperation(BaseOperation):
         info["important_names"] = sorted(
             tables[tk]["table_name"] for tk in info.get("important", []) if tk in tables)
         info["mode"] = mode
-        w(f"    Reduserer {info['total_original']:,} → "
-          f"{info['total_kept']:,} rader.", "ok")
+        w(f"    Reduserer {_fnum(info['total_original'])} → "
+          f"{_fnum(info['total_kept'])} rader.", "ok")
         return keep, info
 
     def _select_important_tables(self, mode: str, tables: dict, relations: dict,
@@ -1101,7 +1102,7 @@ class AnonymizeOperation(BaseOperation):
             out["kept_rows"] = kept
         if out.get("pnr5_fallback"):
             w(f"    {info.get('table_name', xml_path.stem)}: "
-              f"{out['pnr5_fallback']:,} femsifrede personnummer uten "
+              f"{_fnum(out['pnr5_fallback'])} femsifrede personnummer uten "
               f"fødselsdato/fnr i raden → egen fem-til-fem-mapping (ikke "
               f"konsistent med 11-sifrede kolonner)", "warn")
         return out
@@ -1412,8 +1413,8 @@ class AnonymizeOperation(BaseOperation):
     def _log_summary(self, summary: dict, w):
         sub = summary.get("subset")
         if sub:
-            w(f"  DATAREDUKSJON (subset): {sub.get('total_original', 0):,} → "
-              f"{sub.get('total_kept', 0):,} rader "
+            w(f"  DATAREDUKSJON (subset): {_fnum(sub.get('total_original', 0))} → "
+              f"{_fnum(sub.get('total_kept', 0))} rader "
               f"({sub.get('n_rows', 0)} per tabell, modus: {sub.get('mode','?')}).",
               "step")
             names = sub.get("important_names") or []
@@ -1515,13 +1516,13 @@ class AnonymizeOperation(BaseOperation):
                f"{stats.get('lobs_replaced', 0)} LOB-filer byttet, "
                f"{stats.get('mappings', 0)} unike erstatninger")
         if stats.get("kommune_replaced"):
-            msg += f", {stats['kommune_replaced']:,} kommunenavn → Fiktiv…"
+            msg += f", {_fnum(stats['kommune_replaced'])} kommunenavn → Fiktiv…"
         if stats.get("scan_cells"):
-            msg += f", {stats['scan_cells']:,} øvrige tekstfelt med innebygd PII"
+            msg += f", {_fnum(stats['scan_cells'])} øvrige tekstfelt med innebygd PII"
         if "subset_rows_kept" in stats:
             orig = stats.get("subset_original_rows", 0)
-            msg += (f"  |  datasett redusert til {stats['subset_rows_kept']:,}"
-                    + (f" av {orig:,}" if orig else "") + " rader")
+            msg += (f"  |  datasett redusert til {_fnum(stats['subset_rows_kept'])}"
+                    + (f" av {_fnum(orig)}" if orig else "") + " rader")
         return msg
 
 

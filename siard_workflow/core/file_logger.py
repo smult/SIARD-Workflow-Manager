@@ -11,6 +11,7 @@ uavhengig av operasjonens egne fremdriftsmeldinger.
 from __future__ import annotations
 import datetime
 import logging
+import re
 import threading
 import time
 from pathlib import Path
@@ -36,6 +37,22 @@ def resolve_log_dir(siard_path: Path, fallback: "Path | None" = None) -> Path:
     return Path(fallback) if fallback else Path(siard_path).parent
 
 
+# ── Fremdriftslinjer ─────────────────────────────────────────────────────────
+# Loggfila skal kunne leses fra topp til bunn. Fremdrift («Batch 12/1522»,
+# «Detektert: 4 236/211 836 filer», «10 % — …») vises fortløpende i GUI-et, men
+# i fila skrives bare første linje, hver fjerdedel og siste linje i en serie.
+_RE_BATCH = re.compile(r"^(\s*)Batch (\d+)/(\d+): ")
+_NUM = r"\d[\d   ,.]*?"
+_RE_PROGRESS = re.compile(
+    rf"({_NUM})\s*/\s*({_NUM})\s+(filer|linjer|rader|batcher)\b")
+_RE_PCT = re.compile(r"\d+\s*%")
+
+
+def _to_int(text: str) -> int:
+    digits = re.sub(r"\D", "", text)
+    return int(digits) if digits else 0
+
+
 def _fmt_duration(sec: float) -> str:
     d, rest = divmod(int(sec), 86400)
     h, rest = divmod(rest, 3600)
@@ -55,12 +72,26 @@ class WorkflowFileLogger:
             run = wf.execute(...)
     """
 
-    LEVELS = {"info": "INFO", "step": "STEP", "success": "OK  ",
-              "warn": "WARN", "error": "ERR ", "muted": "----"}
+    # Operasjonene bruker både «success»/«error» og de norske «ok»/«feil»
+    LEVELS = {"info": "INFO", "step": "STEP", "success": "OK  ", "ok": "OK  ",
+              "warn": "WARN", "advarsel": "WARN", "error": "ERR ", "feil": "ERR ",
+              "muted": "----"}
+    MAX_NOTABLE = 200
 
     def __init__(self, log_dir: Path, siard_name: str = "",
                  heartbeat_s: float = HEARTBEAT_S,
-                 on_heartbeat: "Optional[Callable[[str], None]]" = None):
+                 on_heartbeat: "Optional[Callable[[str], None]]" = None,
+                 header_info: "Optional[list]" = None,
+                 thin_progress: bool = True):
+        self.header_info = list(header_info or [])   # [(ledetekst, verdi), …]
+        self.thin_progress = thin_progress
+        self._prog: dict = {}        # serie → (sist ferdig, fjerdedel)
+        self._series: dict = {}      # batch-serie → antall linjer sett
+        self.suppressed = 0          # fremdriftslinjer som ikke ble skrevet
+        self.warnings: list = []     # [(klokkeslett, melding)]
+        self.errors: list = []
+        self.n_warnings = 0
+        self.n_errors = 0
         self.log_dir   = Path(log_dir)
         self.siard_name = siard_name
         self._path: Path | None = None
@@ -70,6 +101,7 @@ class WorkflowFileLogger:
         self._last_msg = ""
         self._last_time: "datetime.datetime | None" = None
         self._step = ""
+        self._step_name = ""
         self._step_started = 0.0
         self._started = 0.0
         self._heartbeat_s = heartbeat_s
@@ -107,19 +139,94 @@ class WorkflowFileLogger:
     def set_step(self, label: str) -> None:
         """Steget som kjører nå (brukes i livstegnet)."""
         self._step = label
+        self._step_name = label.split("] ", 1)[-1].strip()
         self._step_started = time.monotonic()
 
-    def log(self, message: str, level: str = "info") -> None:
+    def log(self, message: str, level: str = "info", raw: bool = False) -> None:
+        """raw=True: skriv linja som den er (sammendraget bruker skillelinjer)."""
         if not self._fh:
             return
         tag = self.LEVELS.get(level, "INFO")
+        if not raw and self._step:
+            # Operasjonene skriver et eget banner («=====» / NAVN / «=====»)
+            # rett etter stegoverskriften «[3] Navn» — det sier det samme
+            bare = message.strip()
+            if bare and set(bare) == {"="}:
+                return
+            if tag == "STEP" and bare.upper() == self._step_name.upper():
+                return
+        if message.strip():
+            # Livstegnet viser siste melding — også fremdrift som ikke skrives
+            self._last_msg = message.strip()
+            self._last_time = datetime.datetime.now()
+        # Flerlinjede meldinger (f.eks. stderr fra et eksternt program) blir
+        # én linje, så hver linje i fila har klokkeslett og nivå
+        if "\n" in message.strip("\n"):
+            indent = message[:len(message) - len(message.lstrip())].replace("\n", "")
+            message = indent + " ".join(
+                p.strip() for p in message.splitlines() if p.strip())
+        if self.thin_progress and tag == "INFO":
+            message = self._thin(message)
+            if message is None:
+                self.suppressed += 1
+                return
+        if tag in ("WARN", "ERR "):
+            self._note(tag, message)
         with self._lock:
             if not self._fh:
                 return
             self._write_line(f"[{self._ts()}] [{tag}] {message}\n")
-        if message.strip():
-            self._last_msg = message.strip()
-            self._last_time = datetime.datetime.now()
+
+    def _note(self, tag: str, message: str) -> None:
+        """Hold rede på advarsler og feil — til sluttsammendraget."""
+        text = message.strip()
+        if not text:
+            return
+        if tag == "WARN":
+            self.n_warnings += 1
+            bucket = self.warnings
+        else:
+            self.n_errors += 1
+            bucket = self.errors
+        if len(bucket) < self.MAX_NOTABLE:
+            bucket.append((self._ts(), text))
+
+    def _thin(self, message: str) -> "str | None":
+        """
+        Fremdriftslinje → None når den ikke skal i fila. Første linje, hver
+        fjerdedel og siste linje i en serie skrives. Andre linjer urørt.
+        """
+        m = _RE_BATCH.match(message)
+        if m:
+            total = int(m.group(3))
+            key = ("batch", total)
+            seen = self._series.get(key, 0) + 1
+            if seen > total:                 # ny serie med samme antall
+                seen = 1
+            self._series[key] = seen
+            if total <= 8:
+                return message
+            if seen == total or (4 * seen) // total > (4 * (seen - 1)) // total:
+                pct = 100 * seen // total
+                return f"{m.group(1)}Batcher ferdig: {seen}/{total} ({pct} %)"
+            return None
+        m = _RE_PROGRESS.search(message)
+        if not m:
+            return message
+        done, total = _to_int(m.group(1)), _to_int(m.group(2))
+        if total <= 0:
+            return message
+        key = _RE_PCT.sub("", message[:m.start()]).strip() + "|" + m.group(3)
+        prev = self._prog.get(key)
+        bucket = min(4, (4 * done) // total)
+        self._prog[key] = (done, bucket)
+        if prev is None or done < prev[0]:   # første linje i (en ny) serie
+            return message
+        if done >= total and prev[0] < total:
+            return message
+        if bucket > prev[1] and done < total:
+            return message
+        return None
 
     def heartbeat(self) -> str:
         """Skriv ett livstegn nå og returner teksten."""
@@ -169,6 +276,8 @@ class WorkflowFileLogger:
         self._fh.write(f"  SIARD Workflow Log\n")
         self._fh.write(f"  Fil:       {self.siard_name}\n")
         self._fh.write(f"  Startet:   {now}\n")
+        for label, value in self.header_info:
+            self._fh.write(f"  {(str(label) + ':'):<10} {value}\n")
         self._fh.write("=" * 60 + "\n\n")
 
 

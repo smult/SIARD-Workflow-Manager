@@ -26,6 +26,7 @@ Fremdrift via ctx.metadata["progress_cb"]:
 """
 
 from __future__ import annotations
+from siard_workflow.core.fmt import num as _fnum
 
 import concurrent.futures
 import struct
@@ -407,17 +408,38 @@ def _wpt_raw_text_to_rtf(wpt_bytes: bytes) -> bytes:
         return b""
 
 
+# Linjer LibreOffice skriver til stderr uten at de er feilen: den innebygde
+# Python-tolken finner ikke bibliotekene sine, og Java mangler.
+_LO_NOISE = (
+    "could not find platform independent libraries",
+    "could not find platform dependent libraries",
+    "consider setting $pythonhome",
+    "javaldx:",
+    "warning: failed to read path from javaldx",
+)
+
+
+def _lo_err_text(raw: str) -> str:
+    """LibreOffice-utskrift → én linje uten kjent støy («Error: source file …»)."""
+    lines = [ln.strip() for ln in (raw or "").splitlines()]
+    kept = [ln for ln in lines
+            if ln and not any(n in ln.lower() for n in _LO_NOISE)]
+    return re.sub(r"\s+", " ", " ".join(kept or [ln for ln in lines if ln])).strip()
+
+
 def _err_clean(msg: str) -> str:
     """Fjern intern batch-filinformasjon og berik kjente feilmeldinger."""
     if not msg:
         return msg
+    msg = _lo_err_text(msg)
     # Fjern "Filer: ..." (interne batch-filnavn)
     idx = msg.find(". Filer: ")
     cleaned = msg[:idx] if idx >= 0 else msg
     # LibreOffice kunne ikke åpne kildefilen. Mulige årsaker er mange — ikke
     # gjett på passord (LO-helsesjekken fanger en ødelagt installasjon).
     if "source file could not be loaded" in cleaned:
-        cleaned += (". LibreOffice kunne ikke åpne filen (passordbeskyttet, "
+        cleaned = cleaned.rstrip(" .") + (
+                    ". LibreOffice kunne ikke åpne filen (passordbeskyttet, "
                     "skadet eller format LibreOffice ikke støtter).")
     return cleaned
 
@@ -2050,7 +2072,7 @@ class BlobConvertOperation(BaseOperation):
             parts.append(
                 f"{gp['files']} PDF-fil(er) etterbehandlet med Ghostscript "
                 f"{gp.get('gs_version', '')} for mindre lagringsplass "
-                f"({gp['before']:,} → {gp['after']:,} byte; "
+                f"({_fnum(gp['before'])} → {_fnum(gp['after'])} byte; "
                 + ("JPEG-omkoding av bilder tillatt (tapsbeheftet)" if gp.get("allow_jpeg")
                    else "bilder uten tapsbeheftet komprimering")
                 + "; tekst, sidetall og utseende kontrollert"
@@ -2215,7 +2237,7 @@ class BlobConvertOperation(BaseOperation):
             if _n_prev:
                 _done_set = set(_bp.done)
                 self._resumed_refs = _bp.resumed_refs()
-                w(f"  Fortsetter der forrige kjøring stoppet: {_n_prev:,} filer er "
+                w(f"  Fortsetter der forrige kjøring stoppet: {_fnum(_n_prev)} filer er "
                   f"allerede behandlet og hoppes over ({_bp.path.name})", "info")
             elif _bp.discarded_reason:
                 w(f"  Progresjonsfil fra forrige kjøring brukes ikke "
@@ -2360,9 +2382,9 @@ class BlobConvertOperation(BaseOperation):
                 try:
                     err_log.__exit__(None, None, None)
                     if err_log.log_path and err_log.count > 0:
-                        w(f"  Feillogg ({err_log.count} fil(er)): "
-                          f"{err_log.log_path}", "warn")
-                        w(f"  Komplett feilliste (regneark): {err_log.csv_path}", "warn")
+                        w(f"  Liste over filer som ikke ble konvertert "
+                          f"({err_log.count} fil(er)): {err_log.log_path}", "info")
+                        w(f"  Samme liste som regneark: {err_log.csv_path}", "info")
                 except Exception:
                     pass
             if sf_log:
@@ -2414,9 +2436,19 @@ class BlobConvertOperation(BaseOperation):
             fs = err_log.summary()
             stats["failure_summary"] = fs
             if fs["total"]:
-                w(f"  IKKE KONVERTERT / PROBLEMER: {fs['total']:,} fil(er)", "warn")
-                for key, n in fs["counts"].items():
-                    w(f"    {fs['labels'][key]:<40} {n:,}", "warn")
+                _kept_keys = set(fs.get("kept_keys") or ())
+                _n = lambda v: f"{_fnum(v)}".replace(",", " ")
+                if fs.get("failed_total"):
+                    w(f"  FEILET — bør følges opp: {_n(fs['failed_total'])} fil(er)", "warn")
+                    for key, n in fs["counts"].items():
+                        if key not in _kept_keys:
+                            w(f"    {fs['labels'][key]:<40} {_n(n)}", "warn")
+                if fs.get("kept_total"):
+                    w(f"  Beholdt uendret etter regelen (ikke feil): "
+                      f"{_n(fs['kept_total'])} fil(er)", "info")
+                    for key, n in fs["counts"].items():
+                        if key in _kept_keys:
+                            w(f"    {fs['labels'][key]:<40} {_n(n)}", "info")
         _pipeline = bool(getattr(ctx, "extracted_path", None))
         if not self.params["dry_run"]:
             if _pipeline:
@@ -2441,8 +2473,8 @@ class BlobConvertOperation(BaseOperation):
                 stats["resumed_files"] = _n_resumed
                 stats["runs_combined"] = len(_bp.prior_stats) + 1
                 w(f"  Samlet over {stats['runs_combined']} kjøringer: "
-                  f"{stats.get('converted', 0):,} konvertert, "
-                  f"{stats.get('kept', 0):,} beholdt, {stats.get('failed', 0):,} feil", "info")
+                  f"{_fnum(stats.get('converted', 0))} konvertert, "
+                  f"{_fnum(stats.get('kept', 0))} beholdt, {_fnum(stats.get('failed', 0))} feil", "info")
             else:
                 _bp.record_stats({k: v for k, v in stats.items()
                                   if isinstance(v, int) and not isinstance(v, bool)})
@@ -2572,7 +2604,7 @@ class BlobConvertOperation(BaseOperation):
             ext_counts[e] = ext_counts.get(e, 0) + 1
         ext_summary = ", ".join(
             f"{n}×.{e}" for e, n in sorted(ext_counts.items(), key=lambda x: -x[1]))
-        w(f"  Fant: {len(all_blobs):,} blob-filer ({ext_summary}), "
+        w(f"  Fant: {_fnum(len(all_blobs))} blob-filer ({ext_summary}), "
           f"{len(table_xml_map)} tableX.xml", "info")
         progress("phase_done")
 
@@ -2732,8 +2764,8 @@ class BlobConvertOperation(BaseOperation):
         if _done:
             _before = len(all_blobs)
             all_blobs = [z for z in all_blobs if z not in _done]
-            w(f"  Resume: {_before - len(all_blobs):,} allerede behandlet hoppet over, "
-              f"{len(all_blobs):,} gjenstår", "info")
+            w(f"  Resume: {_fnum(_before - len(all_blobs))} allerede behandlet hoppet over, "
+              f"{_fnum(len(all_blobs))} gjenstår", "info")
 
         # ── Fase 3: Detekter og konverter blob-filer ──────────────────────────
         total = len(all_blobs)
@@ -2906,7 +2938,7 @@ class BlobConvertOperation(BaseOperation):
                     ext_counts[e] = ext_counts.get(e, 0) + 1
                 ext_summary = ", ".join(
                     f"{n}×.{e}" for e, n in sorted(ext_counts.items(), key=lambda x: -x[1]))
-                w(f"  Fant: {len(all_blobs):,} blob-filer ({ext_summary}), "
+                w(f"  Fant: {_fnum(len(all_blobs))} blob-filer ({ext_summary}), "
                   f"{len(table_xml_map)} tableX.xml", "info")
                 progress("phase_done")
 
@@ -2930,7 +2962,7 @@ class BlobConvertOperation(BaseOperation):
                     if n_done % EXTRACT_REPORT == 0 or n_done == n_total:
                         progress("phase_progress",
                                  done=n_done, total=n_total)
-                w(f"  Utpakking fullfort: {n_done:,} filer", "info")
+                w(f"  Utpakking fullfort: {_fnum(n_done)} filer", "info")
 
                 progress("phase_done")
 
@@ -3083,8 +3115,8 @@ class BlobConvertOperation(BaseOperation):
                 if _done:
                     _before = len(all_blobs)
                     all_blobs = [z for z in all_blobs if z not in _done]
-                    w(f"  Resume: {_before - len(all_blobs):,} allerede behandlet hoppet over, "
-                      f"{len(all_blobs):,} gjenstår", "info")
+                    w(f"  Resume: {_fnum(_before - len(all_blobs))} allerede behandlet hoppet over, "
+                      f"{_fnum(len(all_blobs))} gjenstår", "info")
 
                 # ── Fase 3+4: Detekter og konverter .bin/.txt ────────────────
                 total = len(all_blobs)
@@ -3235,8 +3267,8 @@ class BlobConvertOperation(BaseOperation):
             _SF_BATCH = 100
             n_files   = len(_blob_paths)
             n_batches = (n_files + _SF_BATCH - 1) // _SF_BATCH
-            w(f"  Forhåndsskanner {n_files:,} filer med Siegfried "
-              f"({n_batches:,} batcher, {max_w} parallelle) ...", "info")
+            w(f"  Forhåndsskanner {_fnum(n_files)} filer med Siegfried "
+              f"({_fnum(n_batches)} batcher, {max_w} parallelle) ...", "info")
 
             _state = {"last_pct": 0.0,
                       "last_log_t": _time.monotonic(),
@@ -3250,7 +3282,7 @@ class BlobConvertOperation(BaseOperation):
                         or pct - _state["last_pct"] >= 5.0
                         or now - _state["last_log_t"] >= 30):
                     elapsed = now - _state["t0"]
-                    w(f"    Forhåndsskann: {done:,}/{total:,} batcher "
+                    w(f"    Forhåndsskann: {_fnum(done)}/{_fnum(total)} batcher "
                       f"({pct:.0f}%, {elapsed:.0f}s)", "info")
                     _state["last_pct"]   = pct
                     _state["last_log_t"] = now
@@ -3266,12 +3298,12 @@ class BlobConvertOperation(BaseOperation):
                 _reused = getattr(_id, "prescan_reused", 0)
                 if _reused:
                     _from_logs = getattr(_id, "prescan_from_logs", 0)
-                    w(f"  Siegfried: {_reused:,} filer hentet fra forrige (avbrutte) "
+                    w(f"  Siegfried: {_fnum(_reused)} filer hentet fra forrige (avbrutte) "
                       f"kjøring"
-                      + (f" — herav {_from_logs:,} fra identifikasjonslogg(er) "
+                      + (f" — herav {_fnum(_from_logs)} fra identifikasjonslogg(er) "
                          f"({', '.join(p.name for p in self._sf_id_logs[-3:])})"
                          if _from_logs else "")
-                      + f"; {getattr(_id, 'prescan_scanned', 0):,} skannet nå", "info")
+                      + f"; {_fnum(getattr(_id, 'prescan_scanned', 0))} skannet nå", "info")
                 w(f"  Forhåndsskann ferdig på {_total:.0f}s", "ok")
             except Exception as _exc:
                 w(f"  Forhåndsskann feilet: {_exc} — "
@@ -3610,7 +3642,7 @@ class BlobConvertOperation(BaseOperation):
 
             return zip_sti, (ext, mime, is_encrypted)
 
-        w(f"  Detekterer {len(all_blobs):,} filer ...", "info")
+        w(f"  Detekterer {_fnum(len(all_blobs))} filer ...", "info")
         det_results: dict[str, tuple[str, str, bool]] = {}
         n_total       = len(all_blobs)
         # Logg-strategi for deteksjonsfremgang:
@@ -3624,7 +3656,7 @@ class BlobConvertOperation(BaseOperation):
         n_detected    = 0
         if emit_phase_events:
             progress("phase", phase=3, total_phases=6,
-                     label=f"Detekterer {n_total:,} filer ...")
+                     label=f"Detekterer {_fnum(n_total)} filer ...")
         w(f"  Starter parallell deteksjon på {max_w} worker-tråder ...",
           "info")
         import time as _time
@@ -3690,15 +3722,15 @@ class BlobConvertOperation(BaseOperation):
                              text=f"Identifiserer filer: {_st}")
                     _last_log_t = _now
         if _signed_pdfs:
-            w(f"  Digitalt signerte PDF-er (røres ikke): {len(_signed_pdfs):,}", "info")
+            w(f"  Digitalt signerte PDF-er (røres ikke): {_fnum(len(_signed_pdfs))}", "info")
 
         if _utf8_bin_count[0]:
-            w(f"  UTF-8-kodet binærdata: {_utf8_bin_count[0]:,} filer gjenopprettet", "info")
+            w(f"  UTF-8-kodet binærdata: {_fnum(_utf8_bin_count[0])} filer gjenopprettet", "info")
 
         stats["identified"] = len(det_results)
         if _hint_ignored:
             w("  Typekolonne overstyrt av innhold (lesbar tekst beholdes som tekst): "
-              + ", ".join(f"{n:,} merket {e.upper()}"
+              + ", ".join(f"{_fnum(n)} merket {e.upper()}"
                           for e, n in sorted(_hint_ignored.items())), "info")
 
         # Steg B: Kategoriser
@@ -3717,14 +3749,14 @@ class BlobConvertOperation(BaseOperation):
         # Last live versjon av upgrade-mappingen
         _upgrade_live = _get_lo_upgrade()
 
-        w(f"  Sorterer {n_total:,} filer etter behandling …".replace(",", " "), "info")
+        w(f"  Sorterer {_fnum(n_total)} filer etter behandling …".replace(",", " "), "info")
         _sort_t0 = _sort_log_t = _time.monotonic()
         for idx, zip_sti in enumerate(all_blobs):
             ext, mime, is_encrypted = det_results[zip_sti]
             file_ext  = PurePosixPath(zip_sti).suffix.lstrip(".").lower()
             if idx & 0x3FFF == 0 and _time.monotonic() - _sort_log_t >= MAX_LOG_INTERVAL:
                 _sort_log_t = _time.monotonic()
-                w(f"    Sortert {idx:,}/{n_total:,} …".replace(",", " "), "info")
+                w(f"    Sortert {_fnum(idx)}/{_fnum(n_total)} …".replace(",", " "), "info")
 
             # Bevar CSV-ekstensjon: innhold er alltid ren tekst → detektert som "txt",
             # men hvis blob er lagret med .csv-ekstensjon skal den forbli .csv
@@ -3861,21 +3893,23 @@ class BlobConvertOperation(BaseOperation):
                     # hopp_over — ignorer disse filene
                     w(f"  '{unk_ext}' ({len(unk_files)} filer) hoppet over", "warn")
 
-        w(f"  Til PDF/A    : {len(to_convert):,}", "info")
+        w(f"  Til PDF/A    : {_fnum(len(to_convert))}", "info")
         if to_convert:
             fmt_count: dict[str, int] = {}
             for _, _, ext, _ in to_convert:
                 fmt_count[ext] = fmt_count.get(ext, 0) + 1
-            fmt_str = ", ".join(f"{n}×{e.upper()}" for e, n in sorted(fmt_count.items()))
+            fmt_str = ", ".join(f"{_fnum(n)} × {e.upper()}"
+                                for e, n in sorted(fmt_count.items()))
             w(f"    Formater: {fmt_str}", "info")
+            stats["to_pdfa_formats"] = dict(fmt_count)
             if len(to_convert) <= 20:
                 for _, zip_sti, ext, _ in to_convert:
                     sz = 0
                     try: sz = (extract_dir / zip_sti).stat().st_size
                     except Exception: pass
-                    w(f"    → {PurePosixPath(zip_sti).name}  [{ext.upper()}  {sz:,} bytes]", "info")
+                    w(f"    → {PurePosixPath(zip_sti).name}  [{ext.upper()}  {_fnum(sz)} bytes]", "info")
 
-        w(f"  Oppgradering : {len(to_upgrade):,}", "info")
+        w(f"  Oppgradering : {_fnum(len(to_upgrade))}", "info")
         if to_upgrade:
             upg_count: dict[str, int] = {}
             for _, _, ext, _ in to_upgrade:
@@ -3884,17 +3918,17 @@ class BlobConvertOperation(BaseOperation):
                 upg_count[key] = upg_count.get(key, 0) + 1
             w(f"    Formater: {', '.join(f'{n}×{k.upper()}' for k,n in sorted(upg_count.items()))}", "info")
 
-        w(f"  Arkiver      : {len(to_archive):,}", "info")
+        w(f"  Arkiver      : {_fnum(len(to_archive))}", "info")
         if to_archive:
             arc_fmt: dict[str, int] = {}
             for _, _, ext, _ in to_archive:
                 arc_fmt[ext] = arc_fmt.get(ext, 0) + 1
             w(f"    Typer: {', '.join(f'{n}×{e.upper()}' for e,n in sorted(arc_fmt.items()))}", "info")
 
-        w(f"  WPTools (wpt): {len(to_wpt):,}", "info")
-        w(f"  E-post (msg/eml): {len(to_msg):,}", "info")
+        w(f"  WPTools (wpt): {_fnum(len(to_wpt))}", "info")
+        w(f"  E-post (msg/eml): {_fnum(len(to_msg))}", "info")
         if to_extens:
-            w(f"  Extens-bilder (DIB) → PNG: {len(to_extens):,}", "info")
+            w(f"  Extens-bilder (DIB) → PNG: {_fnum(len(to_extens))}", "info")
 
         # Formatdiagram/rapport: e-post og Extens-bilder sender ikke file_done
         # per fil — tell dem her etter innholdstype (som rename-løkken gjør)
@@ -3905,7 +3939,7 @@ class BlobConvertOperation(BaseOperation):
             _own_counts["dib"] = len(to_extens)
         if _own_counts:
             progress("rename_format_counts", counts=_own_counts)
-        w(f"  Rename/behold: {len(to_rename_only):,}", "info")
+        w(f"  Rename/behold: {_fnum(len(to_rename_only))}", "info")
 
         # Logg hva .txt-filer faktisk ble detektert som
         txt_blobs = [z for z in all_blobs if z.lower().endswith(".txt")]
@@ -4100,7 +4134,7 @@ class BlobConvertOperation(BaseOperation):
         # Steg C2: WPTools-filer — rename til .wpt + generer _ext_wpt.rtf,
         # legg RTF i to_convert for viderekonvertering til PDF/A via LO
         if to_wpt:
-            w(f"  Behandler {len(to_wpt):,} WPTools-filer ...", "info")
+            w(f"  Behandler {_fnum(len(to_wpt))} WPTools-filer ...", "info")
             wpt_rtf_for_lo: list[tuple[int, str, str, str]] = []
 
             for idx, zip_sti, ext, mime in to_wpt:
@@ -4132,7 +4166,7 @@ class BlobConvertOperation(BaseOperation):
                     if rtf_bytes:
                         rtf_path.write_bytes(rtf_bytes)
                         w(f"    [WPT] {stem}.wpt → {stem}_ext_wpt.rtf "
-                          f"({len(rtf_bytes):,} bytes) — sendes til PDF/A", "ok")
+                          f"({_fnum(len(rtf_bytes))} bytes) — sendes til PDF/A", "ok")
                         # Legg RTF-filen i kø for LO-konvertering til PDF/A
                         wpt_rtf_for_lo.append((idx, rtf_sti, "rtf",
                                                "application/rtf"))
@@ -4378,7 +4412,8 @@ class BlobConvertOperation(BaseOperation):
                             t_out.join(timeout=1)
                             t_err.join(timeout=1)
                             ok  = p.returncode == 0
-                            err = "".join(stderr_buf) or "".join(stdout_buf)
+                            err = _lo_err_text("".join(stderr_buf)
+                                               or "".join(stdout_buf))
                             return ok, ("" if ok else err[:300])
 
                         _time.sleep(0.25)
@@ -4549,7 +4584,7 @@ class BlobConvertOperation(BaseOperation):
                     stats["failed"] += 1
                     w(f"  Konvertering feilet: {filename} — beholder som "
                       f".{'bin' if _standardize_bin else ext}"
-                      + (f" ({lo_err[:80]})" if lo_err else ""), "warn")
+                      + (f" ({lo_err[:120]})" if lo_err else ""), "warn")
                     # Loggfør til feilogg
                     if err_log:
                         err_log.write(zip_sti, ext, _err_clean(lo_err or "Ingen PDF produsert"))
@@ -4566,7 +4601,7 @@ class BlobConvertOperation(BaseOperation):
                             (PurePosixPath(zip_sti).stem + f".{result_ext}")))
                 til_sz    = til_file.stat().st_size if til_file.exists() else 0
                 kommentar = ("Konvertert til PDF/A" if file_ok
-                             else f"Konvertering feilet: {lo_err[:80]}" if lo_err
+                             else f"Konvertering feilet: {lo_err[:120]}" if lo_err
                              else "Ingen PDF produsert — mulig korrupt fil")
                 csv_log.write(
                     zip_sti, fra_sz, src_ext,
@@ -4813,9 +4848,7 @@ class BlobConvertOperation(BaseOperation):
                                 _process_file_result(
                                     batch_file, zip_sti, ext, retry_root / "out",
                                     False, lo_err or "Ingen PDF produsert")
-                                w(f"    Endelig feilet: "
-                                  f"{PurePosixPath(zip_sti).name} — ingen PDF etter "
-                                  f"siste forsøk som enkeltfil", "warn")
+                                # «Konvertering feilet: …» er alt logget for fila
                             else:
                                 orig = next((it for it in rb_items
                                              if it[1] == zip_sti), None)
@@ -5055,7 +5088,7 @@ class BlobConvertOperation(BaseOperation):
             n_ok_ref   = [0]
             n_fail_ref = [0]
 
-            w(f"  Oppgraderer {len(to_upgrade):,} filer ({max_w} parallelle tråder) ...", "info")
+            w(f"  Oppgraderer {_fnum(len(to_upgrade))} filer ({max_w} parallelle tråder) ...", "info")
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_w) as pool:
                 futs = [pool.submit(_process_one, item) for item in to_upgrade]
                 for fut in concurrent.futures.as_completed(futs):
@@ -5096,7 +5129,7 @@ class BlobConvertOperation(BaseOperation):
         candidates = (len(getattr(self, "_pp_produced", []))
                       + len(getattr(self, "_pp_system", []))
                       + len(getattr(self, "_pp_archive_files", [])))
-        w(f"  Ghostscript-etterbehandling: samler PDF-er ({candidates:,} kandidater, "
+        w(f"  Ghostscript-etterbehandling: samler PDF-er ({_fnum(candidates)} kandidater, "
           f"signerte holdes utenfor) …", "info")
         t0 = last = time.monotonic()
         n_seen = [0]
@@ -5107,7 +5140,7 @@ class BlobConvertOperation(BaseOperation):
             now = time.monotonic()
             if now - last >= 60:
                 last = now
-                w(f"    {n_seen[0]:,}/{candidates:,} kontrollert "
+                w(f"    {_fnum(n_seen[0])}/{_fnum(candidates)} kontrollert "
                   f"({fmt_duration(now - t0)} brukt)", "info")
             key = (str(path), member)
             if key in seen or not path.exists():
@@ -5127,7 +5160,7 @@ class BlobConvertOperation(BaseOperation):
                     _add(p, "arkiv", m)
             elif p.exists() and b"%PDF" in p.read_bytes()[:1024]:
                 _add(p, "arkiv")
-        w(f"    {len(items):,} PDF-er funnet ({fmt_duration(time.monotonic() - t0)})", "info")
+        w(f"    {_fnum(len(items))} PDF-er funnet ({fmt_duration(time.monotonic() - t0)})", "info")
         if items:
             self._gs_postprocess(items, stats, w, workers, work_root, stop_ev)
 
@@ -5175,9 +5208,9 @@ class BlobConvertOperation(BaseOperation):
         try:
             if not always:
                 sample = PP.pick_sample(pdfs, n_sample)
-                w(f"  Ghostscript-etterbehandling: tester {len(sample)} av {len(pdfs):,} "
+                w(f"  Ghostscript-etterbehandling: tester {len(sample)} av {_fnum(len(pdfs))} "
                   f"PDF-filer ("
-                  + ", ".join(f"{n:,} {PP.ORIGIN_LABELS.get(o, o)}" for o, n in _origins.items())
+                  + ", ".join(f"{_fnum(n)} {PP.ORIGIN_LABELS.get(o, o)}" for o, n in _origins.items())
                   + ") …", "step")
                 t0 = time.monotonic()
                 done = PP.run_many(sample, work_root / "utvalg", gs, workers, timeout, stop_ev,
@@ -5185,13 +5218,13 @@ class BlobConvertOperation(BaseOperation):
                 est = PP.estimate(done, pdfs, time.monotonic() - t0, workers)
                 est["gs_version"] = _gs.get_version(gs) or ""
                 est["allow_jpeg"] = allow_jpeg
-                w(f"    Utvalg: {est['sample_before']:,} → {est['sample_after']:,} byte "
+                w(f"    Utvalg: {_fnum(est['sample_before'])} → {_fnum(est['sample_after'])} byte "
                   f"({str(round(est['sample_saving_pct'], 1)).replace('.', ',')} % mindre, "
                   f"{est['n_ok']}/{est['n_sample']} "
                   f"filer forbedret)", "info")
                 for reason, n in est["skipped"].items():
                     w(f"    Beholdt i utvalget: {n} — {reason}", "info")
-                w(f"    Beregnet for alle {est['n_total']:,} filer: "
+                w(f"    Beregnet for alle {_fnum(est['n_total'])} filer: "
                   f"{_fmt_size(est['total_before'])} → ca. {_fmt_size(est['est_after'])} "
                   f"(spart ca. {_fmt_size(est['est_saved'])}, ca. "
                   f"{max(1, round(est['est_seconds'] / 60))} min)", "info")
@@ -5206,7 +5239,7 @@ class BlobConvertOperation(BaseOperation):
             def _prog(k, n):
                 if time.monotonic() - last[0] > 5 or k == n:
                     last[0] = time.monotonic()
-                    w(f"    Ghostscript: {k:,}/{n:,} filer", "info")
+                    w(f"    Ghostscript: {_fnum(k)}/{_fnum(n)} filer", "info")
             done += PP.run_many(rest, work_root / "alle", gs, workers, timeout, stop_ev, _prog,
                                 default_part=default_part, lossless=lossless)
             n, before, after = PP.apply(done)
@@ -5225,15 +5258,15 @@ class BlobConvertOperation(BaseOperation):
                                        "allow_jpeg": allow_jpeg,
                                        "gs_version": _gs.get_version(gs) or ""}
             pct = (1 - after / before) * 100 if before else 0
-            w(f"  Ghostscript-etterbehandling ferdig: {n:,} filer, {_fmt_size(before)} → "
+            w(f"  Ghostscript-etterbehandling ferdig: {_fnum(n)} filer, {_fmt_size(before)} → "
               f"{_fmt_size(after)} (spart {_fmt_size(before - after)}, "
               + f"{pct:.1f}".replace(".", ",") + " %)", "ok")
             for origin, k in by_origin.items():
-                w(f"    {PP.ORIGIN_LABELS.get(origin, origin)}: {k:,}", "info")
+                w(f"    {PP.ORIGIN_LABELS.get(origin, origin)}: {_fnum(k)}", "info")
             if became:
-                w(f"    Herav {became:,} som ikke var PDF/A fra før (nå PDF/A)", "info")
+                w(f"    Herav {_fnum(became)} som ikke var PDF/A fra før (nå PDF/A)", "info")
             for reason, k in skipped.items():
-                w(f"    Beholdt uendret: {k:,} — {reason}", "info")
+                w(f"    Beholdt uendret: {_fnum(k)} — {reason}", "info")
         finally:
             shutil.rmtree(work_root, ignore_errors=True)
 
@@ -5256,7 +5289,7 @@ class BlobConvertOperation(BaseOperation):
         chosen = str(self.params.get("pdfa_version", _PDFA_DEFAULT))
         level = chosen if chosen.startswith("PDF/A-3") else DEFAULT_LEVEL
         timeout = int(self.params.get("lo_timeout", 300))
-        w(f"  Konverterer {len(to_msg):,} e-post (MSG/EML) til "
+        w(f"  Konverterer {_fnum(len(to_msg))} e-post (MSG/EML) til "
           f"{level.split(' (')[0]}"
           + (" med innebygd original" if level.startswith("PDF/A-3") else "")
           + f" ({max_w} parallelle) ...", "info")
@@ -5401,15 +5434,15 @@ class BlobConvertOperation(BaseOperation):
         finally:
             shutil.rmtree(str(tmp_base), ignore_errors=True)
         if n_logged[0] > 40:
-            w(f"  ... og {n_logged[0] - 40:,} e-post til (ikke listet)", "info")
+            w(f"  ... og {_fnum(n_logged[0] - 40)} e-post til (ikke listet)", "info")
         if counter.get("signed"):
             w(f"  E-post med signert PDF-vedlegg der zip ikke kunne lages, beholdt "
-              f"uendret: {counter['signed']:,}", "warn")
+              f"uendret: {_fnum(counter['signed'])}", "warn")
         if stats.get("msg_signed_zip"):
             w(f"  E-post med signert PDF-vedlegg → ZIP (e-post som PDF/A + signert PDF "
-              f"urørt): {stats['msg_signed_zip']:,}", "info")
-        w(f"  E-post ferdig: {counter['ok']:,} konvertert, {counter['fail']:,} feilet; "
-          f"{counter['att']:,} vedlegg ({counter['listed']:,} kun listet/feilet)", "info")
+              f"urørt): {_fnum(stats['msg_signed_zip'])}", "info")
+        w(f"  E-post ferdig: {_fnum(counter['ok'])} konvertert, {_fnum(counter['fail'])} feilet; "
+          f"{_fnum(counter['att'])} vedlegg ({_fnum(counter['listed'])} kun listet/feilet)", "info")
 
     def _convert_extens_images(self, to_extens: list, stats: dict, extract_dir: Path,
                                stop_ev: threading.Event, csv_log, err_log, w,
@@ -5424,7 +5457,7 @@ class BlobConvertOperation(BaseOperation):
         <stamme>.png. Ved feil beholdes originalen som .bin.
         """
         from siard_workflow.core import extens_image as _extens
-        w(f"  Konverterer {len(to_extens):,} Extens-bilder (Windows DIB) til PNG ...",
+        w(f"  Konverterer {_fnum(len(to_extens))} Extens-bilder (Windows DIB) til PNG ...",
           "info")
         n_ok = n_fail = 0
         for idx, zip_sti, ext, mime in to_extens:
@@ -5493,8 +5526,8 @@ class BlobConvertOperation(BaseOperation):
                     err_log.write(zip_sti, "bin", f"{_extens.LABEL} → PNG feilet: {exc} "
                                   f"— original beholdt", kind)
         if n_ok > 20:
-            w(f"  ... og {n_ok - 20:,} Extens-bilder til (ikke listet)", "info")
-        w(f"  Extens-bilder ferdig: {n_ok:,} konvertert til PNG, {n_fail:,} feilet",
+            w(f"  ... og {_fnum(n_ok - 20)} Extens-bilder til (ikke listet)", "info")
+        w(f"  Extens-bilder ferdig: {_fnum(n_ok)} konvertert til PNG, {_fnum(n_fail)} feilet",
           "ok" if not n_fail else "warn")
 
     def _process_archives(self,
@@ -6021,13 +6054,13 @@ class BlobConvertOperation(BaseOperation):
         total = sum(len(v) for v in missing_refs.values())
         stats["missing_blob_refs"] = stats.get("missing_blob_refs", 0) + total
 
-        w(f"  ADVARSEL: {total:,} blob-referanse(r) i tableX.xml peker på "
+        w(f"  ADVARSEL: {_fnum(total)} blob-referanse(r) i tableX.xml peker på "
           f"filer som ikke ble funnet på disk.", "warn")
 
         # Detaljert kjørelogg: hvilke filer i hvilken tableX.xml
         max_logged_per_file = 20
         for xml_sti, items in missing_refs.items():
-            w(f"    {xml_sti}: {len(items):,} fil(er) ikke funnet", "warn")
+            w(f"    {xml_sti}: {_fnum(len(items))} fil(er) ikke funnet", "warn")
             for it in items[:max_logged_per_file]:
                 w(f"      • {it['ref']}  ({it['reason']})", "warn")
             if len(items) > max_logged_per_file:
@@ -6053,7 +6086,7 @@ class BlobConvertOperation(BaseOperation):
             n_annotated = _annotate_missing_refs_in_xml(
                 extract_dir, missing_refs, w)
             if n_annotated > 0:
-                w(f"  ✓ Annotert {n_annotated:,} XML-linjer med "
+                w(f"  ✓ Annotert {_fnum(n_annotated)} XML-linjer med "
                   f"<!-- ADVARSEL ... --> kommentar", "ok")
         except Exception as exc:
             w(f"  Kunne ikke annotere XML med manglende-kommentarer: {exc}",
@@ -6084,10 +6117,10 @@ class BlobConvertOperation(BaseOperation):
 
         # Bygg menneskelig format-tekst med kun de tellingene > 0
         parts = []
-        if n_base:  parts.append(f"{n_base:,} basename")
-        if n_lob:   parts.append(f"{n_lob:,} lob-relative")
-        if n_full:  parts.append(f"{n_full:,} full-relative (content/...)")
-        if n_oth:   parts.append(f"{n_oth:,} annet")
+        if n_base:  parts.append(f"{_fnum(n_base)} basename")
+        if n_lob:   parts.append(f"{_fnum(n_lob)} lob-relative")
+        if n_full:  parts.append(f"{_fnum(n_full)} full-relative (content/...)")
+        if n_oth:   parts.append(f"{_fnum(n_oth)} annet")
         fmt_str = ", ".join(parts)
 
         non_basename = n_lob + n_full + n_oth
@@ -6461,7 +6494,7 @@ class BlobConvertOperation(BaseOperation):
 
         stats["inline_extracted"] += 1
         w(f"    {xml_sti} <{tag_local}>: {detected_as} → {ext} "
-          f"({len(file_bytes):,} bytes) → {zip_sti_lob}", "info")
+          f"({_fnum(len(file_bytes))} bytes) → {zip_sti_lob}", "info")
         return zip_sti_lob
 
     # ── Streaming inline-ekstraksjon for enormt store tableX.xml ──────────────
@@ -6737,7 +6770,7 @@ class BlobConvertOperation(BaseOperation):
             if xml_sti not in xml_pre and sz_bytes >= SIZE_THRESHOLD:
                 # Stor fil: oppdateres direkte på disk og tar tid — vis start
                 # og fremdrift (resultatet skrives av _patch_xml_file_inplace)
-                w(f"{head}: oppdaterer referanser til {n_files:,} fil(er) direkte "
+                w(f"{head}: oppdaterer referanser til {_fnum(n_files)} fil(er) direkte "
                   f"på disk{extras} …", "info")
                 n = self._patch_xml_file_inplace(xml_file_path, renames, w,
                                                   col_map=col_map,
@@ -6782,7 +6815,7 @@ class BlobConvertOperation(BaseOperation):
                     n = 0
 
             if n:
-                w(f"{head}: {n:,} filreferanse{'r' if n != 1 else ''} "
+                w(f"{head}: {_fnum(n)} filreferanse{'r' if n != 1 else ''} "
                   f"oppdatert{extras}", "ok")
             else:
                 w(f"{head}: ingen filreferanser endret", "info")
@@ -6797,11 +6830,11 @@ class BlobConvertOperation(BaseOperation):
         with lock:
             stats["xml_updated"] += xml_updated
 
-        w(f"  XML ferdig: {xml_updated:,} filreferanse{'r' if xml_updated != 1 else ''} oppdatert", "info")
+        w(f"  XML ferdig: {_fnum(xml_updated)} filreferanse{'r' if xml_updated != 1 else ''} oppdatert", "info")
         _dc = getattr(self, "_digest_cache", None)
         if _dc is not None and (_dc.hits or _dc.misses):
-            w(f"    Lengde/MD5: {_dc.hits:,} fra konverteringen, "
-              f"{_dc.misses:,} beregnet under XML-oppdateringen", "info")
+            w(f"    Lengde/MD5: {_fnum(_dc.hits)} fra konverteringen, "
+              f"{_fnum(_dc.misses)} beregnet under XML-oppdateringen", "info")
 
     def _patch_xml_bytes(self, xml_bytes: bytes, xml_sti: str,
                           renames: dict[str, Path],
@@ -7000,14 +7033,14 @@ class BlobConvertOperation(BaseOperation):
                         t_last = _time.monotonic()
                         pct = src.tell() / file_sz * 100 if file_sz else 0
                         msg = (f"    {xml_path.name}: "
-                               f"{line_no:,}/{total_lines:,} linjer "
-                               f"({pct:.0f}%), {updates:,} filreferanse{'r' if updates != 1 else ''} oppdatert"
+                               f"{_fnum(line_no)}/{_fnum(total_lines)} linjer "
+                               f"({pct:.0f}%), {_fnum(updates)} filreferanse{'r' if updates != 1 else ''} oppdatert"
                                + _eta_text(t_start, t_last, pct))
                         w(msg, "info")
 
             tmp_path.replace(xml_path)
             done_msg = (f"    Ferdig: {xml_path.name} ({_fmt_size(xml_path.stat().st_size)}), "
-                        f"{line_no:,} linjer, {updates:,} filreferanse{'r' if updates != 1 else ''} oppdatert")
+                        f"{_fnum(line_no)} linjer, {_fnum(updates)} filreferanse{'r' if updates != 1 else ''} oppdatert")
             w(done_msg, "ok")
 
         except Exception as exc:
@@ -7141,7 +7174,7 @@ class BlobConvertOperation(BaseOperation):
               f"til versjon {target_version}", "info")
 
         sz = dst_path.stat().st_size
-        w(f"  Ferdig: {n_written:,} filer  {sz:,} bytes", "ok")
+        w(f"  Ferdig: {_fnum(n_written)} filer  {_fnum(sz)} bytes", "ok")
         if n_skipped:
             w(f"  OBS: {n_skipped} filer hoppet over", "warn")
 

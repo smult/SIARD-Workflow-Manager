@@ -18,6 +18,7 @@ Alt nettverksarbeid skjer i egne tråder — en treg eller utilgjengelig tjenest
 skal aldri stoppe eller felle en kjøring. Bare stdlib (urllib).
 """
 from __future__ import annotations
+from siard_workflow.core.fmt import num as _fnum
 
 import json
 import logging
@@ -511,7 +512,7 @@ class RunReporter:
         ph = self.phase
         if ph.get("total"):
             pct = 100.0 * (ph.get("done") or 0) / ph["total"]
-            lines.append(f"Fremdrift: {pct:.0f} % ({ph.get('done'):,} av {ph['total']:,})"
+            lines.append(f"Fremdrift: {pct:.0f} % ({_fnum(ph.get('done'))} av {_fnum(ph['total'])})"
                          .replace(",", " ")
                          + (f" · {ph['eta']}" if ph.get("eta") else ""))
             if ph.get("text"):

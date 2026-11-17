@@ -31,6 +31,7 @@ from siard_workflow.core.report import save_html, save_pdf
 from siard_workflow.core.workflow_io import workflow_to_json, workflow_from_json
 from siard_workflow.core.file_logger import WorkflowFileLogger, resolve_log_dir
 from siard_workflow.core.premis_logger import PremisProvenanceLogger
+from siard_workflow.core.fmt import num as _fnum
 from gui.progress_panel import ProgressPanel
 from gui.format_chart_panel import FormatChartPanel
 from settings import get_config, set_config
@@ -2055,10 +2056,10 @@ class App(ctk.CTk):
             n_missing += (lr or {}).get("missing", 0)
         if not hits:
             if n_missing:
-                self._pf(f"ingen rettbare funn; {n_missing:,} referanser til filer "
+                self._pf(f"ingen rettbare funn; {_fnum(n_missing)} referanser til filer "
                          f"som mangler (se «XML-validering»)")
             return True
-        self._pf(f"{sum(lr['fixable'] for lr in hits.values()):,} referanser med bare "
+        self._pf(f"{_fnum(sum(lr['fixable'] for lr in hits.values()))} referanser med bare "
                  f"filnavn (stikkprøve) — operatøren velger KDRS Søk & Vis eller DBPTK")
 
         lines = [
@@ -2076,13 +2077,13 @@ class App(ctk.CTk):
         for path, lr in hits.items():
             ex = next((c for c in lr["columns"] if c["fixable"]), None)
             approx = "minst " if lr.get("sampled") else ""
-            lines.append(f"  {path.name}: {approx}{lr['fixable']:,} referanser med bare "
+            lines.append(f"  {path.name}: {approx}{_fnum(lr['fixable'])} referanser med bare "
                          f"filnavn i {lr['tables_scanned']} tabell(er)")
             if ex:
                 lines.append(f"    \u2022 f.eks. {ex['schema']}/{ex['table']} c{ex['col']}: "
                              f"file=\"{ex['example_ref']}\" → {ex['example_full']}")
         if n_missing:
-            lines.append(f"\n  I tillegg {n_missing:,} referanser til filer som ikke "
+            lines.append(f"\n  I tillegg {_fnum(n_missing)} referanser til filer som ikke "
                          f"finnes i arkivet (se «XML-validering»).")
         lines += ["", "Hvilket mål skal filreferansene tilpasses?"]
 
@@ -2374,7 +2375,7 @@ class App(ctk.CTk):
         counts = {p: AV.zip_entry_count(p) or 0 for p in self.siard_queue}
         n_max = max(counts.values(), default=0)
         if n_max < AV.MANY_FILES:
-            self._pf(f"ikke aktuelt ({n_max:,} filer)".replace(",", " "))
+            self._pf(f"ikke aktuelt ({_fnum(n_max)} filer)".replace(",", " "))
             return True
         temp_root = Path(str(self._global_temp_dir)) if self._global_temp_dir \
             else Path(_tf.gettempdir())
@@ -2388,12 +2389,12 @@ class App(ctk.CTk):
                     big_dir, big_n = d, c
         short_big = bool(vol.get("short_names")) and big_n >= AV.LARGE_FOLDER
         if not av and not vol.get("hdd") and not short_big:
-            self._pf(f"{n_max:,}".replace(",", " ") + " filer — ikke funnet aktivt "
+            self._pf(f"{_fnum(n_max)}".replace(",", " ") + " filer — ikke funnet aktivt "
                      "antivirus, HDD eller 8.3-problem")
             return True
         rate = AV.measure_file_rate(temp_root)
-        n_txt = f"{n_max:,}".replace(",", " ")
-        big_txt = f"{big_n:,}".replace(",", " ")
+        n_txt = f"{_fnum(n_max)}".replace(",", " ")
+        big_txt = f"{_fnum(big_n)}".replace(",", " ")
         drive = temp_root.resolve().drive or "disken"
         summary = (f"{n_txt} filer (største mappe {big_txt}); antivirus: "
                    f"{', '.join(av) or 'ikke funnet'}"
@@ -2577,6 +2578,85 @@ class App(ctk.CTk):
         except Exception:
             pass
 
+    def _log_header_info(self, path: Path, wf) -> list:
+        """Fakta om kjøringen til toppen av loggfila."""
+        from siard_workflow.core import fmt
+        info = [("Program", f"SIARD Workflow Manager v{self.VERSION}")]
+        try:
+            import platform
+            info.append(("Maskin", platform.node() or "?"))
+        except Exception:
+            pass
+        try:
+            info.append(("Kilde", f"{path}  ({fmt.size(path.stat().st_size)})"))
+        except OSError:
+            info.append(("Kilde", str(path)))
+        try:
+            info.append(("Steg", " → ".join(op.label for op in wf)))
+        except Exception:
+            pass
+        return info
+
+    def _finalize_report(self, ctx, file_logger, *, aborted: bool, held: int) -> None:
+        """
+        Kjørerapporten lages før de siste stegene (DIAS-pakking o.l.). Når de
+        er ferdige, skrives rapporten på nytt med alle stegene — til samme fil.
+        """
+        try:
+            data = (getattr(ctx, "results", {}) or {}).get("workflow_report") or {}
+            path = data.get("report_path") if isinstance(data, dict) else None
+            steps = list((ctx.metadata or {}).get("step_results") or [])
+            rep_idx = next((s.get("index", -1) for s in steps
+                            if s.get("id") == "workflow_report" and not s.get("skipped")
+                            and s.get("success")), None)
+            if not path or rep_idx is None:
+                return
+            later = [s for s in steps if s.get("index", -1) > rep_idx
+                     and not s.get("skipped")]
+            if not later:
+                return
+            from siard_workflow.operations.workflow_report_operation import (
+                write_final_report)
+            outcome = ("avbrutt" if aborted else "foreløpig" if held
+                       else "fullført")
+            if write_final_report(ctx, Path(path), outcome=outcome):
+                file_logger.log(
+                    f"Kjørerapporten er oppdatert med stegene som kjørte etter den: "
+                    f"{Path(path).name}", "info")
+        except Exception as exc:
+            file_logger.log(f"Kjørerapporten kunne ikke oppdateres til slutt: {exc}",
+                            "warn")
+
+    def _log_run_summary(self, file_logger, ctx, run, *, aborted: bool,
+                         held: int) -> None:
+        """Sluttsammendrag i loggfila: resultat, tid, steg, advarsler, filer."""
+        from siard_workflow.core import fmt
+        from siard_workflow.core.run_summary import (
+            build_run_summary, collect_outputs, failure_counts)
+        try:
+            results = dict(getattr(ctx, "results", {}) or {})
+            failed, kept = failure_counts(results)
+            extra = [("Kjørelogg", file_logger.log_path)]
+            _pl = (ctx.metadata or {}).get("premis_logger")
+            if _pl is not None and getattr(_pl, "path", None):
+                extra.append(("PREMIS-proveniens", _pl.path))
+            lines = build_run_summary(
+                list((ctx.metadata or {}).get("step_results") or []),
+                total_s=run.elapsed,
+                wait_s=self.__dict__.get("_wait_total", 0.0),
+                warnings=file_logger.warnings, errors=file_logger.errors,
+                n_warnings=file_logger.n_warnings, n_errors=file_logger.n_errors,
+                outputs=collect_outputs(results, extra),
+                failed_files=failed, kept_files=kept, held=held, aborted=aborted)
+            file_logger.log("", "info")
+            for lvl, text in lines:
+                file_logger.log(text, lvl, raw=True)
+        except Exception as exc:
+            file_logger.log(f"Sammendraget kunne ikke lages: {exc}", "warn")
+        file_logger.log(
+            f"Fullført: {'SUKSESS' if run.success else 'FEIL'}  "
+            f"({fmt.duration(run.elapsed)})")
+
     def _remote_wait(self, done, title: str, text: str, choices: list,
                      on_remote, timeout: "float | None" = None) -> "str | None":
         """
@@ -2624,6 +2704,8 @@ class App(ctk.CTk):
             return remote
         finally:
             waited = _time.monotonic() - t_wait
+            # Til sluttsammendraget: hvor mye av kjøretiden var venting på svar
+            self._wait_total = self.__dict__.get("_wait_total", 0.0) + waited
             if logq is not None and waited >= 60:
                 logq.put(("log", f"  Svar på «{title}» etter {fmt_duration(waited)}", "info"))
 
@@ -2790,7 +2872,7 @@ class App(ctk.CTk):
                             else "ingen datoer")
                     flag = ("  ← AVVIKER, holdt utenfor" if t.get("off")
                             else "  ← avviker" if t.get("deviates") else "")
-                    n_txt = f"{t['n']:,}".replace(",", " ")
+                    n_txt = f"{_fnum(t['n'])}".replace(",", " ")
                     lines.append(f"  \u2022 {t['table']}.{t['column']}: {span} "
                                  f"({n_txt} datoer){flag}")
                 if len(tabs) > 12:
@@ -3502,13 +3584,15 @@ class App(ctk.CTk):
             ctx.metadata["log_dir"] = str(log_dir)
 
             run.start_time = time.time()
+            self._wait_total = 0.0
             file_logger = None
             try:
                 # Livstegn hver halvtime — også i GUI-loggen
                 file_logger = WorkflowFileLogger(
                     log_dir, path.stem,
                     on_heartbeat=lambda m: (self._log_queue.put(("log", m, "muted")),
-                                            _rep and _rep.heartbeat(m)))
+                                            _rep and _rep.heartbeat(m)),
+                    header_info=self._log_header_info(path, wf))
                 file_logger.__enter__()
                 ctx.metadata["file_logger"] = file_logger
                 # Preflight kjørte på hovedtråden før fil-loggen fantes —
@@ -3517,7 +3601,8 @@ class App(ctk.CTk):
                 if _pf_lines:
                     # GUI-nivåer og fil-loggerens LEVELS deler nøkler
                     # (info/step/success/warn/error/muted); "ok" → success.
-                    for _lvl, _msg in _pf_lines:
+                    from siard_workflow.core.run_summary import compact_preflight
+                    for _lvl, _msg in compact_preflight(_pf_lines):
                         file_logger.log(_msg, "success" if _lvl == "ok" else _lvl)
                     file_logger.log("", "info")
             except Exception:
@@ -3597,6 +3682,7 @@ class App(ctk.CTk):
                 if _rep:
                     _rep.step_start(i, len(wf), op.label)
                 if file_logger:
+                    file_logger.log("", "info")          # luft mellom stegene
                     file_logger.set_step(f"[{i+1}] {op.label}")
                     file_logger.log(f"[{i+1}] {op.label}", "step")
 
@@ -3710,6 +3796,19 @@ class App(ctk.CTk):
                 if op.operation_id == "workflow_report":
                     ctx.metadata["held_steps"] = [o.label for o in list(wf)
                                                   if id(o) in _held]
+                    # Steg som kjører etter rapporten — rapporten sier fra, og
+                    # får en sluttversjon når de er ferdige
+                    ctx.metadata["steps_after_report"] = [
+                        o.label for o in list(wf)[i + 1:]]
+
+                # DIAS-pakken og depotrapportene tar med PREMIS-fila: skriv
+                # hendelsene så langt nå (den endelige skrives til slutt)
+                if (premis_logger and premis_logger.has_events()
+                        and op.operation_id in ("dias_package", "depot_reports")):
+                    try:
+                        premis_logger.finalize(ctx.siard_path, ctx)
+                    except Exception:
+                        pass
 
                 t0 = time.time()
                 try:
@@ -3737,6 +3836,13 @@ class App(ctk.CTk):
                             wf.insert(i + 1 + k, _op)
                             self._log_queue.put(("log",
                                 f"  ✚ Lagt til i arbeidsflyt: {_op.label}", "ok"))
+                            if file_logger:
+                                # Stegnumrene i kjøreplanen over stemmer ikke lenger
+                                file_logger.log(
+                                    f"  Lagt til automatisk som steg [{i + 2 + k}]: "
+                                    f"{_op.label} — stegene etter får ett nummer "
+                                    f"høyere enn i kjøreplanen (nå {len(wf)} steg)",
+                                    "info")
 
                         # 2. Oppdater workflow_panel (UI) — MÅ kjøres på
                         #    hovedtråden. Sett inn etter forrige op-id slik at
@@ -3893,8 +3999,10 @@ class App(ctk.CTk):
                 if _held:
                     file_logger.log(f"Holdt igjen: {len(_held)} steg — kjør arbeidsflyten "
                                     f"igjen når feilen er rettet", "warn")
-                file_logger.log(
-                    f"Fullført: {'SUKSESS' if run.success else 'FEIL'}  ({run.elapsed:.2f}s)")
+                self._finalize_report(ctx, file_logger, aborted=_aborted,
+                                      held=len(_held))
+                self._log_run_summary(file_logger, ctx, run,
+                                      aborted=_aborted, held=len(_held))
                 file_logger.__exit__(None, None, None)
                 self._log_queue.put(("log_saved", str(file_logger.log_path)))
 
@@ -4208,7 +4316,7 @@ class App(ctk.CTk):
             return False
         done = [c for c in changes if not c.startswith("IKKE")]
         if done:
-            _w("  SIARD-header endret i panelet:", "info")
+            _w("  SIARD-header endret i panelet (skrevet inn mellom stegene):", "info")
         for c in changes:
             _w(f"    {c}", "warn" if c.startswith("IKKE") else "info")
         if done and premis_logger:
@@ -4312,7 +4420,8 @@ class App(ctk.CTk):
                     self.workflow_panel.highlight_step(-1)
                     status = "SUKSESS" if run.success else "FEIL"
                     lvl    = "success" if run.success else "error"
-                    self._log(f"Fullført: {status}  ({run.elapsed:.2f}s)", lvl)
+                    from siard_workflow.core import fmt as _fmt
+                    self._log(f"Fullført: {status}  ({_fmt.duration(run.elapsed)})", lvl)
                     if run.skipped:
                         self._log(f"Hoppet over: {', '.join(run.skipped)}", "muted")
                 elif kind == "workflow_halted":
@@ -4381,7 +4490,7 @@ class App(ctk.CTk):
                     self.progress_panel.init_run(kw["total"])
                     self.format_chart.reset()
                     self.log_panel.set_live_mode(True)
-                    self._log(f"  Konverterer {kw['total']:,} fil(er) ...", "step")
+                    self._log(f"  Konverterer {_fnum(kw['total'])} fil(er) ...", "step")
                     needs_redraw = True
                 elif kind == "conv_phase":
                     _, kw = item
@@ -4662,10 +4771,10 @@ class App(ctk.CTk):
                           for r, n in est.get("skipped", {}).items())
         mins = max(1, round(est.get("est_seconds", 0) / 60))
         pct = f"{est['sample_saving_pct']:.1f}".replace(".", ",")   # norsk desimalkomma
-        n_total = f"{est['n_total']:,}".replace(",", " ")           # 48 210
+        n_total = f"{_fnum(est['n_total'])}".replace(",", " ")           # 48 210
         labels = est.get("origin_labels", {})
         groups = "".join(
-            f"\n   • {f'{n:,}'.replace(',', ' ')} {labels.get(o, o)}"
+            f"\n   • {f'{_fnum(n)}'.replace(',', ' ')} {labels.get(o, o)}"
             for o, n in est.get("origins", {}).items())
         msg = (
             "Dokumentkonverteringen er ferdig. PDF-filene kan etterbehandles med "

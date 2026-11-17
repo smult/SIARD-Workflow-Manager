@@ -35,6 +35,7 @@ False i globale innstillinger.
 """
 
 from __future__ import annotations
+from siard_workflow.core.fmt import num as _fnum
 import os
 import re
 import tempfile
@@ -499,7 +500,7 @@ class StandardizeExtOperation(BaseOperation):
         phase(1, "Skanner LOB-mapper")
         t0 = time.monotonic()
         lob_dirs, xml_files = scan_content_tree(content_dir)
-        w(f"  {len(lob_dirs):,} lob-mapper og {len(xml_files):,} tabell-XML "
+        w(f"  {_fnum(len(lob_dirs))} lob-mapper og {_fnum(len(xml_files))} tabell-XML "
           f"funnet ({time.monotonic() - t0:.1f} s)", "info")
 
         jobs: list[tuple[Path, str, str]] = []            # (lob_dir, old, new)
@@ -524,7 +525,7 @@ class StandardizeExtOperation(BaseOperation):
                 n_name += name_changed
             pp.add()
         if stats["name_collisions"] > n_logged:
-            w(f"  ... og {stats['name_collisions'] - n_logged:,} "
+            w(f"  ... og {_fnum(stats['name_collisions'] - n_logged)} "
               f"navnekollisjon(er) til (ikke listet)", "warn")
         progress("phase_done")
 
@@ -537,8 +538,8 @@ class StandardizeExtOperation(BaseOperation):
                 progress("phase_done")
             return stats
 
-        w(f"  {len(jobs):,} fil(er) skal omdøpes "
-          f"({n_ext:,} endelse → .bin, {n_name:,} navn → recordN)", "info")
+        w(f"  {_fnum(len(jobs))} fil(er) skal omdøpes "
+          f"({_fnum(n_ext)} endelse → .bin, {_fnum(n_name)} navn → recordN)", "info")
 
         # ── Fase 2: Omdøp i tråd-pool ─────────────────────────────────────────
         phase(2, "Omdøper filer")
@@ -566,7 +567,7 @@ class StandardizeExtOperation(BaseOperation):
                         w(f"  FEIL omdøp {old}: {err}", "feil")
                 pp.add(len(ok) + len(errors))
         if stats["rename_errors"] > n_logged:
-            w(f"  ... og {stats['rename_errors'] - n_logged:,} omdøpingsfeil til",
+            w(f"  ... og {_fnum(stats['rename_errors'] - n_logged)} omdøpingsfeil til",
               "feil")
 
         # Tell opp og fjern mislykkede fra XML-kartet. Kartet er per basenavn:
@@ -589,13 +590,13 @@ class StandardizeExtOperation(BaseOperation):
             if new.split(".", 1)[0] != old.split(".", 1)[0]:
                 stats["renamed_names"] += 1
         if stats["renamed"] > n_logged:
-            w(f"  ... og {stats['renamed'] - n_logged:,} endelsesbytte(r) til "
+            w(f"  ... og {_fnum(stats['renamed'] - n_logged)} endelsesbytte(r) til "
               f"(ikke listet)", "info")
         for old in list(global_rename):
             if old not in succeeded_names:
                 del global_rename[old]
-        w(f"  {stats['renamed']:,} fil(er) fikk .bin-endelse, "
-          f"{stats['renamed_names']:,} fil(er) omdøpt til recordN "
+        w(f"  {_fnum(stats['renamed'])} fil(er) fikk .bin-endelse, "
+          f"{_fnum(stats['renamed_names'])} fil(er) omdøpt til recordN "
           f"({time.monotonic() - t0:.1f} s)", "ok")
         progress("phase_done")
 
@@ -638,8 +639,8 @@ class StandardizeExtOperation(BaseOperation):
                     if n and n_logged < _LOG_CAP:
                         n_logged += 1
                         w(f"  {xml_file.parent.name}/{xml_file.name}: "
-                          f"{n:,} referanse(r)", "info")
-        w(f"  {stats['xml_updated']:,} XML-referanser oppdatert "
+                          f"{_fnum(n)} referanse(r)", "info")
+        w(f"  {_fnum(stats['xml_updated'])} XML-referanser oppdatert "
           f"({time.monotonic() - t0:.1f} s).", "ok")
         progress("phase_done")
         return stats

@@ -27,6 +27,7 @@ attributtinnhold (gyldig SIARD-XML har ikke literal "\\u0020" som
 attributtverdi).
 """
 from __future__ import annotations
+from siard_workflow.core.fmt import num as _fnum
 
 import concurrent.futures
 import os
@@ -190,8 +191,8 @@ class XmlCleanerOperation(BaseOperation):
             progress("finish", stats=stats)
             self.produces_siard = False
             return self._ok(stats,
-                            f"{stats['padding_removed']:,} padding-sekvenser fjernet"
-                            f", {stats['bytes_saved']:,} bytes spart")
+                            f"{_fnum(stats['padding_removed'])} padding-sekvenser fjernet"
+                            f", {_fnum(stats['bytes_saved'])} bytes spart")
 
         # ── Standalone-modus: les inn SIARD, skriv ny SIARD ──────────────────
         self.produces_siard = True
@@ -219,8 +220,8 @@ class XmlCleanerOperation(BaseOperation):
         progress("finish", stats=stats)
         return self._ok(
             {**stats, "output_path": str(dst_path)},
-            f"{stats['padding_removed']:,} padding-sekvenser fjernet"
-            f", {stats['bytes_saved']:,} bytes spart")
+            f"{_fnum(stats['padding_removed'])} padding-sekvenser fjernet"
+            f", {_fnum(stats['bytes_saved'])} bytes spart")
 
     # ── Implementasjon ───────────────────────────────────────────────────────
 
@@ -282,8 +283,8 @@ class XmlCleanerOperation(BaseOperation):
                         stats["tables_modified"] += 1
                         stats["padding_removed"] += n_repl
                         stats["bytes_saved"]     += saved
-                        w(f"    {rel_sti}: {n_repl:,} sekvenser, "
-                          f"{saved:,} bytes spart", "info")
+                        w(f"    {rel_sti}: {_fnum(n_repl)} sekvenser, "
+                          f"{_fnum(saved)} bytes spart", "info")
                     progress("phase_progress",
                              done=n_done, total=len(tables))
         except Exception as exc:
@@ -317,8 +318,8 @@ class XmlCleanerOperation(BaseOperation):
                 stats["tables_modified"] += 1
                 stats["padding_removed"] += n_repl
                 stats["bytes_saved"]     += saved
-                w(f"    {rs}: {n_repl:,} sekvenser, "
-                  f"{saved:,} bytes spart", "info")
+                w(f"    {rs}: {_fnum(n_repl)} sekvenser, "
+                  f"{_fnum(saved)} bytes spart", "info")
             progress("phase_progress", done=n_done, total=len(tables))
         progress("phase_done")
 
@@ -352,8 +353,8 @@ class XmlCleanerOperation(BaseOperation):
                     stats["tables_modified"] += 1
                     stats["padding_removed"] += n_repl
                     stats["bytes_saved"]     += len(src_bytes) - len(cleaned)
-                    w(f"    {name}: {n_repl:,} sekvenser, "
-                      f"{len(src_bytes) - len(cleaned):,} bytes (dry-run)",
+                    w(f"    {name}: {_fnum(n_repl)} sekvenser, "
+                      f"{_fnum(len(src_bytes) - len(cleaned))} bytes (dry-run)",
                       "info")
                 progress("phase_done")
                 return
@@ -388,8 +389,8 @@ class XmlCleanerOperation(BaseOperation):
                                 stats["tables_modified"] += 1
                                 stats["padding_removed"] += n_repl
                                 stats["bytes_saved"]     += len(data) - len(cleaned)
-                                w(f"    {info.filename}: {n_repl:,} sekvenser, "
-                                  f"{len(data) - len(cleaned):,} bytes spart",
+                                w(f"    {info.filename}: {_fnum(n_repl)} sekvenser, "
+                                  f"{_fnum(len(data) - len(cleaned))} bytes spart",
                                   "info")
                                 data = cleaned
                             n_done += 1
@@ -428,7 +429,7 @@ class XmlCleanerOperation(BaseOperation):
         for k in ("tables_scanned", "tables_modified",
                   "padding_removed", "bytes_saved"):
             v = stats.get(k, 0)
-            w(f"    {labels[k]:<28} {v:,}", "info")
+            w(f"    {labels[k]:<28} {_fnum(v)}", "info")
         if dry_run:
             w("    (TØRKJØRING — ingen filer skrevet)", "warn")
         w("=" * 56)

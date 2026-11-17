@@ -33,6 +33,7 @@ Avhengigheter (valgfrie — faller tilbake ved manglende installasjon):
   python-docx      : pip install python-docx  (installeres av mailmerge2)
 """
 from __future__ import annotations
+from siard_workflow.core.fmt import num as _fnum
 
 import concurrent.futures
 import hashlib
@@ -714,7 +715,7 @@ def _pack_zip(
     if n_transformed:
         w(f"  {n_transformed} XML-filer transformert til SIARD {target_version}",
           "info")
-    w(f"  Pakket: {n_written:,} oppføringer  ({dst_path.stat().st_size:,} bytes)",
+    w(f"  Pakket: {_fnum(n_written)} oppføringer  ({_fnum(dst_path.stat().st_size)} bytes)",
       "ok")
 
 
@@ -1398,7 +1399,7 @@ class CosDocMailMergeOperation(BaseOperation):
                 new_blob_path = lob_path / new_blobname
                 final_bytes   = final_path.read_bytes()
                 new_blob_path.write_bytes(final_bytes)
-                w(f"    Lagret: {new_blobname} ({len(final_bytes):,} bytes)", "ok")
+                w(f"    Lagret: {new_blobname} ({_fnum(len(final_bytes))} bytes)", "ok")
 
                 old_blob = lob_path / p.main_blob["file"]
                 if old_blob != new_blob_path and old_blob.exists():
@@ -1433,7 +1434,7 @@ class CosDocMailMergeOperation(BaseOperation):
                     if old_blob != new_blob_path and old_blob.exists():
                         old_blob.unlink()
                     w(f"    Fjernet passord og konvertert: {new_blobname} "
-                      f"({len(new_data):,} bytes)", "ok")
+                      f"({_fnum(len(new_data))} bytes)", "ok")
                     base["update"] = {"file": new_blobname, "length": len(new_data),
                                       "digest": _md5_upper(new_data),
                                       "conversion_note": "Konvertert: fjernt passord og konvertert til .docx"}

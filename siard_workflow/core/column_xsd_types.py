@@ -325,6 +325,29 @@ def format_finding(f: dict) -> str:
     return f"{where}: {f['sql_type']} forventer {exp}, XSD har {f['found']}{tail}"
 
 
+def group_lines(lines, examples: int = 3) -> list:
+    """
+    Slå sammen linjer fra format_finding() som bare skiller seg på hvor de
+    gjelder: «203 × dateType maxExclusive «…» → rettes til «…» (schema0/table0,
+    schema0/table1, schema0/table2 og 200 til)». Grupper på inntil `examples`
+    linjer listes enkeltvis. Rekkefølgen følger første forekomst.
+    """
+    groups: dict = {}
+    for line in lines:
+        where, sep, rest = str(line).partition(": ")
+        if not sep:
+            where, rest = "", str(line)
+        groups.setdefault(rest, []).append(where)
+    out: list = []
+    for rest, wheres in groups.items():
+        if len(wheres) <= examples:
+            out.extend(f"{w}: {rest}" if w else rest for w in wheres)
+            continue
+        shown = ", ".join(w for w in wheres[:examples] if w)
+        out.append(f"{len(wheres)} × {rest} ({shown} og {len(wheres) - examples} til)")
+    return out
+
+
 # ── Retting av tableM.xsd ────────────────────────────────────────────────────
 
 _XSD_ELEMENT_RE   = re.compile(rb"<(?:[A-Za-z0-9_]+:)?element\b[^>]*>")

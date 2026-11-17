@@ -76,6 +76,7 @@ class PremisProvenanceLogger:
         self.agent_id  = f"SIARD Manager v{agent_version}" if agent_version else "SIARD Manager"
         self._events: list[dict] = []
         self._path: Path | None = None
+        self._prior: "list | None" = None      # leses én gang (se finalize)
         # Prosjektet er kjørt før (gui/app.py): hendelser fra tidligere kjøringer
         # i {base}_premis.xml beholdes, og denne kjøringens legges til
         self.append_existing = False
@@ -90,6 +91,12 @@ class PremisProvenanceLogger:
 
     def has_events(self) -> bool:
         return bool(self._events)
+
+    def all_events(self) -> list:
+        """Hendelsene så langt — også fra tidligere kjøringer av prosjektet."""
+        if self._prior is None:
+            self._prior = self._read_prior() if self.append_existing else []
+        return list(self._prior) + list(self._events)
 
     def _ts(self) -> str:
         # ISO 8601 med tidssone-offset (lokal tid).
@@ -151,7 +158,11 @@ class PremisProvenanceLogger:
             return None
         try:
             self.log_dir.mkdir(parents=True, exist_ok=True)
-            self._prior = self._read_prior() if self.append_existing else []
+            # finalize kan kalles flere ganger (foreløpig fil før DIAS-pakking,
+            # endelig til slutt): tidligere kjøringers hendelser leses bare
+            # første gang — ellers ville denne kjøringens egne bli doblet
+            if self._prior is None:
+                self._prior = self._read_prior() if self.append_existing else []
             root = self._build_tree(Path(siard_path), ctx)
             tree = ET.ElementTree(root)
             try:

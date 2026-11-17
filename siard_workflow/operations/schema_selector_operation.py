@@ -14,6 +14,7 @@ Auto-add: UnpackSiardOperation tilbyr å legge til denne operasjonen rett
 etter seg selv hvis utpakket SIARD inneholder mer enn ett schema.
 """
 from __future__ import annotations
+from siard_workflow.core.fmt import num as _fnum
 
 import os
 import shutil
@@ -304,8 +305,8 @@ class SchemaSelectorOperation(BaseOperation):
         w(f"  Fant {len(schemas)} schema(er):", "info")
         for s in schemas:
             w(f"    • {s['name']} (folder {s['folder']}): "
-              f"{len(s['tables'])} tabell(er), {s['file_count']:,} filer, "
-              f"{s['size_bytes']:,} bytes", "info")
+              f"{len(s['tables'])} tabell(er), {_fnum(s['file_count'])} filer, "
+              f"{_fnum(s['size_bytes'])} bytes", "info")
         progress("phase_done")
 
         # Velg schemas
@@ -368,8 +369,8 @@ class SchemaSelectorOperation(BaseOperation):
             w(f"  Fant {len(schemas)} schema(er)", "info")
             for s in schemas:
                 w(f"    • {s['name']} (folder {s['folder']}): "
-                  f"{len(s['tables'])} tabell(er), {s['file_count']:,} filer, "
-                  f"{s['size_bytes']:,} bytes", "info")
+                  f"{len(s['tables'])} tabell(er), {_fnum(s['file_count'])} filer, "
+                  f"{_fnum(s['size_bytes'])} bytes", "info")
             progress("phase_done")
 
             if len(schemas) <= 1 or auto_all:
@@ -467,7 +468,7 @@ class SchemaSelectorOperation(BaseOperation):
     def _summary_msg(stats: dict) -> str:
         return (f"{stats.get('removed_schemas', 0)} schema(er) fjernet, "
                 f"{stats.get('kept_schemas', 0)} beholdt, "
-                f"{stats.get('bytes_freed', 0):,} bytes spart")
+                f"{_fnum(stats.get('bytes_freed', 0))} bytes spart")
 
     @staticmethod
     def _fail_dict(msg: str) -> dict:

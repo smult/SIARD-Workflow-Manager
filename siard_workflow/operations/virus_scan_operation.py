@@ -20,6 +20,7 @@ Alle instillinger hentes fra config.json (via settings.py) men kan overstyres
 per operasjon via params.
 """
 from __future__ import annotations
+from siard_workflow.core.fmt import num as _fnum
 
 import datetime
 import os
@@ -233,9 +234,9 @@ class VirusScanOperation(BaseOperation):
             target_path = str(pipeline_dir)
             all_files   = [f for f in pipeline_dir.rglob("*") if f.is_file()]
             w(f"  Bruker utpakket pipeline-mappe: {pipeline_dir}", "info")
-            w(f"  {len(all_files):,} filer klar for skanning.", "info")
+            w(f"  {_fnum(len(all_files))} filer klar for skanning.", "info")
             log_lines.append(
-                f"Skannemål       : pipeline-mappe ({len(all_files):,} filer)")
+                f"Skannemål       : pipeline-mappe ({_fnum(len(all_files))} filer)")
 
         elif scan_target == "folder":
             # Pakk ut SIARD til temp-mappe
@@ -252,7 +253,7 @@ class VirusScanOperation(BaseOperation):
             try:
                 with zipfile.ZipFile(ctx.siard_path, "r") as zf:
                     members = zf.namelist()
-                    w(f"  Pakker ut {len(members):,} filer til {tmp_dir} ...", "info")
+                    w(f"  Pakker ut {_fnum(len(members))} filer til {tmp_dir} ...", "info")
                     zf.extractall(tmp_dir)
             except Exception as exc:
                 if tmp_dir:
@@ -261,8 +262,8 @@ class VirusScanOperation(BaseOperation):
 
             target_path = str(tmp_dir)
             all_files = [f for f in tmp_dir.rglob("*") if f.is_file()]
-            w(f"  {len(all_files):,} filer klar for skanning.", "info")
-            log_lines.append(f"Skannemål       : utpakket mappe ({len(all_files):,} filer)")
+            w(f"  {_fnum(len(all_files))} filer klar for skanning.", "info")
+            log_lines.append(f"Skannemål       : utpakket mappe ({_fnum(len(all_files))} filer)")
         else:
             target_path = str(ctx.siard_path)
             all_files   = [ctx.siard_path]
@@ -348,7 +349,7 @@ class VirusScanOperation(BaseOperation):
                 elapsed = int(now - t_start)
                 m, s = divmod(elapsed, 60)
                 tid  = f"{m}m {s:02d}s" if m else f"{s}s"
-                w(f"  Skanner … {len(stdout_lines):,} linjer lest  ({tid} elapsed)",
+                w(f"  Skanner … {_fnum(len(stdout_lines))} linjer lest  ({tid} elapsed)",
                   "muted")
                 if pcb:
                     pcb("scan_progress",
@@ -377,7 +378,7 @@ class VirusScanOperation(BaseOperation):
         elapsed_total = int(time.time() - t_start)
         m, s = divmod(elapsed_total, 60)
         tid  = f"{m}m {s:02d}s" if m else f"{s}s"
-        w(f"  Skanning fullført på {tid}  ({len(stdout_lines):,} linjer)", "info")
+        w(f"  Skanning fullført på {tid}  ({_fnum(len(stdout_lines))} linjer)", "info")
 
         if stdout_lines:
             log_lines += ["=== AV-OUTPUT (stdout) ==="] + stdout_lines + [""]
@@ -430,7 +431,7 @@ class VirusScanOperation(BaseOperation):
         log_lines += [
             "",
             f"RESULTAT: {resultat_tekst}",
-            f"Filer skannet   : {len(all_files):,}",
+            f"Filer skannet   : {_fnum(len(all_files))}",
         ]
 
         av_log_path = self._write_av_log(log_dir, siard_name, log_lines)
@@ -467,11 +468,11 @@ class VirusScanOperation(BaseOperation):
             return self._fail(msg, data=data)
 
         if infected:
-            msg = (f"TRUSLER FUNNET ({len(all_files):,} filer skannet, "
+            msg = (f"TRUSLER FUNNET ({_fnum(len(all_files))} filer skannet, "
                    f"{len(funn_linjer)} funn)")
             w(f"  {msg}", "warn")
             return self._fail(msg, data=data)
 
-        msg = f"Ingen trusler funnet ({len(all_files):,} filer skannet)"
+        msg = f"Ingen trusler funnet ({_fnum(len(all_files))} filer skannet)"
         w(f"  {msg}", "ok")
         return self._ok(data=data, message=msg)

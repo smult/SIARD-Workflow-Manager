@@ -79,8 +79,11 @@ def test_logger(tmp: Path) -> None:
                                                 "mangler": 1}, f"opptelling uten duplikater ({sm['counts']})")
     _ok(sm["entries"][0]["plassering"] == "arkiv.dokumenter.fil",
         f"plassering = schema.tabell.kolonne ({sm['entries'][0]['plassering']})")
-    _ok(sm["entries"][2]["plassering"] == "arkiv.dokumenter",
+    _mangler = next(e for e in sm["entries"] if e["kategori"] == "mangler")
+    _ok(_mangler["plassering"] == "arkiv.dokumenter",
         "manglende referanse: tabell fra tableX.xml-stien")
+    _ok(sm["entries"][-1]["kategori"] == "passordbeskyttet" and sm["failed_total"] == 2
+        and sm["kept_total"] == 1, "reelle feil først; beholdt etter regelen telles for seg")
     text = Path(sm["log_path"]).read_text("utf-8")
     _ok("OPPSUMMERING" in text and "passordbeskyttet" in text, "feilloggen har kategori og oppsummering")
     with open(sm["csv_path"], encoding="utf-8-sig", newline="") as f:
@@ -138,7 +141,7 @@ def test_blob_and_report(tmp: Path) -> None:
     _ok(any(e["plassering"] == "arkiv.dokumenter.fil" for e in fs["entries"]),
         "tabell/kolonne-navn i lista")
     text = "\n".join(logs)
-    _ok("IKKE KONVERTERT / PROBLEMER" in text and "Tom fil (0 byte)" in text,
+    _ok("FEILET — bør følges opp" in text and "Tom fil (0 byte)" in text,
         "kjøreloggen har opptelling per årsak")
     _ok(fs.get("csv_path") and Path(fs["csv_path"]).exists(), "komplett liste (CSV) skrevet")
 
@@ -154,7 +157,7 @@ def test_blob_and_report(tmp: Path) -> None:
     import fitz
     with fitz.open(rr.data["report_path"]) as doc:
         pdf_text = "\n".join(p.get_text() for p in doc)
-    _ok("Filer som ikke ble konvertert" in pdf_text and "Tom fil (0 byte)" in pdf_text
+    _ok("Filer som ikke lot seg konvertere" in pdf_text and "Tom fil (0 byte)" in pdf_text
         and "Manglende fil" in pdf_text and "record5.bin" in pdf_text,
         "rapporten har opptelling og filliste")
     _ok("arkiv.dokumenter.fil" in pdf_text, "rapporten viser tabell/kolonne")

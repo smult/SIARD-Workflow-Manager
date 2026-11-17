@@ -17,6 +17,7 @@ før «Metadata-uttrekk»/«Kjørerapport»), et estimat alltid merket som estim
 DIAS-pakken bruker samme spenn som periode.
 """
 from __future__ import annotations
+from siard_workflow.core.fmt import num as _fnum
 
 import shutil
 import threading
@@ -118,6 +119,14 @@ class DateSpanOperation(BaseOperation):
         if res.get("metadata_timespan"):
             w(f"    metadata.xml <dataOriginTimespan> «{res['metadata_timespan']}» er ikke "
               "et tolkbart datospenn — estimerer fra uttrekket", "warn")
+            try:
+                from siard_workflow.core.date_span import guess_compact_span
+                _g = guess_compact_span(str(res["metadata_timespan"]))
+            except Exception:
+                _g = None
+            if _g:
+                w(f"    Teksten ligner datoer uten skilletegn (DDMMÅÅÅÅ): {_g[0]} – {_g[1]}. "
+                  "Skriv perioden slik i SIARD-headeren hvis den er riktig.", "info")
         else:
             w("    metadata.xml oppgir ikke datospenn — estimerer fra uttrekket", "info")
         for t in res.get("tiers_tried", []):
@@ -134,15 +143,21 @@ class DateSpanOperation(BaseOperation):
             for t in tabs[:25]:
                 span = (f"{t['from_year']}–{t['to_year']}" if t.get("from_year")
                         else "ingen brukbare datoer")
+                # Et smalere spenn innenfor estimatet er ikke et avvik — bare
+                # tabeller som går utenfor (eller er holdt utenfor) varsles
+                _outside = bool(t.get("deviates") and t.get("from_year") and (
+                    t["from_year"] < res["from_year"] or t["to_year"] > res["to_year"]))
                 flag = ("  ← AVVIKER, holdt utenfor estimatet" if t.get("off")
-                        else "  ← avviker fra estimatet" if t.get("deviates") else "")
-                w(f"      {t['table']}.{t['column']}: {span}  ({t['n']:,} datoer"
-                  + (", rader med LOB-fil" if t.get("lob_rows") else "") + f"){flag}",
-                  "warn" if flag else "info")
+                        else "  ← går utenfor estimatet" if _outside else "")
+                note = ("  (dekker bare en del av perioden)"
+                        if t.get("deviates") and not flag else "")
+                w(f"      {t['table']}.{t['column']}: {span}  ({_fnum(t['n'])} datoer"
+                  + (", rader med LOB-fil" if t.get("lob_rows") else "")
+                  + f"){flag}{note}", "warn" if flag else "info")
             if len(tabs) > 25:
                 w(f"      … og {len(tabs) - 25} tabell(er) til (se kjørerapporten)", "info")
         if res.get("outside_trim"):
-            w(f"    {res['outside_trim']:,} datoverdier utenfor spennet regnes som avvik "
+            w(f"    {_fnum(res['outside_trim'])} datoverdier utenfor spennet regnes som avvik "
               f"(ytterpunkter {res['absolute_first']} – {res['absolute_last']})", "info")
         excluded = [c for c in res.get("columns", []) if c.get("excluded")]
         if excluded:

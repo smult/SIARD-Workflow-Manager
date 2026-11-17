@@ -17,8 +17,153 @@ from __future__ import annotations
 import datetime
 from pathlib import Path
 
+from siard_workflow.core import fmt
 from siard_workflow.core.base_operation import BaseOperation, OperationResult
 from siard_workflow.core.context import WorkflowContext
+
+_n = fmt.num        # antall med mellomrom som tusenskille
+
+# Kategorier i feiloversikten som ikke er feil: fila er beholdt etter regelen
+_KEPT_DEFAULT = ("passordbeskyttet", "signert")
+
+# Ledetekster for resultatverdier som vises uten egen detaljseksjon
+_RESULT_LABELS = {
+    "standardize_ext": {
+        "renamed":         "Filer som fikk .bin-endelse",
+        "renamed_names":   "Filer omdøpt til recordN",
+        "xml_updated":     "Filreferanser oppdatert i XML",
+        "name_collisions": "Navnekollisjoner (nytt navn gitt)",
+        "rename_errors":   "Feil ved omdøping",
+    },
+    "xsd_type_fix": {
+        "fixes":   "Rettinger i tableX.xsd",
+        "unfixed": "Avvik som krever manuell vurdering",
+    },
+    "lobfolder_fix": {
+        "fixes":      "lobFolder-rettinger",
+        "file_paths": "Filreferanser skrevet som full sti",
+    },
+}
+
+
+def _split_failures(fs: dict) -> "tuple[int, int, set]":
+    """(feilet, beholdt etter regelen, nøklene for «beholdt») fra feiloversikten."""
+    if not isinstance(fs, dict) or not fs:
+        return 0, 0, set(_KEPT_DEFAULT)
+    kept_keys = set(fs.get("kept_keys") or _KEPT_DEFAULT)
+    counts = fs.get("counts") or {}
+    kept = sum(n for k, n in counts.items() if k in kept_keys)
+    failed = sum(n for k, n in counts.items() if k not in kept_keys)
+    return failed, kept, kept_keys
+
+
+def key_facts(step_results: list, ctx_results: dict, siard_path: Path) -> list:
+    """Nøkkeltall til forsiden som [(ledetekst, verdi)] — bare det som er kjent."""
+    def data_of(op_id: str) -> dict:
+        for s in step_results:
+            if s.get("id") == op_id and isinstance(s.get("data"), dict) and s["data"]:
+                return s["data"]
+        d = (ctx_results or {}).get(op_id) or {}
+        return d if isinstance(d, dict) else {}
+
+    def file_size(path) -> str:
+        try:
+            p = Path(path)
+            return f"  ({fmt.size(p.stat().st_size)})" if p.is_file() else ""
+        except (OSError, TypeError, ValueError):
+            return ""
+
+    rows: list = []
+    sha = data_of("sha256")
+    src = sha.get("file")
+    if src:
+        rows.append(("Kilde:", f"{Path(src).name}{file_size(src)}"))
+    if sha.get("sha256"):
+        rows.append(("SHA-256 (kilde):", str(sha["sha256"])))
+    out_path = data_of("repack_siard").get("output_path") or data_of("blob_convert").get("output_path")
+    if out_path and (not src or Path(out_path).name != Path(src).name):
+        size_txt = file_size(out_path)
+        if not size_txt and data_of("repack_siard").get("size_mb"):
+            size_txt = f"  ({fmt.size(float(data_of('repack_siard')['size_mb']) * 1024 * 1024)})"
+        rows.append(("Resultat:", f"{Path(out_path).name}{size_txt}"))
+    md = data_of("metadata_extract")
+    if md.get("db_name"):
+        rows.append(("Database:", f"{md['db_name']}"
+                     + (f"  —  {md['db_product']}" if md.get("db_product") else "")))
+    if md.get("table_count"):
+        rows.append(("Innhold:", f"{_n(md['table_count'])} tabeller, "
+                                 f"{_n(md.get('row_count', 0))} rader, "
+                                 f"{_n(md.get('lob_file_count', 0))} LOB-filer"
+                     + (f", SIARD {md['siard_version']}" if md.get("siard_version") else "")))
+    span = md.get("data_origin_time_span") or (
+        f"{md['data_start']} – {md['data_end']}" if md.get("data_start") else "")
+    dias = data_of("dias_package").get("period")
+    if dias:
+        rows.append(("Periode:", f"{dias} (DIAS-pakken)"
+                     + (f"; metadata.xml: {span}" if span else "")))
+    elif span:
+        rows.append(("Periode:", f"{span} (metadata.xml)"))
+    bc = data_of("blob_convert")
+    if bc.get("identified") or bc.get("converted"):
+        failed, kept_rule, _ = _split_failures(bc.get("failure_summary") or {})
+        if not bc.get("failure_summary"):
+            failed = int(bc.get("failed", 0) or 0)
+        rows.append(("Dokumenter:", f"{_n(bc.get('converted', 0))} konvertert til PDF/A, "
+                                    f"{_n(bc.get('kept', 0))} beholdt i originalformat, "
+                                    f"{_n(failed)} feilet"))
+    try:
+        from version import VERSION
+        rows.append(("Program:", f"SIARD Workflow Manager v{VERSION}"))
+    except Exception:
+        pass
+    return rows
+
+
+def follow_up_items(step_results: list, ctx_results: dict) -> "tuple[list, int]":
+    """
+    Det leseren bør følge opp etter kjøringen, som korte setninger, og antall
+    filer som ikke lot seg konvertere. Brukes på forsiden.
+    """
+    def data_of(step) -> dict:
+        d = step.get("data") or (ctx_results or {}).get(step.get("id")) or {}
+        return d if isinstance(d, dict) else {}
+
+    items: list = []
+    by_id = {s.get("id"): data_of(s) for s in step_results}
+    for s in step_results:
+        if not s.get("skipped") and s.get("success") is False:
+            what = "ble avbrutt" if s.get("interrupted") else "feilet"
+            msg = str(s.get("message") or "")[:200]
+            items.append(f"Steget «{s.get('label', '')}» {what}" + (f": {msg}" if msg else ""))
+    fs = (by_id.get("blob_convert") or {}).get("failure_summary") or {}
+    failed, _kept, kept_keys = _split_failures(fs)
+    labels, counts = fs.get("labels") or {}, fs.get("counts") or {}
+    for key, n in counts.items():
+        if key not in kept_keys:
+            items.append(f"{_n(n)} fil(er) ble ikke konvertert og er beholdt i "
+                         f"originalformat: {labels.get(key, key)}")
+    if counts.get("passordbeskyttet"):
+        items.append(f"{_n(counts['passordbeskyttet'])} passordbeskyttet(e) fil(er) kunne "
+                     f"ikke åpnes og er beholdt uendret")
+    if not fs and (by_id.get("blob_convert") or {}).get("failed"):
+        failed = int(by_id["blob_convert"]["failed"])
+        items.append(f"{_n(failed)} fil(er) ble ikke konvertert")
+    xs = by_id.get("xsd_type_fix") or {}
+    if xs.get("unfixed"):
+        items.append(f"{_n(xs['unfixed'])} avvik i tableX.xsd krever manuell vurdering")
+    md = by_id.get("metadata_extract") or {}
+    span = md.get("data_origin_time_span")
+    if (span and not md.get("data_start") and not md.get("data_end")
+            and not md.get("data_origin_time_span_estimated")):
+        from siard_workflow.core.date_span import metadata_span
+        try:
+            ok = metadata_span(str(span)) is not None
+        except Exception:
+            ok = True
+        if not ok:
+            items.append(f"Tidsperioden i metadata.xml («{span}») lar seg ikke tolke som "
+                         f"datoer — bør rettes eller estimeres")
+    return items, failed
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -50,28 +195,19 @@ class WorkflowReportOperation(BaseOperation):
         if not siard_path:
             return self._fail("Ingen SIARD-fil i kontekst — kan ikke lagre rapport.")
 
-        step_results = list(ctx.metadata.get("step_results", []))
-        # Fjern selve rapport-operasjonen fra listen (den er ikke ferdig enda)
-        step_results = [s for s in step_results if s.get("id") != self.operation_id]
-
-        # Prosjektet er kjørt før: hele prosessen, ikke bare denne kjøringen.
-        # Steg som ble hoppet over nå, vises med resultatet fra kjøringen der
-        # de kjørte; steg som er kjørt på nytt, merkes med forrige status.
-        history = None
-        pf = ctx.metadata.get("project_file")
-        if pf is not None:
-            try:
-                step_results, history = project_history(
-                    pf, ctx.metadata.get("run_id"), step_results,
-                    report_index=_report_index(pf, self.operation_id, step_results))
-            except Exception:
-                history = None
+        step_results, history = _collect_steps(ctx, self.operation_id, final=False)
 
         suffix = (self.params.get("report_suffix") or "_workflow_rapport").strip()
         ts     = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         pdf_path = siard_path.parent / f"{siard_path.stem}{suffix}_{ts}.pdf"
 
         format_counts: dict = dict(ctx.metadata.get("format_counts", {}))
+        # Husk valgene — sluttversjonen (write_final_report) bruker de samme
+        ctx.metadata["_report_options"] = {
+            "include_charts":  bool(self.params.get("include_charts", True)),
+            "include_details": bool(self.params.get("include_details", True)),
+            "siard_path":      str(siard_path),
+        }
 
         try:
             _generate_pdf(
@@ -83,6 +219,8 @@ class WorkflowReportOperation(BaseOperation):
                 include_charts  = bool(self.params.get("include_charts", True)),
                 include_details = bool(self.params.get("include_details", True)),
                 history         = history,
+                pending_steps   = list(ctx.metadata.get("steps_after_report") or []),
+                provenance      = _provenance(ctx),
             )
         except ImportError:
             return self._fail(
@@ -101,6 +239,69 @@ class WorkflowReportOperation(BaseOperation):
         return self._ok(
             data={"report_path": str(pdf_path), "size_kb": round(size_kb, 1)},
             message=f"Rapport lagret: {pdf_path.name}  ({size_kb:.0f} KB)")
+
+
+def _collect_steps(ctx, report_id: str, final: bool, outcome: str = "pågår"):
+    """
+    (steg, historikk) til rapporten. Underveis (final=False) er rapportsteget
+    selv og stegene etter det ikke med; sluttversjonen har alle.
+
+    Prosjektet er kjørt før: hele prosessen, ikke bare denne kjøringen. Steg
+    som ble hoppet over nå, vises med resultatet fra kjøringen der de kjørte;
+    steg som er kjørt på nytt, merkes med forrige status.
+    """
+    step_results = list(ctx.metadata.get("step_results", []))
+    if not final:
+        # Rapport-operasjonen er ikke ferdig enda
+        step_results = [s for s in step_results if s.get("id") != report_id]
+    history = None
+    pf = ctx.metadata.get("project_file")
+    if pf is not None:
+        try:
+            idx = (len(pf.operations) if final
+                   else _report_index(pf, report_id, step_results))
+            step_results, history = project_history(
+                pf, ctx.metadata.get("run_id"), step_results, report_index=idx,
+                current_result=outcome)
+        except Exception:
+            history = None
+    return step_results, history
+
+
+def _provenance(ctx) -> list:
+    """PREMIS-hendelsene så langt (endringer i uttrekket), eldste først."""
+    pl = (ctx.metadata or {}).get("premis_logger")
+    if pl is None:
+        return []
+    try:
+        return list(pl.all_events())
+    except Exception:
+        return []
+
+
+def write_final_report(ctx, pdf_path: Path, outcome: str = "fullført") -> bool:
+    """
+    Skriv kjørerapporten på nytt etter siste steg — til samme fil — med alle
+    stegene (rapporten lages ellers før DIAS-pakking o.l. og mangler dem).
+    """
+    opts = (ctx.metadata or {}).get("_report_options") or {}
+    step_results, history = _collect_steps(ctx, "workflow_report", final=True,
+                                           outcome=outcome)
+    siard_path = Path(opts.get("siard_path") or ctx.siard_path)
+    tmp = pdf_path.with_suffix(".tmp.pdf")
+    _generate_pdf(
+        pdf_path        = tmp,
+        siard_path      = siard_path,
+        step_results    = step_results,
+        ctx_results     = dict(ctx.results),
+        format_counts   = dict(ctx.metadata.get("format_counts", {})),
+        include_charts  = bool(opts.get("include_charts", True)),
+        include_details = bool(opts.get("include_details", True)),
+        history         = history,
+        provenance      = _provenance(ctx),
+    )
+    tmp.replace(pdf_path)
+    return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -145,7 +346,8 @@ _STATUS_TXT = {
 }
 
 
-def project_history(pf, run_id, step_results: list, report_index: int):
+def project_history(pf, run_id, step_results: list, report_index: int,
+                    current_result: str = "pågår"):
     """Slå sammen denne kjøringens steg med prosjektets historikk.
 
     Returnerer (steg, historikk). Hvert steg får:
@@ -166,7 +368,9 @@ def project_history(pf, run_id, step_results: list, report_index: int):
         if ran_now:
             st["run_label"] = "denne kjøringen"
             prev = (cp.attempts or [])[-1] if cp.attempts else None
-            if prev:
+            # Et tidligere «forsøk» som aldri kjørte (ventet, holdt igjen) er
+            # ikke en omkjøring
+            if prev and prev.get("status") in ("completed", "failed", "interrupted"):
                 info = {"attempt": cp.attempt_no,
                         "prev_status": _STATUS_TXT.get(prev.get("status"), prev.get("status")),
                         "prev_message": prev.get("message") or "",
@@ -207,7 +411,8 @@ def project_history(pf, run_id, step_results: list, report_index: int):
         runs.append({
             "when":   _fmt_run(r.get("run_id") or r.get("started")),
             "ended":  _fmt_run(r.get("ended")) if r.get("ended") else "",
-            "result": "pågår" if r.get("run_id") == run_id else (r.get("result") or "—"),
+            "result": current_result if r.get("run_id") == run_id
+                      else (r.get("result") or "—"),
             "steps":  ", ".join(f"{x.get('label')} ({_STATUS_TXT.get(x.get('status'), x.get('status'))})"
                                 for x in steps) or "—",
             "log":    Path(r["log_file"]).name if r.get("log_file") else "",
@@ -271,8 +476,13 @@ def _generate_pdf(
     include_charts:  bool = True,
     include_details: bool = True,
     history:         "dict | None" = None,
+    pending_steps:   "list | None" = None,
+    provenance:      "list | None" = None,
 ) -> None:
     """Genererer selve PDF-filen. Krever reportlab.
+
+    pending_steps: steg som kjører etter rapporten (den sier fra om dem).
+    provenance: PREMIS-hendelsene — endringene som er gjort i uttrekket.
 
     history: samlet historikk fra prosjektfila (project_history) — da viser
     rapporten hele prosessen på tvers av kjøringer."""
@@ -315,6 +525,7 @@ def _generate_pdf(
     overall_ok   = (fail_steps == 0 and run_steps > 0)
     preliminary  = bool(held_steps)
     total_elapsed = sum(s.get("elapsed", 0.0) for s in step_results)
+    followups, failed_files = follow_up_items(step_results, ctx_results)
 
     # ── Dokument-oppsett ──────────────────────────────────────────────────────
     W, H = A4
@@ -344,6 +555,13 @@ def _generate_pdf(
                         textColor=C_PRIMARY, spaceBefore=14, spaceAfter=6)
     s_sub     = _style("SSub",   fontName="Helvetica-Bold",  fontSize=10,
                         textColor=C_ACCENT, spaceBefore=8, spaceAfter=4)
+    s_cell    = _style("SCell",  fontName="Helvetica",       fontSize=9,
+                        textColor=colors.HexColor("#222222"), leading=11)
+
+    def _esc_txt(text) -> str:
+        from xml.sax.saxutils import escape
+        return escape(str(text or ""))
+
     s_mono    = _style("SMono",  fontName="Courier",         fontSize=9,
                         textColor=C_PRIMARY, leading=12, spaceAfter=2)
     s_caption = _style("SCap",   fontName="Helvetica-Oblique", fontSize=9,
@@ -401,7 +619,7 @@ def _generate_pdf(
             dur_txt += f" — kjørt på nytt (forsøk {step['rerun'].get('attempt')})"
         tbl = Table(
             [[f"{idx}. {label}", f"{status_txt}{dur_txt}"]],
-            colWidths=[inner_w * 0.68, inner_w * 0.32],
+            colWidths=[inner_w * 0.50, inner_w * 0.50],
         )
         tbl.setStyle(TableStyle([
             ("BACKGROUND",    (0, 0), (-1, -1), bg),
@@ -453,7 +671,8 @@ def _generate_pdf(
         pie.width  = pie_size
         pie.height = pie_size
         pie.data   = values
-        pie.labels = [f"{l}: {v/total*100:.2f}%"
+        # Antall først — små andeler («Feil: 0.00%») sier ellers ingenting
+        pie.labels = [f"{l}: {_n(v)} (" + f"{v / total * 100:.1f}".replace(".", ",") + " %)"
                       for l, v in zip(labels, values)]
         pie.simpleLabels        = False
         pie.checkLabelOverlap   = True
@@ -472,7 +691,7 @@ def _generate_pdf(
     story = []
 
     # ══ FORSIDE ═══════════════════════════════════════════════════════════════
-    story.append(Spacer(1, 2.5 * cm))
+    story.append(Spacer(1, 1.0 * cm))
 
     # Topptittel-boks
     hdr = Table([["KONTROLLRAPPORT"]], colWidths=[inner_w])
@@ -521,7 +740,25 @@ def _generate_pdf(
         ("GRID",          (0, 0), (-1, -1), 0.5, C_BORDER),
     ]))
     story.append(fi_tbl)
-    story.append(Spacer(1, 1.5 * cm))
+
+    facts = key_facts(step_results, ctx_results, siard_path)
+    if facts:
+        story.append(Spacer(1, 0.5 * cm))
+        kf_tbl = Table([[k, Paragraph(_esc_txt(v), s_cell)] for k, v in facts],
+                       colWidths=[3 * cm, inner_w - 3 * cm])
+        kf_tbl.setStyle(TableStyle([
+            ("BACKGROUND",    (0, 0), (0, -1), C_LIGHT_BLUE),
+            ("FONTNAME",      (0, 0), (0, -1), "Helvetica-Bold"),
+            ("FONTSIZE",      (0, 0), (-1, -1), 9),
+            ("TEXTCOLOR",     (0, 0), (-1, -1), C_PRIMARY),
+            ("VALIGN",        (0, 0), (-1, -1), "TOP"),
+            ("TOPPADDING",    (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ("LEFTPADDING",   (0, 0), (-1, -1), 10),
+            ("GRID",          (0, 0), (-1, -1), 0.5, C_BORDER),
+        ]))
+        story.append(kf_tbl)
+    story.append(Spacer(1, 0.8 * cm))
 
     # Samlet status-boks
     if total_steps > 0:
@@ -532,7 +769,13 @@ def _generate_pdf(
         if preliminary and overall_ok:
             stat_txt, stat_sym = "FORELØPIG", "⏸"
             stat_col, stat_bg = C_SKIP, C_SKIP_BG
+        elif overall_ok and (failed_files or followups):
+            # Stegene gikk gjennom, men noe må følges opp
+            stat_txt, stat_sym = "GODKJENT MED AVVIK", "!"
+            stat_col, stat_bg = C_WARNING, colors.HexColor("#fdebd0")
         sum_txt   = (f"{ok_steps} av {run_steps} steg OK"
+                     + (f"  •  {_n(failed_files)} fil(er) ikke konvertert"
+                        if failed_files else "")
                      + (f"  •  {held_steps} holdt igjen" if held_steps else "")
                      + (f"  •  {skip_steps - held_steps} hoppet over"
                         if skip_steps - held_steps else "")
@@ -547,7 +790,7 @@ def _generate_pdf(
             ("BACKGROUND",    (1, 0), (1, -1), C_LIGHT_BG),
             ("FONTNAME",      (0, 0), (0, -1), "Helvetica-Bold"),
             ("FONTNAME",      (1, 0), (1, -1), "Helvetica"),
-            ("FONTSIZE",      (0, 0), (0, -1), 17),
+            ("FONTSIZE",      (0, 0), (0, -1), 15 if len(stat_txt) > 12 else 17),
             ("FONTSIZE",      (1, 0), (1, -1), 11),
             ("TEXTCOLOR",     (0, 0), (0, -1), stat_col),
             ("TEXTCOLOR",     (1, 0), (1, -1), C_PRIMARY),
@@ -559,6 +802,27 @@ def _generate_pdf(
             ("LINEAFTER",     (0, 0), (0, -1), 0.5, C_BORDER),
         ]))
         story.append(st_tbl)
+
+    # Det som bør følges opp — kort, på forsiden
+    if followups:
+        from xml.sax.saxutils import escape as _esc
+        story.append(Spacer(1, 0.7 * cm))
+        fu_rows = [[Paragraph("<b>Dette bør følges opp</b>", s_body)]]
+        for item in followups[:12]:
+            fu_rows.append([Paragraph("•  " + _esc(item), s_body)])
+        if len(followups) > 12:
+            fu_rows.append([Paragraph(f"… og {len(followups) - 12} punkt til "
+                                      f"(se detaljene under)", s_small)])
+        fu_tbl = Table(fu_rows, colWidths=[inner_w])
+        fu_tbl.setStyle(TableStyle([
+            ("BACKGROUND",    (0, 0), (-1, -1), colors.HexColor("#fef9e7")),
+            ("BOX",           (0, 0), (-1, -1), 0.8, C_WARNING),
+            ("LEFTPADDING",   (0, 0), (-1, -1), 10),
+            ("RIGHTPADDING",  (0, 0), (-1, -1), 10),
+            ("TOPPADDING",    (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ]))
+        story.append(fu_tbl)
 
     story.append(PageBreak())
 
@@ -573,7 +837,7 @@ def _generate_pdf(
             "er lagt til i workflowen.", s_body))
     else:
         if history:
-            col_w = [0.8 * cm, 5.2 * cm, 2.3 * cm, 2.6 * cm, 2.0 * cm, 2.3 * cm]
+            col_w = [0.8 * cm, 5.0 * cm, 2.6 * cm, 2.5 * cm, 2.2 * cm, 3.1 * cm]
             tbl_rows = [["#", "Operasjon", "Kategori", "Status", "Varighet", "Kjøring"]]
         else:
             col_w = [0.9 * cm, 6.2 * cm, 2.9 * cm, 2.8 * cm, 2.4 * cm]
@@ -595,10 +859,13 @@ def _generate_pdf(
                 st = "Avbrutt"
             else:
                 st = "FEIL"
-            row = [str(idx), label, cat, st,
+            # Paragraph i tekstcellene: lange navn brytes i stedet for å
+            # skrive over nabocellen
+            row = [str(idx), Paragraph(_esc_txt(label), s_cell),
+                   Paragraph(_esc_txt(cat), s_cell), st,
                    _fmt_elapsed(elapsed) if not skipped else "—"]
             if history:
-                row.append(step.get("run_label") or "—")
+                row.append(Paragraph(_esc_txt(step.get("run_label") or "—"), s_cell))
             tbl_rows.append(row)
 
         sum_tbl = Table(tbl_rows, colWidths=col_w)
@@ -619,6 +886,7 @@ def _generate_pdf(
             ("TOPPADDING",    (0, 0), (-1, -1), 5),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
             ("LEFTPADDING",   (0, 0), (-1, -1), 6),
+            ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
         ]
         for i, step in enumerate(step_results, 1):
             skipped = step.get("skipped", False)
@@ -642,6 +910,13 @@ def _generate_pdf(
                 ]
         sum_tbl.setStyle(TableStyle(style_cmds))
         story.append(sum_tbl)
+        if pending_steps:
+            story.append(Spacer(1, 0.2 * cm))
+            story.append(Paragraph(
+                "<b>Rapporten er laget før disse stegene var kjørt:</b> "
+                + _esc_txt(", ".join(pending_steps))
+                + ". Den skrives på nytt med alle stegene når kjøringen er ferdig.",
+                s_small))
 
     # ══ KJØRINGER (prosjektet er kjørt flere ganger) ══════════════════════════
     if history and (len(history.get("runs") or []) > 1 or history.get("reruns")):
@@ -663,8 +938,9 @@ def _generate_pdf(
         r_rows = [["Startet", "Resultat", "Steg kjørt", "Logg"]]
         for r in history.get("runs") or []:
             r_rows.append([
-                r["when"] + ("  (denne)" if r.get("current") else ""),
-                r["result"],
+                Paragraph(r["when"] + ("<br/>(denne kjøringen)" if r.get("current") else ""),
+                          s_small),
+                Paragraph(_esc_txt(r["result"]), s_small),
                 Paragraph(r["steps"], s_small),
                 Paragraph(r["log"] or "—", s_small),
             ])
@@ -703,6 +979,45 @@ def _generate_pdf(
             ]))
             story.append(rr_tbl)
 
+    # ══ ENDRINGER I UTTREKKET (PREMIS-hendelsene) ═════════════════════════════
+    if provenance:
+        story.append(Spacer(1, 0.6 * cm))
+        story.append(Paragraph("Endringer i uttrekket", s_section))
+        story.append(HRFlowable(width="100%", thickness=1.5, color=C_ACCENT,
+                                 spaceAfter=6))
+        story.append(Paragraph(
+            "Hver operasjon som endrer innholdet, er registrert som en "
+            "PREMIS-hendelse. Den fullstendige proveniensen ligger i "
+            "PREMIS-fila ved siden av uttrekket.", s_body))
+        p_rows = [["Tid", "Hendelse", "Beskrivelse"]]
+        for ev in provenance[:60]:
+            when = str(ev.get("datetime") or "")[:16].replace("T", " ")
+            what = ev.get("label") or ev.get("type") or ""
+            detail = str(ev.get("detail") or "")
+            if len(detail) > 420:
+                detail = detail[:420].rstrip() + " …"
+            if not ev.get("success", True):
+                what += " (feilet)"
+            p_rows.append([Paragraph(_esc_txt(when), s_small),
+                           Paragraph(_esc_txt(what), s_small),
+                           Paragraph(_esc_txt(detail), s_small)])
+        p_tbl = Table(p_rows, colWidths=[2.7 * cm, 4.6 * cm, inner_w - 7.3 * cm],
+                      repeatRows=1)
+        p_tbl.setStyle(TableStyle([
+            ("BACKGROUND",    (0, 0), (-1, 0), C_PRIMARY),
+            ("TEXTCOLOR",     (0, 0), (-1, 0), C_WHITE),
+            ("FONTNAME",      (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE",      (0, 0), (-1, -1), 8.5),
+            ("VALIGN",        (0, 0), (-1, -1), "TOP"),
+            ("GRID",          (0, 0), (-1, -1), 0.5, C_BORDER),
+            ("TOPPADDING",    (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ]))
+        story.append(p_tbl)
+        if len(provenance) > 60:
+            story.append(Paragraph(f"… og {len(provenance) - 60} hendelse(r) til "
+                                   f"(se PREMIS-fila).", s_small))
+
     # ══ FILTYPE-DIAGRAM ═══════════════════════════════════════════════════════
     if format_counts:
         all_sorted = sorted(format_counts.items(), key=lambda x: -x[1])
@@ -714,8 +1029,14 @@ def _generate_pdf(
             story.append(HRFlowable(width="100%", thickness=1.5, color=C_ACCENT,
                                     spaceAfter=6))
             n_types = len(all_sorted)
+            _ident = ((ctx_results or {}).get("blob_convert") or {})
+            _ident = _ident.get("identified", 0) if isinstance(_ident, dict) else 0
+            _rest = int(_ident or 0) - total_files
             story.append(Paragraph(
-                f"Totalt {total_files:,} fil(er) fordelt på {n_types} format(er).",
+                f"Totalt {_n(total_files)} fil(er) fordelt på {n_types} format(er), "
+                f"slik de ble identifisert før konverteringen."
+                + (f" {_n(_rest)} fil(er) til (arkiver og andre filer som behandles "
+                   f"for seg) er ikke med i fordelingen." if _rest > 0 else ""),
                 s_body))
             story.append(Spacer(1, 0.4 * cm))
 
@@ -808,7 +1129,7 @@ def _generate_pdf(
                 bar_rows.append([
                     f".{ext}" if ext != "ingen" else "(ingen)",
                     bar_cell,
-                    f"{cnt:,}",
+                    f"{_n(cnt)}",
                     f"{pct:.1f} %",
                 ])
                 bg = C_ALT_ROW if ri % 2 == 0 else C_WHITE
@@ -846,6 +1167,8 @@ def _generate_pdf(
             skipped = step.get("skipped", False)
             message = step.get("message", "")
             op_data = step.get("data") or ctx_results.get(op_id) or {}
+            if op_id == "blob_convert" and isinstance(op_data, dict) and format_counts:
+                op_data = {**op_data, "_format_counts": dict(format_counts)}
             # Operasjoner kan legge en enkeltverdi under sin egen id (SHA-256
             # legger sjekksummen der før resultatet er klart) — tål det
             if not isinstance(op_data, dict):
@@ -866,7 +1189,7 @@ def _generate_pdf(
                            leftIndent=10, spaceAfter=2)))
             if message:
                 story.append(Paragraph(
-                    f"Melding: {message}",
+                    f"Melding: {_esc_txt(message)}",
                     _style("msg_style", fontName="Helvetica-Oblique",
                            fontSize=9, textColor=colors.HexColor("#444444"),
                            leftIndent=10, spaceAfter=4)))
@@ -960,7 +1283,7 @@ def _date_span_section(ds: dict, inner_w, _kv_table, s_sub, s_small,
     ]
     if ds.get("absolute_first"):
         rows.append(("Ytterpunkter:", f"{ds['absolute_first']} – {ds['absolute_last']}"
-                     + (f" ({ds['outside_trim']:,} verdier regnet som avvik)"
+                     + (f" ({_n(ds['outside_trim'])} verdier regnet som avvik)"
                         if ds.get("outside_trim") else "")))
     rows.append(("metadata.xml:", f"«{ds['metadata_timespan']}» — ikke et tolkbart datospenn"
                  if ds.get("metadata_timespan") else "oppga ikke datospenn"))
@@ -985,12 +1308,18 @@ def _date_span_section(ds: dict, inner_w, _kv_table, s_sub, s_small,
                                               "Estimert fra–til", "Merknad")]]
         for t in tabs:
             span = f"{t['from_year']}–{t['to_year']}" if t.get("from_year") else "–"
+            # Et smalere spenn innenfor estimatet er ikke et avvik
+            _outside = bool(t.get("deviates") and t.get("from_year")
+                            and ds.get("from_year") and ds.get("to_year")
+                            and (t["from_year"] < ds["from_year"]
+                                 or t["to_year"] > ds["to_year"]))
             note_txt = ("AVVIKER — holdt utenfor estimatet" if t.get("off")
-                        else "avviker fra estimatet" if t.get("deviates")
+                        else "går utenfor estimatet" if _outside
+                        else "dekker en del av perioden" if t.get("deviates")
                         else "brukt" + (" (rader med LOB-fil)" if t.get("lob_rows") else ""))
-            st = warn if (t.get("off") or t.get("deviates")) else cell
+            st = warn if (t.get("off") or _outside) else cell
             data.append([Paragraph(escape(t["table"]), cell), Paragraph(escape(t["column"]), cell),
-                         Paragraph(f"{t['n']:,}".replace(",", " "), cell),
+                         Paragraph(_n(t['n']), cell),
                          Paragraph(span, st), Paragraph(escape(note_txt), st)])
         tt = Table(data, colWidths=[inner_w * 0.30, inner_w * 0.22, inner_w * 0.11,
                                     inner_w * 0.15, inner_w * 0.22], repeatRows=1)
@@ -1011,8 +1340,8 @@ def _date_span_section(ds: dict, inner_w, _kv_table, s_sub, s_small,
                                               "År", "Merknad")]]
         for c in cols:
             data.append([Paragraph(escape(f"{c['table']}.{c['column']}"), cell),
-                         Paragraph(f"{c['n']:,}".replace(",", " "), cell),
-                         Paragraph(f"{c['n_lob']:,}".replace(",", " "), cell),
+                         Paragraph(_n(c['n']), cell),
+                         Paragraph(_n(c['n_lob']), cell),
                          Paragraph(escape(c.get("span", "")), cell),
                          Paragraph(escape("utelatt: " + c["excluded"] if c.get("excluded")
                                           else "brukt (rader med LOB-fil)" if c.get("lob_rows")
@@ -1033,6 +1362,70 @@ def _date_span_section(ds: dict, inner_w, _kv_table, s_sub, s_small,
 
 MAX_FAILURE_ROWS = 300          # resten står i feillista (CSV)
 
+# Støy fra LibreOffice sin innebygde Python i feiltekster lagret av eldre
+# versjoner (nye kjøringer filtrerer den bort før den lagres)
+import re as _re
+_NOISE_RE = _re.compile(r"Could not find platform (?:in)?dependent libraries <\w+>\s*",
+                        _re.IGNORECASE)
+
+
+def format_changes(format_counts: dict, to_pdfa: dict, fs: dict) -> list:
+    """
+    [(format, antall før, hva som skjedde)] — formatene slik de ble identifisert
+    og hva de er etter konverteringen. Tom uten opplysning om hva som ble
+    sendt til konvertering (eldre prosjektfiler).
+    """
+    if not format_counts or not to_pdfa:
+        return []
+    kept_keys = set((fs or {}).get("kept_keys") or _KEPT_DEFAULT)
+    failed_by: dict = {}
+    for e in (fs or {}).get("entries") or []:
+        if e.get("kategori") not in kept_keys:
+            f = str(e.get("format") or "").lower().lstrip(".")
+            failed_by[f] = failed_by.get(f, 0) + 1
+    rows = []
+    for ext, n in sorted(format_counts.items(), key=lambda x: -x[1]):
+        key = str(ext).lower().lstrip(".")
+        sent = int(to_pdfa.get(key, 0))
+        if not sent:
+            rows.append((f".{key}", n, "beholdt i originalformat"))
+            continue
+        failed = min(sent, failed_by.get(key, 0))
+        parts = [f"{_n(sent - failed)} konvertert til PDF/A"]
+        if failed:
+            parts.append(f"{_n(failed)} feilet (beholdt)")
+        if n - sent > 0:
+            parts.append(f"{_n(n - sent)} beholdt")
+        rows.append((f".{key}", n, ", ".join(parts)))
+    return rows
+
+
+def _format_change_section(format_counts, to_pdfa, fs, inner_w, s_sub, s_small,
+                           C_PRIMARY, C_BORDER, C_WHITE) -> list:
+    from reportlab.lib import colors as rl_colors
+    from reportlab.platypus import Paragraph, Spacer, Table, TableStyle
+    rows = format_changes(format_counts, to_pdfa, fs)
+    if not rows:
+        return []
+    data = [["Format før", "Antall", "Etter konverteringen"]]
+    data += [[ext, _n(n), Paragraph(txt, s_small)] for ext, n, txt in rows]
+    tbl = Table(data, colWidths=[inner_w * 0.18, inner_w * 0.16, inner_w * 0.66],
+                repeatRows=1)
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND",    (0, 0), (-1, 0), C_PRIMARY),
+        ("TEXTCOLOR",     (0, 0), (-1, 0), C_WHITE),
+        ("FONTNAME",      (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE",      (0, 0), (-1, -1), 9),
+        ("ALIGN",         (1, 0), (1, -1), "RIGHT"),
+        ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+        ("GRID",          (0, 0), (-1, -1), 0.5, C_BORDER),
+        ("TOPPADDING",    (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [rl_colors.HexColor("#f8f9fa"), C_WHITE]),
+    ]))
+    return [Paragraph("Formater før og etter konverteringen", s_sub), tbl,
+            Spacer(1, 6)]
+
 
 def _failure_section(fs: dict, inner_w, _kv_table, s_sub, s_small,
                      C_PRIMARY, C_BORDER, C_WHITE) -> list:
@@ -1046,10 +1439,24 @@ def _failure_section(fs: dict, inner_w, _kv_table, s_sub, s_small,
     labels = fs.get("labels", {})
     counts = fs.get("counts", {})
     total = int(fs.get("total", 0))
-    out: list = [Paragraph(f"Filer som ikke ble konvertert ({total:,})", s_sub)]
-    rows = [(f"{labels.get(k, k)}:", f"{n:,}") for k, n in counts.items()]
-    rows.append(("Totalt:", f"{total:,}"))
-    out.append(_kv_table(rows, col_w=[7 * cm, inner_w - 7 * cm]))
+    n_failed, n_kept, kept_keys = _split_failures(fs)
+    out: list = []
+    if n_failed:
+        out.append(Paragraph(
+            f"Filer som ikke lot seg konvertere — bør følges opp ({_n(n_failed)})", s_sub))
+        out.append(_kv_table(
+            [(f"{labels.get(k, k)}:", _n(n)) for k, n in counts.items()
+             if k not in kept_keys], col_w=[7 * cm, inner_w - 7 * cm]))
+    if n_kept:
+        out.append(Paragraph(
+            f"Beholdt uendret etter regelen — ikke feil ({_n(n_kept)})", s_sub))
+        out.append(_kv_table(
+            [(f"{labels.get(k, k)}:", _n(n)) for k, n in counts.items()
+             if k in kept_keys], col_w=[7 * cm, inner_w - 7 * cm]))
+        if counts.get("signert"):
+            out.append(Paragraph(
+                "Digitalt signerte PDF-er røres aldri: en konvertering ville gjort "
+                "signaturen ugyldig. Filene er listet i regnearket, ikke her.", s_small))
     out.append(Spacer(1, 0.25 * cm))
 
     cell = ParagraphStyle("FailCell", parent=s_small, fontSize=7.5, leading=9,
@@ -1057,10 +1464,12 @@ def _failure_section(fs: dict, inner_w, _kv_table, s_sub, s_small,
     head = ParagraphStyle("FailHead", parent=cell, fontName="Helvetica-Bold",
                           textColor=C_WHITE)
     order = list(labels)
-    entries = sorted(fs.get("entries", []),
+    # Signerte PDF-er listes ikke enkeltvis (kan være tusenvis, og er i orden)
+    entries = sorted((e for e in fs.get("entries", []) if e["kategori"] != "signert"),
                      key=lambda e: (order.index(e["kategori"])
                                     if e["kategori"] in order else 99, e["fil"]))
     shown = entries[:MAX_FAILURE_ROWS]
+    total = total - int(counts.get("signert", 0))
     data = [[Paragraph(h, head) for h in ("Årsak", "Fil", "Tabell/kolonne", "Format", "Detaljer")]]
     for e in shown:
         fil = e["fil"].split("::")[-1]
@@ -1069,10 +1478,10 @@ def _failure_section(fs: dict, inner_w, _kv_table, s_sub, s_small,
             Paragraph(escape(fil), cell),
             Paragraph(escape(e.get("plassering", "")), cell),
             Paragraph(escape(e.get("format", "")), cell),
-            Paragraph(escape(e.get("arsak", ""))[:400], cell),
+            Paragraph(escape(_NOISE_RE.sub("", e.get("arsak", "")))[:400], cell),
         ])
-    tbl = Table(data, colWidths=[inner_w * 0.17, inner_w * 0.30, inner_w * 0.17,
-                                 inner_w * 0.08, inner_w * 0.28], repeatRows=1)
+    tbl = Table(data, colWidths=[inner_w * 0.15, inner_w * 0.27, inner_w * 0.24,
+                                 inner_w * 0.07, inner_w * 0.27], repeatRows=1)
     tbl.setStyle(TableStyle([
         ("BACKGROUND",    (0, 0), (-1, 0), C_PRIMARY),
         ("VALIGN",        (0, 0), (-1, -1), "TOP"),
@@ -1083,13 +1492,14 @@ def _failure_section(fs: dict, inner_w, _kv_table, s_sub, s_small,
         ("RIGHTPADDING",  (0, 0), (-1, -1), 4),
         ("ROWBACKGROUNDS", (0, 1), (-1, -1), [rl_colors.HexColor("#fdf2f2"), C_WHITE]),
     ]))
-    out.append(tbl)
+    if shown:
+        out.append(tbl)
     rest = total - len(shown)
     note = []
     if rest > 0:
-        note.append(f"{rest:,} fil(er) til er ikke vist her.")
+        note.append(f"{_n(rest)} fil(er) til er ikke vist her.")
     if fs.get("csv_path"):
-        note.append(f"Komplett liste: {Path(fs['csv_path']).name}")
+        note.append(f"Komplett liste (regneark): {Path(fs['csv_path']).name}")
     if fs.get("log_path"):
         note.append(f"Feillogg: {Path(fs['log_path']).name}")
     if note:
@@ -1143,10 +1553,10 @@ def _op_detail(
 
         out.append(Paragraph("Opptelling av binærinnhold", s_sub))
         rows = [
-            ("Inline CLOB-felt:",      f"{total_ci:,}"),
-            ("Ekstern CLOB-felt:",     f"{total_ce:,}"),
-            ("BLOB-filer (lob-mapper):", f"{total_bf:,}"),
-            ("Totalt:",                f"{total_ci + total_ce + total_bf:,}"),
+            ("Inline CLOB-felt:",      f"{_n(total_ci)}"),
+            ("Ekstern CLOB-felt:",     f"{_n(total_ce)}"),
+            ("BLOB-filer (lob-mapper):", f"{_n(total_bf)}"),
+            ("Totalt:",                f"{_n(total_ci + total_ce + total_bf)}"),
         ]
         out.append(_kv_table(rows))
 
@@ -1222,27 +1632,33 @@ def _op_detail(
         xml_upd = op_data.get("xml_updated", 0)
 
         out.append(Paragraph("Konverteringsresultat", s_sub))
-        rows = [
-            ("Filer identifisert:",        f"{detected:,}"),
-            ("Konvertert til PDF/A:",      f"{converted:,}"),
-            ("Beholdt originalformat:",    f"{kept:,}"),
-            ("Inline LOBs hentet:",        f"{inline_ex:,}"),
-            ("XML-filer oppdatert:",       f"{xml_upd:,}"),
-            ("Konverteringsfeil:",         f"{failed:,}"),
+        rows = []
+        if op_data.get("identified"):
+            rows.append(("LOB-filer identifisert:", _n(op_data["identified"])))
+        rows += [
+            ("Sendt til konvertering:",        _n(detected)),
+            ("Konvertert til PDF/A:",          _n(converted)),
+            ("Beholdt i originalformat:",      _n(kept)),
+            ("Inline LOB-er hentet ut:",       _n(inline_ex)),
+            ("Filreferanser oppdatert i XML:", _n(xml_upd)),
+            ("Konvertering feilet:",           _n(failed)),
         ]
+        if op_data.get("msg_converted"):
+            rows.append(("E-post (MSG/EML) til PDF/A:", _n(op_data["msg_converted"])))
         _gp = op_data.get("gs_postprocess") or {}
         if _gp.get("files"):
             _b, _a = _gp.get("before", 0), _gp.get("after", 0)
             rows.append(("Etterbehandlet (Ghostscript):",
-                         f"{_gp['files']:,} PDF/A-filer, {_human_size(_b)} → {_human_size(_a)} "
+                         f"{_n(_gp['files'])} PDF/A-filer, {_human_size(_b)} → {_human_size(_a)} "
                          f"(spart {_human_size(_b - _a)}, "
                          f"{(1 - _a / _b) * 100 if _b else 0:.1f} %)"))
         _fs = op_data.get("failure_summary") or {}
         if _fs.get("total"):
-            rows.append(("Ikke konvertert totalt:",
-                         f"{_fs['total']:,}  (skadede, tomme, manglende, passordbeskyttede "
-                         f"og feilede filer — se under)"))
-        out.append(_kv_table(rows, col_w=[4.6 * cm, inner_w - 4.6 * cm]))
+            _nf, _nk, _ = _split_failures(_fs)
+            if _nk:
+                rows.append(("Beholdt uendret etter regelen:",
+                             f"{_n(_nk)}  (signert eller passordbeskyttet — se under)"))
+        out.append(_kv_table(rows, col_w=[5.6 * cm, inner_w - 5.6 * cm]))
 
         if include_charts and (converted + kept + failed) > 0:
             chart = _pie_chart(
@@ -1265,6 +1681,9 @@ def _op_detail(
                     s_caption))
 
         fs = op_data.get("failure_summary") or {}
+        out.extend(_format_change_section(
+            op_data.get("_format_counts") or {}, op_data.get("to_pdfa_formats") or {},
+            fs, inner_w, s_sub, s_small, C_PRIMARY, C_BORDER, C_WHITE))
         if fs.get("total"):
             out.extend(_failure_section(fs, inner_w, _kv_table, s_sub, s_small,
                                         C_PRIMARY, C_BORDER, C_WHITE))
@@ -1292,10 +1711,10 @@ def _op_detail(
         hex_exp = op_data.get("hex_exported", 0)
         tables  = op_data.get("tables_processed", 0)
         rows = [
-            ("HEX-felt eksportert:", f"{hex_exp:,}"),
+            ("HEX-felt eksportert:", f"{_n(hex_exp)}"),
         ]
         if tables:
-            rows.append(("Tabeller behandlet:", f"{tables:,}"))
+            rows.append(("Tabeller behandlet:", f"{_n(tables)}"))
         out.append(Paragraph("HEX-ekstraksjon", s_sub))
         out.append(_kv_table(rows))
         if hex_exp == 0:
@@ -1313,7 +1732,7 @@ def _op_detail(
         if av_exe:
             rows.append(("Antivirusprogram:", Path(av_exe).name))
         if scanned:
-            rows.append(("Filer skannet:", f"{scanned:,}"))
+            rows.append(("Filer skannet:", f"{_n(scanned)}"))
         verdict = "Ingen trusler funnet" if step_ok else "Trusler / feil"
         rows.append(("Konklusjon:", verdict))
         if rows:
@@ -1329,7 +1748,7 @@ def _op_detail(
     elif op_id == "unpack_siard":
         n_files = op_data.get("files_extracted", 0)
         ex_path = op_data.get("extracted_path", "")
-        rows = [("Filer pakket ut:", f"{n_files:,}")]
+        rows = [("Filer pakket ut:", f"{_n(n_files)}")]
         if ex_path:
             rows.append(("Temp-mappe:", ex_path))
         out.append(Paragraph("Utpakking", s_sub))
@@ -1341,8 +1760,8 @@ def _op_detail(
         size_mb   = op_data.get("size_mb", 0.0)
         out_path  = op_data.get("output_path", "")
         rows = [
-            ("Filer skrevet:",   f"{n_written:,}"),
-            ("Filstørrelse:",    f"{size_mb:.1f} MB"),
+            ("Filer skrevet:",   f"{_n(n_written)}"),
+            ("Filstørrelse:",    fmt.size(float(size_mb or 0) * 1024 * 1024)),
         ]
         if out_path:
             rows.append(("Ny SIARD-fil:", Path(out_path).name))
@@ -1386,12 +1805,26 @@ def _op_detail(
     # ── Generisk fallback ─────────────────────────────────────────────────────
     else:
         # Vis enkle nøkkel/verdi-par for kjente skalarverdier
+        _labels = _RESULT_LABELS.get(op_id, {})
         simple_rows = [
-            (k, str(v)) for k, v in op_data.items()
+            (_labels.get(k, k) + ":",
+             _n(v) if isinstance(v, int) and not isinstance(v, bool) else str(v))
+            for k, v in op_data.items()
             if isinstance(v, (str, int, float, bool)) and not k.startswith("_")
+            and not (_labels and k not in _labels)
         ][:12]
         if simple_rows:
             out.append(Paragraph("Resultater", s_sub))
-            out.append(_kv_table(simple_rows))
+            out.append(_kv_table(simple_rows, col_w=[6.5 * cm, inner_w - 6.5 * cm]))
+        if op_id == "xsd_type_fix" and op_data.get("changes"):
+            from xml.sax.saxutils import escape
+            from siard_workflow.core.column_xsd_types import group_lines
+            grouped = group_lines(op_data["changes"])
+            out.append(Paragraph("Rettingene (tapsfrie utvidelser)", s_sub))
+            for line in grouped[:15]:
+                out.append(Paragraph("•  " + escape(line), s_small))
+            if len(grouped) > 15:
+                out.append(Paragraph(f"… og {len(grouped) - 15} linje(r) til "
+                                     f"(se kjøreloggen)", s_small))
 
     return out

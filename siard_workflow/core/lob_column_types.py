@@ -45,6 +45,7 @@ og endres ikke av en formatkonvertering.
 """
 
 from __future__ import annotations
+from siard_workflow.core.fmt import num as _fnum
 
 import os
 import re
@@ -436,7 +437,7 @@ def repair_dangling_lob_refs(extract_dir: Path, w=None) -> dict:
                     stats["shared_files"] += len(shared)
                     ex, cnt = next(iter(shared.items()))
                     if w:
-                        w(f"    ADVARSEL: {sfolder}/{tfolder} c{idx}: {len(shared):,} LOB-fil(er) "
+                        w(f"    ADVARSEL: {sfolder}/{tfolder} c{idx}: {_fnum(len(shared))} LOB-fil(er) "
                           f"brukes av flere rader (f.eks. {Path(ex).name} × {cnt}) — mulig "
                           f"navnekollisjon der én LOB har overskrevet en annen; kontroller "
                           f"uttrekket", "warn")

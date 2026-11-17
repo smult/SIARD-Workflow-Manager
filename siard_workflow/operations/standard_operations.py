@@ -7,6 +7,7 @@ Diverse operasjoner:
 """
 
 from __future__ import annotations
+from siard_workflow.core.fmt import num as _fnum
 import re
 import subprocess
 import zipfile
@@ -175,7 +176,7 @@ class XMLValidationOperation(BaseOperation):
                     if lr and lr["refs"]:
                         if not lr["dbptk_fail"]:
                             ok_msgs.append(
-                                f"LOB-referanser: {lr['refs']:,} file=-referanser i "
+                                f"LOB-referanser: {_fnum(lr['refs'])} file=-referanser i "
                                 f"{lr['tables_scanned']} tabell(er) slås opp av "
                                 f"DBPTK-validatoren (A_M_5.6-1-2)")
                         else:
@@ -184,7 +185,7 @@ class XMLValidationOperation(BaseOperation):
                                     errors.append(f"A_M_5.6-1-2 {_describe_col(c)}")
                             if lr["fixable"]:
                                 errors.append(
-                                    f"A_M_5.6-1-2 oppsummert: {lr['fixable']:,} referanser "
+                                    f"A_M_5.6-1-2 oppsummert: {_fnum(lr['fixable'])} referanser "
                                     f"gir «not found external lob» i DBPTK-validatoren "
                                     f"selv om filene finnes. Velg «DBPTK-validering (full "
                                     f"sti)» i «Korriger lobFolder» hvis DBPTK-validering "
@@ -192,7 +193,7 @@ class XMLValidationOperation(BaseOperation):
                                     f"(enten/eller; standard er KDRS Søk & Vis).")
                             if lr["missing"]:
                                 errors.append(
-                                    f"A_M_5.6-1-2 oppsummert: {lr['missing']:,} LOB-fil(er) "
+                                    f"A_M_5.6-1-2 oppsummert: {_fnum(lr['missing'])} LOB-fil(er) "
                                     f"finnes ikke i arkivet — kan ikke rettes automatisk")
 
                 # ── 5. Velformethet av tableX.xml ────────────────────────────
@@ -356,19 +357,23 @@ class MetadataExtractOperation(BaseOperation):
         # Regex: content/{schema_folder}/{table_folder}/lob*/filnavn
         # Fanger faktiske mappenavn (ikke antatt schema1/table1-indeksering)
         _lob_path_re = re.compile(
-            r"^content/([^/]+)/([^/]+)/lob[^/]*/[^/]+$",
+            r"^content/([^/]+)/([^/]+)/(lob[^/]*)/[^/]+$",
             re.IGNORECASE,
         )
 
         with zipfile.ZipFile(siard_path, "r") as zf:
-            namelist = zf.namelist()
+            infolist = zf.infolist()
+            namelist = [i.filename for i in infolist]
             meta["zip_entry_count"] = len(namelist)
 
             # Tell LOB-filer totalt og per (schema_folder, table_folder)
             lob_extensions: set[str] = set()
             # lob_counts_by_folder[(schema_folder_lower, table_folder_lower)] = antall filer
             lob_counts_by_folder: dict[tuple[str, str], int] = {}
-            for n in namelist:
+            # … og per lob-mappe (= kolonne): {(skjema, tabell): {lobN: [filer, byte]}}
+            lob_by_col: dict[tuple[str, str], dict] = {}
+            for info in infolist:
+                n = info.filename
                 if n.endswith("/"):   # hopp over mappe-oppføringer
                     continue
                 nl = n.lower()
@@ -377,6 +382,9 @@ class MetadataExtractOperation(BaseOperation):
                     meta["lob_file_count"] += 1
                     key = (lob_m.group(1), lob_m.group(2))
                     lob_counts_by_folder[key] = lob_counts_by_folder.get(key, 0) + 1
+                    _c = lob_by_col.setdefault(key, {}).setdefault(lob_m.group(3), [0, 0])
+                    _c[0] += 1
+                    _c[1] += info.file_size
                     ext = PurePosixPath(nl).suffix.lstrip(".")
                     if ext:
                         lob_extensions.add(ext)
@@ -573,6 +581,21 @@ class MetadataExtractOperation(BaseOperation):
                             tbl["lob_file_count"] = lob_counts_by_folder.get(
                                 (schema_folder, table_folder.lower()), 0
                             )
+                            # lobN-mappa hører til kolonne nr. N
+                            _by_pos = {c.get("pos"): c for c in tbl.get("columns", [])}
+                            _lobs = []
+                            for _lf, (_nf, _nb) in sorted(
+                                    lob_by_col.get((schema_folder, table_folder.lower()),
+                                                   {}).items(),
+                                    key=lambda x: (len(x[0]), x[0])):
+                                _d = re.sub(r"\D", "", _lf)
+                                _col = _by_pos.get(int(_d)) if _d else None
+                                _lobs.append({
+                                    "folder": _lf,
+                                    "column": (_col or {}).get("name", ""),
+                                    "type":   (_col or {}).get("type", ""),
+                                    "files":  _nf, "bytes": _nb})
+                            tbl["lob_columns"] = _lobs
                             tables.append(tbl)
                             meta["table_count"] += 1
                             meta["row_count"] += tbl["rows"]
@@ -623,7 +646,7 @@ class MetadataExtractOperation(BaseOperation):
         msg = (
             f"{meta.get('db_name') or '?'} | "
             f"{meta['table_count']} tabeller | "
-            f"{meta['row_count']:,} rader"
+            f"{_fnum(meta['row_count'])} rader"
         )
         if "pdf_path" in result_data:
             msg += f" | PDF: {Path(result_data['pdf_path']).name}"

@@ -13,6 +13,7 @@ Anbefalt rekkefølge:
            → BLOB Konverter → Pakk sammen SIARD
 """
 from __future__ import annotations
+from siard_workflow.core.fmt import num as _fnum
 
 import concurrent.futures
 import datetime
@@ -156,7 +157,7 @@ class UnpackSiardOperation(BaseOperation):
         stop_ev = ctx.metadata.get("stop_event")
 
         def _prog(n_files: int, n_bytes: int) -> ByteProgress:
-            w(f"  {n_files:,} filer, {fmt_bytes(n_bytes)} utpakket størrelse", "info")
+            w(f"  {_fnum(n_files)} filer, {fmt_bytes(n_bytes)} utpakket størrelse", "info")
             return ByteProgress("Pakker ut", n_files, n_bytes, pcb, w)
         try:
             original_namelist, n_done = extract_all(
@@ -171,7 +172,7 @@ class UnpackSiardOperation(BaseOperation):
             return self._fail("Utpakkingen ble stoppet")
 
         elapsed = (datetime.datetime.now() - t0).total_seconds()
-        w(f"  Pakket ut {n_done:,} filer på {fmt_duration(elapsed)}", "ok")
+        w(f"  Pakket ut {_fnum(n_done)} filer på {fmt_duration(elapsed)}", "ok")
 
         ctx.extracted_path = tmp
         data = {
@@ -275,7 +276,7 @@ class UnpackSiardOperation(BaseOperation):
                     w(f"  Advarsel: could not invoke ask_schema_selector_cb: {exc}",
                       "warn")
 
-        return self._ok(data, f"{n_done:,} filer pakket ut til {tmp}")
+        return self._ok(data, f"{_fnum(n_done)} filer pakket ut til {tmp}")
 
     @staticmethod
     def _count_non_standard_lob_files(extract_dir: Path) -> int:
@@ -605,7 +606,7 @@ class RepackSiardOperation(BaseOperation):
         n_written = 0
         t0        = datetime.datetime.now()
         total_bytes = sum(s for _p, s in all_files)
-        w(f"  {n_total:,} filer, {fmt_bytes(total_bytes)}", "info")
+        w(f"  {_fnum(n_total)} filer, {fmt_bytes(total_bytes)}", "info")
         prog = ByteProgress("Pakker sammen", n_total, total_bytes, pcb, w)
 
         # Bestem kompresjonsnivå (per-instans override vinner over global config)
@@ -720,9 +721,21 @@ class RepackSiardOperation(BaseOperation):
 
         elapsed = (datetime.datetime.now() - t0).total_seconds()
         size_mb = dst_path.stat().st_size / 1_048_576
-        w(f"  Skrevet {n_written:,} filer ({fmt_bytes(dst_path.stat().st_size)}) på "
+        w(f"  Skrevet {_fnum(n_written)} filer ({fmt_bytes(dst_path.stat().st_size)}) på "
           f"{fmt_duration(elapsed)}", "ok")
         w(f"  Ny SIARD: {dst_path}", "ok")
+        try:
+            _src = Path(ctx.siard_path)
+            if _src.is_file() and _src.resolve() != dst_path.resolve():
+                _a, _b = _src.stat().st_size, dst_path.stat().st_size
+                if _a:
+                    _pct = (_b - _a) / _a * 100
+                    w(f"  Størrelse: original {fmt_bytes(_a)} → ny {fmt_bytes(_b)} "
+                      f"({'+' if _pct >= 0 else '−'}{abs(_pct):.0f} %)"
+                      + (" — dokumenter konvertert til PDF/A tar som regel mer plass "
+                         "enn kildeformatet" if _pct >= 10 else ""), "info")
+        except Exception:
+            pass
 
         # Rydd temp
         keep = bool(self.params.get("keep_temp", False))
@@ -752,4 +765,4 @@ class RepackSiardOperation(BaseOperation):
             data["lob_files_externalized"] = ext_result.get("lob_files_externalized", 0)
             w(f"  Eksternt fillager: {ext_result.get('lob_files_externalized', 0)} "
               f"fil(er) → {ext_result.get('external_documents_dir')}", "ok")
-        return self._ok(data, f"{n_written:,} filer → {dst_path.name}")
+        return self._ok(data, f"{_fnum(n_written)} filer → {dst_path.name}")

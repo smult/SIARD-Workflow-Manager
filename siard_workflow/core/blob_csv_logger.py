@@ -107,6 +107,9 @@ class ConversionErrorLogger:
         "oppgradering":      "Formatoppgradering feilet",
         "signert":           "Signert PDF (beholdt uendret)",
     }
+    # Beholdt uendret etter regelen — ikke feil. Signerte PDF-er røres aldri,
+    # og passordbeskyttede filer kan ikke åpnes for konvertering.
+    KEPT_BY_RULE = ("passordbeskyttet", "signert")
     CSV_HEADER = ["fil", "plassering", "format", "kategori", "arsak"]
     MAX_ENTRIES_IN_MEMORY = 20000
 
@@ -289,11 +292,18 @@ class ConversionErrorLogger:
     def summary(self, max_entries: int = 1000) -> dict:
         """Til kjørerapport/resultat: antall per kategori + (begrenset) liste."""
         with self._lock:
+            kept = sum(self._counts.get(k, 0) for k in self.KEPT_BY_RULE)
+            # Reelle feil først, så de aldri faller utenfor den begrensede lista
+            entries = sorted(self._entries,
+                             key=lambda e: e["kategori"] in self.KEPT_BY_RULE)
             return {
                 "total":    self._count,
+                "failed_total": self._count - kept,
+                "kept_total":   kept,
+                "kept_keys":    list(self.KEPT_BY_RULE),
                 "counts":   {k: self._counts[k] for k in self.CATEGORIES if self._counts.get(k)},
                 "labels":   dict(self.CATEGORIES),
-                "entries":  list(self._entries[:max_entries]),
+                "entries":  entries[:max_entries],
                 "truncated": max(0, self._count - min(max_entries, len(self._entries))),
                 "log_path": str(self._path) if self._path else "",
                 "csv_path": str(self._csv_path) if self._csv_path else "",
