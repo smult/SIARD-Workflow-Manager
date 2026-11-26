@@ -149,6 +149,9 @@ _current_upstream_op_ids: list = []
 def set_current_siard_path(path: "Path | None") -> None:
     global _current_siard_path
     _current_siard_path = path
+    # Les metadata.xml i bakgrunnen med en gang, så forslagene er klare når
+    # et felt med forslag åpnes
+    _siard_meta(path)
 
 
 def set_upstream_op_ids(ids: list) -> None:
@@ -156,26 +159,91 @@ def set_upstream_op_ids(ids: list) -> None:
     _current_upstream_op_ids = list(ids)
 
 
+# Feltene i metadata.xml som brukes til forslag (små bokstaver)
+_SIARD_META_TAGS = ("databaseorigin", "dborigin", "archivename",
+                    "producerapplication", "databaseproduct")
+# (sti, endret, størrelse) → {felt: tekst}. Leses ÉN gang per SIARD-fil, i en
+# bakgrunnstråd: å åpne en SIARD med mange LOB-filer tar sekunder (hele
+# innholdslista må leses), og før ble det gjort på nytt for hvert tastetrykk.
+_siard_meta_cache:   dict = {}
+_siard_meta_loading: set = set()
+_siard_meta_lock = threading.Lock()
+
+
+def _read_siard_meta(path) -> dict:
+    """Leser forslagsfeltene fra metadata.xml i SIARD-fila (kan ta tid)."""
+    import zipfile
+    import xml.etree.ElementTree as ET
+    found: dict = {}
+    with zipfile.ZipFile(path, "r") as zf:
+        try:
+            member = zf.getinfo("header/metadata.xml")
+        except KeyError:
+            member = next((i for i in zf.infolist()
+                           if i.filename.lower().endswith("metadata.xml")), None)
+            if member is None:
+                return found
+        with zf.open(member) as f:
+            # Feltene står foran <schemas> — resten (kan være mange MB) leses ikke
+            for event, el in ET.iterparse(f, events=("start", "end")):
+                tag = el.tag.rsplit("}", 1)[-1].lower()
+                if event == "start":
+                    if tag == "schemas":
+                        break
+                elif tag in _SIARD_META_TAGS and tag not in found:
+                    found[tag] = (el.text or "").strip()
+    return found
+
+
+def _siard_meta(path) -> "dict | None":
+    """
+    Forslagsfeltene for SIARD-fila, eller None mens de leses i bakgrunnen
+    (og når fila ikke finnes). Blokkerer aldri.
+    """
+    if path is None:
+        return None
+    try:
+        import os
+        st = os.stat(path)
+        key = (str(path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+    with _siard_meta_lock:
+        if key in _siard_meta_cache:
+            return _siard_meta_cache[key]
+        if key in _siard_meta_loading:
+            return None
+        _siard_meta_loading.add(key)
+
+    def _worker():
+        try:
+            meta = _read_siard_meta(path)
+        except Exception:
+            meta = {}
+        with _siard_meta_lock:
+            # Bare siste versjon av hver fil beholdes
+            for k in [k for k in _siard_meta_cache if k[0] == key[0]]:
+                del _siard_meta_cache[k]
+            _siard_meta_cache[key] = meta
+            _siard_meta_loading.discard(key)
+
+    threading.Thread(target=_worker, daemon=True,
+                     name="siard-meta-forslag").start()
+    return None
+
+
 def _get_siard_suggestions(source: str) -> list[str]:
-    """Henter forslag fra metadata.xml i aktiv SIARD-fil."""
-    if _current_siard_path is None:
+    """
+    Forslag ut fra metadata.xml i aktiv SIARD-fil. Kalles for hvert
+    tastetrykk og må derfor svare straks: metadata leses i bakgrunnen, og
+    fram til de er klare gis ingen SIARD-forslag.
+    """
+    meta = _siard_meta(_current_siard_path)
+    if not meta:
         return []
     try:
-        import zipfile, xml.etree.ElementTree as ET
-        with zipfile.ZipFile(_current_siard_path, "r") as zf:
-            candidates = [n for n in zf.namelist()
-                          if n.lower().endswith("metadata.xml")]
-            if not candidates:
-                return []
-            xml_bytes = zf.read(candidates[0])
-        root = ET.fromstring(xml_bytes)
-        ns_strip = __import__("re").compile(r"\{[^}]*\}")
-
         def _text(tag: str) -> str:
-            for el in root.iter():
-                if ns_strip.sub("", el.tag).lower() == tag.lower():
-                    return (el.text or "").strip()
-            return ""
+            return meta.get(tag.lower(), "")
 
         if source == "kommunenummer":
             origin = _text("databaseOrigin") or _text("dbOrigin") or _text("archiveName")
@@ -871,7 +939,8 @@ OP_DEFS = [
             "Genererer et sett depot-PDF-rapporter (Arkivinformasjon, "
             "Konverteringsrapport, Filorganisering og Behandlingssammendrag). "
             "Hvilke rapporter som lages velges automatisk ut fra hvilke "
-            "operasjoner som ble kjørt. Legg operasjonen sist i workflowen."
+            "operasjoner som ble kjørt. Legg operasjonen sist i workflowen "
+            "(før DIAS-pakking — rapportene tas med i pakken)."
         ),
         "status": DepotReportsOperation.status,
         "params": [

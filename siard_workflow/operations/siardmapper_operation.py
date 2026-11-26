@@ -85,6 +85,8 @@ class _Table:
     folder: Optional[str] = None
     description: Optional[str] = None
     columns: List[_Column] = field(default_factory=list)
+    schema_folder: Optional[str] = None      # content/<schema_folder>/<folder>/
+    rows: Optional[int] = None               # antall rader ifølge metadata.xml
 
     @property
     def norm(self) -> str:
@@ -103,6 +105,9 @@ def _parse_metadata(xml_bytes: bytes) -> List[_Table]:
     for schema_el in schemas_el.findall("s:schema", _NS):
         schema_name_el = schema_el.find("s:name", _NS)
         schema_name = (schema_name_el.text or "").strip() if schema_name_el is not None else ""
+        schema_folder_el = schema_el.find("s:folder", _NS)
+        schema_folder = ((schema_folder_el.text or "").strip()
+                         if schema_folder_el is not None else None)
         tables_el = schema_el.find("s:tables", _NS)
         if tables_el is None:
             continue
@@ -112,11 +117,18 @@ def _parse_metadata(xml_bytes: bytes) -> List[_Table]:
                 continue
             desc_el   = table_el.find("s:description", _NS)
             folder_el = table_el.find("s:folder", _NS)
+            rows_el   = table_el.find("s:rows", _NS)
+            try:
+                n_rows = int((rows_el.text or "").strip()) if rows_el is not None else None
+            except ValueError:
+                n_rows = None
             tbl = _Table(
                 name=name_el.text.strip(),
                 schema_name=schema_name,
                 folder=(folder_el.text or "").strip() if folder_el is not None else None,
                 description=(desc_el.text or "").strip() if desc_el is not None else None,
+                schema_folder=schema_folder,
+                rows=n_rows,
             )
             cols_el = table_el.find("s:columns", _NS)
             if cols_el is not None:

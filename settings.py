@@ -30,6 +30,7 @@ _CONFIG_DEFAULTS: dict = {
     "json_template_dir": "",         # mappe med JSON-mal-filer for SIARDMapper
     "siardmapper_show_data": True,   # vis eksempeldata i SIARDMapper-dialogen
     "siardmapper_rows":      5,      # antall eksempelrader i SIARDMapper-dialogen
+    "siardmapper_unique":    False,  # vis bare rader med ulikt innhold
     "global_temp_dir":  "",          # tom = auto-velg ved filvalg
     "log_dir":          "",          # loggfiler for kjøringen; tom = mappa SIARD-fila ligger i
     "av_executable":    "",          # sti til antivirus-program

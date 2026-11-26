@@ -27,6 +27,7 @@ from gui.styles import COLORS, FONTS
 import settings as _settings
 from siard_workflow.core.dias_remember import (
     remembered_fields, remembered_values, save_remembered)
+from siard_workflow.core.naming import OP_SUFFIXES, sidecar_base
 
 # ── Konstanter ────────────────────────────────────────────────────────────────
 
@@ -75,6 +76,11 @@ _PENDING_BY_OP: dict[str, list[dict]] = {
         {"token": "workflow_rapport",  "name": "Kjørerapport (PDF)",
          "folder_id": "repo_ops", "skip_if_suffix": "_workflow_rapport.pdf"},
     ],
+    # Ett merke for hele settet (Arkivinformasjon, Konverteringsrapport, …)
+    "depot_reports": [
+        {"token": "depot_reports",     "name": "Depotrapporter (PDF) – lages under kjøringen",
+         "folder_id": "repo_ops"},
+    ],
 }
 
 # Alltid med — kjørelogg starter uansett hvilke operasjoner som er i workflow
@@ -84,10 +90,17 @@ _ALWAYS_PENDING: list[dict] = [
      "folder_id": "repo_ops"},
 ]
 
+# PREMIS-proveniens: skrives under kjøringen når arbeidsflyten har steg som
+# endrer innholdet — og tas alltid med i pakken
+_PREMIS_PENDING: dict = {
+    "token": "provenance_premis",
+    "name": "PREMIS-proveniens (skrives under kjøringen)",
+    "folder_id": "repo_ops", "skip_if_suffix": "_premis.xml",
+}
+
 # Kjente operasjonssuffikser som strippes for å finne opprinnelig arkivnavn
-_OP_SUFFIXES = [
-    "_konvertert", "_hex_extracted", "_cosdoc", "_blob", "_dias", "_anonymisert",
-]
+# (felles regel: siard_workflow/core/naming.py)
+_OP_SUFFIXES = list(OP_SUFFIXES)
 
 # ── Hjelpefunksjoner ──────────────────────────────────────────────────────────
 
@@ -96,18 +109,10 @@ def _base_stem(siard_stem: str) -> str:
     Strip kjente operasjonssuffikser iterativt for å finne opprinnelig
     arkivnavn.  Eks: «WIS-Marnardal_2024_hex_extracted_konvertert» → «WIS-Marnardal_2024».
     """
-    stem = siard_stem
-    changed = True
-    while changed:
-        changed = False
-        for suf in _OP_SUFFIXES:
-            if stem.lower().endswith(suf.lower()):
-                stem = stem[: -len(suf)]
-                changed = True
-    return stem
+    return sidecar_base(siard_stem)
 
 
-def _discover_files(siard_path: Path) -> list[dict]:
+def _discover_files(siard_path: Path, depot: bool = True) -> list[dict]:
     """
     Finn logg-filer, SHA256, rapport og prosjektfil som tilhører dette
     uttrekket.  Tar utgangspunkt i opprinnelig arkivnavn (uten operasjons-
@@ -120,6 +125,21 @@ def _discover_files(siard_path: Path) -> list[dict]:
     base   = _base_stem(siard_path.stem)   # opprinnelig arkivnavn
     found:      list[dict] = []
     seen_names: set[str]   = set()
+    # Logg-mappa kan være en annen enn SIARD-mappa (Innstillinger → Logg-mappe)
+    dirs: list[Path] = [parent]
+    try:
+        from siard_workflow.core.file_logger import resolve_log_dir
+        _ld = resolve_log_dir(siard_path)
+        if _ld != parent and _ld.is_dir():
+            dirs.append(_ld)
+    except Exception:
+        pass
+
+    def _glob(pattern: str) -> list[Path]:
+        out: list[Path] = []
+        for d in dirs:
+            out.extend(sorted(d.glob(pattern)))
+        return out
 
     def _add(path: Path, folder_id: str) -> None:
         if path.name not in seen_names and path.exists():
@@ -137,22 +157,36 @@ def _discover_files(siard_path: Path) -> list[dict]:
     # - {base}_* fanger bare filer fra dette uttrekket, ikke andre arkiver
     # - {base}.ext bruker dot-separator for nøyaktig filnavn-match
 
-    for path in sorted(parent.glob(f"{base}_*_blob_konvertering.csv")):
+    for path in _glob(f"{base}_*_blob_konvertering.csv"):
         _add(path, "repo_ops")
 
-    for path in sorted(parent.glob(f"{base}_*_konvertering_feil.log")):
+    for path in _glob(f"{base}_*_konvertering_feil.log"):
         _add(path, "repo_ops")
 
-    for path in sorted(parent.glob(f"{base}*_workflow_rapport*.pdf")):
+    for path in _glob(f"{base}*_workflow_rapport*.pdf"):
         _add(path, "repo_ops")
 
-    for path in sorted(parent.glob(f"{base}*_metadata_rapport.pdf")):
+    for path in _glob(f"{base}*_metadata_rapport.pdf"):
         _add(path, "repo_ops")
 
     # Workflow-logg: {base}_YYYYMMDD_HHMMSS.log — ekskluder feilogg-varianter
-    for path in sorted(parent.glob(f"{base}_*.log")):
+    for path in _glob(f"{base}_*.log"):
         if "_konvertering_feil" not in path.name:
             _add(path, "repo_ops")
+
+    # PREMIS-proveniens (bearbeidingslogg) — nøyaktig filnavn
+    for d in dirs:
+        _add(d / f"{base}_premis.xml", "repo_ops")
+
+    # Depotrapporter: nyeste sett (depot=False når de skal lages på nytt i
+    # denne arbeidsflyten — da er det de nye som skal med, ikke de gamle)
+    if depot:
+        try:
+            from siard_workflow.operations.dias_package_operation import depot_report_files
+            for path in depot_report_files(siard_path):
+                _add(path, "repo_ops")
+        except Exception:
+            pass
 
     # SHA256 og prosjektfil: nøyaktig filnavn (dot-separator)
     _add(parent / f"{base}.sha256",  "adm")
@@ -845,9 +879,15 @@ class DiasParamDialog(ctk.CTkToplevel):
                     name=konvertert_siard.name,
                     tag="auto")
 
-            for ef in _discover_files(self._siard_path):
+            for ef in _discover_files(self._siard_path, depot=self._show_depot()):
                 self._insert_file(**ef)
             self._add_pending_dummies()
+
+    def _show_depot(self) -> bool:
+        """Skal depotrapportene som ligger på disk, vises i filtreet? Ja når
+        pakkingen starter (de er nettopp laget) og når arbeidsflyten ikke
+        lager dem på nytt."""
+        return self._runtime or "depot_reports" not in self._upstream_op_ids
 
     def _insert_file(self, src: str, dest: str, folder_id: str,
                      name: str = "", tag: str = "user") -> str:
@@ -875,8 +915,16 @@ class DiasParamDialog(ctk.CTkToplevel):
         pending_defs = list(_ALWAYS_PENDING)
         for op_id in self._upstream_op_ids:
             pending_defs.extend(_PENDING_BY_OP.get(op_id, []))
+        if self._premis_expected():
+            pending_defs.append(_PREMIS_PENDING)
 
+        from siard_workflow.operations.dias_package_operation import depot_report_kind
         for pd in pending_defs:
+            # Depotrapportene er alt laget (vinduet vises når pakkingen starter)
+            if pd["token"] == "depot_reports" and any(
+                    depot_report_kind(n)
+                    for n in auto_in_folder.get(pd["folder_id"], set())):
+                continue
             # Hopp over hvis tilsvarende fil allerede er auto-oppdaget
             skip_suffix = pd.get("skip_if_suffix", "")
             if skip_suffix:
@@ -898,6 +946,19 @@ class DiasParamDialog(ctk.CTkToplevel):
                 name=display_name,
                 tag="pending",
             )
+
+    def _premis_expected(self) -> bool:
+        """Vil kjøringen skrive en PREMIS-proveniensfil? (PREMIS er på, og
+        arbeidsflyten har minst ett steg som endrer innholdet før pakkingen.)"""
+        try:
+            if not _settings.get_config("enable_premis_provenance"):
+                return False
+            from gui.operations_panel import OP_DEFS
+            changing = {getattr(d.get("cls"), "operation_id", None) for d in OP_DEFS
+                        if getattr(d.get("cls"), "modifies_content", False)}
+            return any(i in changing for i in self._upstream_op_ids)
+        except Exception:
+            return False
 
     def _refresh_auto(self):
         for item_id, info in list(self._file_entries.items()):
@@ -926,7 +987,7 @@ class DiasParamDialog(ctk.CTkToplevel):
                     if info["tag"] != new_tag:
                         info["tag"] = new_tag
                         self._tree.item(item_id, tags=(new_tag,))
-            for ef in _discover_files(self._siard_path):
+            for ef in _discover_files(self._siard_path, depot=self._show_depot()):
                 self._insert_file(**ef)
             self._add_pending_dummies()
 

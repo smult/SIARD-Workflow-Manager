@@ -21,6 +21,7 @@ import time
 import tkinter as tk
 import customtkinter as ctk
 from gui.styles import COLORS, FONTS
+from siard_workflow.core.fmt import num as _fnum
 
 _PHASE_LABELS = [
     "Skanner arkiv",
@@ -252,15 +253,18 @@ class ProgressPanel(ctk.CTkFrame):
 
         self._phase_lbls: list[ctk.CTkLabel] = []
         self._phase_pcts: list[ctk.CTkLabel] = []
+        self._phase_rows: list[tuple] = []     # widgetene i hver rad
+        self._plan_labels = list(_PHASE_LABELS)
+        self._rows_shown = len(_PHASE_LABELS)
 
         for i, phase_label in enumerate(_PHASE_LABELS):
             pady = (10, 4) if i == 0 else (4, 4) if i < 5 else (4, 10)
-            ctk.CTkLabel(pf, text=f"{i+1}",
-                         font=ctk.CTkFont(family=FONTS["mono"], size=11,
-                                          weight="bold"),
-                         text_color=COLORS["muted"],
-                         width=16, anchor="e").grid(
-                             row=i, column=0, padx=(10, 4), pady=pady)
+            num_lbl = ctk.CTkLabel(pf, text=f"{i+1}",
+                                   font=ctk.CTkFont(family=FONTS["mono"], size=11,
+                                                    weight="bold"),
+                                   text_color=COLORS["muted"],
+                                   width=16, anchor="e")
+            num_lbl.grid(row=i, column=0, padx=(10, 4), pady=pady)
             pc = _PhaseCanvas(pf)
             pc.widget().grid(row=i, column=1, sticky="ew",
                              padx=(0, 6), pady=pady)
@@ -277,6 +281,7 @@ class ProgressPanel(ctk.CTkFrame):
                                anchor="e", width=70)
             pct.grid(row=i, column=3, padx=(0, 10), pady=pady)
             self._phase_pcts.append(pct)
+            self._phase_rows.append((num_lbl, pc.widget(), lbl, pct))
 
         n = len(self._phase_canvases)
         self._phase_state    = ["venter"] * n
@@ -329,6 +334,9 @@ class ProgressPanel(ctk.CTkFrame):
         self._anim_dir    = 1.0
         self._simple_pct  = None          # start ubestemt til faser melder progresjon
         self._simple_phase_label = ""
+        # Hvert steg starter med tomme faserader — ellers skrives fremdrift fra
+        # et steg uten faser (f.eks. «Pakk ut») til raden forrige steg sluttet på
+        self._reset_phase_rows()
 
         op_label = label.upper()
         self._title_lbl.configure(text=op_label, text_color=COLORS["accent"])
@@ -379,15 +387,7 @@ class ProgressPanel(ctk.CTkFrame):
         if hasattr(self, "_pct_lbl"):
             self._pct_lbl.configure(text="", text_color=COLORS["muted"])
 
-        n = len(self._phase_canvases)
-        self._phase_state    = ["venter"] * n
-        self._phase_progress = [0.0]     * n
-        for pc in self._phase_canvases:
-            pc.set_waiting()
-        for lbl, default in zip(self._phase_lbls, _PHASE_LABELS):
-            lbl.configure(text=default, text_color=COLORS["muted"])
-        for pct in self._phase_pcts:
-            pct.configure(text="")
+        self._reset_phase_rows()
         for key in self._counters:
             self._counters[key].configure(text="0")
 
@@ -425,15 +425,7 @@ class ProgressPanel(ctk.CTkFrame):
             self._counters[key].configure(text="0")
 
         if not self._phase_state or all(s == "venter" for s in self._phase_state):
-            for pc in self._phase_canvases:
-                pc.set_waiting()
-            for lbl, default in zip(self._phase_lbls, _PHASE_LABELS):
-                lbl.configure(text=default, text_color=COLORS["muted"])
-            for pct in self._phase_pcts:
-                pct.configure(text="")
-            n = len(self._phase_canvases)
-            self._phase_state    = ["venter"] * n
-            self._phase_progress = [0.0]     * n
+            self._reset_phase_rows(keep_plan=True)
 
         # Vis begge knapper i blob-modus
         self._pause_btn.grid()
@@ -449,7 +441,53 @@ class ProgressPanel(ctk.CTkFrame):
         self._bar_canvas.after(10, self._redraw_bar)
         self.grid()
 
+    def _reset_phase_rows(self, keep_plan: bool = False):
+        """Tøm faseradene: ingen aktiv fase, alle venter. keep_plan=False setter
+        også tilbake standardtekstene og viser alle radene."""
+        if not keep_plan:
+            self._plan_labels = list(_PHASE_LABELS)
+            self._show_rows(len(self._phase_rows))
+        self._current_phase = 0
+        n = len(self._phase_canvases)
+        self._phase_state    = ["venter"] * n
+        self._phase_progress = [0.0]     * n
+        for pc in self._phase_canvases:
+            pc.set_waiting()
+        for lbl, default in zip(self._phase_lbls, self._plan_labels):
+            lbl.configure(text=default, text_color=COLORS["muted"])
+        for pct in self._phase_pcts:
+            pct.configure(text="")
+
+    def _show_rows(self, n: int):
+        """Vis de n første faseradene og skjul resten."""
+        total = len(self._phase_rows)
+        n = max(1, min(int(n), total))
+        self._rows_shown = n
+        for i, widgets in enumerate(self._phase_rows):
+            pady = (10 if i == 0 else 4, 10 if i == n - 1 else 4)
+            for wdg in widgets:
+                if i < n:
+                    wdg.grid()
+                    wdg.grid_configure(pady=pady)
+                else:
+                    wdg.grid_remove()
+
+    def set_phase_plan(self, labels):
+        """Fasene i steget som kjører: tekst per rad, og bare så mange rader."""
+        labels = [str(x) for x in (labels or [])][:len(self._phase_rows)]
+        if not labels:
+            return
+        self._plan_labels = labels + list(_PHASE_LABELS[len(labels):])
+        for i, lbl in enumerate(self._phase_lbls):
+            if self._phase_state[i] == "venter":
+                lbl.configure(text=self._plan_labels[i],
+                              text_color=COLORS["muted"])
+        self._show_rows(len(labels))
+
     def set_phase(self, phase: int, total_phases: int, label: str):
+        if (1 <= total_phases <= len(self._phase_rows)
+                and total_phases != self._rows_shown):
+            self._show_rows(total_phases)
         prev = getattr(self, "_current_phase", 0)
         if 0 < prev <= len(self._phase_state):
             if self._phase_state[prev - 1] == "aktiv":
@@ -466,7 +504,7 @@ class ProgressPanel(ctk.CTkFrame):
             self._phase_progress[idx] = 0.0
             self._phase_canvases[idx].set_active(0.0)
             self._phase_lbls[idx].configure(
-                text=label or _PHASE_LABELS[idx],
+                text=label or self._plan_labels[idx],
                 text_color=COLORS["text"])
             self._phase_pcts[idx].configure(text="0%",
                                              text_color=COLORS["muted"])
@@ -498,18 +536,25 @@ class ProgressPanel(ctk.CTkFrame):
                 return
         pct = done / total if total else 0
         idx = self._current_phase - 1
-        if 0 <= idx < len(self._phase_canvases):
+        # Bare en fase som faktisk er startet får fremdrift — steg uten faser
+        # skal aldri tegne i faseradene
+        if (0 <= idx < len(self._phase_canvases)
+                and self._phase_state[idx] == "aktiv"):
             self._phase_progress[idx] = pct
             self._phase_canvases[idx].set_active(pct)
+            # Med ferdig statustekst kan done/total være en skala (promille av
+            # bytes), ikke et antall — vis da prosent
+            as_count = not text and total < 10000
             self._phase_pcts[idx].configure(
-                text=f"{done:,}/{total:,}" if total < 10000 else f"{pct*100:.0f}%",
+                text=(f"{_fnum(done)}/{_fnum(total)}" if as_count
+                      else f"{pct*100:.0f}%"),
                 text_color=COLORS["text"])
         # Simple-modus: oppdater den bestemte progressbaren med % ferdig
         if self._simple_mode and not self._simple_done and not text:
             self._simple_pct = pct
             lbl = label or self._simple_phase_label
             self._simple_status.configure(
-                text=f"{lbl}  {done:,}/{total:,} ({pct*100:.0f} %)".strip(),
+                text=f"{lbl}  {_fnum(done)}/{_fnum(total)} ({pct*100:.0f} %)".strip(),
                 text_color=COLORS["text"])
             self._draw_simple()
 
@@ -565,14 +610,16 @@ class ProgressPanel(ctk.CTkFrame):
         self._redraw_bar()
         self._update_counters(stats)
 
-        phase3_idx = 2
+        # Samme rad som file_done: «Konverterer filer» (fase 4) dekker både
+        # omdøping og LibreOffice-konvertering
+        conv_phase_idx = 3
         if (self._total > 0 and done > 0
-                and 0 <= phase3_idx < len(self._phase_state)
-                and self._phase_state[phase3_idx] == "aktiv"):
-            pct = done / self._total
-            self._phase_progress[phase3_idx] = pct
-            self._phase_canvases[phase3_idx].set_active(pct)
-            self._phase_pcts[phase3_idx].configure(
+                and 0 <= conv_phase_idx < len(self._phase_state)
+                and self._phase_state[conv_phase_idx] == "aktiv"):
+            pct = min(1.0, done / self._total)
+            self._phase_progress[conv_phase_idx] = pct
+            self._phase_canvases[conv_phase_idx].set_active(pct)
+            self._phase_pcts[conv_phase_idx].configure(
                 text=f"{pct*100:.0f}%", text_color=COLORS["text"])
 
     def finish(self, stats: dict):

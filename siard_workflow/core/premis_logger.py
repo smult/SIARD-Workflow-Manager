@@ -32,10 +32,9 @@ VALID_EVENT_TYPES = frozenset({
 # Trygg fallback for innholdsendrende operasjoner som ikke oppgir gyldig type.
 DEFAULT_EVENT_TYPE = "Adjustment"
 
-# Suffikser som strippes for å finne uttrekkets «base»-navn — samme liste som
-# DiasPackageOperation bruker, slik at premis-fila matcher de andre sidefilene.
-_SUFFIXES = ("_konvertert", "_hex_extracted", "_cosdoc", "_blob", "_dias",
-             "_anonymisert", "_stdext", "_lobfix", "_xsdfix", "_metafix", "_segfix")
+# Uttrekkets grunnavn: felles regel (core/naming.py) med DIAS-pakkingen, slik
+# at premis-fila finnes igjen sammen med de andre sidefilene.
+from .naming import OP_SUFFIXES as _SUFFIXES, sidecar_base
 
 ET.register_namespace("premis", PREMIS_NS)
 ET.register_namespace("xsi", XSI_NS)
@@ -47,15 +46,7 @@ def _p(tag: str) -> str:
 
 
 def _base_name(siard_path: Path) -> str:
-    base = siard_path.stem
-    changed = True
-    while changed:
-        changed = False
-        for suf in _SUFFIXES:
-            if base.lower().endswith(suf.lower()):
-                base = base[: -len(suf)]
-                changed = True
-    return base
+    return sidecar_base(Path(siard_path))
 
 
 class PremisProvenanceLogger:

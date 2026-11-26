@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import tarfile
 import tempfile
@@ -26,6 +27,7 @@ from uuid import uuid1
 from siard_workflow.core.base_operation import BaseOperation, OperationResult
 from siard_workflow.core.context import WorkflowContext
 from siard_workflow.core import external_lob
+from siard_workflow.core.naming import sidecar_base
 
 logger = logging.getLogger(__name__)
 
@@ -177,16 +179,7 @@ def _resolve_pending(token: str, siard_path: Path, ctx) -> "Path | None":
     Løs opp [[pending:{token}]] til reell filsti, eller None hvis ikke funnet.
     Brukes av DiasPackageOperation.run() rett før ekstra-filer kopieres.
     """
-    base = siard_path.stem
-    _suffixes = ("_konvertert", "_hex_extracted", "_cosdoc", "_blob", "_dias",
-                 "_anonymisert", "_stdext", "_lobfix", "_xsdfix", "_metafix", "_segfix")
-    changed = True
-    while changed:
-        changed = False
-        for suf in _suffixes:
-            if base.lower().endswith(suf.lower()):
-                base = base[: -len(suf)]
-                changed = True
+    base = sidecar_base(siard_path)
 
     parent = siard_path.parent
     meta   = ctx.metadata if ctx and ctx.metadata else {}
@@ -229,9 +222,124 @@ def _resolve_pending(token: str, siard_path: Path, ctx) -> "Path | None":
         return _newest(parent, log_dir, pattern=f"{base}*_workflow_rapport*.pdf")
 
     if token == "provenance_premis":
-        return _newest(parent, log_dir, pattern=f"{base}_premis.xml")
+        return premis_provenance_file(siard_path, ctx)
+
+    if token == "depot_reports":
+        return depot_report_files(siard_path, ctx) or None
 
     return None
+
+
+# Depotrapportene («Depotrapporter (PDF)»): {SIARD-navn}_{type}_{tidsstempel}.pdf
+DEPOT_REPORT_KINDS = ("arkivinformasjon", "konverteringsrapport",
+                      "filorganisering", "behandlingssammendrag")
+_DEPOT_RE = re.compile(
+    r"^(?P<stem>.+)_(?P<kind>" + "|".join(DEPOT_REPORT_KINDS)
+    + r")_(?P<ts>\d{8}_\d{6})\.pdf$", re.IGNORECASE)
+
+
+def depot_report_kind(name, base: str = "") -> str:
+    """Rapporttypen når filnavnet er en depotrapport (for uttrekket `base`,
+    hvis oppgitt) — ellers tom streng."""
+    m = _DEPOT_RE.match(Path(str(name)).name)
+    if not m:
+        return ""
+    if base and sidecar_base(m["stem"]).lower() != base.lower():
+        return ""
+    return m["kind"].lower()
+
+
+def depot_report_files(siard_path: Path, ctx=None) -> "list[Path]":
+    """
+    Depotrapportene som hører til uttrekket — én versjon av hver type.
+
+    Er rapportene laget i denne kjøringen (eller i en tidligere kjøring av
+    samme prosjekt), brukes nøyaktig de filene. Ellers letes det nyeste
+    settet opp ved siden av SIARD-fila og i undermappa «depotrapporter».
+    Et sett er rapportene fra én kjøring (samme tidsstempel), så typer fra
+    ulike kjøringer blandes ikke.
+    """
+    data = (getattr(ctx, "results", None) or {}).get("depot_reports") \
+        if ctx is not None else None
+    data = data if isinstance(data, dict) else {}
+    paths = []
+    for p in data.get("report_paths") or []:
+        try:
+            if Path(p).is_file():
+                paths.append(Path(p))
+        except OSError:
+            pass
+    if paths:
+        return paths
+
+    siard_path = Path(siard_path)
+    base = sidecar_base(siard_path)
+    dirs = [siard_path.parent, siard_path.parent / "depotrapporter"]
+    if data.get("report_dir"):
+        dirs.append(Path(data["report_dir"]))
+    sets: dict = {}
+    seen: set = set()
+    for d in dirs:
+        try:
+            cands = list(d.glob("*.pdf")) if d.is_dir() else []
+        except OSError:
+            cands = []
+        for p in cands:
+            key = os.path.normcase(os.path.abspath(p))
+            if key in seen:
+                continue
+            seen.add(key)
+            m = _DEPOT_RE.match(p.name)
+            if m and sidecar_base(m["stem"]).lower() == base.lower():
+                sets.setdefault(m["ts"], []).append(p)
+    if not sets:
+        return []
+    return sorted(sets[max(sets)], key=lambda p: p.name.lower())
+
+
+def premis_provenance_file(siard_path: Path, ctx) -> "Path | None":
+    """
+    PREMIS-proveniensfila («{grunnavn}_premis.xml») som hører til uttrekket.
+
+    Kjøringens egen PREMIS-logger vet nøyaktig hvor fila ligger — den spørres
+    først, og hendelsene så langt skrives ut hvis de ikke er skrevet ennå.
+    Ellers (DIAS-pakking alene, i en senere økt) letes det etter fila ved
+    siden av SIARD-fila og i logg-mappa.
+    """
+    meta = ctx.metadata if ctx is not None and ctx.metadata else {}
+    pl = meta.get("premis_logger")
+    if pl is not None:
+        try:
+            if pl.has_events():
+                pl.finalize(siard_path, ctx)
+        except Exception:
+            logger.exception("PREMIS-proveniens kunne ikke skrives før DIAS-pakking")
+        for cand in (getattr(pl, "path", None), getattr(pl, "out_path", None)):
+            try:
+                if cand and Path(cand).is_file():
+                    return Path(cand)
+            except OSError:
+                pass
+
+    dirs: list[Path] = [Path(siard_path).parent]
+    for d in (meta.get("log_dir", ""),):
+        if d:
+            dirs.append(Path(d))
+    try:
+        from siard_workflow.core.file_logger import resolve_log_dir
+        dirs.append(resolve_log_dir(Path(siard_path)))
+    except Exception:
+        pass
+    name = f"{sidecar_base(siard_path)}_premis.xml"
+    cands = []
+    for d in dirs:
+        try:
+            p = d / name
+            if p.is_file():
+                cands.append(p)
+        except OSError:
+            pass
+    return max(cands, key=lambda p: p.stat().st_mtime, default=None)
 
 # ── Diskplass-estimering og -sjekk ────────────────────────────────────────────
 
@@ -534,9 +642,11 @@ class DiasPackageOperation(BaseOperation):
                 real  = _resolve_pending(token, siard_path, ctx)
                 if real:
                     dest_dir = ef.get("dest", "").rstrip("/")
-                    resolved_list.append({"src": str(real),
-                                          "dest": f"{dest_dir}/{real.name}"})
-                    logger.info("Pending token '%s' løst til: %s", token, real)
+                    # Ett merke kan stå for flere filer (depotrapportene)
+                    for _one in (real if isinstance(real, list) else [real]):
+                        resolved_list.append({"src": str(_one),
+                                              "dest": f"{dest_dir}/{_one.name}"})
+                        logger.info("Pending token '%s' løst til: %s", token, _one)
                 else:
                     logger.warning("Pending token '%s' — fil ikke funnet, hopper over", token)
             else:
@@ -554,11 +664,9 @@ class DiasPackageOperation(BaseOperation):
         # ── Garantert auto-inkludering av kjente filer fra denne kjøringen ──────
         # Kjører uavhengig av pending-token-systemet slik at filer ikke mangler
         # selv om dialogens extra_files er tom eller tokens feiler å løse.
-        base = siard_path.stem
-        for _suf in ("_konvertert", "_hex_extracted", "_cosdoc", "_blob", "_dias",
-                     "_anonymisert", "_stdext", "_lobfix", "_xsdfix", "_metafix", "_segfix"):
-            if base.lower().endswith(_suf.lower()):
-                base = base[: -len(_suf)]
+        # Sidefilene heter etter originalfila — ikke etter resultatfila, som
+        # kan hete «…_konvertert_anonymisert» eller «…_konvertert_1»
+        base = sidecar_base(siard_path)
         _ctx_meta  = ctx.metadata or {}
         _log_dir_s = _ctx_meta.get("log_dir", "")
         _log_dir   = Path(_log_dir_s) if _log_dir_s else None
@@ -632,14 +740,39 @@ class DiasPackageOperation(BaseOperation):
                                pattern=f"{base}*_workflow_rapport*.pdf"),
                   _repo, "kjørerapport")
 
+        # Depotrapporter — når de er laget (i denne kjøringen eller tidligere).
+        # Pakken skal ha én versjon av hver rapport: eldre versjoner som står
+        # igjen i fillista fra en tidligere åpning av vinduet, tas ut.
+        _depot = depot_report_files(siard_path, ctx)
+        if _depot:
+            def _norm(p) -> str:
+                return os.path.normcase(os.path.abspath(str(p)))
+            _cur   = {_norm(p) for p in _depot}
+            _kinds = {depot_report_kind(p.name) for p in _depot}
+            for _ef in list(metadata_extras):
+                if (depot_report_kind(_ef["src"], base) in _kinds
+                        and _norm(_ef["src"]) not in _cur):
+                    metadata_extras.remove(_ef)
+                    _existing_srcs.discard(_ef["src"])
+                    _wlog(f"  Eldre depotrapport utelatt: {Path(_ef['src']).name}")
+            _have = {_norm(s) for s in _existing_srcs}
+            for _dp in _depot:
+                if _norm(_dp) not in _have:
+                    _auto_add(_dp, _repo, "depotrapport")
+        elif (ctx.results or {}).get("depot_reports") is not None:
+            _wlog("  Auto-inkludering: depotrapporter — filene finnes ikke lenger")
+
         # SHA256 (finnes alltid i SIARD-mappen)
         _auto_add(siard_path.parent / f"{base}.sha256", _adm, "SHA256")
 
         # PREMIS-proveniens (bearbeidingslogg). Legges i repository_operations/
         # for å holde den adskilt fra pakkas egen administrative_metadata/premis.xml.
-        _auto_add(_auto_newest(siard_path.parent, _log_dir,
-                               pattern=f"{base}_premis.xml"),
-                  _repo, "premis-proveniens")
+        _premis = premis_provenance_file(siard_path, ctx)
+        if _premis is None and _ctx_meta.get("premis_logger") is None:
+            _wlog("  PREMIS-proveniens: ingen fil for dette uttrekket (ingen "
+                  "innholdsendrende steg er kjørt, eller PREMIS er slått av)")
+        else:
+            _auto_add(_premis, _repo, "PREMIS-proveniens")
 
         # Samme fil kan være valgt i dialogen og funnet automatisk (ulik
         # skrivemåte av stien) — hver målsti skal bare med én gang

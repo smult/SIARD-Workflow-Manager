@@ -2522,10 +2522,17 @@ class BlobConvertOperation(BaseOperation):
         eller pakke inn ZIP. extract_dir er allerede utpakket av
         UnpackSiardOperation. Repacking gjøres av RepackSiardOperation.
         """
-        PHASES = 4   # scan, inline, convert, patch XML  (ingen utpakking/repakking)
+        # scan, inline, deteksjon, konvertering, patch XML (ingen utpakking/repakking)
+        PHASES = 5
 
         def phase(n, label):
             progress("phase", phase=n, total_phases=PHASES, label=label)
+
+        # Radene i fremdriftspanelet for denne flyten (ellers vises standard-
+        # tekstene for 6-fase-flyten til hver fase starter)
+        progress("phase_plan", labels=[
+            "Skanner utpakket filsystem", "Inline-ekstraksjon",
+            "Detekterer filer", "Konverterer filer", "Oppdaterer tableX.xml"])
 
         schema_re = re.compile(r"^schema\d+$", re.IGNORECASE)
         table_re  = re.compile(r"^table\d+$",  re.IGNORECASE)
@@ -2767,7 +2774,7 @@ class BlobConvertOperation(BaseOperation):
             w(f"  Resume: {_fnum(_before - len(all_blobs))} allerede behandlet hoppet over, "
               f"{_fnum(len(all_blobs))} gjenstår", "info")
 
-        # ── Fase 3: Detekter og konverter blob-filer ──────────────────────────
+        # ── Fase 3 og 4: Detekter og konverter blob-filer ─────────────────────
         total = len(all_blobs)
         # Skrives også til progresjonsfila, så XML-en kan rettes for filer
         # konvertert før et avbrudd
@@ -2775,10 +2782,10 @@ class BlobConvertOperation(BaseOperation):
         _pipeline_creg_lock = threading.Lock()
         if total == 0:
             w("  Ingen blob-filer å behandle", "info")
-            phase(3, "Konvertering hoppet over (ingen blobs)")
+            phase(3, "Deteksjon hoppet over (ingen blobs)")
+            phase(4, "Konvertering hoppet over (ingen blobs)")
             progress("phase_done")
         else:
-            phase(3, "Detekterer og konverterer blob-filer")
             progress("init", total=total)
             self._convert_all(
                 all_blobs, extract_dir, stats, w, progress,
@@ -2787,7 +2794,7 @@ class BlobConvertOperation(BaseOperation):
                 err_log=err_log,
                 conversion_registry=_pipeline_creg,
                 creg_lock=_pipeline_creg_lock,
-                emit_phase_events=False)  # 4-fase-flyt — kalleren styrer faser
+                total_phases=PHASES)   # fase 3 og 4 sendes av _convert_all_run
             progress("phase_done")
 
         if stop_ev.is_set():
@@ -2795,8 +2802,8 @@ class BlobConvertOperation(BaseOperation):
             progress("aborted", stats=dict(stats))
             return
 
-        # ── Fase 4: Patch tableX.xml ──────────────────────────────────────────
-        phase(4, "Oppdaterer tableX.xml")
+        # ── Fase 5: Patch tableX.xml ──────────────────────────────────────────
+        phase(5, "Oppdaterer tableX.xml")
         self._patch_all_xml(
             table_xml_map, table_blobs, extract_dir,
             inline_new, xml_pre, stats, w, progress,
@@ -3191,7 +3198,7 @@ class BlobConvertOperation(BaseOperation):
                      err_log=None,
                      conversion_registry: "dict | None" = None,
                      creg_lock: "threading.Lock | None" = None,
-                     emit_phase_events: bool = True) -> None:
+                     total_phases: int = 6) -> None:
         """
         Kjør konverteringen med en egen, unik arbeidsmappe for denne kjøringen
         (LibreOffice-profiler + batch- og retry-mapper), som alltid ryddes.
@@ -3212,7 +3219,7 @@ class BlobConvertOperation(BaseOperation):
                 all_blobs, extract_dir, stats, w, progress, lo_bin, stop_ev,
                 pause_ev, csv_log=csv_log, xml_type_hints=xml_type_hints,
                 err_log=err_log, conversion_registry=conversion_registry,
-                creg_lock=creg_lock, emit_phase_events=emit_phase_events,
+                creg_lock=creg_lock, total_phases=total_phases,
                 lo_run_root=lo_run_root)
             # Steg B5: Ghostscript-etterbehandling — etter all konvertering (også
             # når ingenting gikk til LibreOffice), FØR tableX.xml patches
@@ -3233,15 +3240,17 @@ class BlobConvertOperation(BaseOperation):
                          err_log=None,
                          conversion_registry: "dict | None" = None,
                          creg_lock: "threading.Lock | None" = None,
-                         emit_phase_events: bool = True,
+                         total_phases: int = 6,
                          lo_run_root: "Path | None" = None) -> None:
         """
         Deteksjon parallelt + LO batch-konvertering med unik brukerprofil per instans.
         xml_type_hints: {filnavn: ext} fra type-kolonner i tableX.xml.
-        emit_phase_events: True i 6-fase standalone-flyt (sender phase 3 og 4
-            som egne fase-events). False i 4-fase pipeline-flyt der kallerens
-            fase allerede dekker både deteksjon og konvertering.
+        total_phases: antall faser i kallerens flyt (6 alene, 5 i en arbeidsflyt).
+            Fase 3 (deteksjon, inkl. forhåndsskann) og fase 4 (alt etter
+            deteksjonen: arkiver, omdøping, LibreOffice) sendes herfra.
         """
+        progress("phase", phase=3, total_phases=total_phases,
+                 label=f"Detekterer {_fnum(len(all_blobs))} filer")
         lock  = threading.Lock()
         max_w = max(1, min(self.params["max_workers"], os.cpu_count() or 2))
         hints = xml_type_hints or {}
@@ -3654,9 +3663,6 @@ class BlobConvertOperation(BaseOperation):
         MIN_LOG_INTERVAL  = 2.0   # sekunder mellom logger
         MAX_LOG_INTERVAL  = 10.0  # tving fram logg etter så lang stillhet
         n_detected    = 0
-        if emit_phase_events:
-            progress("phase", phase=3, total_phases=6,
-                     label=f"Detekterer {_fnum(n_total)} filer ...")
         w(f"  Starter parallell deteksjon på {max_w} worker-tråder ...",
           "info")
         import time as _time
@@ -3732,6 +3738,11 @@ class BlobConvertOperation(BaseOperation):
             w("  Typekolonne overstyrt av innhold (lesbar tekst beholdes som tekst): "
               + ", ".join(f"{_fnum(n)} merket {e.upper()}"
                           for e, n in sorted(_hint_ignored.items())), "info")
+
+        # Fase 4 dekker alt etter deteksjonen: arkiver, formatoppgradering,
+        # e-post, omdøping og LibreOffice-batchene
+        progress("phase", phase=4, total_phases=total_phases,
+                 label="Konverterer filer")
 
         # Steg B: Kategoriser
         to_convert:     list[tuple[int, str, str, str]] = []
@@ -4220,9 +4231,6 @@ class BlobConvertOperation(BaseOperation):
             return
 
         # Steg D: LO batch-konvertering
-        if emit_phase_events:
-            progress("phase", phase=4, total_phases=6,
-                     label="Konverterer filer (batch LO)")
         # Smart batch-fordeling: lo_batch_size er MAKS — bruk mindre batcher
         # når filantallet er for lite til å fylle alle workers. F.eks. 149 filer
         # med max=100/workers=8 ville gitt 2 batcher (100+49) = bare 2 workers

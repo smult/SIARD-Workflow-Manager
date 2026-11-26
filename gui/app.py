@@ -298,6 +298,11 @@ class _LibreOfficeWarningDialog(ctk.CTkToplevel):
         self.destroy()
 
 
+# Et minimert vindu gjenopprettes før en modal dialog vises over det
+from gui.modal_guard import install as _install_modal_guard
+_install_modal_guard()
+
+
 class App(ctk.CTk):
     TITLE   = "SIARD Workflow Manager"
     try:
@@ -319,6 +324,13 @@ class App(ctk.CTk):
         self.minsize(self.MIN_W, self.MIN_H)
         self.after(0, lambda: self.state("zoomed"))
         self.configure(fg_color=COLORS["bg"])
+        # Skriftstørrelse fra tastaturet: Ctrl + / Ctrl − (også talltastaturet),
+        # Ctrl 0 = standard. bind_all → virker også i dialogvinduene.
+        for _seq, _d in (("<Control-plus>", +1), ("<Control-KP_Add>", +1),
+                         ("<Control-minus>", -1), ("<Control-KP_Subtract>", -1)):
+            self.bind_all(_seq, lambda _e, d=_d: self._font_scale(d))
+        for _seq in ("<Control-Key-0>", "<Control-KP_0>"):
+            self.bind_all(_seq, lambda _e: self._font_reset())
 
         self.manager         = create_manager()
         self.siard_path: Path | None = None        # aktiv fil (siste i køen under kjøring)
@@ -4498,6 +4510,10 @@ class App(ctk.CTk):
                         kw["phase"], kw["total_phases"], kw["label"])
                     self._log(f"  [{kw['phase']}/{kw['total_phases']}] {kw['label']}", "step")
                     needs_redraw = True
+                elif kind == "conv_phase_plan":
+                    _, kw = item
+                    self.progress_panel.set_phase_plan(kw.get("labels") or [])
+                    needs_redraw = True
                 elif kind == "conv_phase_done":
                     _, kw = item
                     self.progress_panel.phase_done()
@@ -5085,6 +5101,11 @@ class App(ctk.CTk):
         from settings import save_config
         FontRegistry.scale(delta)
         save_config({"font_offset": FontRegistry.current_offset()})
+
+    def _font_reset(self) -> None:
+        """Tilbake til standard skriftstørrelse (Ctrl 0)."""
+        from gui.styles import FontRegistry
+        self._font_scale(-FontRegistry.current_offset())
 
     def _on_log_show_all(self, show_all: bool) -> None:
         """Callback fra LogPanel når 'Vis alle/Vis siste'-toggle trykkes."""

@@ -6,7 +6,8 @@ Flat redigeringstabell à la original SIARDMapper:
   - Kolonner: Navn | Status | JSON-beskrivelse | Egendefinert beskrivelse
   - Inline tk.Entry-overlay på «Egendefinert»-kolonnen; Enter hopper til neste rad
   - Forslag-popup basert på lignende kolonnebeskrivelser
-  - Datatabell (5 eksempelrader) nederst, oppdateres ved valg
+  - Datatabell nederst med rader fra valgt tabell: velg antall, bla med
+    Start / Forrige / Neste / Slutt, «Unike» viser bare rader med ulikt innhold
   - Autolagring til JSON etter hver endring
   - Re-match-knapp
 """
@@ -15,9 +16,11 @@ from __future__ import annotations
 
 import html as _html_mod
 import json
+import queue
+import threading
+import time
 import tkinter as tk
-import xml.etree.ElementTree as ET
-import zipfile
+import tkinter.font as tkfont
 from dataclasses import dataclass, field
 from pathlib import Path
 from tkinter import ttk
@@ -25,7 +28,10 @@ from typing import Dict, List, Optional
 
 import customtkinter as ctk
 
-from gui.styles import COLORS, FONTS
+from gui.styles import COLORS, FONTS, FontRegistry
+from siard_workflow.core.fmt import num as _fnum, size as _fsize
+from siard_workflow.core.table_rows import (
+    Cancelled, RowPage, SiardZip, TableRows, table_opener)
 
 
 # ── Datamodeller ──────────────────────────────────────────────────────────────
@@ -46,53 +52,8 @@ class _TblItem:
     folder: str
     matched: bool
     columns: List[_ColItem] = field(default_factory=list)
-
-
-# ── Eksempelrader ─────────────────────────────────────────────────────────────
-
-def _read_sample_rows(folder, n_cols, siard_path, extracted_path, limit=5):
-    def _parse(raw):
-        try:
-            root = ET.fromstring(raw)
-        except ET.ParseError:
-            return []
-        rows = []
-        for row_el in root:
-            tag = row_el.tag.split("}")[-1] if "}" in row_el.tag else row_el.tag
-            if tag != "row":
-                continue
-            cells = [""] * n_cols
-            for c in row_el:
-                ct = c.tag.split("}")[-1] if "}" in c.tag else c.tag
-                if ct.startswith("c") and ct[1:].isdigit():
-                    i = int(ct[1:]) - 1
-                    if 0 <= i < n_cols:
-                        cells[i] = (c.text or "").strip()
-            rows.append(cells)
-            if len(rows) >= limit:
-                break
-        return rows
-
-    clean = (folder or "").strip("/")
-    if extracted_path and extracted_path.is_dir():
-        for f in extracted_path.rglob("*.xml"):
-            rel = f.relative_to(extracted_path).as_posix()
-            if f"/{clean}/" in f"/{rel}" and "header" not in rel:
-                try:
-                    return _parse(f.read_bytes())
-                except Exception:
-                    pass
-    if siard_path and Path(siard_path).exists():
-        try:
-            with zipfile.ZipFile(siard_path, "r", allowZip64=True) as zf:
-                cands = [n for n in zf.namelist()
-                         if f"/{clean}/" in f"/{n}" and n.endswith(".xml")
-                         and not n.startswith("header/")]
-                if cands:
-                    return _parse(zf.read(cands[0]))
-        except Exception:
-            pass
-    return []
+    schema_folder: str = ""              # content/<schema_folder>/<folder>/
+    n_rows: Optional[int] = None         # antall rader ifølge metadata.xml
 
 
 # ── Inline-editor ─────────────────────────────────────────────────────────────
@@ -100,7 +61,8 @@ def _read_sample_rows(folder, n_cols, siard_path, extracted_path, limit=5):
 class _InlineEditor:
     """tk.Entry-overlay plassert over riktig celle. Enter/Tab → neste rad."""
 
-    def __init__(self, tree, col_id, on_commit, on_navigate, on_activate):
+    def __init__(self, tree, col_id, on_commit, on_navigate, on_activate,
+                 font=None):
         self._tree       = tree
         self._col_id     = col_id
         self._on_commit  = on_commit
@@ -108,6 +70,8 @@ class _InlineEditor:
         self._on_activate = on_activate
         self._iid: Optional[str] = None
         self._active = False
+        self._placed = None      # sist brukte celle-bbox
+        self._watching = False
 
         self._var = tk.StringVar()
         self._entry = tk.Entry(
@@ -116,7 +80,7 @@ class _InlineEditor:
             bg="#1e2535", fg="#d4daf0",
             insertbackground="#4f8ef7",
             selectbackground="#3a70d4", selectforeground="#ffffff",
-            relief="flat", font=("Courier New", 10), bd=1,
+            relief="flat", font=font or ("Courier New", 10), bd=1,
             highlightthickness=1, highlightbackground="#4f8ef7",
         )
         self._entry.bind("<Return>",    self._on_enter)
@@ -136,6 +100,29 @@ class _InlineEditor:
         self._entry.focus_set()
         self._entry.select_range(0, "end")
         self._on_activate(iid, self._entry)
+        if not self._watching:
+            self._watching = True
+            self._tree.after(self._WATCH_MS, self._watch)
+
+    _WATCH_MS = 100
+
+    def _watch(self):
+        """
+        Hold feltet på cellen så lenge det er åpent. Cellen flytter seg eller
+        endrer bredde når kolonnekanten dras, vinduet endres, det rulles, eller
+        tabeller over åpnes/lukkes — ikke alt dette gir en hendelse å lytte på.
+        """
+        if not self._active or not self._iid:
+            self._watching = False
+            return
+        try:
+            bb = self._tree.bbox(self._iid, self._col_id) or None
+        except Exception:
+            self._watching = False
+            return
+        if bb != self._placed:
+            self._place()
+        self._tree.after(self._WATCH_MS, self._watch)
 
     def hide(self):
         self._entry.place_forget()
@@ -154,9 +141,13 @@ class _InlineEditor:
             bb = self._tree.bbox(self._iid, self._col_id)
         except Exception:
             return
+        self._placed = bb or None
         if bb:
             x, y, w, h = bb
             self._entry.place(x=x, y=y, width=w, height=h)
+        else:
+            # Raden er rullet ut av syne — feltet skal ikke bli hengende igjen
+            self._entry.place_forget()
 
     def _commit_current(self):
         if self._iid and self._active:
@@ -206,7 +197,7 @@ class _InlineEditor:
 class _SuggestionPopup:
     """Liten Listbox under editor-feltet med beskrivelsesforslag."""
 
-    def __init__(self, parent_tree, on_pick):
+    def __init__(self, parent_tree, on_pick, font=None):
         self._tree    = parent_tree
         self._on_pick = on_pick
         self._lb_frame = tk.Frame(parent_tree, bg=COLORS["border"], bd=1)
@@ -215,7 +206,7 @@ class _SuggestionPopup:
             bg="#1e2535", fg="#d4daf0",
             selectbackground=COLORS["accent_dim"],
             selectforeground="#ffffff",
-            font=("Courier New", 10),
+            font=font or ("Courier New", 10),
             height=4, activestyle="none",
             relief="flat", bd=0,
         )
@@ -285,7 +276,23 @@ class SiardMapperDialog(ctk.CTkToplevel):
         self._json_path     = json_path
         self._smap          = suggestion_map or {}
         self._cancelled     = True
-        self._cache: Dict[str, List[List[str]]] = {}
+
+        # Datavisning: én radleser per tabell (husker posisjoner i fila),
+        # leste sider, og hvor brukeren står i hver tabell
+        self._zip = SiardZip(siard_path)
+        self._readers: Dict[str, TableRows] = {}
+        self._page_cache: Dict[tuple, RowPage] = {}
+        self._table_pos: Dict[str, tuple] = {}
+        self._data_tbl: Optional[_TblItem] = None
+        self._data_hl: Optional[int] = None
+        self._data_page: Optional[RowPage] = None
+        self._load_q: "queue.Queue" = queue.Queue()
+        self._load_gen = 0
+        self._load_waiting: Optional[int] = None
+        self._load_polling = False
+        self._load_started = 0.0
+        self._load_bytes = 0
+        self._closed = False
 
         # Redigeringer: {iid: str}
         self._edits: Dict[str, str] = {}
@@ -293,6 +300,9 @@ class SiardMapperDialog(ctk.CTkToplevel):
         self._marked_for_deletion: set[str] = set()
         # Flat liste for navigasjon
         self._items: List[dict] = []
+        # Ferdige tabeller brukeren selv har åpnet (tbl.norm) — lukkes ikke
+        # automatisk ved endring
+        self._keep_open: set[str] = set()
 
         # Autolags-sti
         self._save_path: Optional[Path] = None
@@ -327,9 +337,27 @@ class SiardMapperDialog(ctk.CTkToplevel):
             from settings import get_config
             self._show_data = bool(get_config("siardmapper_show_data", True))
             self._data_rows = int(get_config("siardmapper_rows", 5) or 5)
+            self._unique = bool(get_config("siardmapper_unique", False))
         except Exception:
             self._show_data = True
             self._data_rows = 5
+            self._unique = False
+        self._data_rows = max(1, min(self._MAX_ROWS, self._data_rows))
+
+        # Skrift i tabellene og kontrollraden (ttk/tk — følger A−/A+ og
+        # Ctrl +/− via _apply_fonts). Grunnstørrelse per skrift.
+        _eff = FontRegistry.effective_size
+        def _font(base, **kw):
+            f = tkfont.Font(root=parent, family="Courier New", size=_eff(base), **kw)
+            self._fonts.append((f, base))
+            return f
+        self._fonts: list = []
+        self._f_cell = _font(10)
+        self._f_bold = _font(10, weight="bold")
+        self._f_del  = _font(10, weight="bold", overstrike=1)
+        self._f_head = _font(9, weight="bold")
+        self._f_ctrl = _font(9)
+        self._f_ctrl_b = _font(9, weight="bold")
 
         self.title("SIARDMapper — berik metadata")
         self.configure(fg_color=COLORS["bg"])
@@ -341,6 +369,7 @@ class SiardMapperDialog(ctk.CTkToplevel):
         self._apply_style()
         self._populate()
         self._update_stats()
+        FontRegistry.add_observer(self._apply_fonts)
         self.after(50, lambda: self.state("zoomed"))   # start maksimert
 
     # ── UI ────────────────────────────────────────────────────────────────────
@@ -417,7 +446,9 @@ class SiardMapperDialog(ctk.CTkToplevel):
         vsb = ttk.Scrollbar(tbl_frm, orient="vertical",
                              command=lambda *a: (self._tree.yview(*a),
                                                  self._editor.reposition()))
-        hsb = ttk.Scrollbar(tbl_frm, orient="horizontal", command=self._tree.xview)
+        hsb = ttk.Scrollbar(tbl_frm, orient="horizontal",
+                             command=lambda *a: (self._tree.xview(*a),
+                                                 self._editor.reposition()))
         self._tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
         self._tree.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
@@ -430,14 +461,21 @@ class SiardMapperDialog(ctk.CTkToplevel):
             on_commit=self._commit,
             on_navigate=self._navigate,
             on_activate=self._on_editor_activate,
+            font=self._f_cell,
         )
         self._suggestions = _SuggestionPopup(
-            self._tree, on_pick=self._on_suggestion_pick)
+            self._tree, on_pick=self._on_suggestion_pick, font=self._f_cell)
 
         self._tree.bind("<ButtonRelease-1>", self._on_click)
         self._tree.bind("<<TreeviewSelect>>", self._on_tree_sel)
+        # Redigeringsfeltet følger cellen straks ved vindusstørrelse og rulling;
+        # _InlineEditor._watch fanger resten (f.eks. når kolonnekanten dras)
         self._tree.bind("<Configure>",    lambda _: self._editor.reposition())
-        self._tree.bind("<MouseWheel>",   lambda _: self._editor.reposition())
+        self._tree.bind("<MouseWheel>",
+                        lambda _: self._tree.after_idle(self._editor.reposition))
+        # En ferdig tabell som brukeren selv åpner, lukkes ikke automatisk igjen
+        self._tree.bind("<<TreeviewOpen>>",  self._on_tbl_opened)
+        self._tree.bind("<<TreeviewClose>>", self._on_tbl_closed)
         self._tree.bind("<Motion>",       self._on_motion)
         self._tree.bind("<Leave>",        self._hide_tooltip)
         self._tree.bind("<Button-3>",     self._on_right_click)
@@ -453,7 +491,8 @@ class SiardMapperDialog(ctk.CTkToplevel):
         data_outer.grid_rowconfigure(1, weight=1)
         data_outer.grid_columnconfigure(0, weight=1)
 
-        # Kontrollrad: [☐ Vis data]  [Antall rader: ___]  EKSEMPELDATA
+        # Kontrollrad: [☐ Vis data] [Antall rader: ___] [☐ Unike]
+        #              [⏮ Start] [◀ Forrige N] [Neste N ▶] [Slutt ⏭]  EKSEMPELDATA
         ctrl = tk.Frame(data_outer, bg=COLORS["bg"])
         ctrl.grid(row=0, column=0, sticky="ew", pady=(0, 2))
 
@@ -466,30 +505,67 @@ class SiardMapperDialog(ctk.CTkToplevel):
             bg=COLORS["bg"], fg=COLORS["text"],
             activebackground=COLORS["bg"], activeforeground=COLORS["accent"],
             selectcolor=COLORS["surface"],
-            font=("Courier New", 9, "bold"),
+            font=self._f_ctrl_b,
             bd=0, highlightthickness=0,
         ).pack(side="left", padx=(0, 12))
 
         tk.Label(ctrl, text="Antall rader:",
                  bg=COLORS["bg"], fg=COLORS["muted"],
-                 font=("Courier New", 9)).pack(side="left")
+                 font=self._f_ctrl).pack(side="left")
 
+        # Antallet tas i bruk ved Enter eller når feltet forlates — ikke for
+        # hvert tastetrykk
         self._rows_var = tk.StringVar(value=str(self._data_rows))
-        tk.Entry(
+        self._rows_entry = tk.Entry(
             ctrl,
             textvariable=self._rows_var,
-            width=4,
+            width=5,
             bg=COLORS["surface"], fg=COLORS["text"],
             insertbackground=COLORS["accent"],
-            relief="flat", font=("Courier New", 9), bd=1,
-        ).pack(side="left", padx=(4, 0))
-        self._rows_var.trace_add("write", self._on_rows_changed)
+            relief="flat", font=self._f_ctrl, bd=1,
+        )
+        self._rows_entry.pack(side="left", padx=(4, 0))
+        self._rows_entry.bind("<Return>",   self._on_rows_enter)
+        self._rows_entry.bind("<KP_Enter>", self._on_rows_enter)
+        self._rows_entry.bind("<FocusOut>", self._apply_rows_entry)
+
+        # «Unike»: bare rader med ulikt innhold — ulik verdi i valgt kolonne,
+        # eller ulik rad når en tabell er valgt
+        self._unique_var = tk.BooleanVar(value=self._unique)
+        tk.Checkbutton(
+            ctrl,
+            text="Unike",
+            variable=self._unique_var,
+            command=self._on_unique_toggle,
+            bg=COLORS["bg"], fg=COLORS["text"],
+            activebackground=COLORS["bg"], activeforeground=COLORS["accent"],
+            selectcolor=COLORS["surface"],
+            font=self._f_ctrl,
+            bd=0, highlightthickness=0,
+        ).pack(side="left", padx=(10, 10))
+
+        self._nav_btns: Dict[str, tk.Button] = {}
+        for key, text in (("start", "⏮ Start"), ("prev", "◀ Forrige"),
+                          ("next", "Neste ▶"), ("end", "Slutt ⏭")):
+            btn = tk.Button(
+                ctrl, text=text,
+                command=lambda k=key: self._nav(k),
+                bg=COLORS["surface"], fg=COLORS["text"],
+                activebackground=COLORS["border"], activeforeground=COLORS["text"],
+                disabledforeground=COLORS["muted"],
+                relief="flat", bd=0, padx=8, pady=1,
+                font=self._f_ctrl, cursor="hand2", takefocus=0,
+                state="disabled",
+            )
+            btn.pack(side="left", padx=(0, 3))
+            self._nav_btns[key] = btn
+        self._update_nav(None)
 
         self._data_hdr = tk.Label(
             ctrl, text="   EKSEMPELDATA",
             bg=COLORS["bg"], fg=COLORS["muted"],
-            font=("Courier New", 8, "bold"), anchor="w")
-        self._data_hdr.pack(side="left", padx=(12, 0))
+            font=self._f_head, anchor="w")
+        self._data_hdr.pack(side="left", padx=(9, 0))
 
         # Dataramme som skjules/vises av avkrysningsboksen
         self._data_frm = tk.Frame(data_outer, bg=COLORS["bg"])
@@ -499,7 +575,7 @@ class SiardMapperDialog(ctk.CTkToplevel):
 
         self._data_tree = ttk.Treeview(
             self._data_frm, style="Data.Treeview", show="headings",
-            height=self._data_rows)
+            height=min(self._data_rows, 8))
         dvsb = ttk.Scrollbar(self._data_frm, orient="vertical",   command=self._data_tree.yview)
         dhsb = ttk.Scrollbar(self._data_frm, orient="horizontal", command=self._data_tree.xview)
         self._data_tree.configure(yscrollcommand=dvsb.set, xscrollcommand=dhsb.set)
@@ -545,14 +621,14 @@ class SiardMapperDialog(ctk.CTkToplevel):
             background=self._BG_COL,
             foreground=COLORS["text"],
             fieldbackground=_SEP_CLR,   # synlig mellom rader = horisontal border
-            rowheight=23,
-            font=("Courier New", 10),
+            rowheight=self._f_cell.metrics("linespace") + 7,
+            font=self._f_cell,
             borderwidth=0,
         )
         s.configure("SMap.Treeview.Heading",
             background="#1a1f30",
             foreground=COLORS["muted"],
-            font=("Courier New", 9, "bold"),
+            font=self._f_head,
             relief="ridge",
             borderwidth=1,
             padding=(4, 3),
@@ -565,14 +641,14 @@ class SiardMapperDialog(ctk.CTkToplevel):
             background=COLORS["bg"],
             foreground=COLORS["text"],
             fieldbackground=_SEP_CLR,
-            rowheight=21,
-            font=("Courier New", 10),
+            rowheight=self._f_cell.metrics("linespace") + 5,
+            font=self._f_cell,
             borderwidth=0,
         )
         s.configure("Data.Treeview.Heading",
             background="#1a1f30",
             foreground=COLORS["muted"],
-            font=("Courier New", 9, "bold"),
+            font=self._f_head,
             relief="ridge",
             borderwidth=1,
             padding=(4, 2),
@@ -603,19 +679,19 @@ class SiardMapperDialog(ctk.CTkToplevel):
         # Fargekodet: grønn for ferdig, rød for mangler, gul for delvis
         self._tree.tag_configure("table",
             background=self._BG_TBL, foreground=self._FG_TBL,
-            font=("Courier New", 10, "bold"))
+            font=self._f_bold)
         self._tree.tag_configure("col",     background=self._BG_COL)
         self._tree.tag_configure("tbl_ok",  background="#1a4d2a", foreground="#7eeea0",
-                                  font=("Courier New", 10, "bold"))
+                                  font=self._f_bold)
         self._tree.tag_configure("tbl_par", background="#3d3515", foreground="#e8d57e",
-                                  font=("Courier New", 10, "bold"))
+                                  font=self._f_bold)
         self._tree.tag_configure("tbl_bad", background="#4d1515", foreground="#ee7e7e",
-                                  font=("Courier New", 10, "bold"))
+                                  font=self._f_bold)
         self._tree.tag_configure("col_ok",  background="#0f2914", foreground="#7eeea0")
         self._tree.tag_configure("col_bad", background="#2e1010", foreground="#ee8080")
         # Markert for sletting fra resultat-SIARD
         self._tree.tag_configure("tbl_del", background="#5a1010", foreground="#ffb0b0",
-                                  font=("Courier New", 10, "bold", "overstrike"))
+                                  font=self._f_del)
 
         # Sorter: uferdige tabeller øverst (A–Å), ferdige nederst (A–Å)
         sorted_tables = sorted(
@@ -655,7 +731,7 @@ class SiardMapperDialog(ctk.CTkToplevel):
                 row_tags = ("table", t_tag)
             self._tree.insert("", "end", iid=t_iid,
                 text=display_name,
-                values=(ico, _shorten(tbl.json_desc), _shorten(ed_tbl) or "─"),
+                values=(ico, _cell_text(tbl.json_desc), _cell_text(ed_tbl) or "─"),
                 open=open_state,
                 tags=row_tags)
             self._items.append({"iid": t_iid, "type": "table",
@@ -672,8 +748,8 @@ class SiardMapperDialog(ctk.CTkToplevel):
                 self._tree.insert(t_iid, "end", iid=c_iid,
                     text=f"  {col.name}",
                     values=("✓" if has_c else "✗",
-                            _shorten(col.json_desc),
-                            _shorten(ed_col) or "─"),
+                            _cell_text(col.json_desc),
+                            _cell_text(ed_col) or "─"),
                     tags=("col", c_tag))
                 self._items.append({"iid": c_iid, "type": "col",
                                      "tbl": tbl, "col": col,
@@ -730,7 +806,7 @@ class SiardMapperDialog(ctk.CTkToplevel):
 
     def _show_tooltip(self, xr: int, yr: int, iid: str, col: str):
         text = self._full_cell_text(iid, col)
-        if not text or len(text) <= 55:
+        if not text or not self._is_clipped(iid, col, text):
             return
         self._hide_tooltip()
         tip = tk.Toplevel(self._tree)
@@ -741,11 +817,25 @@ class SiardMapperDialog(ctk.CTkToplevel):
             tip, text=text,
             justify="left", wraplength=480,
             bg="#1e2535", fg="#d4daf0",
-            font=("Courier New", 10),
+            font=self._f_cell,
             relief="flat", bd=1, padx=10, pady=5,
         )
         lbl.pack()
         self._tooltip_win = tip
+
+    def _is_clipped(self, iid: str, col: str, text: str) -> bool:
+        """True når teksten ikke får plass i cellen slik kolonnen er nå."""
+        if "\n" in text.strip():
+            return True
+        try:
+            bb = self._tree.bbox(iid, col)
+            if not bb:
+                return len(text) > 55
+            # #0 har innrykk og åpne/lukke-merke foran teksten
+            pad = (60 if self._tree.parent(iid) else 30) if col == "#0" else 10
+            return self._f_cell.measure(_cell_text(text)) > bb[2] - pad
+        except Exception:
+            return len(text) > 55
 
     def _hide_tooltip(self, _=None):
         if self._tooltip_after:
@@ -855,15 +945,16 @@ class SiardMapperDialog(ctk.CTkToplevel):
             self._tree.item(t_iid, text=tbl.name)
 
     def _copy_json_to_custom(self, iid: str, json_desc: str):
+        was_complete = self._row_tbl_complete(iid)
         self._edits[iid] = json_desc
         vals = list(self._tree.item(iid, "values"))
         if len(vals) >= 3:
-            vals[2] = _shorten(json_desc)
+            vals[2] = _cell_text(json_desc)
             self._tree.item(iid, values=vals)
         self._refresh_status(iid)
         self._update_stats()
         self._autosave()
-        self._auto_close_if_complete(iid)
+        self._auto_close_if_complete(iid, was_complete)
         # Oppdater editor om den er aktiv på denne raden
         if self._editor.current_iid() == iid:
             self._editor._var.set(json_desc)
@@ -875,16 +966,17 @@ class SiardMapperDialog(ctk.CTkToplevel):
         self._tree.see(iid)
 
     def _commit(self, iid: str, value: str):
+        was_complete = self._row_tbl_complete(iid)
         self._edits[iid] = value.strip()
         # Oppdater synlig verdi i treet (indeks 2 = custom_desc)
         vals = list(self._tree.item(iid, "values"))
         if len(vals) >= 3:
-            vals[2] = _shorten(value.strip()) or "─"
+            vals[2] = _cell_text(value.strip()) or "─"
             self._tree.item(iid, values=vals)
         self._refresh_status(iid)
         self._update_stats()
         self._autosave()
-        self._auto_close_if_complete(iid)
+        self._auto_close_if_complete(iid, was_complete)
 
     def _navigate(self, from_iid: str, direction: int):
         self._suggestions.hide()
@@ -975,20 +1067,9 @@ class SiardMapperDialog(ctk.CTkToplevel):
         info = next((it for it in self._items if it["iid"] == iid), None)
         if not info:
             return
-        tbl = info["tbl"]
-        col = info["col"]
-        rows = self._get_rows(tbl)
-        col_names = [c.name for c in tbl.columns]
-        if info["type"] == "table":
-            self._data_hdr.configure(
-                text=f"EKSEMPELDATA — {tbl.name}  "
-                     f"({len(rows)} rad(er), alle {len(col_names)} kolonner)")
-            self._set_data_tree(col_names, rows, highlight=None)
-        else:
-            self._data_hdr.configure(
-                text=f"EKSEMPELDATA — {tbl.name}.{col.name}  "
-                     f"({len(rows)} rad(er))")
-            self._set_data_tree(col_names, rows, highlight=col.col_index)
+        self._data_tbl = info["tbl"]
+        self._data_hl = info["col"].col_index if info["type"] == "col" else None
+        self._reload_data()
 
     # ── Statusoppdatering ─────────────────────────────────────────────────────
 
@@ -1027,43 +1108,222 @@ class SiardMapperDialog(ctk.CTkToplevel):
 
     # ── Datatabell ────────────────────────────────────────────────────────────
 
-    def _get_rows(self, tbl: _TblItem) -> List[List[str]]:
-        if tbl.norm not in self._cache:
-            self._cache[tbl.norm] = _read_sample_rows(
-                tbl.folder or tbl.name,
-                len(tbl.columns),
-                self._siard, self._extracted,
-                limit=self._data_rows,
-            )
-        return self._cache[tbl.norm]
+    _MAX_ROWS = 1000          # rader per side
+    _LOAD_NOTE_AFTER = 0.25   # sek. før «henter rader …» vises
 
-    def _set_data_tree(self, col_names: List[str], rows: List[List[str]],
+    def _reader_for(self, tbl: _TblItem) -> TableRows:
+        reader = self._readers.get(tbl.norm)
+        if reader is None:
+            reader = TableRows(
+                table_opener(tbl.folder or tbl.name, tbl.schema_folder,
+                             self._extracted, self._zip),
+                len(tbl.columns))
+            self._readers[tbl.norm] = reader
+        return reader
+
+    def _reload_data(self, direction: Optional[str] = None, pos=None):
+        """
+        Vis en side med rader for valgt tabell. Uten argumenter: der brukeren
+        sist sto i tabellen. direction "fwd" = fra og med rad `pos`,
+        "back" = radene før rad `pos` (None = slutten av tabellen).
+        Lesingen skjer i en egen tråd, så vinduet ikke fryser for store tabeller.
+        """
+        tbl = self._data_tbl
+        if tbl is None:
+            return
+        if direction is None:
+            direction, pos = self._table_pos.get(tbl.norm, ("fwd", 0))
+        else:
+            self._table_pos[tbl.norm] = (direction, pos)
+        if not self._show_data:
+            return
+        ukey = None
+        if self._unique:
+            ukey = self._data_hl if self._data_hl is not None else -1
+        req = (tbl.norm, direction, pos, self._data_rows, ukey)
+        self._load_gen += 1                 # eldre forespørsler er uaktuelle
+        self._load_waiting = None
+        page = self._page_cache.get(req)
+        if page is None and not (self._extracted or self._siard):
+            page = RowPage(total=0, error="ingen SIARD-data tilgjengelig")
+        if page is not None:
+            self._show_page(req, page)
+            return
+
+        self._data_page = None              # blaing venter til siden er lest
+        self._update_nav(None)
+        gen = self._load_gen
+        reader = self._reader_for(tbl)
+        limit = self._data_rows
+        if ukey is None:
+            key = None
+        elif ukey < 0:
+            key = tuple                     # hele raden
+        else:
+            key = lambda cells, i=ukey: cells[i] if i < len(cells) else ""
+        q = self._load_q
+        cancel = lambda: gen != self._load_gen or self._closed
+        last = [0.0]
+
+        def _progress(n_bytes):
+            now = time.monotonic()
+            if now - last[0] > 0.2:
+                last[0] = now
+                q.put(("progress", gen, n_bytes))
+
+        def _work():
+            try:
+                if direction == "back":
+                    page = reader.page_backward(pos, limit, key, cancel, _progress)
+                else:
+                    page = reader.page_forward(pos or 0, limit, key, cancel, _progress)
+            except Cancelled:
+                return
+            except FileNotFoundError:
+                page = RowPage(total=0, error="fant ikke tabellfila")
+            except Exception as exc:
+                page = RowPage(error=f"kunne ikke lese tabellen ({exc})")
+            q.put(("page", gen, req, page))
+
+        self._load_waiting = gen
+        self._load_started = time.monotonic()
+        self._load_bytes = 0
+        threading.Thread(target=_work, daemon=True,
+                         name="siardmapper-rader").start()
+        if not self._load_polling:
+            self._load_polling = True
+            self.after(15, self._poll_loads)
+
+    def _poll_loads(self):
+        if self._closed:
+            return
+        read_bytes = None
+        try:
+            while True:
+                item = self._load_q.get_nowait()
+                if item[0] == "page":
+                    _, gen, req, page = item
+                    if not page.error:
+                        if len(self._page_cache) > 200:
+                            self._page_cache.clear()
+                        self._page_cache[req] = page
+                    if gen == self._load_gen:
+                        self._load_waiting = None
+                        self._show_page(req, page)
+                elif item[1] == self._load_gen:
+                    read_bytes = item[2]
+        except queue.Empty:
+            pass
+        if self._load_waiting is None:
+            self._load_polling = False
+            return
+        if read_bytes:
+            self._load_bytes = read_bytes
+        if time.monotonic() - self._load_started > self._LOAD_NOTE_AFTER:
+            note = "henter rader …"
+            if self._load_bytes:
+                note += f" ({_fsize(self._load_bytes)} lest)"
+            self._data_hdr.configure(
+                text=f"   EKSEMPELDATA — {self._data_name()}  ·  {note}")
+        self.after(40, self._poll_loads)
+
+    def _data_name(self) -> str:
+        tbl, hl = self._data_tbl, self._data_hl
+        if tbl is None:
+            return ""
+        if hl is not None and hl < len(tbl.columns):
+            return f"{tbl.name}.{tbl.columns[hl].name}"
+        return tbl.name
+
+    def _show_page(self, req: tuple, page: RowPage):
+        tbl = self._data_tbl
+        if tbl is None or req[0] != tbl.norm:
+            return
+        self._data_page = page
+        self._set_data_tree([c.name for c in tbl.columns], page, self._data_hl)
+        self._data_hdr.configure(text=self._page_caption(tbl, page, req[4]))
+        self._update_nav(page)
+
+    def _page_caption(self, tbl: _TblItem, page: RowPage, ukey) -> str:
+        head = f"   EKSEMPELDATA — {self._data_name()}  ·  "
+        if page.error:
+            return head + page.error
+        total = page.total if page.total is not None else tbl.n_rows
+        of = f" av {_fnum(total)}" if total is not None else ""
+        if not page.rows:
+            return head + "ingen rader"
+        if ukey is None:
+            first, last = page.numbers[0] + 1, page.numbers[-1] + 1
+            span = f"rad {_fnum(first)}" if first == last \
+                else f"rad {_fnum(first)}–{_fnum(last)}"
+            return head + span + of
+        if ukey < 0 or ukey >= len(tbl.columns):
+            what = "unike rader" if len(page.rows) != 1 else "unik rad"
+        else:
+            what = (f"unike verdier i {tbl.columns[ukey].name}"
+                    if len(page.rows) != 1
+                    else f"unik verdi i {tbl.columns[ukey].name}")
+        text = (f"{len(page.rows)} {what} blant rad "
+                f"{_fnum(page.scan_from + 1)}–{_fnum(page.scan_to)}{of}")
+        if page.capped:
+            text += "  (letingen stoppet her — «Neste» leter videre)"
+        return head + text
+
+    def _update_nav(self, page: Optional[RowPage]):
+        n = self._data_rows
+        self._nav_btns["prev"].configure(text=f"◀ Forrige {n}")
+        self._nav_btns["next"].configure(text=f"Neste {n} ▶")
+        ok = page is not None and not page.error
+        back = "normal" if ok and not page.at_start else "disabled"
+        fwd = "normal" if ok and not page.at_end else "disabled"
+        self._nav_btns["start"].configure(state=back)
+        self._nav_btns["prev"].configure(state=back)
+        self._nav_btns["next"].configure(state=fwd)
+        self._nav_btns["end"].configure(state=fwd)
+
+    def _nav(self, where: str):
+        """Start / Forrige N / Neste N / Slutt."""
+        self._apply_rows_entry(reload=False)
+        if self._data_tbl is None:
+            return
+        page = self._data_page
+        if where == "start":
+            self._reload_data("fwd", 0)
+        elif where == "end":
+            self._reload_data("back", None)
+        elif page is None:
+            return                          # forrige side er ikke ferdig lest
+        elif where == "next":
+            self._reload_data("fwd", page.scan_to)
+        elif where == "prev":
+            self._reload_data("back", page.scan_from)
+
+    def _set_data_tree(self, col_names: List[str], page: RowPage,
                        highlight: Optional[int]):
-        # Bruk sikre numeriske kolonne-ID-er
+        # Sikre kolonne-ID-er: «n» = radnummer, c0.. = tabellens kolonner
         n = len(col_names)
-        new_cols = [f"c{i}" for i in range(n)]
-
-        # Nullstill datatabell
-        if self._data_cols != new_cols:
-            self._data_tree.delete(*self._data_tree.get_children())
+        new_cols = ["n"] + [f"c{i}" for i in range(n)]
+        self._data_tree.delete(*self._data_tree.get_children())
+        fresh = self._data_cols != new_cols
+        ch = max(6, self._f_cell.measure("0"))
+        if fresh:
             self._data_tree["columns"] = new_cols
             self._data_cols = new_cols
-            for i, (cid, cname) in enumerate(zip(new_cols, col_names)):
-                htext = f"▶ {cname}" if i == highlight else cname
-                self._data_tree.heading(cid, text=htext, anchor="w")
-                w = 140 if i == highlight else 100
-                self._data_tree.column(cid, width=w, minwidth=50, stretch=True)
-        else:
-            self._data_tree.delete(*self._data_tree.get_children())
-            for i, (cid, cname) in enumerate(zip(new_cols, col_names)):
-                htext = f"▶ {cname}" if i == highlight else cname
-                self._data_tree.heading(cid, text=htext, anchor="w")
-
-        for row in rows:
-            vals = [row[i] if i < len(row) else "" for i in range(n)]
+            self._data_tree.heading("n", text="Rad", anchor="e")
+            self._data_tree.column("n", width=ch * 9, minwidth=ch * 4,
+                                   stretch=False, anchor="e")
+        for i, cname in enumerate(col_names):
+            cid = f"c{i}"
+            self._data_tree.heading(
+                cid, text=f"▶ {cname}" if i == highlight else cname, anchor="w")
+            if fresh:
+                self._data_tree.column(
+                    cid, width=ch * (17 if i == highlight else 12),
+                    minwidth=50, stretch=True)
+        for num, row in zip(page.numbers, page.rows):
+            vals = [_fnum(num + 1)] + [
+                _cell_text(row[i], 500) if i < len(row) else "" for i in range(n)]
             self._data_tree.insert("", "end", values=vals)
-
-    # ── Autolagring ───────────────────────────────────────────────────────────
 
     # ── Vis-data-innstillinger ────────────────────────────────────────────────
 
@@ -1072,24 +1332,46 @@ class SiardMapperDialog(ctk.CTkToplevel):
         self._show_data = show
         if show:
             self._data_frm.grid()
+            self._reload_data()
         else:
             self._data_frm.grid_remove()
         self._save_data_settings()
 
-    def _on_rows_changed(self, *_):
-        try:
-            n = int(self._rows_var.get())
-            if n < 1 or n > 100:
-                return
-        except ValueError:
-            return
-        self._data_rows = n
-        # Tøm cache så neste oppslag leser riktig antall rader
-        self._cache.clear()
-        sel = self._tree.selection()
-        if sel:
-            self._on_row_selected(sel[0])
+    def _on_unique_toggle(self):
+        self._unique = bool(self._unique_var.get())
         self._save_data_settings()
+        self._reload_data()
+
+    def _apply_rows_entry(self, _=None, reload: bool = True) -> bool:
+        """
+        Ta i bruk antallet i feltet. Kalles ved Enter og når feltet forlates —
+        ikke for hvert tastetrykk (da ble dataene lest på nytt for hvert siffer,
+        og «199» stoppet på 19). Returnerer True når antallet ble endret.
+        """
+        raw = self._rows_var.get().strip()
+        try:
+            n = int(raw)
+        except ValueError:
+            n = self._data_rows
+        n = max(1, min(self._MAX_ROWS, n))
+        if str(n) != raw:
+            self._rows_var.set(str(n))
+        if n == self._data_rows:
+            return False
+        self._data_rows = n
+        self._update_nav(self._data_page)
+        self._save_data_settings()
+        if reload:
+            self._reload_data()
+        return True
+
+    def _on_rows_enter(self, _=None):
+        self._apply_rows_entry()
+        try:
+            self._rows_entry.select_range(0, "end")
+        except Exception:
+            pass
+        return "break"
 
     def _save_data_settings(self):
         try:
@@ -1097,9 +1379,42 @@ class SiardMapperDialog(ctk.CTkToplevel):
             save_config({
                 "siardmapper_show_data": self._show_data,
                 "siardmapper_rows":      self._data_rows,
+                "siardmapper_unique":    self._unique,
             })
         except Exception:
             pass
+
+    # ── Skriftstørrelse ───────────────────────────────────────────────────────
+
+    def _apply_fonts(self):
+        """
+        A−/A+ og Ctrl +/−: tabellene her er ttk-/tk-widgeter og følger ikke
+        CTkFont-registeret av seg selv. Kalles av FontRegistry ved endring.
+        """
+        try:
+            if self._closed or not self.winfo_exists():
+                return
+        except Exception:
+            return
+        for font, base in self._fonts:
+            font.configure(size=FontRegistry.effective_size(base))
+        s = ttk.Style()
+        s.configure("SMap.Treeview",
+                    rowheight=self._f_cell.metrics("linespace") + 7)
+        s.configure("Data.Treeview",
+                    rowheight=self._f_cell.metrics("linespace") + 5)
+        self.after_idle(self._editor.reposition)
+
+    def destroy(self):
+        self._closed = True
+        self._load_gen += 1                 # avbryt lesing som pågår
+        try:
+            self._zip.close()
+        except Exception:
+            pass
+        super().destroy()
+
+    # ── Autolagring ───────────────────────────────────────────────────────────
 
     def _autosave(self):
         if not self._save_path:
@@ -1111,18 +1426,40 @@ class SiardMapperDialog(ctk.CTkToplevel):
         except Exception:
             pass
 
-    def _auto_close_if_complete(self, iid: str):
-        """Lukk tabellnoden automatisk når alle felt er beskrevet."""
+    def _row_tbl_complete(self, iid: str) -> bool:
+        """Er tabellen raden hører til, ferdig beskrevet nå?"""
+        info = next((it for it in self._items if it["iid"] == iid), None)
+        return bool(info) and self._tbl_completion(info["tbl"]) >= 1.0
+
+    def _on_tbl_opened(self, _=None):
+        """Brukeren åpnet en tabell. Er den alt ferdig, er det for å endre noe —
+        da skal den stå åpen til brukeren selv lukker den."""
+        iid = self._tree.focus()
+        info = next((it for it in self._items
+                     if it["iid"] == iid and it["type"] == "table"), None)
+        if info and self._tbl_completion(info["tbl"]) >= 1.0:
+            self._keep_open.add(info["tbl"].norm)
+
+    def _on_tbl_closed(self, _=None):
+        iid = self._tree.focus() or ""
+        if iid.startswith("T:"):
+            self._keep_open.discard(iid[2:])
+
+    def _auto_close_if_complete(self, iid: str, was_complete: bool = False):
+        """
+        Lukk tabellnoden automatisk i det den BLIR ferdig beskrevet.
+        Var tabellen ferdig fra før (was_complete), eller har brukeren selv
+        åpnet en ferdig tabell, er det en endring i en ferdig tabell — da
+        lukkes den ikke før brukeren gjør det selv.
+        """
         info = next((it for it in self._items if it["iid"] == iid), None)
         if not info:
             return
         tbl = info["tbl"]
-        t_iid = f"T:{tbl.norm}"
-        has_tbl = self._has_desc(t_iid, tbl.json_desc)
-        n_done  = sum(1 for c in tbl.columns
-                      if self._has_desc(f"C:{tbl.norm}:{c.norm}", c.json_desc))
-        if has_tbl and n_done == len(tbl.columns):
-            self._tree.item(t_iid, open=False)
+        if was_complete or tbl.norm in self._keep_open:
+            return
+        if self._tbl_completion(tbl) >= 1.0:
+            self._tree.item(f"T:{tbl.norm}", open=False)
 
     def _build_json(self) -> dict:
         """Bygg JSON med alle beskrivelser: egendefinert overstyrer json-mal, json-mal er fallback.
@@ -1400,6 +1737,18 @@ class SiardMapperDialog(ctk.CTkToplevel):
 
 # ── Hjelpere ──────────────────────────────────────────────────────────────────
 
+def _cell_text(text: str, n: int = 2000) -> str:
+    """
+    Celletekst på én linje. Treeview klipper selv ved kolonnekanten, så
+    teksten følger kolonnebredden (før ble den alltid kuttet ved 55 tegn,
+    uansett hvor bred kolonnen var).
+    """
+    if not text:
+        return ""
+    t = " ".join(str(text).split())
+    return t if len(t) <= n else t[:n - 1] + "…"
+
+
 def _shorten(text: str, n: int = 55) -> str:
     if not text:
         return ""
@@ -1430,6 +1779,8 @@ def build_dialog_tables(matches) -> List[_TblItem]:
             json_desc=_decode_desc(m.json_table_desc or ""),
             folder=getattr(m.table, "folder", None) or m.table.name,
             matched=m.json_table_desc is not None,
+            schema_folder=getattr(m.table, "schema_folder", None) or "",
+            n_rows=getattr(m.table, "rows", None),
         )
         for i, col in enumerate(m.table.columns):
             tbl.columns.append(_ColItem(

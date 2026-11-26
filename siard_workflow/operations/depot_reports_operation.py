@@ -35,7 +35,8 @@ class DepotReportsOperation(BaseOperation):
         "Genererer et sett PDF-rapporter etter mønster fra et arkivdepot: "
         "Arkivinformasjon, Konverteringsrapport, Filorganisering og et "
         "Behandlingssammendrag. Rapportene som lages velges automatisk ut fra "
-        "hvilke operasjoner som ble kjørt. Legg operasjonen sist i workflowen."
+        "hvilke operasjoner som ble kjørt. Legg operasjonen sist i workflowen "
+        "(før DIAS-pakking — rapportene tas med i pakken)."
     )
     category        = "Rapport"
     status          = 2

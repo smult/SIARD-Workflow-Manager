@@ -61,7 +61,7 @@ def _run_convert_all(extract_dir: Path, rel_paths: list[str]):
         threading.Event(), threading.Event(),          # stop, pause
         csv_log=None, xml_type_hints=None, err_log=None,
         conversion_registry={}, creg_lock=threading.Lock(),
-        emit_phase_events=False)
+        total_phases=5)
     return stats, logs
 
 
