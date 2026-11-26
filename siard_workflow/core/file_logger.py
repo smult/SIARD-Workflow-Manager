@@ -44,7 +44,7 @@ def resolve_log_dir(siard_path: Path, fallback: "Path | None" = None) -> Path:
 _RE_BATCH = re.compile(r"^(\s*)Batch (\d+)/(\d+): ")
 _NUM = r"\d[\d   ,.]*?"
 _RE_PROGRESS = re.compile(
-    rf"({_NUM})\s*/\s*({_NUM})\s+(filer|linjer|rader|batcher)\b")
+    rf"({_NUM})\s*/\s*({_NUM})\s+(filer|linjer|rader|batcher|tabeller)\b")
 _RE_PCT = re.compile(r"\d+\s*%")
 
 

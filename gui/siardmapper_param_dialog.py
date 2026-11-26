@@ -176,6 +176,18 @@ def _analyze_template(json_path: Path,
 
 # ── Param-dialog ──────────────────────────────────────────────────────────────
 
+_INPLACE_WARNING = (
+    "ADVARSEL: original-SIARD-fila endres. Ny metadata.xml skrives inn i fila "
+    "på sekunder, uten kopi.\n"
+    "• Sjekksummer (SHA-256) som alt er beregnet for fila, gjelder ikke lenger.\n"
+    "• Den gamle metadata.xml blir liggende som ubrukte byte i fila.\n"
+    "• Avbrytes skrivingen, gjenopprettes fila fra en angrefil (….siard.angre) — "
+    "men ha en kopi av originalen et annet sted.\n"
+    "• Brukes ikke når tabeller er markert for sletting (da skrives ny fil).\n"
+    "Gjelder bare når steget kjøres uten «Pakk ut SIARD»."
+)
+
+
 class SiardMapperParamDialog(ctk.CTkToplevel):
 
     def __init__(self, parent, op_def: dict, on_confirm, on_saved=None):
@@ -196,6 +208,9 @@ class SiardMapperParamDialog(ctk.CTkToplevel):
             value=existing.get("json_template", ""))
         self._overwrite_var = ctk.BooleanVar(
             value=existing.get("overwrite_existing", False))
+        self._write_var = ctk.StringVar(
+            value="direkte" if str(existing.get("standalone_write", "")).strip().lower()
+            == "direkte" else "ny_fil")
 
         # Aktiv SIARD-fil fra operations panel
         from gui.operations_panel import _current_siard_path
@@ -369,6 +384,31 @@ class SiardMapperParamDialog(ctk.CTkToplevel):
             fg_color=COLORS["accent"],
         ).grid(row=r, column=0, sticky="w", padx=16, pady=(4, 8))
         r += 1
+
+        # ── Uten «Pakk ut SIARD»: ny fil eller direkte i SIARD-fila ───────────
+        ctk.CTkFrame(body, fg_color=COLORS["border"], height=1).grid(
+            row=r, column=0, sticky="ew", padx=16, pady=(0, 4)); r += 1
+        ctk.CTkLabel(body, text="Når steget kjøres uten «Pakk ut SIARD»:",
+                     font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                     text_color=COLORS["text_sub"], anchor="w",
+        ).grid(row=r, column=0, sticky="w", padx=16, pady=(4, 2)); r += 1
+        for _val, _txt in (
+                ("ny_fil",  "Skriv ny fil (…_beriket.siard) — originalen røres ikke"),
+                ("direkte", "Skriv direkte i SIARD-fila — raskt, men endrer originalen")):
+            ctk.CTkRadioButton(
+                body, text=_txt, variable=self._write_var, value=_val,
+                command=self._on_write_mode,
+                font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                text_color=COLORS["text"], fg_color=COLORS["accent"],
+            ).grid(row=r, column=0, sticky="w", padx=24, pady=2)
+            r += 1
+        self._write_warn = ctk.CTkLabel(
+            body, text=_INPLACE_WARNING, justify="left", anchor="w", wraplength=500,
+            font=ctk.CTkFont(family=FONTS["mono"], size=10),
+            text_color=COLORS["yellow"])
+        self._write_warn.grid(row=r, column=0, sticky="w", padx=24, pady=(2, 8))
+        r += 1
+        self._on_write_mode()
 
         # ── Knapper ───────────────────────────────────────────────────────────
         btns = ctk.CTkFrame(body, fg_color="transparent")
@@ -714,6 +754,13 @@ class SiardMapperParamDialog(ctk.CTkToplevel):
 
     # ── OK ────────────────────────────────────────────────────────────────────
 
+    def _on_write_mode(self):
+        """Advarselen vises bare når «direkte» er valgt."""
+        if self._write_var.get() == "direkte":
+            self._write_warn.grid()
+        else:
+            self._write_warn.grid_remove()
+
     def _ok(self):
         json_path = self._json_path_var.get().strip()
         if not json_path:
@@ -721,9 +768,15 @@ class SiardMapperParamDialog(ctk.CTkToplevel):
                                    "Velg en JSON-malfil eller generer en ny.",
                                    parent=self)
             return
+        if self._write_var.get() == "direkte" and not messagebox.askokcancel(
+                "Skrive direkte i SIARD-fila?",
+                _INPLACE_WARNING + "\n\nVil du bruke dette valget?",
+                icon="warning", default="cancel", parent=self):
+            return
         op = self._op_def["cls"](
             json_template=json_path,
             overwrite_existing=self._overwrite_var.get(),
+            standalone_write=self._write_var.get(),
         )
         self.destroy()
         self._confirm(op)

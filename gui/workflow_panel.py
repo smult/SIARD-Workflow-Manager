@@ -341,6 +341,13 @@ class WorkflowPanel(ctk.CTkFrame):
                 row.show_warning(bad[id(row.op)])
             else:
                 row.clear_warning()
+        # Arbeidsflyten er endret (steg lagt til, fjernet, flyttet eller lastet)
+        cb = getattr(self, "on_changed", None)
+        if cb:
+            try:
+                cb()
+            except Exception:
+                pass
         return bool(bad)
 
     def has_order_violations(self) -> bool:

@@ -286,6 +286,11 @@ class SiardMapperDialog(ctk.CTkToplevel):
         self._data_tbl: Optional[_TblItem] = None
         self._data_hl: Optional[int] = None
         self._data_page: Optional[RowPage] = None
+        # Utheving av kolonnen som beskrives (se _hl_refresh)
+        self._hl_canvas: Optional[tk.Canvas] = None
+        self._hl_pending = False
+        self._hl_seen: Optional[tuple] = None
+        self._hl_rows: List[tuple] = []
         self._load_q: "queue.Queue" = queue.Queue()
         self._load_gen = 0
         self._load_waiting: Optional[int] = None
@@ -578,11 +583,27 @@ class SiardMapperDialog(ctk.CTkToplevel):
             height=min(self._data_rows, 8))
         dvsb = ttk.Scrollbar(self._data_frm, orient="vertical",   command=self._data_tree.yview)
         dhsb = ttk.Scrollbar(self._data_frm, orient="horizontal", command=self._data_tree.xview)
-        self._data_tree.configure(yscrollcommand=dvsb.set, xscrollcommand=dhsb.set)
+        # Rulling og endret visning → uthevingen av valgt kolonne følger med
+        self._data_tree.configure(
+            yscrollcommand=lambda *a: (dvsb.set(*a), self._hl_schedule()),
+            xscrollcommand=lambda *a: (dhsb.set(*a), self._hl_schedule()))
         self._data_tree.grid(row=0, column=0, sticky="nsew")
         dvsb.grid(row=0, column=1, sticky="ns")
         dhsb.grid(row=1, column=0, sticky="ew")
         self._data_cols: List[str] = []
+        self._data_cols_tbl: Optional[str] = None    # tabellen breddene gjelder
+        self._data_fitted = False                    # bredder satt ut fra data
+
+        # Kolonnen som beskrives, utheves i datavisningen. ttk.Treeview kan
+        # bare fargelegge hele rader, så kolonnens celler tegnes på et lerret
+        # som ligger over dem og følger rulling, kolonnebredde og skriftstørrelse.
+        self._hl_canvas = tk.Canvas(self._data_tree, highlightthickness=0, bd=0,
+                                    bg=COLORS["hl_bg"], cursor="arrow")
+        for _seq in ("<Configure>", "<B1-Motion>", "<ButtonRelease-1>",
+                     "<<TreeviewSelect>>"):
+            self._data_tree.bind(_seq, self._hl_schedule, add="+")
+        self._hl_canvas.bind("<MouseWheel>", self._hl_wheel)
+        self._hl_canvas.bind("<Button-1>", self._hl_click)
 
         # Anvend starttilstand fra config
         if not self._show_data:
@@ -654,7 +675,9 @@ class SiardMapperDialog(ctk.CTkToplevel):
             padding=(4, 2),
         )
         s.map("Data.Treeview",
-            background=[("selected", COLORS["border"])])
+            background=[("selected", COLORS["border"])],
+            # uten denne ble teksten i valgt rad hvit — uleselig i lyst tema
+            foreground=[("selected", COLORS["text"])])
 
     # ── Populer ───────────────────────────────────────────────────────────────
 
@@ -1304,11 +1327,14 @@ class SiardMapperDialog(ctk.CTkToplevel):
         n = len(col_names)
         new_cols = ["n"] + [f"c{i}" for i in range(n)]
         self._data_tree.delete(*self._data_tree.get_children())
-        fresh = self._data_cols != new_cols
+        tbl_key = self._data_tbl.norm if self._data_tbl else None
+        fresh = self._data_cols != new_cols or tbl_key != self._data_cols_tbl
         ch = max(6, self._f_cell.measure("0"))
         if fresh:
             self._data_tree["columns"] = new_cols
             self._data_cols = new_cols
+            self._data_cols_tbl = tbl_key
+            self._data_fitted = False
             self._data_tree.heading("n", text="Rad", anchor="e")
             self._data_tree.column("n", width=ch * 9, minwidth=ch * 4,
                                    stretch=False, anchor="e")
@@ -1316,14 +1342,171 @@ class SiardMapperDialog(ctk.CTkToplevel):
             cid = f"c{i}"
             self._data_tree.heading(
                 cid, text=f"▶ {cname}" if i == highlight else cname, anchor="w")
-            if fresh:
-                self._data_tree.column(
-                    cid, width=ch * (17 if i == highlight else 12),
-                    minwidth=50, stretch=True)
+        shown: List[list] = []
         for num, row in zip(page.numbers, page.rows):
             vals = [_fnum(num + 1)] + [
                 _cell_text(row[i], 500) if i < len(row) else "" for i in range(n)]
             self._data_tree.insert("", "end", values=vals)
+            if len(shown) < 200:
+                shown.append(vals)
+
+        # Kolonnebredde etter innholdet. Kolonnene strekkes/klemmes ikke med
+        # vinduet (før ble de klemt ned til 50 px i tabeller med mange
+        # kolonner) — datavisningen ruller sidelengs i stedet. Breddene settes
+        # når tabellen vises første gang; etterpå beholdes det brukeren drar.
+        def _fit(i: int, cap: int) -> int:
+            longest = max((len(v[i + 1]) for v in shown), default=0)
+            chars = max(len(col_names[i]) + 3, longest + 1, 6)
+            return ch * min(chars, cap) + 12
+
+        if n and (fresh or not self._data_fitted):
+            for i in range(n):
+                w = _fit(i, 45 if i == highlight else 28)
+                # Siste kolonne fyller resten av bredden når tabellen er smal
+                self._data_tree.column(f"c{i}", width=w, minwidth=w if i == n - 1 else ch * 4,
+                                       stretch=(i == n - 1))
+            self._data_fitted = bool(shown)
+        elif n and highlight is not None and highlight < n:
+            # Kolonnen som beskrives skal kunne leses: gjør den bredere ved behov
+            w = _fit(highlight, 45)
+            if int(self._data_tree.column(f"c{highlight}", "width")) < w:
+                self._data_tree.column(f"c{highlight}", width=w)
+        # Ny kolonne valgt → sørg for at den er synlig (ikke ved blaing: da
+        # kan brukeren ha rullet til siden med vilje)
+        key = (self._data_tbl.norm if self._data_tbl else None, highlight)
+        if key != self._hl_seen:
+            self._hl_seen = key
+            try:
+                self.after_idle(self._hl_ensure_visible)
+            except Exception:
+                pass
+        self._hl_schedule()
+
+    # ── Utheving av kolonnen som beskrives ────────────────────────────────────
+
+    _HL_PAD = 5      # venstremarg for celleteksten, som i Treeview
+
+    def _hl_column(self) -> Optional[str]:
+        """Kolonne-ID-en i datatreet for kolonnen som er valgt (ellers None)."""
+        if self._data_hl is None or not self._show_data:
+            return None
+        cid = f"c{self._data_hl}"
+        return cid if cid in self._data_cols else None
+
+    def _hl_schedule(self, *_):
+        """Tegn uthevingen på nytt når programmet er ledig (samler flere kall)."""
+        if self._hl_pending or self._closed or self._hl_canvas is None:
+            return
+        self._hl_pending = True
+        try:
+            self.after_idle(self._hl_refresh)
+        except Exception:
+            self._hl_pending = False
+
+    def _hl_visible_rows(self, cid: str) -> List[tuple]:
+        """[(iid, (x, y, bredde, høyde))] for radene som er synlige nå."""
+        tree = self._data_tree
+        kids = tree.get_children()
+        n = len(kids)
+        if not n:
+            return []
+        i = min(n - 1, max(0, int(tree.yview()[0] * n + 0.5)))
+        while i > 0 and tree.bbox(kids[i - 1], cid):
+            i -= 1
+        rows: List[tuple] = []
+        misses = 0
+        while i < n:
+            bb = tree.bbox(kids[i], cid)
+            if bb:
+                rows.append((kids[i], bb))
+            elif rows or misses >= 3:
+                break
+            else:
+                misses += 1
+            i += 1
+        return rows
+
+    def _hl_refresh(self):
+        """Legg lerretet over cellene i den valgte kolonnen og tegn dem uthevet."""
+        self._hl_pending = False
+        cv, tree = self._hl_canvas, self._data_tree
+        try:
+            if self._closed or cv is None or not tree.winfo_exists():
+                return
+            cid = self._hl_column()
+            rows = self._hl_visible_rows(cid) if cid else []
+            self._hl_rows = []
+            if not rows:
+                cv.place_forget()
+                return
+            x, y0, w, _h = rows[0][1]
+            y1 = rows[-1][1][1] + rows[-1][1][3]
+            idx = self._data_cols.index(cid)
+            sel = set(tree.selection())
+            cv.delete("all")
+            # Lerretets egen farge skinner gjennom som 1 px skille mellom radene
+            cv.configure(bg=COLORS["bg"])
+            for iid, (_bx, by, _bw, bh) in rows:
+                top = by - y0
+                cv.create_rectangle(
+                    0, top, w, top + bh - 1, width=0,
+                    fill=COLORS["hl_sel_bg" if iid in sel else "hl_bg"])
+                vals = tree.item(iid, "values")
+                cv.create_text(
+                    self._HL_PAD, top + bh // 2, anchor="w",
+                    text=vals[idx] if idx < len(vals) else "",
+                    font=self._f_cell, fill=COLORS["hl_text"])
+                self._hl_rows.append((iid, top, bh))
+            cv.place(x=x, y=y0, width=w, height=y1 - y0)
+        except tk.TclError:
+            pass
+
+    def _hl_ensure_visible(self):
+        """Rull datavisningen sidelengs slik at den valgte kolonnen er synlig."""
+        try:
+            cid = self._hl_column()
+            if not cid or self._closed:
+                return
+            tree = self._data_tree
+            tree.update_idletasks()
+            widths = [int(tree.column(c, "width")) for c in self._data_cols]
+            total = sum(widths)
+            f0, f1 = tree.xview()
+            if total <= 0 or (f0 <= 0.0 and f1 >= 1.0):
+                return                              # alt er synlig
+            i = self._data_cols.index(cid)
+            left, right = sum(widths[:i]), sum(widths[:i + 1])
+            v0, v1 = f0 * total, f1 * total
+            if left >= v0 - 1 and right <= v1 + 1:
+                return                              # kolonnen er alt synlig
+            # Ta med nabokolonnen på den siden det rulles fra, så man ser
+            # sammenhengen (og radnummeret når første kolonne er valgt)
+            view = v1 - v0
+            lo = sum(widths[:max(0, i - 1)])
+            hi = sum(widths[:min(len(widths), i + 2)])
+            if left < v0:
+                target = lo if right - lo <= view else left
+            else:
+                target = hi - view if hi - view <= left else left
+            tree.xview_moveto(max(0.0, target) / total)
+        except (tk.TclError, ValueError):
+            pass
+        self._hl_schedule()
+
+    def _hl_wheel(self, event):
+        """Musehjulet over den uthevede kolonnen ruller datavisningen."""
+        self._data_tree.yview_scroll(-1 if event.delta > 0 else 1, "units")
+        return "break"
+
+    def _hl_click(self, event):
+        """Klikk i den uthevede kolonnen velger raden, som ellers i tabellen."""
+        for iid, top, h in self._hl_rows:
+            if top <= event.y < top + h:
+                self._data_tree.selection_set(iid)
+                self._data_tree.focus(iid)
+                break
+        self._data_tree.focus_set()
+        return "break"
 
     # ── Vis-data-innstillinger ────────────────────────────────────────────────
 
@@ -1335,6 +1518,7 @@ class SiardMapperDialog(ctk.CTkToplevel):
             self._reload_data()
         else:
             self._data_frm.grid_remove()
+        self._hl_schedule()
         self._save_data_settings()
 
     def _on_unique_toggle(self):
@@ -1404,6 +1588,7 @@ class SiardMapperDialog(ctk.CTkToplevel):
         s.configure("Data.Treeview",
                     rowheight=self._f_cell.metrics("linespace") + 5)
         self.after_idle(self._editor.reposition)
+        self._hl_schedule()
 
     def destroy(self):
         self._closed = True

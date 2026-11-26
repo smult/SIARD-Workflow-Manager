@@ -74,17 +74,18 @@ def main() -> int:
     op._kildesystem_list = ["Acos WebSak (Acos)", "Visma Familia (Visma)",
                             "Visma Flyt Skole (Visma)"]
 
+    # Teller hvor mange ganger metadata leses fra SIARD-fila. (Før ble
+    # zipfile-åpninger telt; lesingen går nå utenom zipfile — se
+    # zip_progress.read_member_fast — så selve lesekallet telles.)
     opens: list[str] = []
-    real_zip = zipfile.ZipFile
+    counted_read = op._read_siard_meta
 
-    class _CountingZip(real_zip):
-        def __init__(self, file, mode="r", *a, **kw):
-            if mode == "r":
-                opens.append(str(file))
-            super().__init__(file, mode, *a, **kw)
+    def _counting_read(path):
+        opens.append(str(path))
+        return counted_read(path)
 
     tmp = Path(tempfile.mkdtemp(prefix="ac_test_"))
-    zipfile.ZipFile = _CountingZip
+    op._read_siard_meta = _counting_read
     try:
         print("\n[1] SIARD-fila åpnes én gang")
         siard = tmp / "uttrekk.siard"
@@ -182,7 +183,7 @@ def main() -> int:
         finally:
             root.destroy()
     finally:
-        zipfile.ZipFile = real_zip
+        op._read_siard_meta = counted_read
         op.set_current_siard_path(None)
         import shutil
         shutil.rmtree(tmp, ignore_errors=True)

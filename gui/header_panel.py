@@ -1,11 +1,19 @@
 """
 gui/header_panel.py
 SIARD-header (feltene øverst i header/metadata.xml) i et panel til høyre for
-kjøreloggen. Feltene kan endres mens workflowen går. Endringene må bekreftes
-(«Bekreft endringer»); bekreftede skrives inn i den utpakkede metadata.xml
-mellom stegene (av kjøretråden i app.py) — senest rett før «Pakk sammen
-SIARD». Ubekreftede endringer gir et spørsmål før sammenpakkingen. Steg som
-endrer headeren oppdaterer panelet etter at de er ferdige.
+kjøreloggen. Headeren vises så snart en SIARD-fil er valgt i fillista.
+
+To modus, etter hva arbeidsflyten inneholder:
+
+  «Bekreft endringer»  arbeidsflyten har både «Pakk ut SIARD» og «Pakk sammen
+      SIARD». Feltene kan endres før og mens workflowen går; bekreftede
+      endringer skrives inn i den utpakkede metadata.xml mellom stegene (av
+      kjøretråden i app.py) — senest rett før «Pakk sammen SIARD».
+      Ubekreftede endringer stopper kjøringen med et spørsmål før pakkingen.
+  «Lagre endringer»    ellers. Endringene skrives direkte tilbake i SIARD-fila
+      (app.py: _on_header_save) — bare når ingen kjøring pågår.
+
+Steg som endrer headeren oppdaterer panelet etter at de er ferdige.
 
   HeaderDock   skillelinje (dra for bredde) + HeaderPanel (» minimerer), eller en smal
                stripe ytterst til høyre når panelet er minimert
@@ -42,6 +50,9 @@ class HeaderPanel(ctk.CTkFrame):
         self._confirmed: dict[str, str] = {}  # bekreftet, ikke skrevet ennå
         self._invalid: dict[str, str] = {}    # {tag: feiltekst}
         self.on_confirm = None                # kalles med {tag: verdi} ved «Bekreft»
+        self.on_save = None                   # kalles med {tag: verdi} ved «Lagre»
+        self._mode = "confirm"                # "confirm" | "save" (se modulteksten)
+        self._busy = False                    # lagring pågår
         self._editable = False
         self._loading = False
         self._vars: dict[str, tk.StringVar] = {}
@@ -76,10 +87,26 @@ class HeaderPanel(ctk.CTkFrame):
         ).grid(row=0, column=2)
 
         self._source_lbl = ctk.CTkLabel(
-            self, text="", anchor="w", justify="left",
+            self, text="", anchor="w", justify="left", wraplength=300,
             font=ctk.CTkFont(family=FONTS["mono"], size=11),
             text_color=COLORS["accent"])
         self._source_lbl.grid(row=1, column=0, sticky="ew", padx=12, pady=(2, 4))
+
+        # Ventevisning: vises i stedet for feltene mens headeren leses fra fila
+        self._wait = ctk.CTkFrame(self, fg_color="transparent")
+        self._wait.grid(row=2, column=0, sticky="nsew", padx=12, pady=0)
+        self._wait.grid_columnconfigure(0, weight=1)
+        self._wait.grid_rowconfigure((0, 3), weight=1)
+        self._wait_bar = ctk.CTkProgressBar(self._wait, mode="indeterminate", height=6,
+                                            progress_color=COLORS["accent"])
+        self._wait_bar.grid(row=1, column=0, sticky="ew", padx=24, pady=(0, 10))
+        self._wait_lbl = ctk.CTkLabel(
+            self._wait, text="", justify="center", wraplength=260,
+            font=ctk.CTkFont(family=FONTS["ui"], size=12),
+            text_color=COLORS["text_sub"])
+        self._wait_lbl.grid(row=2, column=0, sticky="ew")
+        self._wait.grid_remove()
+        self._waiting = False
 
         body = ctk.CTkScrollableFrame(self, fg_color="transparent")
         body.grid(row=2, column=0, sticky="nsew", padx=(6, 2), pady=0)
@@ -145,7 +172,7 @@ class HeaderPanel(ctk.CTkFrame):
             fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"],
             text_color=COLORS["on_accent"],
             font=ctk.CTkFont(family=FONTS["ui"], size=12, weight="bold"),
-            command=self.confirm, state="disabled")
+            command=self._on_button, state="disabled")
         self._confirm_btn.grid(row=3, column=0, sticky="ew", padx=12, pady=(8, 0))
 
         self._note = ctk.CTkLabel(self, text="", font=small, text_color=COLORS["muted"],
@@ -155,8 +182,22 @@ class HeaderPanel(ctk.CTkFrame):
         self._set_inputs_state(False)
 
     def _on_resize(self, ev) -> None:
-        wl = max(160, ev.width - 40)
+        # Hendelsen gir bredden i skjermpiksler, mens CTk selv ganger
+        # wraplength med skaleringen. Uten å dele på den ble teksten brutt for
+        # sent (150 % skalering → halvannen panelbredde) og kuttet i høyre kant.
+        if ev.widget is not self and ev.widget is not getattr(self, "_canvas", None):
+            return
+        try:
+            scale = float(ctk.ScalingTracker.get_widget_scaling(self)) or 1.0
+        except Exception:
+            scale = 1.0
+        wl = max(140, int(ev.width / scale) - 34)
+        if wl == getattr(self, "_wrap_now", None):
+            return
+        self._wrap_now = wl
         self._note.configure(wraplength=wl)
+        self._source_lbl.configure(wraplength=wl)
+        self._wait_lbl.configure(wraplength=max(120, wl - 30))
         for e in self._errors.values():
             e.configure(wraplength=wl)
         for lbl, _l in self._ro_labels.values():
@@ -219,7 +260,8 @@ class HeaderPanel(ctk.CTkFrame):
         if err:
             mark, color = "● ugyldig", COLORS["red"]
         elif pending:
-            mark, color = "● ikke bekreftet", COLORS["yellow"]
+            mark, color = ("● ikke lagret" if self._mode == "save"
+                           else "● ikke bekreftet"), COLORS["yellow"]
         elif confirmed:
             mark, color = "✓ bekreftet", COLORS["green"]
         else:
@@ -237,11 +279,64 @@ class HeaderPanel(ctk.CTkFrame):
         with self._lock:
             n_pending = len(self._pending)
             any_change = bool(self._pending or self._invalid or self._confirmed)
-        on = self._editable
+        on = self._editable and not self._busy
         self._undo_btn.configure(state="normal" if any_change and on else "disabled")
+        word = "Lagre endringer" if self._mode == "save" else "Bekreft endringer"
         self._confirm_btn.configure(
             state="normal" if n_pending and on else "disabled",
-            text=f"Bekreft endringer ({n_pending})" if n_pending else "Bekreft endringer")
+            text=f"{word} ({n_pending})" if n_pending else word)
+
+    # ── Modus ─────────────────────────────────────────────────────────────────
+
+    @property
+    def mode(self) -> str:
+        return self._mode
+
+    def set_mode(self, mode: str) -> None:
+        """
+        "confirm": knappen er «Bekreft endringer» (arbeidsflyten pakker ut og
+        sammen — endringene skrives inn underveis). "save": knappen er «Lagre
+        endringer» (skrives direkte i SIARD-fila). Endringene i feltene beholdes.
+        """
+        mode = "save" if mode == "save" else "confirm"
+        if mode == self._mode:
+            return
+        self._mode = mode
+        if mode == "save":
+            # «Bekreftet» betyr «skrives inn under kjøringen» — uten utpakking
+            # er de ikke skrevet noe sted, og må lagres
+            with self._lock:
+                self._pending.update(self._confirmed)
+                self._confirmed.clear()
+        for f in FIELDS:
+            if f.editable:
+                self._show_state(f.tag)
+        self._update_buttons()
+
+    def _on_button(self) -> None:
+        if self._mode == "save":
+            self.save()
+        else:
+            self.confirm()
+
+    def save(self) -> None:
+        """«Lagre endringer»: gi endringene til on_save (som skriver dem til
+        SIARD-fila og laster panelet på nytt når det er gjort)."""
+        with self._lock:
+            values = dict(self._pending)
+        if values and self.on_save:
+            self.on_save(values)
+
+    def set_busy(self, busy: bool, note: "str | None" = None) -> None:
+        """Lås feltene og knappene mens endringene lagres."""
+        self._busy = bool(busy)
+        self._set_inputs_state(self._editable and not self._busy)
+        if note is not None:
+            self._note.configure(text=note)
+        self._update_buttons()
+
+    def set_note(self, note: str) -> None:
+        self._note.configure(text=note or "")
 
     def confirm(self) -> None:
         """«Bekreft endringer»: endringene skrives inn og tas med ved sammenpakking."""
@@ -260,10 +355,49 @@ class HeaderPanel(ctk.CTkFrame):
             w.configure(state="normal" if editable else "disabled",
                         text_color=COLORS["text"] if editable else COLORS["muted"])
 
+    # ── Ventevisning ──────────────────────────────────────────────────────────
+
+    def show_loading(self, source: str, text: str) -> None:
+        """
+        Headeren leses fra fila: vis filnavnet og et «arbeider»-felt i stedet
+        for tomme felt. Feltene kommer når load()/refresh() kalles med innhold.
+        """
+        with self._lock:
+            self._pending.clear()
+            self._confirmed.clear()
+            self._invalid.clear()
+        self._busy = False
+        self._editable = False
+        self._source_src = source
+        self._source_lbl.configure(text=source)
+        self._body.grid_remove()
+        self._confirm_btn.grid_remove()
+        self._note.grid_remove()
+        self._wait_lbl.configure(text="⏳  " + text)
+        self._wait.grid()
+        if not self._waiting:
+            self._waiting = True
+            self._wait_bar.start()
+        self._update_buttons()
+
+    def is_loading(self) -> bool:
+        return self._waiting
+
+    def _hide_loading(self) -> None:
+        if not self._waiting:
+            return
+        self._waiting = False
+        self._wait_bar.stop()
+        self._wait.grid_remove()
+        self._body.grid()
+        self._confirm_btn.grid()
+        self._note.grid()
+
     # ── Offentlig ─────────────────────────────────────────────────────────────
 
     def load(self, info: dict, source: str, editable: bool, note: str) -> None:
         """Vis headeren for en ny fil (forkaster ventende endringer)."""
+        self._busy = False
         with self._lock:
             self._pending.clear()
             self._confirmed.clear()
@@ -276,6 +410,7 @@ class HeaderPanel(ctk.CTkFrame):
         Oppdater fra fila etter et steg. Felt med endringer som ikke er
         skrevet ennå (ubekreftede, bekreftede eller ugyldige) overskrives ikke.
         """
+        self._hide_loading()
         values = (info or {}).get("values", {})
         if source is not None:
             self._source_src = source
@@ -518,3 +653,7 @@ class HeaderDock(ctk.CTkFrame):
 
     def refresh(self, info: "dict | None", editable: bool, note: str) -> None:
         self.panel.refresh(info, editable, note)
+
+    def show_loading(self, source: str, text: str) -> None:
+        self.grid()
+        self.panel.show_loading(source, text)

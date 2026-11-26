@@ -17,7 +17,10 @@ Parametere:
 Pipeline-modus (ctx.extracted_path satt):
     Modifiserer header/metadata.xml direkte på disk.
 Standalone-modus:
-    Skriver ny <original>_beriket.siard.
+    Skriver ny <original>_beriket.siard (standalone_write = "ny_fil", standard),
+    eller — valgfritt — ny metadata.xml direkte i SIARD-fila
+    (standalone_write = "direkte": sekunder i stedet for en full kopi, men
+    originalfila endres).
 """
 
 from __future__ import annotations
@@ -393,7 +396,13 @@ class SiardMapperOperation(BaseOperation):
     default_params = {
         "json_template":       "",     # sti til JSON-malfilen
         "overwrite_existing":  False,  # True = overstyr beskrivelser som allerede finnes
+        # Uten «Pakk ut SIARD»: "ny_fil" = skriv <original>_beriket.siard (full
+        # kopi), "direkte" = skriv ny metadata.xml i selve SIARD-fila
+        "standalone_write":    "ny_fil",
     }
+
+    def writes_in_place(self) -> bool:
+        return str(self.params.get("standalone_write") or "").strip().lower() == "direkte"
 
     def premis_should_record(self, result, ctx) -> bool:
         d = result.data or {}
@@ -448,9 +457,25 @@ class SiardMapperOperation(BaseOperation):
             all_info  = None
             meta_entry = None
         else:
+            # Uten «Pakk ut SIARD»: metadata.xml leses fra arkivet, og resultatet
+            # skrives som en ny SIARD-fil. Si fra med en gang — å lese
+            # innholdslista i et arkiv med millioner av filer tar tid.
+            # En tidligere direkte-endring ble avbrutt → legg fila tilbake først
+            try:
+                from siard_workflow.core.zip_progress import restore_interrupted_update
+                restore_interrupted_update(siard_path, w)
+            except Exception as exc:
+                return self._fail(f"Kunne ikke gjenopprette SIARD-fila: {exc}")
+            try:
+                _sz = siard_path.stat().st_size
+            except OSError:
+                _sz = 0
+            from siard_workflow.core.zip_progress import fmt_bytes as _fb
+            w(f"  Leser innholdslista i {siard_path.name} ({_fb(_sz)}) …", "info")
             try:
                 with zipfile.ZipFile(siard_path, "r") as zf:
                     name_lower = {n.lower(): n for n in zf.namelist()}
+                    w(f"  {len(name_lower):,} filer i arkivet".replace(",", " "), "info")
                     meta_entry = next(
                         (name_lower[c] for c in _METADATA_PATHS if c in name_lower), None)
                     if not meta_entry:
@@ -544,6 +569,22 @@ class SiardMapperOperation(BaseOperation):
                  "tables_deleted": 0},
                 "Ingen endringer gjort")
 
+        # Uten utpakking: direkte i SIARD-fila bare når brukeren har valgt det,
+        # ingen tabeller skal slettes, og det bekreftes ved kjøring (valget kan
+        # ha fulgt med en lagret arbeidsflyt til en annen fil)
+        in_place = False
+        if not pipeline and self.writes_in_place():
+            if deleted_paths:
+                w("  Tabeller er markert for sletting — da skrives det ny fil i stedet "
+                  "for direkte i SIARD-fila (ellers ville dataene blitt liggende "
+                  "igjen i fila)", "warn")
+            else:
+                confirm = ctx.metadata.get("confirm_inplace_cb")
+                in_place = True if confirm is None else bool(confirm(siard_path.name))
+                if not in_place:
+                    w("  Direkte skriving ble valgt bort ved kjøring — skriver ny fil",
+                      "info")
+
         if pipeline:
             meta_path.write_bytes(enriched)
             # Slett content/{schema}/{table}/-mapper for markerte tabeller
@@ -559,48 +600,69 @@ class SiardMapperOperation(BaseOperation):
                 {"tables_enriched": n_tbl, "columns_enriched": n_col,
                  "tables_deleted": len(deleted_paths)},
                 summary)
+        elif in_place:
+            # ── Direkte i SIARD-fila (valgt av brukeren) ──────────────────────
+            from siard_workflow.core.zip_progress import (
+                fmt_bytes, undo_path, update_member_in_place)
+            w(f"  ADVARSEL: skriver ny metadata.xml DIREKTE i {siard_path.name} — "
+              f"originalfila endres (valgt i innstillingene for steget)", "warn")
+            w(f"  Den gamle innholdslista lagres først i {undo_path(siard_path).name}; "
+              f"avbrytes skrivingen, gjenopprettes fila fra den", "info")
+            try:
+                stats = update_member_in_place(siard_path, meta_entry, enriched, w=w)
+            except PermissionError as exc:
+                return self._fail(
+                    f"Kan ikke skrive til {siard_path.name} (skrivebeskyttet eller "
+                    f"åpen i et annet program): {exc}")
+            except Exception as exc:
+                return self._fail(
+                    f"Feil ved skriving direkte i SIARD-fila — fila er gjenopprettet "
+                    f"slik den var: {exc}")
+            summary = (f"{n_tbl} tabell(er) beriket, {n_col} kolonne(r) beriket "
+                       f"(skrevet direkte i SIARD-fila)")
+            w(f"  Skrevet direkte i {siard_path.name} "
+              f"({fmt_bytes(stats['size_before'])} → {fmt_bytes(stats['size_after'])})"
+              f"  —  {summary}", "ok")
+            w("  Sjekksummer (SHA-256) som er beregnet for denne fila tidligere, "
+              "gjelder ikke lenger", "warn")
+            return self._ok(
+                {"tables_enriched": n_tbl, "columns_enriched": n_col,
+                 "tables_deleted": 0, "in_place": True,
+                 "output_path": str(siard_path)},
+                summary)
         else:
             dst_path = siard_path.with_name(siard_path.stem + "_beriket" + siard_path.suffix)
+            # Den nye fila skrives strømmet: innholdet kopieres uendret, uten å
+            # pakkes ut eller leses inn i minnet (før ble HELE den nye fila
+            # bygget i minnet — umulig for store uttrekk, og uten livstegn).
+            from siard_workflow.core.zip_progress import (
+                NotEnoughSpace, RewriteCancelled, fmt_bytes, fmt_duration,
+                write_siard_copy)
+            # Filer som tilhører tabeller markert for sletting, tas ikke med
+            skip_prefixes = tuple(
+                f"content/{s}/{t}/" for s, t in deleted_paths)
+            stop_ev = ctx.metadata.get("stop_event")
             try:
-                # Hopp over content/{schema}/{table}/-entries som tilhører
-                # tabeller markert for sletting.
-                skip_prefixes = tuple(
-                    f"content/{s}/{t}/" for s, t in deleted_paths)
-                from siard_workflow.core.siard_format import (
-                    get_zip_compresslevel as _get_lvl,
-                    get_smart_skip_enabled as _get_skip,
-                    is_precompressed_bytes as _is_pre,
-                )
-                _level     = _get_lvl()
-                _smartskip = _get_skip()
-                _compress  = (zipfile.ZIP_STORED if _level == 0
-                              else zipfile.ZIP_DEFLATED)
-                _comp_lvl  = _level if _level > 0 else None
-                buf = io.BytesIO()
-                with zipfile.ZipFile(siard_path, "r") as zin, \
-                     zipfile.ZipFile(buf, "w", _compress,
-                                     allowZip64=True,
-                                     compresslevel=_comp_lvl) as zout:
-                    for item in all_info:
-                        # Skip filer som tilhører slettede tabeller
-                        if skip_prefixes and item.filename.startswith(skip_prefixes):
-                            continue
-                        data = enriched if item.filename == meta_entry else zin.read(item.filename)
-                        # Smart-skip: STORED for allerede-komprimerte filer
-                        if (_level > 0 and _smartskip
-                                and _is_pre(data[:16])):
-                            item.compress_type = zipfile.ZIP_STORED
-                        else:
-                            item.compress_type = _compress
-                        zout.writestr(item, data)
-                dst_path.write_bytes(buf.getvalue())
+                stats = write_siard_copy(
+                    siard_path, dst_path, {meta_entry: enriched},
+                    skip=((lambda name: name.startswith(skip_prefixes))
+                          if skip_prefixes else None),
+                    tables=[(t.schema_folder, t.folder, t.name) for t in tables],
+                    pcb=pcb, w=w,
+                    stop=(stop_ev.is_set if stop_ev is not None else None))
+            except RewriteCancelled:
+                return self._fail("Stoppet mens den nye SIARD-fila ble skrevet — "
+                                  "den halvferdige fila er slettet")
+            except NotEnoughSpace as exc:
+                return self._fail(str(exc))
             except Exception as exc:
                 return self._fail(f"Feil ved skriving av SIARD: {exc}")
 
             summary = (f"{n_tbl} tabell(er) beriket, {n_col} kolonne(r) beriket"
                        + (f", {len(deleted_paths)} tabell(er) slettet"
                           if deleted_paths else ""))
-            w(f"  Skrevet: {dst_path.name}  —  {summary}", "ok")
+            w(f"  Skrevet: {dst_path.name} ({fmt_bytes(stats['bytes'])}) på "
+              f"{fmt_duration(stats['seconds'])}  —  {summary}", "ok")
             return self._ok(
                 {"tables_enriched": n_tbl, "columns_enriched": n_col,
                  "tables_deleted": len(deleted_paths),

@@ -168,6 +168,11 @@ def read_header(source: "Path | str") -> "dict | None":
             return read_header_bytes(p.read_bytes()) if p else None
         if source.suffix.lower() == ".xml":
             return read_header_bytes(source.read_bytes())
+        # Rask vei: bare metadata.xml leses (ikke hele innholdslista)
+        from .zip_progress import read_member_fast
+        got = read_member_fast(source, _METADATA_PATHS)
+        if got is not None:
+            return read_header_bytes(got[1])
         with zipfile.ZipFile(source) as z:
             names = set(z.namelist())
             for rel in _METADATA_PATHS:
@@ -285,6 +290,31 @@ def apply_header(meta: bytes, values: dict) -> "tuple[bytes, list[str]]":
     if not any(not c.startswith("IKKE") for c in changes):
         return meta, changes
     return text.encode(codec, errors="xmlcharrefreplace"), changes
+
+
+def save_header_in_place(siard_path: "Path | str", values: dict,
+                         w=None) -> "list[str]":
+    """
+    Skriv header-endringer direkte tilbake i SIARD-fila (uten utpakking og
+    uten kopi): metadata.xml leses fra arkivet, endres som i apply_header(),
+    og byttes ut i selve fila. Returnerer endringslista fra apply_header().
+
+    Originalfila endres. En angrefil sørger for at den legges tilbake hvis
+    skrivingen avbrytes (se zip_progress.update_member_in_place).
+    """
+    from .zip_progress import restore_interrupted_update, update_member_in_place
+    siard_path = Path(siard_path)
+    restore_interrupted_update(siard_path, w)
+    with zipfile.ZipFile(siard_path) as z:
+        names = set(z.namelist())
+        entry = next((rel for rel in _METADATA_PATHS if rel in names), None)
+        if entry is None:
+            raise FileNotFoundError("header/metadata.xml finnes ikke i SIARD-fila")
+        raw = z.read(entry)
+    new, changes = apply_header(raw, values)
+    if new != raw:
+        update_member_in_place(siard_path, entry, new, w=w)
+    return changes
 
 
 def apply_header_file(path: "Path | str", values: dict) -> "list[str]":

@@ -362,16 +362,19 @@ class MetadataQualityOperation(BaseOperation):
         dst_path = siard_path.with_name(
             siard_path.stem + suffix + siard_path.suffix)
 
+        # Strømmet kopi med fremdrift (før ble hele den nye fila bygget i minnet)
+        from siard_workflow.core.zip_progress import (
+            NotEnoughSpace, RewriteCancelled, write_siard_copy)
+        stop_ev = ctx.metadata.get("stop_event")
         try:
-            buf = io.BytesIO()
-            with zipfile.ZipFile(siard_path, "r") as zin, \
-                 zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED,
-                                 allowZip64=True) as zout:
-                for item in all_info:
-                    data = (meta_bytes_new if item.filename == meta_entry
-                            else zin.read(item.filename))
-                    zout.writestr(item, data)
-            dst_path.write_bytes(buf.getvalue())
+            write_siard_copy(
+                siard_path, dst_path, {meta_entry: meta_bytes_new}, pcb=pcb, w=w,
+                stop=(stop_ev.is_set if stop_ev is not None else None))
+        except RewriteCancelled:
+            return self._fail("Stoppet mens den nye SIARD-fila ble skrevet — "
+                              "den halvferdige fila er slettet")
+        except NotEnoughSpace as exc:
+            return self._fail(str(exc))
         except Exception as exc:
             return self._fail(f"Feil ved skriving av SIARD: {exc}")
 

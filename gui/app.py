@@ -338,6 +338,10 @@ class App(ctk.CTk):
         self.workflow: Workflow | None = None
         self._log_queue: queue.Queue = queue.Queue()
         self._running        = False
+        # SIARD-header-panelet: fila som vises, lesing som pågår, lagring som pågår
+        self._hdr_path: "Path | None" = None
+        self._hdr_token = None
+        self._hdr_saving = False
         self._log_entries: list[tuple[str,str]] = []
         self._current_run: "WorkflowRun | None" = None
         self._global_temp_dir: Path | None = None
@@ -456,6 +460,9 @@ class App(ctk.CTk):
         self.header_dock.grid(row=0, column=1, sticky="ns")
         self.header_dock.grid_remove()
         self.header_dock.panel.on_confirm = self._on_header_confirm
+        self.header_dock.panel.on_save = self._on_header_save
+        # «Bekreft endringer» gjelder bare når arbeidsflyten pakker ut og sammen
+        self.workflow_panel.on_changed = self._header_mode_update
 
     def _build_topbar(self):
         bar = ctk.CTkFrame(self, fg_color=COLORS["surface"], corner_radius=0, height=48)
@@ -780,17 +787,58 @@ class App(ctk.CTk):
             except Exception:
                 pass
 
-    def _auto_select_temp(self, siard_path: Path):
-        """Velg beste temp-disk automatisk basert på disktype."""
-        try:
-            from disk_selector import best_temp_disk, get_disk_candidates
-            self._global_temp_dir = best_temp_disk(siard_path=siard_path)
-            candidates = get_disk_candidates()
+    @staticmethod
+    def _temp_candidates(siard_path: Path) -> "tuple[Path | None, list]":
+        """(beste temp-disk, alle kandidater). TREG: disktypene hentes fra
+        Windows (PowerShell) — flere sekunder, mer med nettverksdisker."""
+        from disk_selector import best_temp_disk, get_disk_candidates
+        candidates = get_disk_candidates()
+        best = (candidates[0]["path"] if candidates
+                else best_temp_disk(siard_path=siard_path))
+        return best, candidates
+
+    def _auto_select_temp(self, siard_path: Path, background: bool = True):
+        """
+        Velg beste temp-disk automatisk basert på disktype. Gjøres i
+        bakgrunnen: før sto hele programmet stille i mange sekunder første gang
+        en SIARD-fil ble valgt. background=False (når kjøringen starter og
+        valget ennå ikke er klart) venter på svaret.
+        """
+        if not background:
+            try:
+                best, candidates = self._temp_candidates(siard_path)
+            except Exception:
+                best, candidates = None, []
+            self._apply_auto_temp(siard_path, best, candidates)
+            return
+        if getattr(self, "_temp_auto_busy", False):
+            return
+        self._temp_auto_busy = True
+        self.temp_label.configure(text="Temp: finner beste disk …",
+                                  text_color=COLORS["muted"])
+
+        def _work():
+            try:
+                best, candidates = self._temp_candidates(siard_path)
+            except Exception:
+                best, candidates = None, []
+            self._log_queue.put(("temp_auto", siard_path, best, candidates))
+
+        threading.Thread(target=_work, daemon=True, name="temp-disk").start()
+
+    def _apply_auto_temp(self, siard_path: Path, best, candidates: list) -> None:
+        """Hovedtråden: ta i bruk den automatisk valgte temp-disken."""
+        self._temp_auto_busy = False
+        if self._global_temp_dir is not None:
+            self._update_temp_label()
+            return                        # valgt av brukeren i mellomtiden
+        if best is not None:
+            self._global_temp_dir = best
             self._log(f"Temp-mappe (auto): {self._global_temp_dir}", "info")
             for c in candidates:
                 marker = "→" if c["path"] == self._global_temp_dir else " "
                 self._log(f"  {marker} {c['label']}", "muted")
-        except Exception:
+        else:
             self._global_temp_dir = siard_path.parent
             self._log(f"Temp-mappe (fallback): {self._global_temp_dir}", "info")
         # Lagre til config.json
@@ -966,6 +1014,10 @@ class App(ctk.CTk):
             self.siard_path = None
             self._update_status_right("")
             self._clear_project_state()
+            if not self._running:
+                self._hdr_path = None
+                self._hdr_token = None
+                self.header_dock.grid_remove()
 
     def _queue_render(self):
         """Tegn kø-listen på nytt."""
@@ -1021,6 +1073,7 @@ class App(ctk.CTk):
             self._auto_select_temp(path)
         self.workflow_panel.set_file(path)
         self._sync_project_to_siard(path)
+        self._header_show_idle(path)
 
     def _sync_project_to_siard(self, path: Path) -> None:
         """Synkroniser prosjektfil-tilstand med ny aktiv SIARD.
@@ -3353,6 +3406,12 @@ class App(ctk.CTk):
         if not ops:
             self._log("Workflowen er tom", "warn")
             return
+        # Temp-disken velges i bakgrunnen når en fil velges — er det ikke
+        # ferdig ennå, må kjøringen vente på det
+        if self._global_temp_dir is None:
+            self._log("Finner beste temp-disk …", "info")
+            self.update_idletasks()
+            self._auto_select_temp(self.siard_queue[0], background=False)
 
         if self.workflow_panel.has_order_violations():
             from tkinter import messagebox
@@ -3362,6 +3421,22 @@ class App(ctk.CTk):
                 "Rett opp rekkefølgen (se ⚠-markeringene) før du kjører.",
                 parent=self)
             return
+
+        # Endringer i SIARD-header som bare kan lagres direkte i fila (ingen
+        # utpakking/sammenpakking i arbeidsflyten) blir ikke med i en kjøring
+        _hp = self.header_dock.panel
+        if _hp.mode == "save" and (_hp.unconfirmed() or _hp.invalid_fields()):
+            from tkinter import messagebox
+            if not messagebox.askyesno(
+                    "Endringer i SIARD-header er ikke lagret",
+                    "Det er gjort endringer i SIARD-headeren som ikke er lagret.\n\n"
+                    "Arbeidsflyten har ikke både «Pakk ut SIARD» og «Pakk sammen "
+                    "SIARD», så endringene blir ikke med i kjøringen. Trykk «Lagre "
+                    "endringer» i header-panelet først hvis de skal inn i SIARD-fila.\n\n"
+                    "Starte kjøringen likevel? Endringene forkastes.",
+                    icon="warning", default="no", parent=self):
+                return
+            _hp.undo()
 
         # ── Kjøreplan: prosjektet er kjørt før ───────────────────────────────
         # Vis hva som hoppes over / kjøres (på nytt) før noe skjer, og la
@@ -3525,6 +3600,9 @@ class App(ctk.CTk):
             ctx.metadata["stop_event"]          = self._stop_event
             ctx.metadata["pause_event"]         = self._pause_event
             ctx.metadata["siardmapper_dialog_cb"] = self._siardmapper_dialog_cb
+            # «Berik SIARD» satt til å skrive direkte i SIARD-fila: bekreft ved
+            # kjøring (spørres hver gang — originalfila endres)
+            ctx.metadata["confirm_inplace_cb"] = self._confirm_write_in_place
             # Registrer callback for "Standardiser filendelser" kun hvis
             # operasjonen ikke allerede er i workflowen
             _has_stdext = any(
@@ -4238,8 +4316,9 @@ class App(ctk.CTk):
         if info is None:
             note = "Fant ikke header/metadata.xml."
         elif not hdr["can_edit"]:
-            note = ("Skrivebeskyttet: endringer krever «Pakk ut SIARD» og "
-                    "«Pakk sammen SIARD» i arbeidsflyten.")
+            note = ("Låst mens arbeidsflyten kjører. Uten «Pakk ut SIARD» og «Pakk "
+                    "sammen SIARD» kan endringer lagres direkte i SIARD-fila når "
+                    "kjøringen er ferdig.")
         elif hdr["repacked"]:
             note = f"Pakket inn som header i {ctx.siard_path.name}."
         elif done and meta:
@@ -4256,29 +4335,200 @@ class App(ctk.CTk):
                               "i metadata.xml før neste steg")
                     + " og pakkes med i den nye SIARD-fila.")
         self._log_queue.put(("header_show", first, info, ctx.siard_path.name,
-                             editable, note))
+                             editable, note, str(ctx.siard_path)))
 
-    def _ask_header_unconfirmed(self, unconf: dict) -> bool:
-        """Arbeidstråden, før «Pakk sammen SIARD»: ta med ubekreftede header-endringer?"""
+    @staticmethod
+    def _header_lines(values: dict) -> str:
         from siard_workflow.core.siard_header import FIELD_BY_TAG
 
         def _short(v: str) -> str:
-            v = " ".join(v.split())
+            v = " ".join(str(v).split())
             return v if len(v) <= 120 else v[:117] + "…"
-        lines = "\n".join(
+        return "\n".join(
             f"   • {FIELD_BY_TAG[t].label if t in FIELD_BY_TAG else t}: «{_short(v)}»"
-            for t, v in unconf.items())
-        return self._ask_yes_no(
-            "Ubekreftede endringer i SIARD-header",
-            "Det er gjort endringer i SIARD-headeren som ikke er bekreftet med "
-            f"«Bekreft endringer»:\n\n{lines}\n\n"
-            "Lagre endringer i SIARD-header ved pakking av ny siard?",
-            "Ja, lagre endringene", "Nei, forkast")
+            for t, v in values.items())
+
+    def _ask_header_unconfirmed(self, unconf: dict, invalid: "dict | None" = None) -> bool:
+        """Arbeidstråden, før «Pakk sammen SIARD»: kjøringen stopper og venter
+        til brukeren har bekreftet eller forkastet endringene."""
+        text = ("Kjøringen venter før «Pakk sammen SIARD».\n\n"
+                "Det er gjort endringer i SIARD-headeren som ikke er bekreftet. "
+                "Endringer må bekreftes for å bli med i den nye SIARD-fila:\n\n"
+                f"{self._header_lines(unconf)}\n\n")
+        if invalid:
+            text += ("Felt med ugyldig verdi tas ikke med uansett: "
+                     + ", ".join(invalid) + "\n\n")
+        text += "Vil du bekrefte endringene og ta dem med i pakken?"
+        return self._ask_yes_no("Endringer i SIARD-header er ikke bekreftet", text,
+                                "Bekreft endringene", "Forkast endringene")
 
     def _on_header_confirm(self, values: dict) -> None:
         """Hovedtråden: «Bekreft endringer» i header-panelet."""
+        when = ("skrives inn før neste steg" if self._running else
+                "skrives inn etter utpakkingen når arbeidsflyten kjøres")
         self._log(f"  SIARD-header: {len(values)} endring(er) bekreftet "
-                  f"({', '.join(values)}) — skrives inn før neste steg", "info")
+                  f"({', '.join(values)}) — {when}", "info")
+
+    # ── SIARD-header utenom kjøring ───────────────────────────────────────────
+
+    def _header_wf_mode(self) -> str:
+        """"confirm" når arbeidsflyten har både «Pakk ut SIARD» og «Pakk sammen
+        SIARD» (endringene skrives inn underveis) — ellers "save" (direkte i fila)."""
+        try:
+            ids = {op.operation_id for op in self.workflow_panel.get_operations()}
+        except Exception:
+            ids = set()
+        return "confirm" if {"unpack_siard", "repack_siard"} <= ids else "save"
+
+    @staticmethod
+    def _header_idle_note(mode: str) -> str:
+        if mode == "confirm":
+            return ("Trykk «Bekreft endringer» for å ta endringene med. De skrives inn "
+                    "etter utpakkingen når arbeidsflyten kjøres, og pakkes med i den "
+                    "nye SIARD-fila.")
+        return ("«Lagre endringer» skriver metadata.xml direkte tilbake i SIARD-fila "
+                "(originalfila endres). Legg til «Pakk ut SIARD» og «Pakk sammen "
+                "SIARD» for å få endringene inn i en ny fil i stedet.")
+
+    def _header_show_idle(self, path: Path) -> None:
+        """Hovedtråden: vis headeren til valgt SIARD-fil. Fila leses i en
+        bakgrunnstråd — innholdslista i et stort uttrekk tar tid å lese."""
+        if self._running or self._hdr_saving:
+            return
+        self._hdr_path = path
+        self._hdr_token = token = object()
+        self.header_dock.panel.set_mode(self._header_wf_mode())
+        # Ingen tomme felt mens fila leses — et «arbeider»-felt i stedet
+        self.header_dock.show_loading(path.name, "Leser header fra SIARD-fila …")
+
+        def _work():
+            from siard_workflow.core.siard_header import read_header
+            from siard_workflow.core.zip_progress import restore_interrupted_update
+            try:
+                # En tidligere «Lagre endringer» ble avbrutt → legg fila tilbake
+                restore_interrupted_update(
+                    path, lambda m, lvl="info": self._log_queue.put(("log", m, lvl)))
+            except Exception as exc:
+                self._log_queue.put(("log", f"  {path.name}: {exc}", "error"))
+            self._log_queue.put(("header_idle", token, path, read_header(path)))
+
+        threading.Thread(target=_work, daemon=True, name="siard-header-les").start()
+
+    def _header_idle_loaded(self, token, path: Path, info: "dict | None") -> None:
+        if token is not self._hdr_token or self._running:
+            return
+        mode = self._header_wf_mode()
+        self.header_dock.panel.set_mode(mode)
+        if info is None:
+            self.header_dock.load({"values": {}}, path.name, False,
+                                  "Fant ikke header/metadata.xml i SIARD-fila.")
+        else:
+            self.header_dock.load(info, path.name, True, self._header_idle_note(mode))
+
+    def _header_mode_update(self) -> None:
+        """Arbeidsflyten er endret: riktig knapp («Bekreft» / «Lagre») i panelet."""
+        dock = getattr(self, "header_dock", None)
+        if dock is None or self._running or self._hdr_path is None:
+            return
+        panel = dock.panel
+        if not panel.is_editable():
+            return
+        mode = self._header_wf_mode()
+        if mode != panel.mode:
+            panel.set_mode(mode)
+            panel.set_note(self._header_idle_note(mode))
+
+    def _on_header_save(self, values: dict) -> None:
+        """Hovedtråden: «Lagre endringer» — skriv metadata.xml direkte tilbake
+        i SIARD-fila (arbeidsflyten har ikke utpakking + sammenpakking)."""
+        path = self._hdr_path
+        if self._running or self._hdr_saving or path is None or not values:
+            return
+        from tkinter import messagebox
+        if not messagebox.askokcancel(
+                "Lagre endringer i SIARD-fila?",
+                f"Endringene skrives direkte inn i\n{path.name}\n\n"
+                f"{self._header_lines(values)}\n\n"
+                "Originalfila endres: sjekksummer (SHA-256) som alt er beregnet, "
+                "gjelder ikke lenger, og den gamle metadata.xml blir liggende som "
+                "ubrukte byte i fila. Avbrytes skrivingen, gjenopprettes fila fra "
+                "en angrefil.\n\nVil du lagre?",
+                icon="warning", parent=self):
+            return
+        self._hdr_saving = True
+        self.header_dock.panel.set_busy(True, "Lagrer endringene i SIARD-fila …")
+        self._log(f"SIARD-header: lagrer {len(values)} endring(er) direkte i "
+                  f"{path.name} …", "info")
+        threading.Thread(target=self._header_save_worker, args=(path, dict(values)),
+                         daemon=True, name="siard-header-lagre").start()
+
+    def _header_save_worker(self, path: Path, values: dict) -> None:
+        """Bakgrunnstråd: skriv endringene, før PREMIS-hendelsen, les headeren på nytt."""
+        from siard_workflow.core.siard_header import read_header, save_header_in_place
+
+        def _w(msg: str, lvl: str = "info") -> None:
+            self._log_queue.put(("log", msg, lvl))
+        try:
+            changes = save_header_in_place(path, values, w=_w)
+            done = [c for c in changes if not c.startswith("IKKE")]
+            if done:
+                try:
+                    self._header_premis_standalone(path, done)
+                except Exception as exc:
+                    _w(f"  PREMIS-hendelsen kunne ikke føres: {exc}", "warn")
+            self._log_queue.put(("header_saved", path, read_header(path), changes, None))
+        except Exception as exc:
+            self._log_queue.put(("header_saved", path, None, [], str(exc)))
+
+    def _header_premis_standalone(self, path: Path, done: list) -> None:
+        """Endringen er gjort utenom en kjøring — den føres likevel i uttrekkets
+        PREMIS-proveniens ({grunnavn}_premis.xml), etter hendelsene som alt står der."""
+        if not get_config("enable_premis_provenance"):
+            return
+        from types import SimpleNamespace
+        from siard_workflow.core.file_logger import resolve_log_dir
+        pl = PremisProvenanceLogger(resolve_log_dir(path), path,
+                                    agent_version=str(self.VERSION))
+        pl.append_existing = True
+        detail = ("Manuell endring av SIARD-header (header/metadata.xml), skrevet "
+                  "direkte i SIARD-fila: " + "; ".join(done))
+        pl.record(SimpleNamespace(operation_id="header_edit",
+                                  premis_event_type="Adjustment",
+                                  premis_event_label="metadataendring (manuell)",
+                                  premis_detail=lambda _r, _c: detail),
+                  SimpleNamespace(success=True, message=detail), None)
+        out = pl.finalize(path, None)
+        if out:
+            self._log_queue.put(("log", f"  PREMIS-hendelse ført i {out.name}", "info"))
+
+    def _header_saved(self, path: Path, info: "dict | None", changes: list,
+                      err: "str | None") -> None:
+        """Hovedtråden: lagringen er ferdig (eller feilet)."""
+        self._hdr_saving = False
+        panel = self.header_dock.panel
+        if err is not None:
+            self._log(f"SIARD-header kunne ikke lagres i {path.name}: {err} — "
+                      "fila er som før", "error")
+            panel.set_busy(False, "Lagringen feilet — SIARD-fila er som før. "
+                                  "Se kjøreloggen.")
+            return
+        for c in changes:
+            self._log(f"    {c}", "warn" if c.startswith("IKKE") else "info")
+        self._log(f"SIARD-header lagret direkte i {path.name}. Sjekksummer (SHA-256) "
+                  "beregnet tidligere gjelder ikke lenger.", "ok")
+        if path != self._hdr_path or self._running:
+            panel.set_busy(False)
+            return
+        mode = self._header_wf_mode()
+        panel.set_mode(mode)
+        stamp = datetime.datetime.now().strftime("%H:%M")
+        if info is None:
+            self.header_dock.load({"values": {}}, path.name, False,
+                                  "Fant ikke header/metadata.xml i SIARD-fila.")
+        else:
+            self.header_dock.load(info, path.name, True,
+                                  f"Lagret i SIARD-fila kl. {stamp}.  "
+                                  + self._header_idle_note(mode))
 
     def _header_apply_pending(self, ctx, file_logger, premis_logger,
                               before_repack: bool = False,
@@ -4305,9 +4555,11 @@ class App(ctk.CTk):
                    f"ikke med ({err})", "warn")
             unconf = panel.unconfirmed()
             if unconf:
-                if self._ask_header_unconfirmed(unconf):
+                _w("  SIARD-header: endringer er ikke bekreftet — kjøringen venter "
+                   "på svar før sammenpakking", "warn")
+                if self._ask_header_unconfirmed(unconf, panel.invalid_fields()):
                     values.update(panel.take_unconfirmed())
-                    _w("  SIARD-header: ubekreftede endringer lagres (valgt før "
+                    _w("  SIARD-header: endringene er bekreftet og tas med (valgt før "
                        "sammenpakking)", "info")
                 else:
                     panel.take_unconfirmed()
@@ -4420,11 +4672,34 @@ class App(ctk.CTk):
                         f"Kjører [{q_idx+1}/{q_tot}]: {path.name}")
                     needs_redraw = True
                 elif kind == "header_show":
-                    _, first, info, name, editable, note = item
-                    if first:
+                    _, first, info, name, editable, note, *_rest = item
+                    _hpath = Path(_rest[0]) if _rest else None
+                    _panel = self.header_dock.panel
+                    _panel.set_mode(self._header_wf_mode())
+                    # Samme fil som alt vises, og den kan endres: behold det
+                    # brukeren har skrevet og bekreftet før kjøringen startet
+                    _keep = (first and editable and info is not None
+                             and _hpath is not None and _hpath == self._hdr_path
+                             and _panel.is_editable())
+                    if first and not _keep:
                         self.header_dock.load(info or {"values": {}}, name, editable, note)
                     elif info is not None:
                         self.header_dock.refresh(info, editable, note)
+                    if first:
+                        self._hdr_path = _hpath
+                        self._hdr_token = None      # lesing fra før kjøringen gjelder ikke
+                    needs_redraw = True
+                elif kind == "temp_auto":
+                    _, _ta_path, _ta_best, _ta_cands = item
+                    self._apply_auto_temp(_ta_path, _ta_best, _ta_cands)
+                    needs_redraw = True
+                elif kind == "header_idle":
+                    _, _tok, _hp_path, _hp_info = item
+                    self._header_idle_loaded(_tok, _hp_path, _hp_info)
+                    needs_redraw = True
+                elif kind == "header_saved":
+                    _, _hp_path, _hp_info, _hp_changes, _hp_err = item
+                    self._header_saved(_hp_path, _hp_info, _hp_changes, _hp_err)
                     needs_redraw = True
                 elif kind == "done_one":
                     _, run, q_idx, q_tot, path = item
@@ -4487,6 +4762,11 @@ class App(ctk.CTk):
                 elif kind == "queue_done":
                     self._running = False
                     self._step_stopped = False
+                    # Uten utpakking/sammenpakking var headeren låst under
+                    # kjøringen — nå kan den endres og lagres direkte igjen
+                    if (self._header_wf_mode() == "save" and self.siard_path is not None
+                            and self.siard_path.exists()):
+                        self._header_show_idle(self.siard_path)
                     self.workflow_panel.set_running(False)
                     self.workflow_panel.highlight_step(-1)
                     self.progress_panel.reset()   # skjuler panel og Stopp-knapp
@@ -4603,6 +4883,7 @@ class App(ctk.CTk):
     def _clear_workflow(self):
         self.workflow = None
         self.workflow_panel.clear()
+        self._header_mode_update()          # tom arbeidsflyt → «Lagre endringer»
         self.log_panel.clear()
         self._log_entries.clear()
         self._log("Workflow tomt", "muted")
@@ -4667,6 +4948,19 @@ class App(ctk.CTk):
                 "Vil du legge til «Standardiser filendelser» i arbeidsflyten?")
         return self._ask_yes_no("Ikke-standard LOB-filer funnet", text,
                                 "Ja, legg til", "Nei")
+
+    def _confirm_write_in_place(self, siard_name: str) -> bool:
+        """Kalles fra «Berik SIARD» (arbeidstråd) før metadata.xml skrives
+        direkte i SIARD-fila. True = skriv direkte, False = skriv ny fil."""
+        text = (f"Steget er satt til å skrive ny metadata.xml DIREKTE i\n{siard_name}\n\n"
+                "Det tar sekunder i stedet for en full kopi, men originalfila endres: "
+                "sjekksummer som alt er beregnet, gjelder ikke lenger, og den gamle "
+                "metadata.xml blir liggende som ubrukte byte i fila.\n\n"
+                "Avbrytes skrivingen, gjenopprettes fila fra en angrefil. "
+                "Ha likevel en kopi av originalen et annet sted.\n\n"
+                "Vil du skrive direkte i fila?")
+        return self._ask_yes_no("Skrive direkte i SIARD-fila?", text,
+                                "Ja, skriv direkte", "Nei, skriv ny fil")
 
     def _ask_yes_no(self, title: str, text: str, yes_text: str = "Ja",
                     no_text: str = "Nei") -> bool:

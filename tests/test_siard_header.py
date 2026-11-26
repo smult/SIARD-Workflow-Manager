@@ -274,9 +274,12 @@ def test_run_chain(tmp: Path) -> None:
     fake._ask_yes_no = lambda title, text, yes, no: (asked.append((title, text, yes, no)),
                                                     answer["v"])[1]
     fake._ask_header_unconfirmed = App._ask_header_unconfirmed.__get__(fake)
+    fake._header_lines = App._header_lines                  # staticmethod
     fake._header_apply_pending(ctx, None, None, before_repack=True)
-    _ok(len(asked) == 1 and "Lagre endringer i SIARD-header ved pakking av ny siard?"
-        in asked[0][1] and "«Ubekreftet»" in asked[0][1],
+    _ok(len(asked) == 1 and "Endringer må bekreftes for å bli med i den nye SIARD-fila"
+        in asked[0][1] and "Kjøringen venter" in asked[0][1]
+        and asked[0][2:] == ("Bekreft endringene", "Forkast endringene")
+        and "«Ubekreftet»" in asked[0][1],
         "spørsmålet stilles med endringene listet")
     _ok("Ubekreftet" not in meta_p.read_text("utf-8") and panel.unconfirmed() == {},
         "«Nei» → ubekreftet endring forkastes")

@@ -175,6 +175,28 @@ def _read_siard_meta(path) -> dict:
     import zipfile
     import xml.etree.ElementTree as ET
     found: dict = {}
+
+    def _scan(f) -> None:
+        # Feltene står foran <schemas> — resten (kan være mange MB) leses ikke
+        for event, el in ET.iterparse(f, events=("start", "end")):
+            tag = el.tag.rsplit("}", 1)[-1].lower()
+            if event == "start":
+                if tag == "schemas":
+                    break
+            elif tag in _SIARD_META_TAGS and tag not in found:
+                found[tag] = (el.text or "").strip()
+
+    # Rask vei: bare metadata.xml leses. Å åpne arkivet med zipfile bygger
+    # hele innholdslista i Python — sekunder med full last for store uttrekk,
+    # og brukergrensesnittet blir tregt imens selv om det skjer i en bakgrunnstråd.
+    from siard_workflow.core.zip_progress import read_member_fast
+    got = read_member_fast(path, ("header/metadata.xml",))
+    if got is not None:
+        try:
+            _scan(io.BytesIO(got[1]))
+            return found
+        except ET.ParseError:
+            found.clear()
     with zipfile.ZipFile(path, "r") as zf:
         try:
             member = zf.getinfo("header/metadata.xml")
@@ -184,14 +206,7 @@ def _read_siard_meta(path) -> dict:
             if member is None:
                 return found
         with zf.open(member) as f:
-            # Feltene står foran <schemas> — resten (kan være mange MB) leses ikke
-            for event, el in ET.iterparse(f, events=("start", "end")):
-                tag = el.tag.rsplit("}", 1)[-1].lower()
-                if event == "start":
-                    if tag == "schemas":
-                        break
-                elif tag in _SIARD_META_TAGS and tag not in found:
-                    found[tag] = (el.text or "").strip()
+            _scan(f)
     return found
 
 
@@ -865,7 +880,8 @@ OP_DEFS = [
             "Beriker header/metadata.xml med tabell- og kolonnebeskrivelser fra en "
             "JSON-mal produsert av KDRS SIARDMapper-verktøyet. "
             "I pipeline-modus oppdateres metadata.xml direkte. "
-            "Standalone: skrives ny <original>_beriket.siard. Krever lxml>=4.9.0."
+            "Uten «Pakk ut SIARD» skrives ny <original>_beriket.siard — eller, "
+            "om du velger det, direkte i SIARD-fila. Krever lxml>=4.9.0."
         ),
         "status": SiardMapperOperation.status,
         "params": [
@@ -873,6 +889,10 @@ OP_DEFS = [
              "type": "str", "default": ""},
             {"key": "overwrite_existing", "label": "Overstyr eksisterende beskrivelser",
              "type": "bool", "default": False},
+            {"key": "standalone_write",   "label": "Uten utpakking: skriv til",
+             "type": "choice", "choices": ["ny_fil", "direkte"], "default": "ny_fil",
+             "hint": "ny_fil = <original>_beriket.siard (full kopi)  |  "
+                     "direkte = i selve SIARD-fila (endrer originalen)"},
         ],
     },
     # ── Pakking ──────────────────────────────────────────────────────────────

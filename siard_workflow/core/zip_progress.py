@@ -311,6 +311,446 @@ def _extract_raw(fh, offset: int, csize: int, size: int, method: int, crc: int,
     prog.add(len(data))
 
 
+# ── Kopi av arkivet med endret metadata ──────────────────────────────────────
+class RewriteCancelled(Exception):
+    """Brukeren stoppet kjøringen mens den nye fila ble skrevet."""
+
+
+class NotEnoughSpace(OSError):
+    """For lite ledig plass til den nye fila."""
+
+
+def _strip_zip64_extra(extra: bytes) -> bytes:
+    """Fjern ZIP64-feltet (id 1) — det skrives på nytt ut fra størrelsene."""
+    out, i = b"", 0
+    while i + 4 <= len(extra):
+        tag, ln = struct.unpack_from("<HH", extra, i)
+        if tag != 1:
+            out += extra[i:i + 4 + ln]
+        i += 4 + ln
+    return out
+
+
+def _copy_entry_raw(raw, zi: zipfile.ZipInfo, zout: zipfile.ZipFile,
+                    prog: "Optional[ByteProgress]", stop) -> None:
+    """
+    Kopier én oppføring uten å pakke den ut: de komprimerte bytene flyttes som
+    de er, med ny lokal header. CRC og størrelser hentes fra innholdslista.
+    """
+    raw.seek(zi.header_offset)
+    hdr = raw.read(30)
+    if len(hdr) < 30 or hdr[:4] != b"PK\x03\x04":
+        raise zipfile.BadZipFile(f"ugyldig lokal filheader for {zi.filename}")
+    n, m = struct.unpack_from("<HH", hdr, 26)
+    raw.seek(zi.header_offset + 30 + n + m)
+
+    import copy
+    ni = copy.copy(zi)
+    ni.flag_bits &= ~0x08            # størrelsene står i headeren (ingen datadeskriptor)
+    ni.extra = _strip_zip64_extra(zi.extra or b"")
+    out = zout.fp
+    out.seek(zout.start_dir)
+    ni.header_offset = out.tell()
+    zip64 = (ni.file_size > zipfile.ZIP64_LIMIT
+             or ni.compress_size > zipfile.ZIP64_LIMIT)
+    out.write(ni.FileHeader(zip64))
+    left = zi.compress_size
+    while left > 0:
+        if stop is not None and stop():
+            raise RewriteCancelled()
+        chunk = raw.read(min(CHUNK, left))
+        if not chunk:
+            raise EOFError(f"arkivet sluttet for tidlig ({zi.filename})")
+        out.write(chunk)
+        left -= len(chunk)
+        if prog:
+            prog.add(len(chunk))
+    zout.filelist.append(ni)
+    zout.NameToInfo[ni.filename] = ni
+    zout.start_dir = out.tell()
+    zout._didModify = True
+    if prog:
+        prog.add(0, 1)
+
+
+def rewrite_zip(src: Path, dst: Path, replace: "Optional[dict]" = None,
+                skip: "Optional[Callable[[str], bool]]" = None, *,
+                setup: "Optional[Callable]" = None,
+                stop: "Optional[Callable[[], bool]]" = None) -> dict:
+    """
+    Skriv en kopi av zip-arkivet `src` til `dst`, der oppføringene i `replace`
+    ({navn: bytes}) er byttet ut og de `skip(navn)` peker ut, er utelatt.
+
+    Alt annet kopieres RÅTT og strømmet: ingenting pakkes ut og inn igjen, og
+    ingenting holdes i minnet. (Før ble hele den nye fila bygget i minnet —
+    umulig for store SIARD-filer, og uten livstegn underveis.)
+
+    `setup(oppføringer, bytes_totalt)` kalles før noe skrives og kan gi
+    `(fremdrift, før, etter)`: en ByteProgress og funksjoner som kalles med
+    `(indeks, ZipInfo)` før og etter hver oppføring. Den kan også avbryte ved
+    å kaste et unntak (f.eks. NotEnoughSpace).
+
+    Fila skrives som `dst` + «.part» og får riktig navn når alt er skrevet;
+    ved feil eller stopp slettes den halvferdige fila.
+    """
+    src, dst = Path(src), Path(dst)
+    replace = dict(replace or {})
+    part = dst.with_name(dst.name + ".part")
+    stats = {"copied": 0, "replaced": 0, "skipped": 0, "entries": 0}
+    try:
+        with zipfile.ZipFile(src, "r") as zin:
+            infos = zin.infolist()
+            total = sum(i.compress_size for i in infos)
+            prog = before = after = None
+            if setup is not None:
+                got = setup(infos, total)
+                if got:
+                    prog, before, after = got
+            with open(src, "rb") as raw, \
+                 zipfile.ZipFile(part, "w", zipfile.ZIP_DEFLATED,
+                                 allowZip64=True) as zout:
+                for idx, zi in enumerate(infos):
+                    if stop is not None and stop():
+                        raise RewriteCancelled()
+                    if before:
+                        before(idx, zi)
+                    name = zi.filename
+                    if skip is not None and skip(name):
+                        stats["skipped"] += 1
+                        if prog:
+                            prog.add(zi.compress_size, 1)
+                    elif name in replace:
+                        ni = zipfile.ZipInfo(name, date_time=zi.date_time)
+                        ni.compress_type = zipfile.ZIP_DEFLATED
+                        ni.external_attr = zi.external_attr
+                        ni.comment = zi.comment
+                        zout.writestr(ni, replace[name])
+                        stats["replaced"] += 1
+                        if prog:
+                            prog.add(zi.compress_size, 1)
+                    else:
+                        _copy_entry_raw(raw, zi, zout, prog, stop)
+                        stats["copied"] += 1
+                    if after:
+                        after(idx, zi)
+                stats["entries"] = len(zout.filelist)
+            if prog:
+                prog.finish()
+        os.replace(part, dst)
+    except BaseException:
+        try:
+            part.unlink()
+        except OSError:
+            pass
+        raise
+    return stats
+
+
+def write_siard_copy(src: Path, dst: Path, replace: dict, *,
+                     skip: "Optional[Callable[[str], bool]]" = None,
+                     tables: "Optional[list]" = None,
+                     pcb: "Optional[Callable]" = None,
+                     w: "Optional[Callable[[str, str], None]]" = None,
+                     stop: "Optional[Callable[[], bool]]" = None) -> dict:
+    """
+    Ny SIARD-fil med endret metadata.xml — for operasjoner som kjøres uten
+    «Pakk ut SIARD». Sjekker ledig plass, viser fremdrift i bytes med anslått
+    gjenstående tid, og melder fra for hver tabell som er ferdig skrevet.
+
+    `tables`: [(skjemamappe, tabellmappe, tabellnavn)] fra metadata.xml.
+    """
+    import shutil
+    src, dst = Path(src), Path(dst)
+    say = w or (lambda _m, _l="info": None)
+    names = {(str(s or "").lower(), str(t or "").lower()): n
+             for s, t, n in (tables or [])}
+    t0 = time.monotonic()
+
+    def _key(name: str) -> "tuple | None":
+        p = name.split("/")
+        if len(p) >= 4 and p[0].lower() == "content":
+            return p[1].lower(), p[2].lower()
+        return None
+
+    def _setup(infos, total):
+        kept = [i for i in infos if not (skip and skip(i.filename))]
+        need = (sum(i.compress_size for i in kept if i.filename not in replace)
+                + sum(len(v) for v in replace.values()) + 150 * len(kept) + (1 << 20))
+        try:
+            free = shutil.disk_usage(dst.parent).free
+        except OSError:
+            free = None
+        say(f"  Skriver ny SIARD-fil: {_n(len(kept))} filer, {fmt_bytes(need)}"
+            + (f" (ledig på disken: {fmt_bytes(free)})" if free is not None else ""), "info")
+        if free is not None and free < need * 1.01:
+            raise NotEnoughSpace(
+                f"For lite ledig plass i {dst.parent}: trenger {fmt_bytes(need)}, "
+                f"ledig {fmt_bytes(free)}")
+        say("  Innholdet kopieres uendret (uten ny komprimering); bare metadata.xml "
+            "skrives på nytt", "info")
+
+        last: dict = {}
+        size: dict = {}
+        for idx, i in enumerate(infos):
+            k = _key(i.filename)
+            if k is not None and not (skip and skip(i.filename)):
+                last[k] = idx
+                size[k] = size.get(k, 0) + i.compress_size
+        n_tables = len(last)
+        prog = ByteProgress("Skriver ny SIARD", len(infos), total, pcb, w)
+        state = {"cur": None, "done": 0, "seen": 0}
+
+        def before(idx, zi):
+            k = _key(zi.filename)
+            if k is not None and k != state["cur"] and k in last:
+                state["cur"] = k
+                state["seen"] += 1
+                prog.verb = (f"Skriver ny SIARD — {names.get(k, k[1])} "
+                             f"(tabell {min(state['seen'], n_tables)} av {n_tables})")
+
+        def after(idx, zi):
+            k = _key(zi.filename)
+            if k is not None and last.get(k) == idx:
+                state["done"] += 1
+                say(f"  {state['done']}/{n_tables} tabeller skrevet — "
+                    f"{names.get(k, k[1])} ({fmt_bytes(size[k])})", "info")
+
+        return prog, before, after
+
+    stats = rewrite_zip(src, dst, replace, skip, setup=_setup, stop=stop)
+    stats["seconds"] = time.monotonic() - t0
+    try:
+        stats["bytes"] = dst.stat().st_size
+    except OSError:
+        stats["bytes"] = 0
+    return stats
+
+
+# ── Rask lesing av én oppføring ──────────────────────────────────────────────
+def read_member_fast(zip_path: Path, names: "tuple | list",
+                     max_size: int = 512 << 20) -> "tuple[str, bytes] | None":
+    """
+    Les én oppføring (første av `names` som finnes) fra et zip-arkiv UTEN å
+    bygge hele innholdslista.
+
+    zipfile.ZipFile lager ett Python-objekt per fil når arkivet åpnes — for en
+    SIARD med millioner av LOB-filer tar det mange sekunder med ren
+    Python-kjøring, som også gjør brukergrensesnittet tregt når det skjer i en
+    bakgrunnstråd. Her letes filnavnet opp direkte i innholdslistas rå byte
+    (lesing fra disk + bytes.find), og bare den ene oppføringen pakkes ut.
+
+    Returnerer (navn, innhold), eller None når oppføringen ikke finnes eller
+    arkivet har en form som ikke håndteres her — kall da zipfile i stedet.
+    """
+    try:
+        with open(zip_path, "rb") as f:
+            size = f.seek(0, 2)
+            tail_len = min(size, 65536 + 22 + 20)
+            f.seek(size - tail_len)
+            tail = f.read(tail_len)
+            i = tail.rfind(b"PK\x05\x06")
+            if i < 0 or i + 22 > len(tail):
+                return None
+            _d, _cd, _nd, n_total, cd_size, cd_off = struct.unpack_from("<HHHHII", tail, i + 4)
+            if n_total == 0xFFFF or cd_size == 0xFFFFFFFF or cd_off == 0xFFFFFFFF:
+                # ZIP64: pekeren til den store sluttposten står rett foran
+                j = i - 20
+                if j < 0 or tail[j:j + 4] != b"PK\x06\x07":
+                    return None
+                z64_off = struct.unpack_from("<Q", tail, j + 8)[0]
+                f.seek(z64_off)
+                rec = f.read(56)
+                if len(rec) < 56 or rec[:4] != b"PK\x06\x06":
+                    return None
+                cd_size, cd_off = struct.unpack_from("<QQ", rec, 40)
+            if cd_off + cd_size > size:
+                return None
+            f.seek(cd_off)
+            if f.read(4) != b"PK\x01\x02":
+                return None                       # f.eks. data lagt foran arkivet
+
+            for name in names:
+                nb = name.encode("utf-8")
+                pos = _find_cd_record(f, cd_off, cd_size, nb)
+                if pos is None:
+                    continue
+                f.seek(pos)
+                head = f.read(46)
+                flags, method = struct.unpack_from("<HH", head, 8)
+                crc, csize, usize = struct.unpack_from("<III", head, 16)
+                fnlen, exlen = struct.unpack_from("<HH", head, 28)
+                lho = struct.unpack_from("<I", head, 42)[0]
+                f.seek(pos + 46 + fnlen)
+                extra = f.read(exlen)
+                # ZIP64-tillegget har verdiene som ikke fikk plass, i fast rekkefølge
+                k = 0
+                while k + 4 <= len(extra):
+                    tag, ln = struct.unpack_from("<HH", extra, k)
+                    if tag == 1:
+                        q = k + 4
+                        if usize == 0xFFFFFFFF:
+                            usize = struct.unpack_from("<Q", extra, q)[0]
+                            q += 8
+                        if csize == 0xFFFFFFFF:
+                            csize = struct.unpack_from("<Q", extra, q)[0]
+                            q += 8
+                        if lho == 0xFFFFFFFF:
+                            lho = struct.unpack_from("<Q", extra, q)[0]
+                        break
+                    k += 4 + ln
+                if flags & 0x01 or method not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+                    return None                   # kryptert / annen komprimering
+                if csize > max_size or usize > max_size:
+                    return None
+                f.seek(lho)
+                lh = f.read(30)
+                if len(lh) < 30 or lh[:4] != b"PK\x03\x04":
+                    return None
+                n, m = struct.unpack_from("<HH", lh, 26)
+                f.seek(lho + 30 + n + m)
+                raw = f.read(csize)
+                if len(raw) != csize:
+                    return None
+                data = zlib.decompress(raw, -15) if method == zipfile.ZIP_DEFLATED else raw
+                if len(data) != usize or zlib.crc32(data) & 0xFFFFFFFF != crc:
+                    return None
+                return name, data
+    except (OSError, struct.error, zlib.error, ValueError):
+        return None
+    return None
+
+
+def _find_cd_record(f, cd_off: int, cd_size: int, name: bytes) -> "int | None":
+    """Filposisjonen til innholdslistas post for `name` (nøyaktig navn), eller None."""
+    block = 8 << 20
+    keep = 46 + len(name) + 8                 # overlapp, så et treff på blokkgrensa finnes
+    pos, buf, base = cd_off, b"", cd_off
+    end = cd_off + cd_size
+    while pos < end:
+        f.seek(pos)
+        chunk = f.read(min(block, end - pos))
+        if not chunk:
+            break
+        buf = buf[-keep:] + chunk
+        base = pos + len(chunk) - len(buf)
+        pos += len(chunk)
+        at = buf.find(name)
+        while at >= 0:
+            start = at - 46
+            if (start >= 0 and buf[start:start + 4] == b"PK\x01\x02"
+                    and struct.unpack_from("<H", buf, start + 28)[0] == len(name)):
+                return base + start
+            at = buf.find(name, at + 1)
+    return None
+
+
+# ── Endring direkte i arkivet ────────────────────────────────────────────────
+# Én oppføring (metadata.xml) byttes ut uten at arkivet kopieres: den nye
+# versjonen skrives der innholdslista sto, og ny innholdsliste skrives etter.
+# Tar sekunder uansett størrelse — men ORIGINALFILA endres. Derfor lagres den
+# gamle innholdslista i en angrefil først; avbrytes skrivingen, legges den
+# tilbake (med en gang, eller neste gang fila brukes), og fila er som før.
+UNDO_SUFFIX = ".angre"
+
+
+def undo_path(zip_path: Path) -> Path:
+    zip_path = Path(zip_path)
+    return zip_path.with_name(zip_path.name + UNDO_SUFFIX)
+
+
+def restore_interrupted_update(zip_path: Path,
+                               w: "Optional[Callable[[str, str], None]]" = None) -> bool:
+    """
+    Finnes det en angrefil etter en avbrutt direkte-endring, legges den gamle
+    innholdslista tilbake og fila får opprinnelig størrelse. Returnerer True
+    når fila ble gjenopprettet.
+    """
+    import hashlib
+    import json
+    zip_path = Path(zip_path)
+    undo = undo_path(zip_path)
+    if not undo.is_file():
+        return False
+    with open(undo, "rb") as u:
+        head = json.loads(u.readline().decode("utf-8"))
+        tail = u.read()
+    if (len(tail) != head["tail_len"]
+            or hashlib.sha256(tail).hexdigest() != head["sha256"]):
+        raise zipfile.BadZipFile(
+            f"Angrefila {undo.name} er skadet — {zip_path.name} kan ikke "
+            f"gjenopprettes automatisk")
+    with open(zip_path, "r+b") as f:
+        f.seek(head["start_dir"])
+        f.write(tail)
+        f.truncate(head["size"])
+        f.flush()
+        os.fsync(f.fileno())
+    undo.unlink()
+    if w:
+        w(f"  {zip_path.name} er gjenopprettet slik den var før en avbrutt "
+          f"endring (angrefila er brukt og slettet)", "warn")
+    return True
+
+
+def update_member_in_place(zip_path: Path, name: str, data: bytes, *,
+                           w: "Optional[Callable[[str, str], None]]" = None) -> dict:
+    """
+    Bytt ut oppføringen `name` i zip-arkivet med `data` — i selve fila.
+
+    Ingen andre byte i arkivet flyttes eller leses. Den gamle versjonen av
+    oppføringen blir liggende som ubrukte byte (den står ikke lenger i
+    innholdslista). Feiler noe underveis, gjenopprettes fila fra angrefila.
+    """
+    import datetime
+    import hashlib
+    import json
+    zip_path = Path(zip_path)
+    restore_interrupted_update(zip_path, w)
+    size = zip_path.stat().st_size
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        start_dir = zf.start_dir
+        n_before = len(zf.filelist)
+        zf.getinfo(name)                       # KeyError hvis den ikke finnes
+    with open(zip_path, "rb") as f:
+        f.seek(start_dir)
+        tail = f.read()                        # innholdslista (ca. 100 byte per fil)
+
+    # 1. Angrefil — skrives ferdig og til disk FØR SIARD-fila røres
+    undo = undo_path(zip_path)
+    tmp = undo.with_name(undo.name + ".tmp")
+    head = {"size": size, "start_dir": start_dir, "tail_len": len(tail),
+            "sha256": hashlib.sha256(tail).hexdigest(), "member": name,
+            "written": datetime.datetime.now().isoformat(timespec="seconds")}
+    with open(tmp, "wb") as u:
+        u.write(json.dumps(head).encode("utf-8") + b"\n")
+        u.write(tail)
+        u.flush()
+        os.fsync(u.fileno())
+    os.replace(tmp, undo)
+
+    # 2. Skriv ny oppføring + ny innholdsliste, og kontroller resultatet
+    try:
+        with zipfile.ZipFile(zip_path, "a", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+            old = zf.getinfo(name)
+            zf.filelist.remove(old)
+            del zf.NameToInfo[name]
+            ni = zipfile.ZipInfo(name, date_time=datetime.datetime.now().timetuple()[:6])
+            ni.compress_type = zipfile.ZIP_DEFLATED
+            ni.external_attr = old.external_attr
+            zf.writestr(ni, data)
+        with open(zip_path, "r+b") as f:
+            os.fsync(f.fileno())
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            if len(zf.filelist) != n_before or zf.read(name) != data:
+                raise zipfile.BadZipFile("kontrollen etter skriving feilet")
+    except BaseException:
+        restore_interrupted_update(zip_path, w)
+        raise
+    undo.unlink()
+    return {"entries": n_before, "size_before": size,
+            "size_after": zip_path.stat().st_size, "dead_bytes": 0}
+
+
 # ── Innpakking ───────────────────────────────────────────────────────────────
 
 def scan_files(root: Path, pcb: "Optional[Callable]" = None) -> "list[tuple[Path, int]]":
