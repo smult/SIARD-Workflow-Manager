@@ -32,7 +32,7 @@ from siard_workflow.core.siard_format import (
 )
 from siard_workflow.core import external_lob
 from siard_workflow.core.zip_progress import (
-    BIG_FILE, CHUNK, ByteProgress, extract_all, fmt_bytes, fmt_duration,
+    BIG_FILE, CHUNK, ByteProgress, ExtractErrors, extract_all, fmt_bytes, fmt_duration,
     read_small, rmtree_progress, scan_files,
 )
 
@@ -64,6 +64,10 @@ def _root_tag_end(head: bytes) -> int:
                 return j + 1
             break
     return head.rfind(b"\n") + 1 or len(head)
+
+
+_MAX_UNPACK_WARNINGS = 20       # advarsler per fil i loggen ved utpakkingsfeil
+_MAX_LOSS_LISTED = 12           # filer/tabeller listet i advarselen om datatap
 
 
 def _zip_workers() -> int:
@@ -130,6 +134,10 @@ class UnpackSiardOperation(BaseOperation):
             if log: log.log(msg, lvl)
             if pcb: pcb("log", msg=msg, level=lvl)
 
+        # Settes når utpakkingen stopper fordi data mangler: da skal ingen
+        # flere steg kjøres for denne fila (se halt_on_failure i kjøreløkka)
+        self.halt_on_failure = False
+
         # Hopp over hvis allerede pakket ut (f.eks. ved gjenkjøring)
         if ctx.extracted_path and ctx.extracted_path.is_dir():
             w(f"  SIARD allerede utpakket: {ctx.extracted_path}", "info")
@@ -159,27 +167,61 @@ class UnpackSiardOperation(BaseOperation):
         def _prog(n_files: int, n_bytes: int) -> ByteProgress:
             w(f"  {_fnum(n_files)} filer, {fmt_bytes(n_bytes)} utpakket størrelse", "info")
             return ByteProgress("Pakker ut", n_files, n_bytes, pcb, w)
+        errors = ExtractErrors()
+        n_warned = [0]
+
+        def _warn(msg: str) -> None:
+            # Full disk gir én feil per gjenstående fil — logg de første
+            n_warned[0] += 1
+            if n_warned[0] <= _MAX_UNPACK_WARNINGS:
+                w(msg, "warn")
         try:
             original_namelist, n_done = extract_all(
                 siard_path, tmp, _prog, workers=_zip_workers(),
                 stop=(stop_ev.is_set if stop_ev else None),
-                warn=lambda m: w(m, "warn"))
+                warn=_warn, errors=errors,
+                on_disk_full=self._disk_full_asker(ctx, tmp, siard_path, w))
         except Exception as exc:
             shutil.rmtree(tmp, ignore_errors=True)
             return self._fail(f"Kunne ikke åpne SIARD: {exc}")
         if stop_ev is not None and stop_ev.is_set():
             shutil.rmtree(tmp, ignore_errors=True)
             return self._fail("Utpakkingen ble stoppet")
+        if n_warned[0] > _MAX_UNPACK_WARNINGS:
+            w(f"  … og {_fnum(n_warned[0] - _MAX_UNPACK_WARNINGS)} tilsvarende "
+              f"advarsler til (ikke listet)", "warn")
+        if errors.fatal:
+            w(f"  FEIL: Utpakkingen ble avbrutt — {errors.fatal}. "
+              f"{_fnum(errors.count)} fil(er) rakk å feile før avbruddet.", "feil")
+            rmtree_progress(tmp, w, "Rydder temp-mappa", pcb=pcb)
+            self.halt_on_failure = True
+            return self._fail(f"Utpakkingen ble avbrutt: {errors.fatal}. Frigjør plass "
+                              f"eller velg en annen temp-mappe, og kjør på nytt.")
 
         elapsed = (datetime.datetime.now() - t0).total_seconds()
-        w(f"  Pakket ut {_fnum(n_done)} filer på {fmt_duration(elapsed)}", "ok")
+        n_ok = n_done - errors.count
+        w(f"  Pakket ut {_fnum(n_ok)} filer på {fmt_duration(elapsed)}",
+          "warn" if errors else "ok")
+
+        # ── Er alt kommet med, og er tabellfilene hele? ───────────────────────
+        # Filer som ikke lot seg pakke ut, og tabellfiler uten avsluttende
+        # </table>, betyr at data mangler. Kjøringen stoppes; operatøren kan
+        # velge å fortsette, men da med datatap.
+        loss = self._check_unpacked(tmp, siard_path, errors, ctx, w)
+        if loss is None:
+            rmtree_progress(tmp, w, "Rydder temp-mappa", pcb=pcb)
+            self.halt_on_failure = True
+            return self._fail(
+                "Stoppet etter utpakking: data mangler ("
+                + self._loss_text(errors.count, len(self._incomplete)) + ")")
 
         ctx.extracted_path = tmp
         data = {
             "extracted_path":    str(tmp),
             "original_namelist": original_namelist,
-            "files_extracted":   n_done,
+            "files_extracted":   n_ok,
         }
+        data.update(loss)
 
         # ── Internaliser eksternt fillager (ekstern lobFolder) ─────────────────
         # SIARD kan lagre LOB-ene i en søstermappe (ekstern db-nivå <lobFolder>).
@@ -276,7 +318,162 @@ class UnpackSiardOperation(BaseOperation):
                     w(f"  Advarsel: could not invoke ask_schema_selector_cb: {exc}",
                       "warn")
 
-        return self._ok(data, f"{_fnum(n_done)} filer pakket ut til {tmp}")
+        msg = f"{_fnum(n_ok)} filer pakket ut til {tmp}"
+        if loss:
+            msg += (" — ADVARSEL: data mangler ("
+                    + self._loss_text(errors.count, len(self._incomplete))
+                    + "); operatøren valgte å fortsette")
+        return self._ok(data, msg)
+
+    # ── Full disk under utpakkingen ───────────────────────────────────────────
+
+    @staticmethod
+    def _disk_full_asker(ctx, tmp: Path, siard_path: Path, w):
+        """
+        Callback til extract_all når disken blir full: utpakkingen venter, og
+        operatøren får rydde plass og velge «Fortsett» eller «Avbryt». Kontrollen
+        av at det faktisk er blitt mer ledig plass gjøres av DiskFullGate, som
+        spør på nytt (no_gain) hvis ikke. None uten operatør — da avbrytes det.
+        """
+        ask = ctx.metadata.get("ask_disk_full_cb")
+        if ask is None:
+            return None
+        drive = Path(tmp).anchor or str(tmp)
+
+        def _on_full(info: dict) -> bool:
+            free = info.get("free", -1)
+            free_txt = fmt_bytes(free) if free >= 0 else "ukjent"
+            left_txt = fmt_bytes(info.get("remaining", 0))
+            parts = []
+            if info.get("no_gain"):
+                w(f"  Det er ikke blitt mer ledig plass på {drive} (ledig: {free_txt}) — "
+                  f"varsler på nytt", "warn")
+                parts.append("Det er IKKE blitt mer ledig plass siden du valgte «Fortsett». "
+                             "Rydd mer plass, eller avbryt.")
+            else:
+                w(f"  DISKEN ER FULL ({drive}) — utpakkingen venter på operatøren. "
+                  f"Ledig: {free_txt}; gjenstår å pakke ut: {left_txt}", "feil")
+            parts.append(f"Disken med temp-mappa ({drive}) er full. Utpakkingen av "
+                         f"{siard_path.name} venter — ingenting er avbrutt.")
+            parts.append(f"  Ledig nå:             {free_txt}\n"
+                         f"  Gjenstår å pakke ut:  {left_txt}\n"
+                         f"  Temp-mappe:           {tmp}")
+            parts.append("Rydd plass på disken og velg «Fortsett». Programmet kontrollerer "
+                         "at det er blitt mer ledig plass før utpakkingen går videre; hvis "
+                         "ikke, får du dette varselet på nytt.")
+            parts.append("Velger du «Avbryt kjøringen», stoppes kjøringen og temp-mappa "
+                         "ryddes.")
+            try:
+                go_on = bool(ask("DISKEN ER FULL — UTPAKKINGEN VENTER", "\n\n".join(parts)))
+            except Exception as exc:
+                w(f"  Spørsmålet kunne ikke stilles ({exc}) — utpakkingen avbrytes.", "warn")
+                go_on = False
+            if not go_on:
+                w("  Operatøren avbrøt utpakkingen (full disk).", "warn")
+            return go_on
+
+        _on_full.resumed = lambda free: w(
+            f"  Mer ledig plass på {drive} ({fmt_bytes(free)}) — utpakkingen fortsetter", "ok")
+        return _on_full
+
+    # ── Kontroll etter utpakking ──────────────────────────────────────────────
+
+    @staticmethod
+    def _loss_text(n_failed: int, n_incomplete: int) -> str:
+        parts = []
+        if n_failed:
+            parts.append(f"{_fnum(n_failed)} fil(er) ikke pakket ut")
+        if n_incomplete:
+            parts.append(f"{_fnum(n_incomplete)} ufullstendig(e) tabellfil(er)")
+        return ", ".join(parts)
+
+    def _check_unpacked(self, tmp: Path, siard_path: Path, errors, ctx, w) -> "dict | None":
+        """
+        Kom alt med, og er tabellfilene hele (slutter med </table>)?
+
+        Returnerer {} når alt er i orden. Mangler data, stoppes kjøringen og
+        operatøren får en kraftig advarsel: None = stopp (standard, også uten
+        operatør), ellers resultatfeltene som dokumenterer at operatøren valgte
+        å fortsette med datatap.
+        """
+        from siard_workflow.core import table_integrity as ti
+        self._incomplete = []
+        n_checked = 0
+        try:
+            res = ti.check_dir(tmp)
+            failed_names = {name for name, _why in errors.items}
+            # En tabellfil som ikke lot seg pakke ut står alt i fillista
+            self._incomplete = [f for f in res["findings"]
+                                if not (f["kind"] == ti.MISSING and f["path"] in failed_names)]
+            n_checked = res["checked"]
+        except Exception as exc:
+            w(f"  Advarsel: tabellfilene kunne ikke kontrolleres: {exc}", "warn")
+        incomplete = self._incomplete
+        if not errors and not incomplete:
+            if n_checked:
+                w(f"  Tabellfiler kontrollert: {_fnum(n_checked)} — alle slutter med "
+                  f"</table>", "ok")
+            return {}
+
+        loss = {
+            "data_loss_accepted":      True,
+            "unpack_failed":           errors.count,
+            "unpack_failed_files":     [f"{name} — {why}" for name, why in errors.items[:50]],
+            "tables_incomplete":       len(incomplete),
+            "tables_incomplete_files": [ti.format_finding(f) for f in incomplete[:50]],
+        }
+        lines: list = []
+        if errors:
+            lines.append(f"{_fnum(errors.count)} fil(er) kunne IKKE pakkes ut:")
+            lines += [f"  • {name} — {why}" for name, why in errors.items[:_MAX_LOSS_LISTED]]
+            if errors.count > _MAX_LOSS_LISTED:
+                lines.append(f"  … og {_fnum(errors.count - _MAX_LOSS_LISTED)} til")
+        if incomplete:
+            if lines:
+                lines.append("")
+            lines.append(f"{_fnum(len(incomplete))} tabellfil(er) er ufullstendige:")
+            lines += ti.summary_lines(incomplete, _MAX_LOSS_LISTED)
+
+        if errors:
+            title = "FEIL VED UTPAKKING — DATA MANGLER"
+            intro = (f"Utpakkingen av {siard_path.name} gikk IKKE feilfritt, og "
+                     f"kjøringen er stoppet.")
+            advice = ("Anbefalt: stopp kjøringen, kontroller ledig diskplass og at "
+                      "SIARD-fila er hel (be om nytt uttrekk hvis den er skadet), og "
+                      "kjør på nytt.")
+        else:
+            title = "UFULLSTENDIGE TABELLFILER — DATA MANGLER"
+            intro = (f"{siard_path.name} ble pakket ut uten feil, men tabellfilene under "
+                     f"er ufullstendige i selve SIARD-fila. Kjøringen er stoppet.")
+            advice = ("Anbefalt: stopp kjøringen og be om nytt uttrekk — eksporten ble "
+                      "trolig avbrutt, og rader mangler.")
+        warning = ("Du KAN fortsette, men da MANGLER disse dataene i resultatet. Er en "
+                   "tabellfil rammet, kan hele eller store deler av tabellen gå tapt — "
+                   "POTENSIELT STORT DATATAP. Steg som leser en ufullstendig tabellfil "
+                   "rad for rad, vil dessuten feile.")
+
+        w("  " + "!" * 54, "feil")
+        w(f"  {title}", "feil")
+        for ln in lines:
+            w(f"  {ln}", "feil")
+        w("  " + "!" * 54, "feil")
+
+        go_on = False
+        ask = ctx.metadata.get("ask_data_loss_cb")
+        if ask is None:
+            w("  Ingen operatør å spørre — kjøringen stoppes.", "warn")
+        else:
+            try:
+                go_on = bool(ask(title, "\n\n".join(
+                    [intro, "\n".join(lines), warning, advice])))
+            except Exception as exc:
+                w(f"  Spørsmålet kunne ikke stilles ({exc}) — kjøringen stoppes.", "warn")
+        if not go_on:
+            w("  Kjøringen stoppes. Original-SIARD er ikke endret.", "feil")
+            return None
+        w("  OPERATØREN VALGTE Å FORTSETTE MED MANGLENDE DATA — resultatet blir "
+          "ufullstendig (" + self._loss_text(errors.count, len(incomplete)) + ").", "feil")
+        return loss
 
     @staticmethod
     def _count_non_standard_lob_files(extract_dir: Path) -> int:

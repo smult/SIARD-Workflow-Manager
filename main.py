@@ -181,6 +181,13 @@ def main():
         except Exception:
             pass
         raise
+    # Hovedvinduet er borte. Avslutt prosessen for godt — ellers kan en tråd
+    # som venter (f.eks. en kjøring på pause) holde den i live uten vindu, mens
+    # livstegnet fortsetter å gå. Returnerer aldri.
+    try:
+        app.shutdown_after_mainloop()
+    finally:
+        os._exit(0)
 
 
 if __name__ == "__main__":

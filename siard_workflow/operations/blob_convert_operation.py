@@ -50,6 +50,7 @@ import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path, PurePosixPath
 
+from siard_workflow.core.atomic_write import write_bytes_atomic
 from siard_workflow.core.base_operation import BaseOperation, OperationResult
 from siard_workflow.core.context import WorkflowContext
 from siard_workflow.core import external_lob
@@ -1984,7 +1985,7 @@ def _annotate_missing_refs_in_xml(extract_dir: Path,
 
         if modified:
             try:
-                xml_file.write_bytes(b"".join(out_lines))
+                write_bytes_atomic(xml_file, b"".join(out_lines))
             except Exception as exc:
                 w(f"  Kunne ikke skrive annotert XML {xml_sti}: {exc}",
                   "warn")
@@ -2024,7 +2025,7 @@ def _prepatch_external_refs(
                 w(f"  Pre-patch ekstern ref: '{orig}' → '{new}' i {xml_sti}", "info")
         if changed:
             try:
-                xml_path.write_bytes(data)
+                write_bytes_atomic(xml_path, data)
             except Exception as exc:
                 w(f"  Pre-patch skriving feilet for {xml_sti}: {exc}", "warn")
 
@@ -6817,7 +6818,8 @@ class BlobConvertOperation(BaseOperation):
             if n > 0 or xml_sti in xml_pre:
                 xml_out = extract_dir / xml_sti
                 try:
-                    xml_out.write_bytes(patched)
+                    # Byttes inn i ett trinn — aldri en halvskrevet tabellfil
+                    write_bytes_atomic(xml_out, patched)
                 except Exception as exc:
                     w(f"  FEIL skriv {xml_sti}: {exc}", "feil")
                     n = 0

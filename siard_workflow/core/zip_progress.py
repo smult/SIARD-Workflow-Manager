@@ -147,13 +147,148 @@ def _target_path(name: str, dest: str) -> str:
     return os.path.join(dest, arc)
 
 
+class ExtractErrors:
+    """
+    Filer som ikke lot seg pakke ut. Trådsikker. Antallet er alltid riktig;
+    detaljene (navn, årsak) holdes for de første KEEP. `fatal` settes når det
+    ikke er vits i å fortsette (disken er full) — da avbrytes utpakkingen.
+    """
+    KEEP = 200
+
+    def __init__(self) -> None:
+        self.count = 0
+        self.items: list = []            # [(navn i arkivet, årsak)]
+        self.fatal = ""
+        self._lock = threading.Lock()
+
+    def add(self, name: str, exc) -> None:
+        with self._lock:
+            self.count += 1
+            if len(self.items) < self.KEEP:
+                self.items.append((name, str(exc)))
+            if is_disk_full(exc):
+                self.fatal = "disken er full"
+
+    def __bool__(self) -> bool:
+        return self.count > 0
+
+
+def is_disk_full(exc) -> bool:
+    import errno
+    return isinstance(exc, OSError) and (
+        exc.errno == errno.ENOSPC or getattr(exc, "winerror", 0) in (39, 112))
+
+
+class DiskFullGate:
+    """
+    Disken ble full under utpakkingen: vent i stedet for å avbryte.
+
+    Tråden som får «disken er full», kaller handle(). Én tråd om gangen spør
+    operatøren (ask(info) → True = fortsett, False = avbryt); de andre venter på
+    samme svar. Ved «fortsett» kontrolleres det at det er blitt MER ledig plass
+    enn da det ble spurt — ellers spørres det på nytt (info["no_gain"]). True
+    fra handle() betyr «prøv fila på nytt».
+
+    info: dest, free (ledig nå), remaining (gjenstår å pakke ut), name (fila
+    som stoppet), no_gain (forrige «fortsett» ga ikke mer plass), asked (antall
+    ganger spurt).
+    """
+    MIN_GAIN = 1 << 20               # «mer ledig plass» = minst så mye mer
+
+    def __init__(self, dest: str, ask: Callable[[dict], bool],
+                 remaining: "Optional[Callable[[], int]]" = None) -> None:
+        self.dest = dest
+        self.aborted = False
+        self.asked = 0               # antall ganger operatøren er spurt
+        self.resumed = 0             # antall ganger utpakkingen har fortsatt
+        self._ask = ask
+        self._remaining = remaining
+        self._lock = threading.Lock()
+        self._resolved_at = -1.0
+
+    def free(self) -> int:
+        """Ledig plass på måldisken (-1 hvis den ikke kan leses)."""
+        import shutil as _sh
+        try:
+            return _sh.disk_usage(self.dest).free
+        except OSError:
+            return -1
+
+    def handle(self, name: str) -> bool:
+        t_fail = time.monotonic()
+        with self._lock:
+            if self.aborted:
+                return False
+            if self._resolved_at >= t_fail:
+                return True          # en annen tråd fikk svar mens denne ventet
+            free0 = self.free()
+            no_gain = False
+            while True:
+                self.asked += 1
+                info = {"dest": self.dest, "free": self.free(), "name": name,
+                        "remaining": self._remaining() if self._remaining else 0,
+                        "no_gain": no_gain, "asked": self.asked}
+                try:
+                    go_on = bool(self._ask(info))
+                except Exception:
+                    go_on = False
+                if not go_on:
+                    self.aborted = True
+                    return False
+                free = self.free()
+                if free < 0 or free0 < 0 or free - free0 >= self.MIN_GAIN:
+                    self._resolved_at = time.monotonic()
+                    self.resumed += 1
+                    resumed = getattr(self._ask, "resumed", None)
+                    if callable(resumed):        # valgfritt: si fra at det går videre
+                        try:
+                            resumed(free)
+                        except Exception:
+                            pass
+                    return True
+                no_gain = True       # ikke mer plass — varsle på nytt
+
+
+class _Tally:
+    """Teller byte meldt til fremdriften for én fil (trekkes fra ved nytt forsøk)."""
+    __slots__ = ("prog", "n")
+
+    def __init__(self, prog) -> None:
+        self.prog = prog
+        self.n = 0
+
+    def add(self, nbytes: int = 0, files: int = 0) -> None:
+        self.n += nbytes
+        self.prog.add(nbytes, files)
+
+
+def _remove_partial(target: str) -> None:
+    """En halvskrevet fil er verre enn ingen — den ser ut som data."""
+    try:
+        os.unlink(target)
+    except OSError:
+        pass
+
+
 def extract_all(zip_path: Path, dest: Path, progress_factory: Callable[[int, int], ByteProgress],
                 workers: int = 4, stop: "Optional[Callable[[], bool]]" = None,
-                warn: "Optional[Callable[[str], None]]" = None) -> "tuple[list[str], int]":
+                warn: "Optional[Callable[[str], None]]" = None,
+                errors: "Optional[ExtractErrors]" = None,
+                on_disk_full: "Optional[Callable[[dict], bool]]" = None
+                ) -> "tuple[list[str], int]":
     """
     Pakk ut hele arkivet til `dest` i `workers` tråder. Returnerer (namelist,
     antall filer). progress_factory(n_filer, bytes_totalt) lager
     fremdriftsobjektet når innholdet er kjent.
+
+    En fil som ikke lar seg pakke ut (CRC-feil, lesefeil, full disk) stopper
+    ikke de andre: den meldes via `warn`, samles i `errors`, og det som rakk å
+    bli skrevet av den, slettes. Kalleren avgjør hva som skjer videre.
+
+    Blir disken full, venter utpakkingen og spør via on_disk_full(info) (se
+    DiskFullGate): True = operatøren har ryddet plass, fila prøves på nytt og
+    utpakkingen fortsetter; False = avbryt. Uten on_disk_full avbrytes resten
+    (errors.fatal).
 
     Innholdsfortegnelsen leses ÉN gang. Per oppføring beholdes bare
     posisjon, størrelser, metode, CRC og flagg i kompakte tall-arrayer (~32 byte),
@@ -183,8 +318,13 @@ def extract_all(zip_path: Path, dest: Path, progress_factory: Callable[[int, int
         os.makedirs(d, exist_ok=True)
     n_jobs = len(idx)
     prog = progress_factory(n_jobs, sum(sizes))
+    gate = None
+    if on_disk_full is not None:
+        gate = DiskFullGate(dest_s, on_disk_full,
+                            lambda: max(0, getattr(prog, "total", 0)
+                                        - getattr(prog, "bytes", 0)))
     return _extract_entries(zip_path, dest_s, names, offs, csizes, sizes, crcs, kinds,
-                            idx, prog, workers, stop, warn)
+                            idx, prog, workers, stop, warn, errors, gate)
 
 
 def _read_catalog(zip_path, dest_s, names, offs, csizes, sizes, crcs, kinds, idx,
@@ -208,7 +348,9 @@ def _read_catalog(zip_path, dest_s, names, offs, csizes, sizes, crcs, kinds, idx
 
 
 def _extract_entries(zip_path, dest_s, names, offs, csizes, sizes, crcs, kinds, idx,
-                     prog: ByteProgress, workers: int, stop, warn) -> "tuple[list[str], int]":
+                     prog: ByteProgress, workers: int, stop, warn,
+                     errors: "Optional[ExtractErrors]" = None,
+                     gate: "Optional[DiskFullGate]" = None) -> "tuple[list[str], int]":
     n_jobs = len(idx)
     # Sammenhengende biter (sekvensiell lesing per tråd), flere biter enn
     # tråder slik at én stor fil ikke holder igjen resten
@@ -218,15 +360,35 @@ def _extract_entries(zip_path, dest_s, names, offs, csizes, sizes, crcs, kinds, 
     fallback: list = []                          # krypterte/uvanlige metoder
     fb_lock = threading.Lock()
 
-    def _warn(name: str, exc) -> None:
+    def _warn(name: str, exc, target: str = "") -> None:
+        if target:
+            _remove_partial(target)
+        if errors is not None:
+            errors.add(name, exc)
         if warn:
             warn(f"  [ADVARSEL] Kunne ikke pakke ut {name}: {exc}")
 
+    def _halt() -> bool:
+        return bool((stop and stop()) or (errors is not None and errors.fatal)
+                    or (gate is not None and gate.aborted))
+
+    def _retry(name: str, exc, target: str, tally: _Tally) -> bool:
+        """Full disk: rydd det halvskrevne, vent på operatøren. True = prøv igjen."""
+        if gate is None or not is_disk_full(exc):
+            return False
+        _remove_partial(target)
+        if not gate.handle(name):
+            return False
+        tally.prog.add(-tally.n)                 # fila telles på nytt
+        tally.n = 0
+        return True
+
     def run(part) -> None:
         a, b = part
+        tally = _Tally(prog)
         with open(zip_path, "rb") as fh:
             for j in range(a, b):
-                if stop and stop():
+                if _halt():
                     return
                 name = names[idx[j]]
                 method, flags = kinds[j] & 0xFFFF, kinds[j] >> 16
@@ -235,31 +397,45 @@ def _extract_entries(zip_path, dest_s, names, offs, csizes, sizes, crcs, kinds, 
                         fallback.append(j)
                     continue
                 target = _target_path(name, dest_s)
-                try:
-                    _extract_raw(fh, offs[j], csizes[j], sizes[j], method, crcs[j],
-                                 target, prog)
-                except Exception as exc:
-                    _warn(name, exc)
+                while True:
+                    tally.n = 0
+                    try:
+                        _extract_raw(fh, offs[j], csizes[j], sizes[j], method, crcs[j],
+                                     target, tally)
+                    except Exception as exc:
+                        if _retry(name, exc, target, tally):
+                            continue
+                        _warn(name, exc, target)
+                    break
                 prog.add(files=1)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers),
                                                thread_name_prefix="utpakking") as pool:
         for _ in pool.map(run, parts):
             pass
-    if fallback and not (stop and stop()):
+    if fallback and not _halt():
+        tally = _Tally(prog)
         with zipfile.ZipFile(zip_path, "r", allowZip64=True) as zf:
             for j in fallback:
+                if _halt():
+                    break
                 name = names[idx[j]]
-                try:
-                    with zf.open(name) as src, open(_target_path(name, dest_s), "wb") as dst:
-                        while True:
-                            chunk = src.read(CHUNK)
-                            if not chunk:
-                                break
-                            dst.write(chunk)
-                            prog.add(len(chunk))
-                except Exception as exc:
-                    _warn(name, exc)
+                target = _target_path(name, dest_s)
+                while True:
+                    tally.n = 0
+                    try:
+                        with zf.open(name) as src, open(target, "wb") as dst:
+                            while True:
+                                chunk = src.read(CHUNK)
+                                if not chunk:
+                                    break
+                                dst.write(chunk)
+                                tally.add(len(chunk))
+                    except Exception as exc:
+                        if _retry(name, exc, target, tally):
+                            continue
+                        _warn(name, exc, target)
+                    break
                 prog.add(files=1)
     prog.finish()
     return names, n_jobs

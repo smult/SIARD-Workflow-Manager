@@ -400,6 +400,7 @@ class RunReporter:
         self.last_log = ""
         self.queue_t0 = time.time()
         self.failed_steps: list = []
+        self.hold: "tuple | None" = None        # (tittel, tidspunkt) — pause / stoppet
         hub.set_status_provider(self.status_text)
 
     # Navn
@@ -487,10 +488,28 @@ class RunReporter:
                             tags=("stop_sign" if stopped else "tada",), status_button=False)
 
     @_safe
+    def set_hold(self, title: "str | None") -> None:
+        """Kjøringen står stille med vilje («På pause» / «Stoppet»); None opphever.
+        Livstegnet og «Status nå» sier det da i stedet for å se ut som fremdrift."""
+        self.hold = (title, time.time()) if title else None
+
+    @_safe
+    def closed(self, forced: bool) -> None:
+        """Programmet ble lukket mens kjøringen pågikk."""
+        self.hub.notify(f"Programmet er avsluttet: {self._name()}",
+                        "Kjøringen ble stoppet fordi programmet ble lukket. "
+                        + ("Steget rakk ikke å stoppe ordentlig. "
+                           if forced else "Prosjektet er lagret. ")
+                        + "Kjør arbeidsflyten igjen for å fortsette.",
+                        priority=3, tags=("stop_sign",), status_button=False)
+
+    @_safe
     def heartbeat(self, text: str) -> None:
         if self.heartbeat_on:
-            self.hub.notify(f"Livstegn: {self._name()}", self._scrub(text),
-                            priority=1, tags=("hourglass",))
+            hold = self.hold
+            self.hub.notify(f"{hold[0] if hold else 'Livstegn'}: {self._name()}",
+                            self._scrub(text), priority=1,
+                            tags=("pause_button" if hold else "hourglass",))
 
     @_safe
     def progress(self, event: str, kw: dict) -> None:
@@ -509,6 +528,11 @@ class RunReporter:
                  f"Steg {self.step_idx + 1} av {self.step_total}: {self.step_label}",
                  f"Tid i steget: {_fmt_secs(time.time() - self.step_t0)}"
                  f" · totalt {_fmt_secs(time.time() - self.queue_t0)}"]
+        hold = self.hold
+        if hold:
+            lines.insert(1, f"{hold[0].upper()} siden "
+                            f"{time.strftime('%H:%M', time.localtime(hold[1]))} "
+                            f"— venter på operatøren ved PC-en")
         ph = self.phase
         if ph.get("total"):
             pct = 100.0 * (ph.get("done") or 0) / ph["total"]

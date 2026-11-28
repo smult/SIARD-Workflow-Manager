@@ -349,10 +349,21 @@ class ProgressPanel(ctk.CTkFrame):
 
         # Pause-knapp skjult i simple-modus
         self._pause_btn.grid_remove()
-        self._stop_btn.configure(state="normal")
+        self._stop_btn_ready()
 
         self.grid()   # vis panelet
         self._draw_simple()
+
+    def _stop_btn_ready(self) -> None:
+        """«⏹ Stopp» synlig og klar. Kalles når et steg starter — knappen skal
+        alltid finnes mens noe kjører (den ble tidligere skjult etter et ferdig
+        BLOB-steg og kom ikke tilbake i stegene etter)."""
+        self._step_stopped_state = False
+        self._stop_btn.configure(
+            text="⏹ Stopp", state="normal",
+            fg_color=COLORS["danger_bg"], hover_color=COLORS["danger_hover"],
+            text_color=COLORS["danger_text"])
+        self._stop_btn.grid()
 
     def step_complete(self, success: bool):
         """
@@ -431,8 +442,9 @@ class ProgressPanel(ctk.CTkFrame):
         self._pause_btn.grid()
         self._pause_btn.configure(state="normal", text="⏸ Pause", command=self._on_pause,
                                    fg_color=COLORS["btn"],
-                                   hover_color=COLORS["btn_hover"])
-        self._stop_btn.configure(state="normal")
+                                   hover_color=COLORS["btn_hover"],
+                                   text_color=COLORS["btn_text"])
+        self._stop_btn_ready()
 
         # Bytt innhold: skjul simple, vis blob
         self._simple_frame.grid_remove()
@@ -646,17 +658,23 @@ class ProgressPanel(ctk.CTkFrame):
                 self._phase_lbls[i].configure(text_color=COLORS["green"])
                 self._phase_pcts[i].configure(text="✓",
                                                text_color=COLORS["green"])
-        self.set_stopped()
+        # Steget er ferdig: ingenting å stoppe før neste steg starter
+        # (show_simple/init_run gjør knappene klare igjen)
+        self._step_stopped_state = False
+        self._pause_btn.configure(state="disabled")
+        self._stop_btn.configure(state="disabled")
 
     def set_paused(self, paused: bool):
         if paused:
             self._pause_btn.configure(text="▶ Fortsett",
                                        fg_color=COLORS["accent"],
-                                       hover_color=COLORS["accent_dim"])
+                                       hover_color=COLORS["accent_dim"],
+                                       text_color=COLORS["on_accent"])
         else:
             self._pause_btn.configure(text="⏸ Pause", command=self._on_pause,
                                        fg_color=COLORS["btn"],
-                                       hover_color=COLORS["btn_hover"])
+                                       hover_color=COLORS["btn_hover"],
+                                       text_color=COLORS["btn_text"])
 
     def set_step_stopped(self, stopped: bool) -> None:
         """Veksle Stopp-knappen mellom 'Stopp' og '▶ Fortsett' ved steg-pause."""
@@ -666,6 +684,7 @@ class ProgressPanel(ctk.CTkFrame):
                 text="▶ Fortsett",
                 fg_color=COLORS["accent"], hover_color=COLORS["accent_dim"], text_color=COLORS["on_accent"],
                 state="normal")
+            self._stop_btn.grid()
             # Pause-knappen blir «Avslutt» mens kjøringen står stoppet:
             # avslutter kjøringen, prosjektet er lagret og kan fortsettes senere
             if self._abort_cb:
@@ -688,10 +707,13 @@ class ProgressPanel(ctk.CTkFrame):
             self._stop_btn.grid()
 
     def set_stopped(self):
+        """«⏹ Stopp» er trykket: vis at det skjer noe til steget har stoppet
+        (da kommer «▶ Fortsett» / «⏹ Avslutt», se set_step_stopped)."""
         self._step_stopped_state = False
+        self.set_paused(False)
         self._pause_btn.configure(state="disabled")
-        self._stop_btn.configure(state="disabled")
-        self._stop_btn.grid_remove()
+        self._stop_btn.configure(text="⏳ Stopper …", state="disabled")
+        self._stop_btn.grid()
 
     def update_spinner(self):
         """Animasjon for ubestemt progressbar i simple-modus."""

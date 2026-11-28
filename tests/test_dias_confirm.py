@@ -87,7 +87,10 @@ def test_operation(tmp: Path) -> None:
         return None
     ctx2 = WorkflowContext(siard_path=siard, metadata={"file_logger": log,
                                                         "ask_dias_config_cb": cancel})
-    r = DiasPackageOperation(period_start="1999-01-01", period_end="1999-12-31").run(ctx2)
+    # Bryteren settes uttrykkelig: «Husk» i brukerens egne innstillinger kan ha
+    # slått den av, og testen skal ikke avhenge av det
+    r = DiasPackageOperation(period_start="1999-01-01", period_end="1999-12-31",
+                             confirm_before_packing=True).run(ctx2)
     _ok(not r.success and "avbrutt" in r.message
         and seen.get("period") == ("2014-10-01", "2020-06-19"),
         "vinduet får perioden fra metadata.xml (ikke gamle verdier); avbrudd → steget feiler")

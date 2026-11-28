@@ -772,8 +772,11 @@ OP_DEFS = [
             "heltallsvarianter→xs:integer/xs:decimal). T_6.3-1: minInclusive/"
             "maxExclusive på dateType og dateTimeType settes til DBPTKs eksakte "
             "verdier (år 0001–9999; SCFC skriver 9999-12-31Z som avvises). "
-            "Andre avvik rapporteres for manuell vurdering. metadata.xml og "
-            "tableX.xml røres ikke. Legges automatisk til etter 'Pakk ut SIARD' "
+            "Andre avvik rapporteres for manuell vurdering. T_6.0-2: tidspunkt "
+            "uten tidssone helt inntil grensen (f.eks. 9999-12-31T23:59:59) kan "
+            "ikke avgjøres mot fasetten; de merkes som UTC med «Z» i tableX.xml "
+            "(sifrene endres ikke, andre verdier røres ikke). metadata.xml røres "
+            "ikke. Legges automatisk til etter 'Pakk ut SIARD' "
             "dersom rettbare avvik oppdages. Standalone: skriver ny "
             "<original>_xsdfix.siard."
         ),
@@ -781,6 +784,9 @@ OP_DEFS = [
         "params": [
             {"key": "output_suffix", "label": "Suffix ny SIARD-fil (standalone)",
              "type": "str", "default": "_xsdfix"},
+            {"key": "mark_boundary_datetimes",
+             "label": "Merk tidspunkt ved grensen som UTC («Z», T_6.0-2)",
+             "type": "bool", "default": True},
         ],
     },
     {

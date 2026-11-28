@@ -108,6 +108,15 @@ class WorkflowFileLogger:
         self.on_heartbeat = on_heartbeat        # f.eks. ekko til GUI-loggen
         self._stop = threading.Event()
         self._hb_thread: "threading.Thread | None" = None
+        # Kjøringen står stille med vilje (pause / stoppet): (tekst, tidspunkt, monotonic)
+        self._hold: "tuple | None" = None
+
+    def set_hold(self, text: "str | None") -> None:
+        """
+        Kjøringen står stille med vilje — f.eks. «PÅ PAUSE (venter på …)».
+        Livstegnet sier da det i stedet for «Fortsatt i gang». None opphever.
+        """
+        self._hold = (text, datetime.datetime.now(), time.monotonic()) if text else None
 
     def __enter__(self):
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -231,7 +240,14 @@ class WorkflowFileLogger:
     def heartbeat(self) -> str:
         """Skriv ett livstegn nå og returner teksten."""
         now = datetime.datetime.now()
-        parts = [f"Fortsatt i gang — totalt {_fmt_duration(time.monotonic() - self._started)}"]
+        total = f"totalt {_fmt_duration(time.monotonic() - self._started)}"
+        hold = self._hold
+        if hold:
+            # Ikke «Fortsatt i gang»: ingenting skjer før operatøren gjør noe
+            parts = [f"{hold[0]} siden {hold[1]:%d.%m %H:%M} "
+                     f"({_fmt_duration(time.monotonic() - hold[2])})", total]
+        else:
+            parts = [f"Fortsatt i gang — {total}"]
         if self._step:
             parts.append(f"steg «{self._step}» i "
                          f"{_fmt_duration(time.monotonic() - self._step_started)}")

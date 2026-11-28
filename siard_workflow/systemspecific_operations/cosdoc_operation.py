@@ -34,6 +34,7 @@ Avhengigheter (valgfrie — faller tilbake ved manglende installasjon):
 """
 from __future__ import annotations
 from siard_workflow.core.fmt import num as _fnum
+from siard_workflow.core.metadata_rows import count_rows, sync_table_rows
 
 import concurrent.futures
 import hashlib
@@ -897,6 +898,40 @@ class CosDocMailMergeOperation(BaseOperation):
     category       = "Systemspesifikt"
     status         = 2
     produces_siard = True
+    # Avkrypterer og fletter dokumenter og fjerner datakilde-radene: føres
+    # som PREMIS-proveniens
+    modifies_content   = True
+    premis_event_type  = "Migration"
+    premis_event_label = "avkryptering og dokumentfletting"
+
+    def premis_should_record(self, result, ctx) -> bool:
+        d = result.data or {}
+        return bool(result.success and not self.params.get("dry_run")
+                    and (d.get("pairs_merged") or d.get("singles_decrypted")
+                         or d.get("rows_removed")))
+
+    def premis_detail(self, result, ctx) -> str:
+        d = result.data or {}
+        parts = [f"{_fnum(d.get('pairs_merged', 0))} av "
+                 f"{_fnum(d.get('pairs_found', 0))} dokumentpar flettet med "
+                 f"datakilde (mailmerge)",
+                 f"{_fnum(d.get('singles_decrypted', 0))} av "
+                 f"{_fnum(d.get('singles_found', 0))} enkeltdokumenter avkryptert"]
+        if d.get("rows_removed"):
+            parts.append(
+                f"{_fnum(d['rows_removed'])} datakilde-rad(er) fjernet fra "
+                f"{d.get('table_name') or 'tabellen'} "
+                f"({_fnum(d.get('rows_before', 0))} → {_fnum(d.get('rows_after', 0))} "
+                f"rader, <rows> i metadata.xml oppdatert)")
+        if d.get("decrypt_failed"):
+            parts.append(f"{_fnum(d['decrypt_failed'])} avkryptering(er) feilet")
+        if d.get("merge_failed"):
+            parts.append(f"{_fnum(d['merge_failed'])} fletting(er) feilet eller "
+                         f"ble hoppet over")
+        if d.get("data_sources_kept"):
+            parts.append(f"{_fnum(d['data_sources_kept'])} datakilde(r) beholdt "
+                         f"uendret fordi dokumentet ikke ble flettet")
+        return "; ".join(parts)
 
     default_params: dict = {
         "dry_run":        False,
@@ -984,6 +1019,7 @@ class CosDocMailMergeOperation(BaseOperation):
             "singles_decrypted": 0,
             "decrypt_failed":    0,
             "merge_failed":      0,
+            "data_sources_kept": 0,
         }
 
         with tempfile.TemporaryDirectory(dir=temp_root) as _tmpdir:
@@ -1123,6 +1159,10 @@ class CosDocMailMergeOperation(BaseOperation):
 
             xml_updates: dict[int, dict] = {}
             xml_deletes: set[int]        = set()
+            # Datakilder som IKKE er flettet inn i dokumentet beholdes — også
+            # når et annet dokument med samme datakilde ble flettet
+            xml_keeps:   set[int]        = set()
+            data_files:  dict[int, str]  = {}
             total        = len(pairs) + len(singles)
             lock         = threading.Lock()
             done_count   = [0]
@@ -1314,8 +1354,11 @@ class CosDocMailMergeOperation(BaseOperation):
             def _merge_pair(p: _PP) -> dict:
                 base = {"type": "pair", "eef_id_main": p.eef_id_main,
                         "eef_id_data": p.eef_id_data,
-                        "update": None, "delete": False, "sd": dict(p.sd)}
+                        "update": None, "delete": False, "keep": False,
+                        "data_file": (p.data_blob or {}).get("file", ""),
+                        "sd": dict(p.sd)}
                 if p.skip:
+                    base["keep"] = not dry_run
                     return base
 
                 main_docx = converted.get(p.main_dec)
@@ -1351,6 +1394,7 @@ class CosDocMailMergeOperation(BaseOperation):
                     else:
                         w(f"    Kan ikke produsere output for {p.main_fname}", "feil")
                         base["sd"]["merge_failed"] = 1
+                        base["keep"] = True
                         return base
                     base["sd"]["merge_failed"] = base["sd"].get("merge_failed", 0) + 1
                 else:
@@ -1404,15 +1448,20 @@ class CosDocMailMergeOperation(BaseOperation):
                 old_blob = lob_path / p.main_blob["file"]
                 if old_blob != new_blob_path and old_blob.exists():
                     old_blob.unlink()
-                data_src_file = lob_path / p.data_blob["file"]
-                if data_src_file.exists():
-                    data_src_file.unlink()
-                    w(f"    Slettet datakilde: {p.data_blob['file']}", "info")
 
                 base["update"] = {"file": new_blobname, "length": len(final_bytes),
                                   "digest": _md5_upper(final_bytes),
                                   "conversion_note": conversion_note}
-                base["delete"] = True
+                # Datakilden fjernes bare når innholdet faktisk er flettet inn
+                # i dokumentet. Uten fletting beholdes både fila og raden —
+                # ellers går flettedataene tapt. Selve slettingen gjøres etter
+                # at alle par er ferdige (en datakilde kan deles av flere).
+                base["delete"] = merge_ok
+                base["keep"]   = not merge_ok
+                if not merge_ok:
+                    w(f"    Beholder datakilden {p.data_fname} "
+                      f"({p.data_blob['file']}): ikke flettet inn i dokumentet",
+                      "warn")
                 return base
 
             def _finish_single(s: _SP) -> dict:
@@ -1468,11 +1517,32 @@ class CosDocMailMergeOperation(BaseOperation):
                                 xml_updates[res["eef_id_main"]] = res["update"]
                             if res.get("delete"):
                                 xml_deletes.add(res["eef_id_data"])
+                                data_files[res["eef_id_data"]] = res.get("data_file", "")
+                            if res.get("keep"):
+                                xml_keeps.add(res["eef_id_data"])
                         elif res.get("type") == "single" and res.get("update"):
                             xml_updates[res["eef_id"]] = res["update"]
                         done_count[0] += 1
                         progress("phase_progress",
                                  done=done_count[0], total=total)
+
+            # En datakilde som deles av flere dokumenter fjernes bare når alle
+            # dokumentene er flettet
+            xml_deletes -= xml_keeps
+            stats["data_sources_kept"] = len(xml_keeps)
+            if not dry_run:
+                n_del = 0
+                for eid in sorted(xml_deletes):
+                    data_src_file = lob_path / data_files.get(eid, "")
+                    if data_files.get(eid) and data_src_file.is_file():
+                        data_src_file.unlink()
+                        n_del += 1
+                if n_del:
+                    w(f"  Slettet {_fnum(n_del)} datakilde-fil(er) som er flettet "
+                      f"inn i dokumentene", "info")
+                if xml_keeps:
+                    w(f"  Beholdt {_fnum(len(xml_keeps))} datakilde(r) som ikke "
+                      f"ble flettet inn (fil og rad står urørt)", "warn")
 
             if not dry_run and (xml_updates or xml_deletes):
                 w(f"\n  Oppdaterer {tf}.xml …", "step")
@@ -1481,6 +1551,26 @@ class CosDocMailMergeOperation(BaseOperation):
                     eefid_col, fname_col, blob_col, size_col, w,
                 )
                 table_xml_path.write_bytes(updated_xml)
+
+                # Rader er fjernet: <rows> i metadata.xml må følge med, ellers
+                # feiler DBPTK-validatoren på P_4.3-10 (radantall)
+                n_after = count_rows(updated_xml)
+                stats["table_name"]   = table_name
+                stats["rows_before"]  = len(rows)
+                stats["rows_after"]   = n_after
+                stats["rows_removed"] = max(0, len(rows) - n_after)
+                try:
+                    old_rows = sync_table_rows(metadata_path, sf, tf, n_after)
+                except OSError as exc:
+                    old_rows = None
+                    w(f"    metadata.xml kunne ikke oppdateres: {exc}", "feil")
+                if old_rows is None:
+                    w(f"    ADVARSEL: fant ikke <rows> for {table_name} i "
+                      f"metadata.xml — radantallet ({_fnum(n_after)}) er ikke "
+                      f"oppdatert (DBPTK P_4.3-10)", "warn")
+                elif old_rows != n_after:
+                    w(f"    metadata.xml: <rows> for {table_name} "
+                      f"{_fnum(old_rows)} → {_fnum(n_after)}", "info")
 
             progress("phase_done")
 
@@ -1506,6 +1596,9 @@ class CosDocMailMergeOperation(BaseOperation):
             w(f"  Avkryptering feilet: {stats['decrypt_failed']}", "warn")
         if stats["merge_failed"]:
             w(f"  Mailmerge feilet/hoppet over: {stats['merge_failed']}", "warn")
+        if stats["data_sources_kept"]:
+            w(f"  Datakilder beholdt (ikke flettet): "
+              f"{stats['data_sources_kept']}", "warn")
         if pipeline_mode:
             w("  Pipeline-modus: repakking overlates til 'Pakk sammen SIARD'",
               "info")

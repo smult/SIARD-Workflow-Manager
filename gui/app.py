@@ -107,9 +107,14 @@ class _PipelineSuggestionDialog(ctk.CTkToplevel):
 
     def __init__(self, parent, message: str, heading: str = "Pipeline-modus anbefalt",
                  yes_text: str = "Ja, legg til automatisk", no_text: str = "Nei, kjør uten",
-                 cancel: bool = True):
+                 cancel: bool = True, danger: bool = False,
+                 close_result: "str | None" = None):
+        # danger: advarsel om datatap — rød topp, og «nei»-knappen er farevalget.
+        # close_result: svaret når vinduet lukkes uten valg (standard: «avbryt»
+        # med Avbryt-knapp, ellers «nei»).
         super().__init__(parent)
-        self.result = "avbryt" if cancel else "nei"
+        self.result = close_result or ("avbryt" if cancel else "nei")
+        self._close_result = self.result
         self.title("Pipeline-forslag")
         self.resizable(False, False)
         self.grab_set()
@@ -121,13 +126,14 @@ class _PipelineSuggestionDialog(ctk.CTkToplevel):
         wrap = w - 64
 
         # Ikon + tittel
-        header = ctk.CTkFrame(self, fg_color=COLORS["panel"], corner_radius=0)
+        header = ctk.CTkFrame(self, fg_color=COLORS["danger_bg" if danger else "panel"],
+                              corner_radius=0)
         header.pack(side="top", fill="x", padx=0, pady=0)
         ctk.CTkLabel(
             header,
             text=f"  {heading}",
             font=ctk.CTkFont(family=FONTS["mono"], size=13, weight="bold"),
-            text_color=COLORS["accent"],
+            text_color=COLORS["danger_text" if danger else "accent"],
             anchor="w",
         ).pack(side="left", padx=12, pady=10)
 
@@ -145,9 +151,11 @@ class _PipelineSuggestionDialog(ctk.CTkToplevel):
             command=self._on_ja,
         ).grid(row=0, column=0, padx=(0, 6), sticky="ew")
 
+        _no = ("danger_bg", "danger_hover", "danger_text", "danger_border") if danger \
+            else ("btn", "btn_hover", "btn_text", "btn_border")
         ctk.CTkButton(
             btn_row, text=no_text,
-            fg_color=COLORS["btn"], hover_color=COLORS["btn_hover"], text_color=COLORS["btn_text"], border_color=COLORS["btn_border"], border_width=1,
+            fg_color=COLORS[_no[0]], hover_color=COLORS[_no[1]], text_color=COLORS[_no[2]], border_color=COLORS[_no[3]], border_width=1,
             font=ctk.CTkFont(family=FONTS["mono"], size=11),
             height=34,
             command=self._on_nei,
@@ -177,7 +185,7 @@ class _PipelineSuggestionDialog(ctk.CTkToplevel):
         )
         msg_label.pack(padx=16, pady=(14, 8), fill="x", anchor="nw")
 
-        self.protocol("WM_DELETE_WINDOW", self._on_avbryt if cancel else self._on_nei)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # Dynamisk høyde ut fra faktisk innhold (klemt til 85 % av skjermen),
         # sentrert over foreldrevinduet.
@@ -203,6 +211,10 @@ class _PipelineSuggestionDialog(ctk.CTkToplevel):
 
     def _on_avbryt(self):
         self.result = "avbryt"
+        self.destroy()
+
+    def _on_close(self):
+        self.result = self._close_result
         self.destroy()
 
 
@@ -358,6 +370,10 @@ class App(ctk.CTk):
         self._remote_rep = None
         self._step_stopped      = False
         self._abort_requested   = False
+        # Kjøretråden (for avslutning) og «programmet lukkes» (se _on_close_request)
+        self._run_thread: "threading.Thread | None" = None
+        self._closing           = False
+        self._closing_win       = None
         # Valgt grunnlag per fil når temp-mappa må lages på nytt (kjøreplanen)
         self._run_plan_bases: dict = {}
         # Prosjektfil-tilstand
@@ -367,6 +383,9 @@ class App(ctk.CTk):
         self._spinner_idx   = 0
 
         self._build_ui()
+        # X på hovedvinduet: spør når en kjøring pågår, og avslutt prosessen
+        # for godt (ellers kan den bli stående uten vindu)
+        self.protocol("WM_DELETE_WINDOW", self._on_close_request)
         # Last lagret font-offset og appliser
         from gui.styles import FontRegistry
         _saved_offset = get_config("font_offset") or 0
@@ -2260,6 +2279,125 @@ class App(ctk.CTk):
         self._pf("avbrutt av operatør")
         return False  # avbrutt
 
+    def _rowversion_preflight(self, ops: list) -> bool:
+        """
+        Radversjonstellere (SQL Server/Sybase TIMESTAMP/ROWVERSION — 8 byte,
+        ikke et tidspunkt) som uttrekket beskriver som BLOB. Bare en
+        opplysning i loggen, ingen dialog: «HEX Inline Extract» omtyper dem
+        til BINARY(8) og lar verdiene stå inline. Før ble hver verdi en egen
+        .bin-fil på 8 byte. Leser bare metadata.xml.
+        """
+        from siard_workflow.core import rowversion as rv
+
+        cols: list = []
+        for path in self.siard_queue:
+            meta = rv.read_metadata_bytes(path)
+            if meta:
+                cols.extend(rv.find_rowversion_columns(meta))
+        if not cols:
+            return True
+        what = f"{rv.summarize(cols)} er radversjonstellere lagret som BLOB"
+        if any(op.operation_id == "hex_extract" for op in ops):
+            self._pf(f"{what} — «HEX Inline Extract» omtyper dem til BINARY(8) "
+                     f"og lar verdiene stå inline (ingen filer)")
+        else:
+            self._pf(f"{what} — de blir stående som de er (omtypes til "
+                     f"BINARY(8) hvis «HEX Inline Extract» er med)")
+        return True
+
+    def _resume_workdir(self, path: Path, ops: list) -> "Path | None":
+        """
+        Temp-mappa stegene kommer til å lese når kjøringen gjenopptas uten ny
+        utpakking — None ved ny kjøring, når «Pakk ut SIARD» kjøres på nytt,
+        eller når temp-mappa er borte.
+        """
+        import copy
+        from types import SimpleNamespace
+        pf = self._project_file
+        resume = self.__dict__.get("_pf_resume")
+        try:
+            if (resume and not resume.get("unpack") and pf is not None and self.siard_path
+                    and Path(pf.source_siard) == Path(path) == Path(self.siard_path)):
+                cps = _sync_checkpoints_to_ops(copy.deepcopy(pf.operations), ops)
+                view = SimpleNamespace(operations=cps, workdir=pf.workdir)
+                return self._project_workdir(view, ops)
+        except Exception:
+            pass
+        return None
+
+    def _table_files_preflight(self, ops: list) -> bool:
+        """
+        Gjenopptatt kjøring: er tabellfilene i temp-mappa hele? En tableX.xml
+        uten avsluttende </table> er avkuttet (avbrudd mens fila ble skrevet,
+        full disk, eller ufullstendig allerede i SIARD-fila): rader mangler, og
+        steg som leser fila rad for rad feiler. Bare slutten av hver fil leses.
+
+        Ved ny kjøring gjøres kontrollen rett etter utpakkingen i stedet (se
+        UnpackSiardOperation) — å lese tabellfilene i SIARD-fila på forhånd
+        ville kostet minutter for store uttrekk.
+
+        Returnerer True = fortsett kjøring, False = avbryt.
+        """
+        from siard_workflow.core import table_integrity as ti
+
+        hits: list = []                  # [(mappenavn, funn)]
+        notes: list = []
+        n_checked = n_dirs = 0
+        for path in self.siard_queue:
+            workdir = self._resume_workdir(path, ops)
+            if workdir is None:
+                continue
+            n_dirs += 1
+            try:
+                res = ti.check_dir(workdir)
+            except Exception as exc:
+                notes.append(f"{workdir.name}: kunne ikke kontrolleres ({exc})")
+                continue
+            n_checked += res["checked"]
+            if res["findings"]:
+                hits.append((workdir.name, res["findings"]))
+
+        tail = ("; " + "; ".join(notes)) if notes else ""
+        if not n_dirs:
+            self._pf("ikke aktuelt (kjøringen fortsetter ikke i en temp-mappe — ved "
+                     "utpakking kontrolleres tabellfilene rett etterpå)")
+            return True
+        if not hits:
+            self._pf(f"{_fnum(n_checked)} tabellfil(er) i temp-mappa kontrollert — alle "
+                     f"slutter med </table>" + tail)
+            return True
+
+        n_bad = sum(len(found) for _name, found in hits)
+        self._pf(f"{_fnum(n_bad)} ufullstendig(e) tabellfil(er) i temp-mappa" + tail)
+        lines = ["En tabellfil skal slutte med </table>. Disse gjør det ikke — de er "
+                 "avkuttet eller ufullstendige, og rader mangler trolig:\n"]
+        for name, found in hits:
+            lines.append(f"{name} (temp-mappa fra forrige kjøring):")
+            lines += ti.summary_lines(found, 12)
+            for f in found[:50]:
+                self._log(f"    {name}: {ti.format_finding(f)}", "error")
+        lines += ["",
+                  "Fila kan ha blitt avkuttet i en tidligere kjøring (avbrudd, full disk) "
+                  "eller være ufullstendig i selve SIARD-fila. Nullstill fra «Pakk ut "
+                  "SIARD» for å pakke ut på nytt — da kontrolleres tabellfilene igjen "
+                  "rett etter utpakkingen.",
+                  "",
+                  "Du KAN fortsette, men da MANGLER data i resultatet — POTENSIELT STORT "
+                  "DATATAP — og steg som leser tabellfila rad for rad (HEX Inline "
+                  "Extract, BLOB Konverter) vil feile."]
+        dlg = _PipelineSuggestionDialog(
+            self, "\n".join(lines), heading="UFULLSTENDIGE TABELLFILER — DATA MANGLER",
+            yes_text="Stopp (anbefalt)", no_text="Fortsett med datatap",
+            cancel=False, danger=True, close_result="ja")
+        dlg.title("Ufullstendige tabellfiler")
+        self.wait_window(dlg)
+        if dlg.result == "nei":
+            self._pf((self._pf_status or "funn")
+                     + " → OPERATØREN FORTSETTER MED MANGLENDE DATA")
+            return True
+        self._pf((self._pf_status or "funn") + " → stoppet av operatør")
+        return False
+
     def _xsd_type_preflight(self, ops: list) -> bool:
         """
         Skanner SIARD-filene for tableX.xsd-avvik DBPTK-validatoren avviser:
@@ -2307,8 +2445,10 @@ class App(ctk.CTk):
             "P_4.3-3: kolonnetyper må stemme med metadata.xml (f.eks. xs:double",
             "for FLOAT(p), ikke xs:float). T_6.3-1: dateType/dateTimeType må ha",
             "DBPTKs eksakte minInclusive/maxExclusive (år 0001–9999).",
-            "Rettingene er tapsfrie — ingen verdier i tableX.xml endres, og",
-            "metadata.xml røres ikke.\n",
+            "Rettingene i XSD-ene er tapsfrie, og metadata.xml røres ikke.",
+            "Tidspunkt uten tidssone helt inntil grensen (f.eks.",
+            "9999-12-31T23:59:59) merkes samtidig som UTC med «Z» (T_6.0-2);",
+            "sifrene endres ikke, og ingen andre verdier i tableX.xml røres.\n",
         ]
         MAX_LINES = 12
         for path, issues in all_fixable.items():
@@ -2697,7 +2837,7 @@ class App(ctk.CTk):
         """Sluttsammendrag i loggfila: resultat, tid, steg, advarsler, filer."""
         from siard_workflow.core import fmt
         from siard_workflow.core.run_summary import (
-            build_run_summary, collect_outputs, failure_counts)
+            build_run_summary, collect_outputs, data_loss_notes, failure_counts)
         try:
             results = dict(getattr(ctx, "results", {}) or {})
             failed, kept = failure_counts(results)
@@ -2712,7 +2852,8 @@ class App(ctk.CTk):
                 warnings=file_logger.warnings, errors=file_logger.errors,
                 n_warnings=file_logger.n_warnings, n_errors=file_logger.n_errors,
                 outputs=collect_outputs(results, extra),
-                failed_files=failed, kept_files=kept, held=held, aborted=aborted)
+                failed_files=failed, kept_files=kept, held=held, aborted=aborted,
+                data_loss=data_loss_notes(results))
             file_logger.log("", "info")
             for lvl, text in lines:
                 file_logger.log(text, lvl, raw=True)
@@ -3460,6 +3601,7 @@ class App(ctk.CTk):
                   f"{len(ops)} operasjon(er)", "step")
         self._log("  Sjekker køen før kjøring. Dialog vises bare ved funn.", "muted")
         self._preflight_active = True
+        self._pf_resume = resume or None      # for stegene som må vite hva som leses
         self._status_spinner.configure(text="⏳")
         t_pf = time.monotonic()
         steps = [
@@ -3469,6 +3611,7 @@ class App(ctk.CTk):
             ("LOB-referanser (DBPTK A_M_5.6-1-2)",         self._lob_fullpath_preflight),
             ("LOB-segmentering (SIARD 2.2→2.1)",           self._segfolder_preflight),
             ("tableX.xsd (DBPTK P_4.3-3 / T_6.3-1)",       self._xsd_type_preflight),
+            ("Radversjon (TIMESTAMP lagret som BLOB)",     self._rowversion_preflight),
             ("Metadata-kvalitet (dbname/datospenn)",       self._metadata_quality_preflight),
             ("Datospenn i metadata.xml",                   self._date_span_preflight),
             ("Sluttrapport (PDF)",                         self._report_preflight),
@@ -3476,6 +3619,7 @@ class App(ctk.CTk):
             ("LibreOffice (konvertering)",                 self._libreoffice_preflight),
             ("Diskplass (temp/output)",                    self._disk_space_preflight),
             ("Antivirus og temp-disk (mange filer)",       self._antivirus_preflight),
+            ("Tabellfiler i temp-mappa (gjenopptak)",      self._table_files_preflight),
         ]
         # Prosjektet er kjørt før: forslagene om å legge til steg (og
         # skanningene bak dem) ble besvart i første kjøring — ikke spør igjen.
@@ -3483,6 +3627,7 @@ class App(ctk.CTk):
         _answered = {self._filename_preflight, self._pipeline_preflight,
                      self._lobfolder_preflight, self._lob_fullpath_preflight,
                      self._segfolder_preflight, self._xsd_type_preflight,
+                     self._rowversion_preflight,
                      self._metadata_quality_preflight, self._date_span_preflight,
                      self._report_preflight}
         if resume:
@@ -3536,6 +3681,7 @@ class App(ctk.CTk):
             target=self._run_queue_thread,
             args=(filer, ops, self._project_file, self._project_path),
             daemon=True)
+        self._run_thread = thread
         thread.start()
 
     def _run_queue_thread(self, filer: list, ops: list,
@@ -3603,6 +3749,11 @@ class App(ctk.CTk):
             # «Berik SIARD» satt til å skrive direkte i SIARD-fila: bekreft ved
             # kjøring (spørres hver gang — originalfila endres)
             ctx.metadata["confirm_inplace_cb"] = self._confirm_write_in_place
+            # Data mangler etter utpakking: stopp, eller fortsett med datatap
+            # (spørres hver gang — huskes ikke)
+            ctx.metadata["ask_data_loss_cb"] = self._ask_data_loss
+            # Full disk under utpakking: vent, la operatøren rydde, fortsett/avbryt
+            ctx.metadata["ask_disk_full_cb"] = self._ask_disk_full
             # Registrer callback for "Standardiser filendelser" kun hvis
             # operasjonen ikke allerede er i workflowen
             _has_stdext = any(
@@ -4282,11 +4433,23 @@ class App(ctk.CTk):
         """Blokker kjøretråden etter «⏹ Stopp» til brukeren velger.
 
         True = «▶ Fortsett» (fortsett med steget / neste steg),
-        False = «⏹ Avslutt» (kjøringen avsluttes; prosjektet er lagret)."""
+        False = «⏹ Avslutt» (kjøringen avsluttes; prosjektet er lagret) — også
+        når programmet lukkes (da finnes ingen knapp å vente på)."""
+        if self.__dict__.get("_closing"):
+            return False
         self._log_queue.put(("workflow_step_stopped", i, label, interrupted))
+        self._run_note("  Kjøringen står stoppet — venter på «▶ Fortsett» eller "
+                       "«⏹ Avslutt» i programmet", gui=False)
+        self._set_hold("STOPPET (venter på «▶ Fortsett» eller «⏹ Avslutt» i programmet)",
+                       "Stoppet")
         self._step_resume_event.clear()
-        self._step_resume_event.wait()          # blokkerer bakgrunnstråden
-        if getattr(self, "_abort_requested", False):
+        # Blokkerer bakgrunnstråden. Med tidsavbrudd, så en lukking av
+        # programmet som kom mellom clear() og wait() også slipper gjennom.
+        while not self._step_resume_event.wait(0.5):
+            if self.__dict__.get("_closing"):
+                break
+        self._set_hold(None)
+        if self.__dict__.get("_closing") or getattr(self, "_abort_requested", False):
             self._abort_requested = False
             return False
         self._stop_event.clear()
@@ -4890,6 +5053,41 @@ class App(ctk.CTk):
 
     # ─── Konvertering pause/stopp ────────────────────────────────────────────
 
+    def _run_file_logger(self):
+        """Kjøreloggen for kjøringen som pågår (None når ingen er åpen)."""
+        ctx = self.__dict__.get("_conv_ctx")
+        return ctx.metadata.get("file_logger") if ctx is not None else None
+
+    def _run_note(self, msg: str, lvl: str = "warn", gui: bool = True) -> None:
+        """
+        Noe operatøren gjorde (pause, stopp, fortsett, avslutt) — i loggpanelet
+        OG i kjøreloggen. Tidligere sto dette bare i panelet, så kjøreloggen
+        og livstegnet så ut som en kjøring som gikk for fullt. Trygg fra
+        kjøretråden (gui=False: bare kjøreloggen; panelet får egen melding).
+        """
+        if gui:
+            self._log(msg.strip(), lvl)
+        try:
+            fl = self._run_file_logger()
+            if fl:
+                # «info» i fila: operatørens valg er ikke en advarsel i sammendraget
+                fl.log(msg, "info")
+        except Exception:
+            pass
+
+    def _set_hold(self, text: "str | None", title: "str | None" = None) -> None:
+        """Kjøringen står stille med vilje (pause/stoppet) — livstegnet i
+        kjøreloggen og varslene på mobilen sier det. None opphever."""
+        try:
+            fl = self._run_file_logger()
+            if fl:
+                fl.set_hold(text)
+            rep = self.__dict__.get("_remote_rep")
+            if rep:
+                rep.set_hold(title if text else None)
+        except Exception:
+            pass
+
     def _conv_pause(self):
         if self._pause_event.is_set():
             # Allerede pauset — fortsett
@@ -4897,14 +5095,17 @@ class App(ctk.CTk):
             if self._conv_ctx:
                 self._conv_ctx.metadata["paused"] = False
             self.progress_panel.set_paused(False)
-            self._log("Konvertering fortsetter", "warn")
+            self._set_hold(None)
+            self._run_note("  ▶ Pausen er opphevet av operatøren — kjøringen fortsetter")
         else:
             # Sett pause
             self._pause_event.set()
             if self._conv_ctx:
                 self._conv_ctx.metadata["paused"] = True
             self.progress_panel.set_paused(True)
-            self._log("Konvertering pauset", "warn")
+            self._run_note("  ⏸ Satt på pause av operatøren — påbegynte filer gjøres "
+                           "ferdig, resten venter på «▶ Fortsett»")
+            self._set_hold("PÅ PAUSE (venter på «▶ Fortsett» i programmet)", "På pause")
 
     def _conv_stop(self):
         self._stop_event.set()
@@ -4915,7 +5116,9 @@ class App(ctk.CTk):
             self._conv_ctx.metadata["stopped"] = True
             self._conv_ctx.metadata["paused"]  = False
         self.progress_panel.set_stopped()
-        self._log("Stopper workflow ...", "warn")
+        self._set_hold(None)
+        self._run_note("  ⏹ Stopp valgt av operatøren — steget stopper så snart det kan. "
+                       "Deretter: «▶ Fortsett» eller «⏹ Avslutt».")
 
     def _conv_resume(self):
         """Gjenoppta workflow etter steg-nivå stopp (et avbrutt steg fortsetter
@@ -4926,7 +5129,7 @@ class App(ctk.CTk):
         if self._conv_ctx is not None:
             self._conv_ctx.metadata["stopped"] = False
         self._step_resume_event.set()
-        self._log("Gjenopptar workflow ...", "info")
+        self._run_note("  ▶ Fortsett valgt av operatøren — kjøringen gjenopptas", "info")
 
     def _conv_abort(self):
         """Avslutt kjøringen etter stopp. Prosjektet er lagret, så neste kjøring
@@ -4934,7 +5137,196 @@ class App(ctk.CTk):
         self._abort_requested = True
         self._step_stopped = False
         self._step_resume_event.set()
-        self._log("Avslutter kjøringen — prosjektet er lagret", "warn")
+        self._run_note("  ⏹ Avslutt valgt av operatøren — kjøringen avsluttes, "
+                       "prosjektet er lagret")
+
+    # ─── Avslutning av programmet ────────────────────────────────────────────
+    #
+    # Funnet 2026-11-28: hovedvinduet ble lukket mens en kjøring sto på pause.
+    # Vinduet forsvant, men prosessen levde videre i 20 timer (arbeidstrådene
+    # ventet på «▶ Fortsett», Python ventet på arbeidstrådene) og sendte
+    # livstegn hver halvtime. Derfor: spør når en kjøring pågår, stopp den
+    # ordentlig, og avslutt prosessen for godt (core/proc_exit).
+
+    _CLOSE_GRACE_S = 30          # så lenge får steget på seg til å stoppe
+
+    def _run_alive(self) -> bool:
+        t = self.__dict__.get("_run_thread")
+        return bool(t is not None and t.is_alive())
+
+    def _on_close_request(self) -> None:
+        """X på hovedvinduet (WM_DELETE_WINDOW)."""
+        if self._closing:
+            return                    # avslutning pågår — vinduet «Avslutter …» vises
+        if not self._run_alive():
+            self._exit_app()
+            return
+        fl = self._run_file_logger()
+        step = (getattr(fl, "_step", "") or "").strip()
+        state = ("Kjøringen står på pause." if self._pause_event.is_set()
+                 else "Kjøringen står stoppet." if self._step_stopped
+                 else "Kjøringen går nå.")
+        msg = ("En kjøring pågår"
+               + (f" — steg «{step}»" if step else "") + f".\n{state}\n\n"
+               "Avslutter du programmet nå, stoppes kjøringen først. Prosjektet "
+               "lagres, så du kan fortsette der den stoppet neste gang du kjører "
+               "arbeidsflyten.\n\n"
+               "Vil du bare stoppe kjøringen og la programmet stå åpent, bruker "
+               "du «⏹ Stopp» i fremdriftspanelet.")
+        dlg = _PipelineSuggestionDialog(
+            self, msg, heading="EN KJØRING PÅGÅR — AVSLUTTE PROGRAMMET?",
+            yes_text="La kjøringen gå", no_text="Stopp kjøringen og avslutt",
+            cancel=False, danger=True, close_result="ja")
+        dlg.title("Avslutte programmet?")
+        self.wait_window(dlg)
+        if dlg.result != "nei":
+            self._log("Programmet ble ikke avsluttet — kjøringen fortsetter som før", "info")
+            return
+        if not self._run_alive():     # ble ferdig mens spørsmålet sto oppe
+            self._exit_app()
+            return
+        self._begin_shutdown()
+
+    def _request_stop_for_exit(self, reason: str) -> None:
+        """Be kjøringen stoppe fordi programmet lukkes. Ingen Tk-kall her —
+        brukes også etter at hovedvinduet er borte (main.py)."""
+        self._closing = True
+        self._stopped_for_exit = True         # → verktøyprosesser ryddes ved avslutning
+        try:
+            fl = self._run_file_logger()
+            if fl:
+                fl.set_hold(None)
+                fl.log(reason, "warn")
+        except Exception:
+            pass
+        self._abort_requested = True
+        self._step_stopped = True
+        self._stop_event.set()
+        self._pause_event.clear()             # slipp arbeidstråder som står på pause
+        ctx = self.__dict__.get("_conv_ctx")
+        if ctx is not None:
+            ctx.metadata["stopped"] = True
+            ctx.metadata["paused"] = False
+        self._step_resume_event.set()         # slipp «venter på Fortsett/Avslutt»
+
+    def _begin_shutdown(self) -> None:
+        """Stopp kjøringen, vis at det skjer, og avslutt når steget har stoppet
+        (eller etter _CLOSE_GRACE_S)."""
+        import time as _time
+        self._log("Programmet avsluttes — kjøringen stoppes først …", "warn")
+        self._request_stop_for_exit(
+            "Programmet avsluttes av operatøren — kjøringen stoppes (prosjektet lagres)")
+        try:
+            self.progress_panel.set_stopped()
+        except Exception:
+            pass
+        win = ctk.CTkToplevel(self)
+        win.title("Avslutter")
+        win.resizable(False, False)
+        win.configure(fg_color=COLORS["bg"])
+        win.protocol("WM_DELETE_WINDOW", lambda: None)     # lukkes av programmet
+        ctk.CTkLabel(win, text="Avslutter programmet",
+                     font=ctk.CTkFont(family=FONTS["mono"], size=13, weight="bold"),
+                     text_color=COLORS["accent"], anchor="w"
+                     ).pack(fill="x", padx=18, pady=(16, 4))
+        lbl = ctk.CTkLabel(win, text="", justify="left", anchor="w", wraplength=400,
+                           font=ctk.CTkFont(family=FONTS["mono"], size=11),
+                           text_color=COLORS["text"])
+        lbl.pack(fill="x", padx=18, pady=(0, 10))
+        ctk.CTkButton(
+            win, text="Avslutt nå (ikke vent)", height=30,
+            fg_color=COLORS["danger_bg"], hover_color=COLORS["danger_hover"],
+            text_color=COLORS["danger_text"], border_color=COLORS["danger_border"],
+            border_width=1, font=ctk.CTkFont(family=FONTS["mono"], size=11),
+            command=lambda: self._exit_app(forced=True)).pack(padx=18, pady=(0, 16), anchor="e")
+        win.update_idletasks()
+        w, h = 440, max(150, win.winfo_reqheight())
+        win.geometry(f"{w}x{h}+{self.winfo_x() + (self.winfo_width() - w) // 2}"
+                     f"+{self.winfo_y() + (self.winfo_height() - h) // 2}")
+        try:
+            win.transient(self)
+            win.lift()
+            win.grab_set()
+        except Exception:
+            pass
+        self._closing_win = win
+        t0 = _time.monotonic()
+
+        def _poll():
+            waited = _time.monotonic() - t0
+            if not self._run_alive():
+                self._exit_app()
+                return
+            if waited >= self._CLOSE_GRACE_S:
+                self._exit_app(forced=True)
+                return
+            fl = self._run_file_logger()
+            step = (getattr(fl, "_step", "") or "").strip()
+            try:
+                lbl.configure(text=(
+                    "Venter på at "
+                    + (f"steget «{step}»" if step else "kjøringen")
+                    + f" stopper og prosjektet lagres … {int(waited)} s\n\n"
+                    f"Programmet avsluttes uansett etter {self._CLOSE_GRACE_S} s."))
+            except Exception:
+                pass
+            self.after(250, _poll)
+
+        _poll()
+
+    def _final_cleanup(self, forced: bool) -> None:
+        """Siste opprydding før prosessen avsluttes. Ingen Tk-kall. forced:
+        kjøretråden rakk ikke å stoppe — kjøreloggen lukkes herfra."""
+        self._closing = True
+        if forced:
+            try:
+                fl = self._run_file_logger()
+                if fl and getattr(fl, "_fh", None):
+                    fl.set_hold(None)
+                    fl.log("Programmet ble avsluttet før steget rakk å stoppe — kjøringen "
+                           "er avbrutt her. Kjør arbeidsflyten igjen for å fortsette "
+                           "(steget begynner der det sist ble lagret).", "warn")
+                    fl.__exit__(None, None, None)
+            except Exception:
+                pass
+        # Mobilvarsling: fortsatt satt = kjøretråden kom ikke til _remote_finish
+        rep, hub = self.__dict__.get("_remote_rep"), self.__dict__.get("_remote_hub")
+        self._remote_rep = self._remote_hub = None
+        try:
+            if rep:
+                rep.closed(forced)
+            if hub:
+                hub.stop(flush_timeout=5.0)
+        except Exception:
+            pass
+
+    def _exit_app(self, forced: bool = False) -> None:
+        """Lukk programmet for godt — returnerer aldri."""
+        from siard_workflow.core.proc_exit import exit_process
+        run_was_alive = self._run_alive()
+        self._final_cleanup(forced=forced or run_was_alive)
+        try:
+            self.destroy()
+        except Exception:
+            pass
+        exit_process(0, kill_tools=run_was_alive
+                     or bool(self.__dict__.get("_stopped_for_exit")))
+
+    def shutdown_after_mainloop(self) -> None:
+        """
+        Kalles fra main.py når mainloop har returnert (hovedvinduet er borte
+        uten at _exit_app ble brukt). Stopper en kjøring som fortsatt går,
+        venter en avgrenset tid, og avslutter prosessen — returnerer aldri.
+        """
+        from siard_workflow.core.proc_exit import exit_process
+        t = self.__dict__.get("_run_thread")
+        if t is not None and t.is_alive():
+            self._request_stop_for_exit(
+                "Hovedvinduet er lukket — kjøringen stoppes (prosjektet lagres)")
+            t.join(self._CLOSE_GRACE_S)
+        alive = bool(t is not None and t.is_alive())
+        self._final_cleanup(forced=alive)
+        exit_process(0, kill_tools=alive or bool(self.__dict__.get("_stopped_for_exit")))
 
     def _ask_add_standardize_ext(self, count: int) -> bool:
         """
@@ -4985,6 +5377,52 @@ class App(ctk.CTk):
         self._remote_wait(done, title, text, [("ja", yes_text), ("nei", no_text)],
                           lambda k: self._answer_suggestion(box.get("dlg"), k))
         return box["result"]
+
+    def _ask_danger(self, title: str, text: str, yes_text: str, no_text: str,
+                    close_result: str) -> str:
+        """
+        Advarsel fra arbeidstråden i rødt vindu («nei» er farevalget). Blokkerer
+        til svar; kan besvares fra mobilen. Returnerer «ja» eller «nei» —
+        close_result når vinduet lukkes uten valg.
+        """
+        import threading as _threading
+        done = _threading.Event()
+        box: dict = {"result": close_result}
+
+        def _show():
+            dlg = _PipelineSuggestionDialog(self, text, heading=title, yes_text=yes_text,
+                                            no_text=no_text, cancel=False, danger=True,
+                                            close_result=close_result)
+            dlg.title(title)
+            box["dlg"] = dlg
+            self.wait_window(dlg)
+            box["result"] = dlg.result
+            done.set()
+
+        self.after(0, _show)
+        self._remote_wait(done, title, text, [("ja", yes_text), ("nei", no_text)],
+                          lambda k: self._answer_suggestion(box.get("dlg"), k))
+        return box["result"]
+
+    def _ask_data_loss(self, title: str, text: str) -> bool:
+        """
+        Kraftig advarsel fra arbeidstråden: data mangler (feil ved utpakking,
+        ufullstendige tabellfiler). True = operatøren velger å fortsette med
+        datatap. Stopp er standard — også når vinduet lukkes. Spørres hver gang
+        (huskes ikke i prosjektfila).
+        """
+        return self._ask_danger(title, text, "Stopp kjøringen (anbefalt)",
+                                "Fortsett med datatap", close_result="ja") == "nei"
+
+    def _ask_disk_full(self, title: str, text: str) -> bool:
+        """
+        Disken ble full under utpakkingen, som venter: True = operatøren har
+        ryddet plass og vil fortsette, False = avbryt kjøringen. Lukkes vinduet
+        uten valg, regnes det som «Fortsett» — er det ikke blitt mer plass,
+        kommer varselet på nytt; kjøringen avbrytes bare med et uttrykkelig valg.
+        """
+        return self._ask_danger(title, text, "Fortsett — jeg har ryddet plass",
+                                "Avbryt kjøringen", close_result="ja") == "ja"
 
     def _ask_add_schema_selector(self, schema_count: int) -> bool:
         """

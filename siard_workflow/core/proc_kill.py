@@ -202,3 +202,60 @@ def kill_process_tree(proc: "subprocess.Popen | int") -> None:
                 pass
         else:
             _terminate_pid(api, pid, root_t[0])
+
+
+# ── Verktøyprosesser programmet selv har startet ─────────────────────────────
+
+# Bare disse avsluttes når programmet lukkes — ikke f.eks. en PDF-leser eller
+# Utforsker som operatøren har åpnet fra programmet.
+TOOL_NAMES = frozenset({
+    "soffice.exe", "soffice.bin", "soffice.com",
+    "gswin64c.exe", "gswin32c.exe", "sf.exe",
+})
+
+
+def _snapshot_names(api) -> "dict[int, str]":
+    ctypes, wintypes, k32, PE = api
+    snap = k32.CreateToolhelp32Snapshot(0x2, 0)
+    out: dict = {}
+    if not snap or snap == wintypes.HANDLE(-1).value:
+        return out
+    try:
+        pe = PE()
+        pe.dwSize = ctypes.sizeof(PE)
+        ok = k32.Process32FirstW(snap, ctypes.byref(pe))
+        while ok:
+            out[pe.th32ProcessID] = (pe.szExeFile or "").lower()
+            ok = k32.Process32NextW(snap, ctypes.byref(pe))
+    finally:
+        k32.CloseHandle(snap)
+    return out
+
+
+def kill_child_tools(names: "frozenset[str] | set[str]" = TOOL_NAMES) -> int:
+    """
+    Avslutt verktøyprosesser (LibreOffice, Ghostscript, Siegfried) som er EKTE
+    etterkommere av dette programmet. Brukes når programmet lukkes mens en
+    kjøring pågår — ellers blir de stående igjen uten eier. Returnerer antall
+    prosesser som ble forsøkt avsluttet. Kaster aldri.
+    """
+    if not _IS_WIN:
+        return 0
+    try:
+        api = _win_api()
+        me = os.getpid()
+        my_t = _times(api, me)
+        if not my_t:
+            return 0
+        procs = _snapshot(api)
+        times = {p: t for p, _pp in procs if (t := _times(api, p))}
+        prot = _protected(api, procs, times)
+        exe = _snapshot_names(api)
+        wanted = {n.lower() for n in names}
+        kids = [k for k in select_tree(me, (my_t[0], None), procs, times, prot)
+                if exe.get(k, "") in wanted]
+        for k in reversed(kids):                 # dypeste først
+            _terminate_pid(api, k, times[k][0])
+        return len(kids)
+    except Exception:
+        return 0

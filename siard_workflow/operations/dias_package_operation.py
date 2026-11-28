@@ -19,6 +19,7 @@ import re
 import shutil
 import tarfile
 import tempfile
+import time
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -28,8 +29,50 @@ from siard_workflow.core.base_operation import BaseOperation, OperationResult
 from siard_workflow.core.context import WorkflowContext
 from siard_workflow.core import external_lob
 from siard_workflow.core.naming import sidecar_base
+from siard_workflow.core.zip_progress import ByteProgress, fmt_bytes, fmt_duration
 
 logger = logging.getLogger(__name__)
+
+_CHUNK = 4 << 20                 # blokkstørrelse ved lesing/skriving av store filer
+
+
+class PackagingStopped(Exception):
+    """Brukeren trykket Stopp mens pakken ble laget."""
+
+
+def _check_stop(stop) -> None:
+    if stop is not None and stop.is_set():
+        raise PackagingStopped()
+
+
+def _size(path) -> int:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def _emit(ctx_meta: "dict | None", msg: str, lvl: str = "info") -> None:
+    """
+    Melding til programloggen, kjøreloggen (fil) og loggvinduet i GUI-et.
+    (Før gikk DIAS-meldingene bare til loggfila — loggvinduet sto stille
+    gjennom hele steget.)
+    """
+    logger.info(msg)
+    meta = ctx_meta or {}
+    fl = meta.get("file_logger")
+    if fl:
+        fl.log(msg, lvl)
+    pcb = meta.get("progress_cb")
+    if pcb:
+        try:
+            pcb("log", msg=msg, level=lvl)
+        except Exception:
+            pass
+
+
+def _lvl(msg: str, lvl: str = "") -> str:
+    return lvl or ("warn" if "ADVARSEL" in msg.upper() else "info")
 
 # Brukerdata-mappa (programmappa, eller mappa med SIARDManager.exe når pakket)
 try:
@@ -470,9 +513,7 @@ class DiasPackageOperation(BaseOperation):
         fl = (ctx.metadata or {}).get("file_logger")
 
         def _w(msg: str, lvl: str = "info") -> None:
-            logger.info(msg)
-            if fl:
-                fl.log(msg, lvl)
+            _emit(ctx.metadata, msg, lvl)
 
         src = ctx.extracted_path if (ctx.extracted_path and ctx.extracted_path.is_dir()) \
             else siard_path
@@ -513,9 +554,7 @@ class DiasPackageOperation(BaseOperation):
         fl = (ctx.metadata or {}).get("file_logger")
 
         def _w(msg: str, lvl: str = "info") -> None:
-            logger.info(msg)
-            if fl:
-                fl.log(msg, lvl)
+            _emit(ctx.metadata, msg, lvl)
 
         def _use(res: dict, origin: str) -> bool:
             if not (res and res.get("found") and res.get("from_date") and res.get("to_date")):
@@ -577,9 +616,7 @@ class DiasPackageOperation(BaseOperation):
         fl = (ctx.metadata or {}).get("file_logger")
 
         def _w(msg: str, lvl: str = "info") -> None:
-            logger.info(msg)
-            if fl:
-                fl.log(msg, lvl)
+            _emit(ctx.metadata, msg, lvl)
 
         if ask is None:
             return True
@@ -681,10 +718,8 @@ class DiasPackageOperation(BaseOperation):
         _fl        = _ctx_meta.get("file_logger")
         _existing_srcs = {ef["src"] for ef in metadata_extras}
 
-        def _wlog(msg: str) -> None:
-            logger.info(msg)
-            if _fl:
-                _fl.log(msg, "info")
+        def _wlog(msg: str, lvl: str = "") -> None:
+            _emit(_ctx_meta, msg, _lvl(msg, lvl))
 
         def _auto_add(path, dest_dir: str, label: str = "") -> None:
             if not path:
@@ -853,10 +888,8 @@ class DiasPackageOperation(BaseOperation):
 
         _file_log = (ctx.metadata or {}).get("file_logger")
 
-        def _log_fn(msg: str) -> None:
-            logger.info(msg)
-            if _file_log:
-                _file_log.log(msg, "info")
+        def _log_fn(msg: str, lvl: str = "") -> None:
+            _emit(_ctx_meta, msg, _lvl(msg, lvl))
 
         # ── Eksternt fillager (ekstern lobFolder) ──────────────────────────────
         # Hvis en inkludert SIARD refererer et eksternt fillager (søster-
@@ -877,7 +910,12 @@ class DiasPackageOperation(BaseOperation):
                 meta         = meta,
                 log_fn       = _log_fn,
                 temp_base    = _temp_base,
+                pcb          = _ctx_meta.get("progress_cb"),
+                stop         = _ctx_meta.get("stop_event"),
             )
+        except PackagingStopped:
+            return self._fail("DIAS-pakking stoppet av bruker — den halvferdige "
+                              "pakken og temp-filene er slettet")
         except Exception as exc:
             logger.exception("DIAS-pakking feilet")
             return self._fail(f"DIAS-pakking feilet: {exc}")
@@ -979,12 +1017,12 @@ def _content_entries(content) -> "list[tuple[Path, str]]":
             for p in sorted(root.rglob("*")) if p.is_file()]
 
 
-def _gather_file_info(directory, prefix: str, log_fn) -> dict:
+def _gather_file_info(directory, prefix: str, log_fn, pcb=None, stop=None) -> dict:
     """SHA-256, MIME-type, størrelse og endringstidspunkt for alle filer i
     mappen — eller i en liste [(kildefil, sti under prefix)]."""
     if isinstance(directory, (list, tuple)):
-        return _gather_entries_info(directory, prefix, log_fn)
-    log_fn(f"Beregner sjekksummer for {prefix}...")
+        return _gather_entries_info(directory, prefix, log_fn, pcb, stop)
+    log_fn("Beregner sjekksummer for metadatafilene ...")
     _use_magic = False
     try:
         import magic as _magic  # type: ignore
@@ -1016,49 +1054,169 @@ def _gather_file_info(directory, prefix: str, log_fn) -> dict:
     return info_dict
 
 
-def _gather_entries_info(entries, prefix: str, log_fn) -> dict:
+def _gather_entries_info(entries, prefix: str, log_fn, pcb=None, stop=None) -> dict:
     """Som _gather_file_info, for (kildefil, sti)-par (filer leses der de ligger)."""
-    log_fn(f"Beregner sjekksummer for {prefix}...")
+    items = _content_entries(entries)
+    total = sum(_size(f) for f, _rel in items)
+    log_fn(f"Beregner sjekksummer (SHA-256) for innholdet: {len(items)} fil(er), "
+           f"{fmt_bytes(total)} — hele innholdet leses ...")
     try:
         import magic as _magic  # type: ignore
     except ImportError:
         _magic = None
+    prog = ByteProgress("Beregner sjekksum", len(items), total, pcb, log_fn)
     info_dict = {}
-    for full, rel in _content_entries(entries):
+    for full, rel in items:
         sha = hashlib.sha256()
         mime = "application/octet-stream"
         with open(full, "rb") as f:
-            chunk = f.read(4_000_000)
+            chunk = f.read(_CHUNK)
             if _magic is not None and chunk:
                 try:
                     mime = _magic.from_buffer(chunk, mime=True)
                 except Exception:
                     pass
             while chunk:
+                _check_stop(stop)
                 sha.update(chunk)
-                chunk = f.read(4_000_000)
+                prog.add(len(chunk))
+                chunk = f.read(_CHUNK)
+        prog.add(0, files=1)
         mtime = datetime.fromtimestamp(os.path.getmtime(full)).strftime("%Y-%m-%dT%H:%M:%S+02:00")
         info_dict[f"{prefix}/{rel}"] = [sha.hexdigest(), mime, os.stat(full).st_size, mtime]
+    prog.finish()
+    log_fn(f"  Sjekksummer beregnet ({fmt_duration(time.monotonic() - prog.t0)})")
     return info_dict
 
 
-def _pack_sip(sip_dir: str, sip_id: str, content_path, log_fn):
-    log_fn("Komprimerer SIP til tar-arkiv...")
+class _HashingWriter:
+    """
+    Skrivemål for tar-arkivet som beregner SHA-256 av alt som skrives.
+    Sjekksummen til tar-fila (info.xml) er da klar når fila er skrevet — før
+    ble hele tar-fila lest en gang til bare for å beregne den.
+    tarfile skriver fortløpende i modus «w»; uten seek() her vil et forsøk
+    på å gå tilbake i fila feile høyt i stedet for å gi feil sjekksum.
+    """
+
+    def __init__(self, fh):
+        self._fh = fh
+        self.sha = hashlib.sha256()
+        self.pos = 0
+
+    def write(self, data) -> int:
+        self._fh.write(data)
+        self.sha.update(data)
+        self.pos += len(data)
+        return len(data)
+
+    def tell(self) -> int:
+        return self.pos
+
+    def flush(self) -> None:
+        self._fh.flush()
+
+
+class _CountingReader:
+    """Kildefil som melder leste byte til fremdriften (og stopper på Stopp)."""
+
+    def __init__(self, fh, prog, stop):
+        self._fh, self._prog, self._stop = fh, prog, stop
+
+    def read(self, n: int = -1) -> bytes:
+        _check_stop(self._stop)
+        data = self._fh.read(n)
+        if data:
+            self._prog.add(len(data))
+        return data
+
+
+def _pack_sip(sip_dir: str, sip_id: str, content_path, log_fn,
+              pcb=None, stop=None) -> str:
+    """Skriv tar-arkivet. Returnerer tar-filas SHA-256 (beregnet under skriving)."""
     sip_dir_path = Path(sip_dir)
     sip_dir_parent = sip_dir_path.parent  # {tmp_out}/{sip_id}/content/
+    tar_path = f"{sip_dir}.tar"
 
-    with tarfile.open(f"{sip_dir}.tar", "w") as tar:
-        # SIP-innholdet: arkiveres som {sip_id}/xxx
-        for file in sip_dir_path.rglob("*"):
-            if file.is_file():
-                arcname = str(file.relative_to(sip_dir_parent)).replace("\\", "/")
-                tar.add(str(file), arcname=arcname)
-        # Content-filer: arkiveres som {sip_id}/content/xxx — leses direkte
-        # fra kildestedet (ingen mellomkopi)
-        for file, rel in _content_entries(content_path):
-            tar.add(str(file), arcname=f"{sip_id}/content/{rel}")
+    sip_files = [f for f in sip_dir_path.rglob("*") if f.is_file()]
+    content = _content_entries(content_path)
+    total = sum(_size(f) for f in sip_files) + sum(_size(f) for f, _rel in content)
+    n_files = len(sip_files) + len(content)
+    log_fn(f"Skriver tar-arkivet: {n_files} fil(er), {fmt_bytes(total)} → "
+           f"{Path(tar_path).anchor or Path(tar_path).parent} (temp) ...")
+    prog = ByteProgress("Skriver tar-arkiv", n_files, total, pcb, log_fn)
+
+    def _add(tar, file, arcname: str) -> None:
+        ti = tar.gettarinfo(str(file), arcname=arcname)
+        if ti is None or not ti.isreg():
+            tar.add(str(file), arcname=arcname)
+        else:
+            with open(file, "rb") as f:
+                tar.addfile(ti, _CountingReader(f, prog, stop))
+        prog.add(0, files=1)
+
+    with open(tar_path, "wb") as raw:
+        out = _HashingWriter(raw)
+        with tarfile.open(fileobj=out, mode="w", copybufsize=_CHUNK) as tar:
+            # SIP-innholdet: arkiveres som {sip_id}/xxx
+            for file in sip_files:
+                _add(tar, file, str(file.relative_to(sip_dir_parent)).replace("\\", "/"))
+            # Content-filer: arkiveres som {sip_id}/content/xxx — leses direkte
+            # fra kildestedet (ingen mellomkopi)
+            for file, rel in content:
+                _add(tar, file, f"{sip_id}/content/{rel}")
+        raw.flush()
+    prog.finish()
 
     shutil.rmtree(sip_dir_path)
+    if os.path.getsize(tar_path) != out.pos:        # skal ikke skje — les da fila
+        log_fn("  ADVARSEL: tar-fila har uventet størrelse — sjekksummen "
+               "beregnes ved å lese fila på nytt", "warn")
+        return _sha256_file(tar_path)
+    log_fn(f"  Tar-arkivet skrevet: {fmt_bytes(out.pos)} "
+           f"({fmt_duration(time.monotonic() - prog.t0)}), sjekksum beregnet under skriving")
+    return out.sha.hexdigest()
+
+
+def _move_package(src: Path, dst: Path, log_fn, pcb=None, stop=None) -> None:
+    """
+    Flytt den ferdige pakken fra temp til utmappa. Samme disk: omdøping
+    (øyeblikkelig). Ulike disker: kopiering med fremdrift; en halvferdig
+    kopi i utmappa slettes ved feil/stopp. Kilden ryddes av kalleren.
+    """
+    try:
+        src.rename(dst)
+        return
+    except OSError:
+        pass
+    files = [p for p in sorted(src.rglob("*")) if p.is_file()]
+    dirs = [p for p in sorted(src.rglob("*")) if p.is_dir()]
+    total = sum(_size(p) for p in files)
+    log_fn(f"  Temp og utmappe ligger på ulike disker — kopierer pakken "
+           f"({fmt_bytes(total)}) til {dst.parent} ...")
+    prog = ByteProgress("Kopierer pakken til utmappa", len(files), total, pcb, log_fn)
+    try:
+        dst.mkdir(parents=True, exist_ok=True)
+        for d in dirs:
+            (dst / d.relative_to(src)).mkdir(parents=True, exist_ok=True)
+        for p in files:
+            target = dst / p.relative_to(src)
+            with open(p, "rb") as fi, open(target, "wb") as fo:
+                while True:
+                    _check_stop(stop)
+                    chunk = fi.read(_CHUNK)
+                    if not chunk:
+                        break
+                    fo.write(chunk)
+                    prog.add(len(chunk))
+            shutil.copystat(p, target)
+            if os.path.getsize(target) != os.path.getsize(p):
+                raise OSError(f"Kopien av {p.name} har feil størrelse i {dst.parent}")
+            prog.add(0, files=1)
+    except BaseException:
+        shutil.rmtree(dst, ignore_errors=True)
+        raise
+    prog.finish()
+    log_fn(f"  Pakken kopiert til utmappa ({fmt_duration(time.monotonic() - prog.t0)})")
 
 
 def _write_sip_log(path: str, sip_id: str, create_date: str, meta: dict):
@@ -1307,9 +1465,9 @@ def _write_sip_mets(mets_path: str, premis_path: str, sip_id: str,
 
 
 def _write_sip_info(info_path: str, tar_path: str, sip_id: str,
-                    creation_date: str, meta: dict):
+                    creation_date: str, meta: dict, tar_sha: str = ""):
     extra_id = f"ID{uuid1()}"
-    tar_sha   = _sha256_file(tar_path)
+    tar_sha   = tar_sha or _sha256_file(tar_path)
     tar_size  = os.stat(tar_path).st_size
     tar_mtime = datetime.fromtimestamp(os.path.getmtime(tar_path)).strftime("%Y-%m-%dT%H:%M:%S+02:00")
 
@@ -1434,7 +1592,30 @@ def _build_dias_package(
     meta:         dict,
     log_fn,
     temp_base:    "Path | None" = None,
+    pcb=None,
+    stop=None,
 ) -> Path:
+    """
+    Bygger DIAS-pakken i en temp-mappe og flytter den til out_root. Temp-mappa
+    slettes alltid — også ved feil eller Stopp (en halvferdig tar-fil kan være
+    like stor som uttrekket). pcb: fremdrift til GUI, stop: threading.Event.
+    """
+    def _log(msg: str, lvl: str = "info") -> None:
+        try:
+            log_fn(msg, lvl)
+        except TypeError:
+            log_fn(msg)
+
+    # Opprett kortbane-arbeidskatalog for å unngå Windows MAX_PATH-problemer
+    _tmp_work = tempfile.mkdtemp(dir=temp_base)  # kort sti i %TEMP% eller angitt dir
+    try:
+        return _build_in_temp(_tmp_work, content_path, out_root, meta, _log, pcb, stop)
+    finally:
+        shutil.rmtree(_tmp_work, ignore_errors=True)
+
+
+def _build_in_temp(_tmp_work: str, content_path, out_root: Path, meta: dict,
+                   log_fn, pcb=None, stop=None) -> Path:
     """
     Bygger full DIAS AIC/SIP-pakke og returnerer stien til AIC-mappen.
 
@@ -1456,8 +1637,6 @@ def _build_dias_package(
     log_fn("Bygger mappestruktur...")
     sip_id = str(uuid1())
 
-    # Opprett kortbane-arbeidskatalog for å unngå Windows MAX_PATH-problemer
-    _tmp_work = tempfile.mkdtemp(dir=temp_base)  # kort sti i %TEMP% eller angitt dir
     tmp_out     = Path(_tmp_work) / "d"          # én bokstav — minimer stiidybde
     tarfile_dir = tmp_out / sip_id / "content" / sip_id
 
@@ -1504,7 +1683,7 @@ def _build_dias_package(
     info_dict = _gather_file_info(str(tarfile_dir), sip_id, log_fn)
     info_dict.update(_gather_file_info(
         content_path if isinstance(content_path, (list, tuple)) else str(content_path),
-        f"{sip_id}/content", log_fn))
+        f"{sip_id}/content", log_fn, pcb, stop))
 
     log_fn("Skriver premis.xml...")
     premis_path = str(tarfile_dir / "administrative_metadata" / "premis.xml")
@@ -1513,27 +1692,21 @@ def _build_dias_package(
     log_fn("Skriver mets.xml...")
     _write_sip_mets(str(tarfile_dir / "mets.xml"), premis_path, sip_id, now, info_dict, meta)
 
-    _pack_sip(str(tarfile_dir), sip_id, content_path, log_fn)
+    tar_sha = _pack_sip(str(tarfile_dir), sip_id, content_path, log_fn, pcb, stop)
 
     log_fn("Skriver info.xml...")
     _write_sip_info(
         str(tmp_out / "info.xml"),
         f"{tarfile_dir}.tar",
-        sip_id, now, meta,
+        sip_id, now, meta, tar_sha,
     )
 
     # Zone 2 — ETA (AIC-omslag)
     log_fn("Oppretter AIC-struktur...")
     aic_id   = str(uuid1())
     aic_path = out_root / aic_id
-    try:
-        # Forsøk rask rename (kun mulig på samme filsystem)
-        tmp_out.rename(aic_path)
-    except OSError:
-        # Faller tilbake til copy+delete ved kryssfilsystem-move (f.eks. C: → X:)
-        shutil.move(str(tmp_out), str(aic_path))
-    finally:
-        shutil.rmtree(_tmp_work, ignore_errors=True)
+    # Rask omdøping på samme disk, ellers kopiering med fremdrift (f.eks. E: → X:)
+    _move_package(tmp_out, aic_path, log_fn, pcb, stop)
 
     log_fn("Skriver AIC log.xml...")
     _write_aic_log(str(aic_path / sip_id / "log.xml"), aic_id, sip_id, _ts(), meta)

@@ -38,10 +38,23 @@ _RESULT_LABELS = {
     "xsd_type_fix": {
         "fixes":   "Rettinger i tableX.xsd",
         "unfixed": "Avvik som krever manuell vurdering",
+        "date_values_marked": "Tidspunkt ved grensen merket som UTC (Z)",
     },
     "lobfolder_fix": {
         "fixes":      "lobFolder-rettinger",
         "file_paths": "Filreferanser skrevet som full sti",
+    },
+    "cosdoc_mailmerge": {
+        "pairs_found":       "Dokumentpar (dokument + datakilde)",
+        "pairs_merged":      "Dokumentpar flettet",
+        "singles_found":     "Enkeltdokumenter",
+        "singles_decrypted": "Enkeltdokumenter avkryptert",
+        "decrypt_failed":    "Avkryptering feilet",
+        "merge_failed":      "Fletting feilet eller hoppet over",
+        "rows_before":       "Rader før",
+        "rows_after":        "Rader etter",
+        "rows_removed":      "Datakilde-rader fjernet",
+        "data_sources_kept": "Datakilder beholdt (ikke flettet)",
     },
 }
 
@@ -135,6 +148,10 @@ def follow_up_items(step_results: list, ctx_results: dict) -> "tuple[list, int]"
             what = "ble avbrutt" if s.get("interrupted") else "feilet"
             msg = str(s.get("message") or "")[:200]
             items.append(f"Steget «{s.get('label', '')}» {what}" + (f": {msg}" if msg else ""))
+    # Data som mangler fordi operatøren valgte å fortsette etter utpakkingen
+    from siard_workflow.core.run_summary import data_loss_notes
+    for note in data_loss_notes({"unpack_siard": by_id.get("unpack_siard") or {}}):
+        items.append(f"DATATAP: {note} (operatøren valgte å fortsette)")
     fs = (by_id.get("blob_convert") or {}).get("failure_summary") or {}
     failed, _kept, kept_keys = _split_failures(fs)
     labels, counts = fs.get("labels") or {}, fs.get("counts") or {}
@@ -1715,10 +1732,25 @@ def _op_detail(
         ]
         if tables:
             rows.append(("Tabeller behandlet:", f"{_n(tables)}"))
+        rv_cols = op_data.get("rowversion_columns", 0)
+        if rv_cols:
+            rows.append(("Radversjonskolonner omtypet:", f"{_n(rv_cols)}"))
+            rows.append(("Radversjonsverdier (inline):",
+                         f"{_n(op_data.get('rowversion_values', 0))}"))
+            if op_data.get("rowversion_files_inlined"):
+                rows.append(("Småfiler lest inn igjen:",
+                             f"{_n(op_data['rowversion_files_inlined'])}"))
         out.append(Paragraph("HEX-ekstraksjon", s_sub))
         out.append(_kv_table(rows))
         if hex_exp == 0:
             out.append(Paragraph("Ingen HEX-kodede CLOB-felt funnet.", s_small))
+        if rv_cols:
+            out.append(Paragraph(
+                "Radversjonskolonner er tellere på 8 byte fra kildebasen "
+                "(SQL Server/Sybase TIMESTAMP/ROWVERSION — ikke tidspunkt) som "
+                "uttrekket beskrev som BLOB. De er omtypet til BINARY(8) / "
+                "VARBINARY(8). Verdiene er uendret og står inline i tabellfila; "
+                "det er ikke laget filer av dem.", s_small))
 
     # ── Virusskan ────────────────────────────────────────────────────────────
     elif op_id == "virus_scan":
@@ -1751,8 +1783,31 @@ def _op_detail(
         rows = [("Filer pakket ut:", f"{_n(n_files)}")]
         if ex_path:
             rows.append(("Temp-mappe:", ex_path))
+        n_lost = op_data.get("unpack_failed", 0)
+        n_cut = op_data.get("tables_incomplete", 0)
+        if n_lost:
+            rows.append(("Ikke pakket ut (mangler):", f"{_n(n_lost)} fil(er)"))
+        if n_cut:
+            rows.append(("Ufullstendige tabellfiler:", f"{_n(n_cut)}"))
         out.append(Paragraph("Utpakking", s_sub))
         out.append(_kv_table(rows))
+        if op_data.get("data_loss_accepted"):
+            lost = (list(op_data.get("unpack_failed_files") or [])
+                    + list(op_data.get("tables_incomplete_files") or []))
+            out.append(Paragraph(
+                "DATATAP: Data mangler i resultatet. Operatøren ble advart og valgte "
+                "å fortsette.",
+                _style("unpack_loss", fontName="Helvetica-Bold", fontSize=10,
+                       textColor=C_ERROR, leftIndent=10, spaceBefore=4, spaceAfter=2)))
+            from xml.sax.saxutils import escape as _xml_esc
+            for line in lost[:30]:
+                out.append(Paragraph(
+                    "• " + _xml_esc(line),
+                    _style("unpack_loss_item", fontSize=8, leftIndent=18, spaceAfter=1)))
+            if len(lost) > 30 or n_lost + n_cut > len(lost):
+                out.append(Paragraph(
+                    f"… og {_n(n_lost + n_cut - min(len(lost), 30))} til (se kjøreloggen)",
+                    _style("unpack_loss_more", fontSize=8, leftIndent=18, spaceAfter=2)))
 
     # ── Pakk sammen SIARD ────────────────────────────────────────────────────
     elif op_id == "repack_siard":

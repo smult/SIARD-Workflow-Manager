@@ -65,6 +65,24 @@ def failure_counts(results: dict) -> "tuple[int, int]":
     return failed, kept
 
 
+def data_loss_notes(results: dict) -> list:
+    """
+    Korte setninger om data som mangler i resultatet fordi operatøren valgte å
+    fortsette etter feil ved utpakking eller ufullstendige tabellfiler.
+    """
+    d = (results or {}).get("unpack_siard")
+    if not isinstance(d, dict) or not d.get("data_loss_accepted"):
+        return []
+    out: list = []
+    if d.get("unpack_failed"):
+        out.append(f"{fmt.num(d['unpack_failed'])} fil(er) kunne ikke pakkes ut og "
+                   f"mangler i resultatet")
+    if d.get("tables_incomplete"):
+        out.append(f"{fmt.num(d['tables_incomplete'])} tabellfil(er) er ufullstendige "
+                   f"(slutter uten </table>) — rader mangler trolig")
+    return out
+
+
 def collect_outputs(results: dict, extra: "list | None" = None) -> list:
     """[(ledetekst, sti)] for filene kjøringen laget — uten duplikater."""
     out: list = []
@@ -104,7 +122,8 @@ def _size_text(path: str) -> str:
 
 
 def overall_status(step_results: list, *, aborted: bool = False, held: int = 0,
-                   failed_files: int = 0) -> "tuple[str, str]":
+                   failed_files: int = 0,
+                   data_loss: "list | None" = None) -> "tuple[str, str]":
     """(nivå, tekst) for kjøringen samlet."""
     n_fail = sum(1 for s in step_results
                  if not s.get("skipped") and s.get("success") is False
@@ -116,6 +135,9 @@ def overall_status(step_results: list, *, aborted: bool = False, held: int = 0,
     if held:
         return "warn", (f"FORELØPIG — {held} steg holdt igjen; kjør arbeidsflyten "
                         f"igjen når feilen er rettet")
+    if data_loss:
+        return "error", ("FULLFØRT MED DATATAP — " + "; ".join(data_loss)
+                         + " (operatøren valgte å fortsette)")
     if failed_files:
         return "warn", (f"FULLFØRT MED AVVIK — {fmt.num(failed_files)} fil(er) kunne "
                         f"ikke konverteres og bør følges opp")
@@ -127,12 +149,15 @@ def build_run_summary(step_results: list, *, total_s: float, wait_s: float = 0.0
                       n_warnings: int = 0, n_errors: int = 0,
                       outputs: "list | None" = None, failed_files: int = 0,
                       kept_files: int = 0, held: int = 0,
-                      aborted: bool = False) -> list:
+                      aborted: bool = False,
+                      data_loss: "list | None" = None) -> list:
     """Linjene i sluttsammendraget som [(nivå, tekst)]."""
     lines: list = [("info", "=" * 56), ("step", "SAMMENDRAG")]
     lvl, text = overall_status(step_results, aborted=aborted, held=held,
-                               failed_files=failed_files)
+                               failed_files=failed_files, data_loss=data_loss)
     lines.append((lvl, f"  Resultat:  {text}"))
+    for note in (data_loss or []):
+        lines.append(("error", f"  DATATAP:   {note}"))
     tid = fmt.duration(total_s)
     if wait_s >= 60:
         tid += (f"  (herav {fmt.duration(wait_s)} venting på svar; "
